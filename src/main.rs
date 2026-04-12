@@ -1,10 +1,14 @@
-//! siGit — AI coding agent that runs a local LLM via Onde Inference and
-//! speaks ACP over stdio so editors like Zed can talk to it.
+//! siGit Code — AI coding agent powered by a local LLM via Onde Inference.
+//!
+//! Two modes of operation:
+//!
+//! - **Interactive** (stdin is a TTY): full-screen chat UI built on ratatui.
+//! - **ACP server** (stdin is piped): JSON-RPC over stdio for editors like Zed.
 //!
 //! On macOS the model cache is shared with the siGit desktop app through an
 //! App Group container. See [`setup`].
 //!
-//! # Zed setup
+//! # Zed setup (ACP mode)
 //!
 //! Add to `~/.config/zed/settings.json`:
 //! ```json
@@ -18,8 +22,10 @@
 //! }
 //! ```
 
+mod chat;
 mod setup;
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 use agent_client_protocol::{
@@ -230,24 +236,33 @@ fn print_banner() {
     eprintln!("{art}");
 }
 
-// ── Entry point ──────────────────────────────────────────────────────────────
+// ── Interactive mode ─────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // stdout is the ACP wire, so logs go to stderr.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stderr)
-        .init();
+/// Load the model, then hand off to the ratatui chat TUI.
+async fn run_interactive() -> anyhow::Result<()> {
+    println!("  Loading model...");
 
-    print_banner();
+    let engine = ChatEngine::new();
+    let config = GgufModelConfig::platform_default();
+    engine
+        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("model load failed: {e}"))?;
 
-    log::info!("siGit v{} starting", env!("CARGO_PKG_VERSION"));
+    let info = engine.info().await;
+    println!(
+        "  \x1b[32m✓\x1b[0m {} ({})\n",
+        info.model_name.as_deref().unwrap_or("unknown"),
+        info.approx_memory.as_deref().unwrap_or("?"),
+    );
 
-    // Point HF_HOME at the shared App Group container (macOS) so we pick up
-    // models the desktop app already downloaded. Must happen before anything
-    // touches hf-hub.
-    setup::setup_shared_model_cache();
+    chat::run(&engine).await
+}
 
+// ── ACP server mode ──────────────────────────────────────────────────────────
+
+/// Speak ACP JSON-RPC over stdio. The editor spawns us as a subprocess.
+async fn run_acp_server() -> anyhow::Result<()> {
     // Agent::prompt sends chunks here; the forwarder task writes them out.
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
 
@@ -288,6 +303,29 @@ async fn main() -> anyhow::Result<()> {
         })
         .await;
 
-    log::info!("siGit shutting down");
     Ok(())
+}
+
+// ── Entry point ──────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Logs always go to stderr (stdout is either the TUI or the ACP wire).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Stderr)
+        .init();
+
+    // Shared model cache (macOS App Group) — must run before anything
+    // touches hf-hub or ChatEngine.
+    setup::setup_shared_model_cache();
+
+    if std::io::stdin().is_terminal() {
+        // Interactive mode — full-screen chat TUI.
+        print_banner();
+        run_interactive().await
+    } else {
+        // Editor spawned us — speak ACP over stdio.
+        log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));
+        run_acp_server().await
+    }
 }
