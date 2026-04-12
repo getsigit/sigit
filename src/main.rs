@@ -40,17 +40,21 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const SYSTEM_PROMPT: &str = "\
-You are siGit, an expert AI coding agent integrated directly into your editor \
-via the Agent Client Protocol. You specialize in:
+Your name is siGit — spelled exactly that way: lowercase 's', uppercase 'G', \
+no spaces. Never write it as 'SiGit', 'Sigit', or any other variation. \
+When introducing yourself, say 'I am siGit'.
+
+You are an AI coding agent built into the editor via the Agent Client Protocol. \
+You help with:
 
 - Code analysis, writing, and refactoring
 - Bug hunting and debugging
 - Git workflows and commit messages
 - Software architecture and design patterns
-- Code review and best practices
+- Code review
 
-Be concise, precise, and practical. Write clean, idiomatic code with brief \
-explanations. Identify root causes when debugging. Prefer correctness over brevity.";
+Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
+root cause, not the symptom. Correct beats clever.";
 
 // ── Per-session state ────────────────────────────────────────────────────────
 
@@ -62,8 +66,7 @@ struct Session {
 
 // ── Agent implementation ─────────────────────────────────────────────────────
 
-/// The actual agent. Holds one `ChatEngine` (loaded lazily on the first
-/// session) and talks ACP over stdio.
+/// The agent. One `ChatEngine`, loaded on the first session.
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     active_session: Arc<Mutex<Option<Session>>>,
@@ -173,7 +176,6 @@ impl Agent for SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
-        // Stream tokens from the LLM and forward each one as an ACP update.
         let mut rx = self
             .engine
             .stream_message(user_text)
@@ -261,7 +263,7 @@ async fn run_interactive() -> anyhow::Result<()> {
 
 // ── ACP server mode ──────────────────────────────────────────────────────────
 
-/// Speak ACP JSON-RPC over stdio. The editor spawns us as a subprocess.
+/// The editor spawns us and talks ACP over stdio.
 async fn run_acp_server() -> anyhow::Result<()> {
     // Agent::prompt sends chunks here; the forwarder task writes them out.
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
@@ -277,7 +279,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
     local
         .run_until(async move {
-            // Wire up the ACP connection. The closure spawns its internal IO tasks.
+            // Wire up the ACP connection.
             let (conn, io_task) = AgentSideConnection::new(
                 agent,
                 stdout,

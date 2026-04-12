@@ -97,7 +97,7 @@ impl App {
             env!("CARGO_PKG_VERSION"),
         )));
         messages.push(ChatMessage::system(
-            "AI coding agent, powered by local LLM.",
+            "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
         ));
         messages.push(ChatMessage::system("Type /help for commands."));
 
@@ -239,7 +239,10 @@ fn render_title(frame: &mut Frame, area: ratatui::layout::Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" Code", Style::default().fg(Color::White)),
-        Span::styled(" — AI Chat", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " — maybe deploy later?",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(title).style(Style::default().bg(Color::Black)),
