@@ -2,13 +2,19 @@
 //!
 //! Takes over the alternate screen and multiplexes terminal events with
 //! streaming LLM tokens via `tokio::select!`.
+//!
+//! Inference runs on a background `tokio::spawn` task so the event loop
+//! keeps redrawing while the model thinks. Results flow back through an
+//! `mpsc` channel as `InferenceUpdate` variants.
 
 use std::future::pending;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use onde::inference::{ChatEngine, StreamChunk};
+use onde::inference::{ChatEngine, StreamChunk, ToolDefinition, ToolResult};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position},
@@ -55,6 +61,18 @@ impl ChatMessage {
     }
 }
 
+// ── Inference updates from background task ───────────────────────────────────
+
+/// Messages sent from the spawned inference task back to the event loop.
+enum InferenceUpdate {
+    /// The model is calling a tool — show its name in the chat.
+    ToolUse(String),
+    /// The model produced a final text response.
+    Response(String),
+    /// Something went wrong during inference.
+    Error(String),
+}
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 struct App {
@@ -64,6 +82,12 @@ struct App {
     scroll_offset: u16,
     stream_rx: Option<mpsc::Receiver<StreamChunk>>,
     stream_buf: String,
+    /// Channel for receiving results from the background inference task.
+    inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
+    /// True while waiting for inference to finish.
+    thinking: bool,
+    /// Counter driving the thinking spinner animation.
+    thinking_tick: u8,
     quit: bool,
     /// Toggled every other tick while streaming — drives the blinking cursor.
     blink_on: bool,
@@ -84,6 +108,9 @@ const BANNER_ART: &str = "\
 2222255555555555555555555555299        708    1002          80     00      90852222222222222
 55555555555555555555555555555560953258000866660000051140866908666600008966900065555555555555
 88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888";
+
+/// Spinner frames for the "thinking" animation.
+const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl App {
     fn new() -> Self {
@@ -108,10 +135,18 @@ impl App {
             scroll_offset: 0,
             stream_rx: None,
             stream_buf: String::new(),
+            inference_rx: None,
+            thinking: false,
+            thinking_tick: 0,
             quit: false,
             blink_on: true,
             blink_counter: 0,
         }
+    }
+
+    /// True when either streaming tokens or waiting for inference.
+    fn is_busy(&self) -> bool {
+        self.is_streaming() || self.thinking
     }
 
     fn is_streaming(&self) -> bool {
@@ -134,6 +169,25 @@ impl App {
         self.blink_on = self.blink_counter % 4 < 2;
     }
 
+    fn start_thinking(&mut self) {
+        self.thinking = true;
+        self.thinking_tick = 0;
+    }
+
+    fn stop_thinking(&mut self) {
+        self.thinking = false;
+        self.inference_rx = None;
+    }
+
+    fn tick_thinking(&mut self) {
+        self.thinking_tick = self.thinking_tick.wrapping_add(1);
+    }
+
+    fn thinking_frame(&self) -> &'static str {
+        let idx = (self.thinking_tick as usize) % THINKING_FRAMES.len();
+        THINKING_FRAMES[idx]
+    }
+
     /// Total lines the messages area would need (rough estimate for scrolling).
     fn total_message_lines(&self, width: u16) -> u16 {
         if width == 0 {
@@ -147,6 +201,10 @@ impl App {
         // streaming buffer
         if !self.stream_buf.is_empty() {
             lines += wrapped_line_count(&self.stream_buf, Role::Assistant, w);
+        }
+        // thinking indicator
+        if self.thinking {
+            lines += 1;
         }
         lines
     }
@@ -165,7 +223,7 @@ impl App {
 fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
     let prefix_len = match role {
         Role::User => 6,      // "you > "
-        Role::Assistant => 7, // "siGit > "  — wait, that's 8. Let's just use 7 for "siGit> "
+        Role::Assistant => 8, // "siGit > "
         Role::System => 0,
     };
     let effective = if width > prefix_len {
@@ -270,7 +328,7 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         let buf_lines: Vec<&str> = app.stream_buf.split('\n').collect();
         for (i, segment) in buf_lines.iter().enumerate() {
             if i > 0 {
-                lines.push(Line::from(spans.drain(..).collect::<Vec<_>>()));
+                lines.push(Line::from(std::mem::take(&mut spans)));
                 // continuation lines get no prefix
             }
             spans.push(Span::raw(segment.to_string()));
@@ -282,6 +340,25 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         }
 
         lines.push(Line::from(spans));
+    }
+
+    // thinking indicator (animated spinner)
+    if app.thinking {
+        let frame_char = app.thinking_frame();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "siGit > ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{frame_char} thinking…"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]));
     }
 
     // auto-scroll
@@ -350,19 +427,21 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(if app.is_streaming() {
+        .title(if app.thinking {
+            " thinking… "
+        } else if app.is_streaming() {
             " streaming… "
         } else {
             " message "
         })
-        .title_style(Style::default().fg(if app.is_streaming() {
+        .title_style(Style::default().fg(if app.is_busy() {
             Color::Yellow
         } else {
             Color::DarkGray
         }));
 
     let input_text = Paragraph::new(app.input.as_str())
-        .style(Style::default().fg(if app.is_streaming() {
+        .style(Style::default().fg(if app.is_busy() {
             Color::DarkGray
         } else {
             Color::White
@@ -372,7 +451,7 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(input_text, area);
 
     // place cursor inside the input block (1 for border padding)
-    if !app.is_streaming() {
+    if !app.is_busy() {
         let x = area.x + app.cursor as u16 + 1;
         let y = area.y + 1;
         frame.set_cursor_position(Position::new(x.min(area.right().saturating_sub(1)), y));
@@ -380,7 +459,7 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let hints: &[(&str, &str)] = if app.is_streaming() {
+    let hints: &[(&str, &str)] = if app.is_busy() {
         &[("Ctrl+C", "cancel")]
     } else {
         &[("Enter", "send"), ("/help", "commands"), ("Ctrl+C", "quit")]
@@ -395,12 +474,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             format!(" {key} "),
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::DarkGray)
+                .bg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(" {label}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ));
     }
 
@@ -513,19 +592,114 @@ async fn exec_slash(app: &mut App, cmd: SlashCommand, engine: &ChatEngine) {
     }
 }
 
+// ── Background inference task ────────────────────────────────────────────────
+
+/// Maximum number of tool-calling rounds before forcing a text response.
+const MAX_TOOL_ROUNDS: usize = 10;
+
+/// Build onde `ToolDefinition`s from our agent tools.
+fn build_onde_tools() -> Vec<ToolDefinition> {
+    crate::tools::all_tools()
+        .into_iter()
+        .map(|t| ToolDefinition {
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+            parameters_schema: t.parameters_schema.to_string(),
+        })
+        .collect()
+}
+
+/// Runs the agentic tool-calling loop on a background task and sends
+/// progress updates back through `tx`.
+///
+/// The sender is dropped when the task finishes, which the event loop
+/// detects as `None` from `rx.recv()`.
+async fn run_inference_task(
+    engine: Arc<ChatEngine>,
+    text: String,
+    tx: mpsc::Sender<InferenceUpdate>,
+) {
+    let onde_tools = build_onde_tools();
+
+    let mut result = match engine.send_message_with_tools(&text, &onde_tools).await {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+            return;
+        }
+    };
+
+    let mut round = 0;
+
+    while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+        round += 1;
+        log::info!("tool round {} — {} call(s)", round, result.tool_calls.len());
+
+        let mut tool_results = Vec::new();
+
+        for tc in &result.tool_calls {
+            log::info!(
+                "  → {}({})",
+                tc.function_name,
+                tc.arguments.chars().take(120).collect::<String>()
+            );
+
+            // Notify the UI about the tool call.
+            let _ = tx
+                .send(InferenceUpdate::ToolUse(tc.function_name.clone()))
+                .await;
+
+            // Execute the tool (synchronous / blocking-ok for file I/O).
+            let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments);
+            log::info!("  ← {} chars", output.len());
+
+            tool_results.push(ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: output,
+            });
+        }
+
+        // Allow further tool calls unless we've hit the limit.
+        let next_tools = if round < MAX_TOOL_ROUNDS {
+            Some(onde_tools.as_slice())
+        } else {
+            None // force a text response on the last round
+        };
+
+        match engine.send_tool_results(tool_results, next_tools).await {
+            Ok(r) => result = r,
+            Err(err) => {
+                let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+                return;
+            }
+        }
+    }
+
+    // Send the final text response.
+    if !result.text.is_empty() && result.tool_calls.is_empty() {
+        let _ = tx.send(InferenceUpdate::Response(result.text)).await;
+    }
+
+    log::info!("inference complete — {} tool round(s)", round);
+    // Sender drops here → event loop sees `None`.
+}
+
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 /// Run the interactive chat UI. Blocks until the user quits.
 ///
 /// The caller must have already loaded a model into `engine`.
-pub async fn run(engine: &ChatEngine) -> Result<()> {
+pub async fn run(engine: Arc<ChatEngine>) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, engine).await;
     ratatui::restore();
     result
 }
 
-async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine) -> Result<()> {
+async fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    engine: Arc<ChatEngine>,
+) -> Result<()> {
     let mut app = App::new();
     let mut event_stream = EventStream::new();
 
@@ -537,11 +711,12 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
             break;
         }
 
-        // multiplex terminal events and streaming tokens
+        // multiplex terminal events, streaming tokens, inference updates,
+        // and the thinking-spinner timer.
         tokio::select! {
             biased;
 
-            // streaming chunks — only active when we have a receiver
+            // ── streaming chunks ─────────────────────────────────────────
             chunk = async {
                 match app.stream_rx.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -564,7 +739,45 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
                 }
             }
 
-            // terminal events
+            // ── inference updates from background task ───────────────────
+            update = async {
+                match app.inference_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => pending().await,
+                }
+            } => {
+                match update {
+                    Some(InferenceUpdate::ToolUse(name)) => {
+                        app.messages.push(ChatMessage::system(format!("🔧 {name}")));
+                    }
+                    Some(InferenceUpdate::Response(text)) => {
+                        app.stop_thinking();
+                        app.messages.push(ChatMessage::assistant(text));
+                    }
+                    Some(InferenceUpdate::Error(msg)) => {
+                        app.stop_thinking();
+                        app.messages.push(ChatMessage::system(format!("error: {msg}")));
+                    }
+                    None => {
+                        // Sender dropped — task finished (possibly with no
+                        // text response, e.g. all tool calls with empty final).
+                        app.stop_thinking();
+                    }
+                }
+            }
+
+            // ── thinking spinner tick (100ms) ────────────────────────────
+            _ = async {
+                if app.thinking {
+                    tokio::time::sleep(Duration::from_millis(100)).await
+                } else {
+                    pending().await
+                }
+            } => {
+                app.tick_thinking();
+            }
+
+            // ── terminal events ──────────────────────────────────────────
             maybe_event = event_stream.next() => {
                 let Some(Ok(event)) = maybe_event else {
                     // stream ended or error — bail
@@ -572,14 +785,21 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
                 };
 
                 if let Event::Key(key) = event {
-                    // while streaming, only ctrl+c/d work
-                    if app.is_streaming() {
+                    // While busy (streaming or thinking), only Ctrl+C/D work.
+                    if app.is_busy() {
                         if key.kind == KeyEventKind::Press {
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                             if ctrl && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d')) {
-                                // drop the receiver to stop reading
-                                app.finalize_stream();
-                                app.messages.push(ChatMessage::system("(cancelled)"));
+                                if app.is_streaming() {
+                                    app.finalize_stream();
+                                    app.messages.push(ChatMessage::system("(cancelled)"));
+                                }
+                                if app.thinking {
+                                    // Drop the receiver — the background task
+                                    // will see a closed channel and stop.
+                                    app.stop_thinking();
+                                    app.messages.push(ChatMessage::system("(cancelled)"));
+                                }
                             }
                         }
                         continue;
@@ -588,26 +808,22 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
                     if let Some(text) = handle_key(&mut app, key) {
                         // check for slash command first
                         if let Some(cmd) = parse_slash(&text) {
-                            exec_slash(&mut app, cmd, engine).await;
+                            exec_slash(&mut app, cmd, &engine).await;
                             continue;
                         }
 
-                        // regular message — send to engine
+                        // ── Spawn inference on a background task ─────────
                         app.messages.push(ChatMessage::user(&text));
+                        app.start_thinking();
 
-                        match engine.stream_message(text).await {
-                            Ok(rx) => {
-                                app.stream_rx = Some(rx);
-                                app.stream_buf.clear();
-                                app.blink_counter = 0;
-                                app.blink_on = true;
-                            }
-                            Err(err) => {
-                                app.messages.push(ChatMessage::system(format!(
-                                    "error: {err}"
-                                )));
-                            }
-                        }
+                        let (tx, rx) = mpsc::channel::<InferenceUpdate>(64);
+                        app.inference_rx = Some(rx);
+
+                        let engine_handle = Arc::clone(&engine);
+                        let user_text = text.clone();
+                        tokio::spawn(async move {
+                            run_inference_task(engine_handle, user_text, tx).await;
+                        });
                     }
                 }
             }

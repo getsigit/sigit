@@ -24,7 +24,9 @@
 
 mod chat;
 mod setup;
+mod tools;
 
+use std::fs::File;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -35,7 +37,7 @@ use agent_client_protocol::{
     SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use futures::future::LocalBoxFuture;
-use onde::inference::{ChatEngine, GgufModelConfig};
+use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -53,8 +55,27 @@ You help with:
 - Software architecture and design patterns
 - Code review
 
+You have access to tools that let you read files, list directories, and search \
+code. Use them proactively to understand the codebase before answering questions \
+or writing code. Always ground your answers in the actual code.
+
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
 root cause, not the symptom. Correct beats clever.";
+
+/// Maximum number of tool-calling rounds before forcing a text response.
+const MAX_TOOL_ROUNDS: usize = 10;
+
+/// Convert the agent tool definitions into onde's `ToolDefinition` type.
+fn agent_tools_as_onde() -> Vec<ToolDefinition> {
+    tools::all_tools()
+        .into_iter()
+        .map(|t| ToolDefinition {
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+            parameters_schema: t.parameters_schema.to_string(),
+        })
+        .collect()
+}
 
 // ── Per-session state ────────────────────────────────────────────────────────
 
@@ -121,8 +142,9 @@ impl Agent for SiGitAgent {
             self.engine.clear_history().await;
         } else {
             // First session — pull the model (if needed) and load it.
-            log::info!("loading default model (this may take a minute on first run)...");
-            let config = GgufModelConfig::platform_default();
+            // Qwen 3 4B is required for tool calling support.
+            log::info!("loading Qwen 3 4B model (this may take a minute on first run)...");
+            let config = GgufModelConfig::qwen3_4b();
             self.engine
                 .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
                 .await
@@ -176,32 +198,93 @@ impl Agent for SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
-        let mut rx = self
+        // ── Agentic tool-calling loop ────────────────────────────────────
+        //
+        // 1. Send the user message with tool definitions (non-streaming).
+        // 2. If the model responds with tool calls, execute them, feed
+        //    results back, and repeat (up to MAX_TOOL_ROUNDS).
+        // 3. Once the model produces a text response (no tool calls),
+        //    stream it to the editor.
+
+        let onde_tools = agent_tools_as_onde();
+
+        let mut result = self
             .engine
-            .stream_message(user_text)
+            .send_message_with_tools(&user_text, &onde_tools)
             .await
             .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
 
-        while let Some(chunk) = rx.recv().await {
-            if !chunk.delta.is_empty() {
-                let notification = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                        chunk.delta,
-                    ))),
+        let mut round = 0;
+
+        while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+            round += 1;
+            log::info!(
+                "prompt({}) tool round {} — {} call(s)",
+                session_id,
+                round,
+                result.tool_calls.len()
+            );
+
+            let mut tool_results = Vec::new();
+
+            for tc in &result.tool_calls {
+                log::info!(
+                    "  → {}({})",
+                    tc.function_name,
+                    tc.arguments.chars().take(120).collect::<String>()
                 );
-                // Forwarder gone (client disconnected?) — stop.
-                if self.notification_tx.send(notification).await.is_err() {
-                    log::warn!("notification channel closed — stopping stream");
-                    break;
-                }
+
+                // Notify the editor that we're calling a tool.
+                let status_text = format!("🔧 `{}`\n", tc.function_name,);
+                let _ = self
+                    .notification_tx
+                    .send(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                            status_text,
+                        ))),
+                    ))
+                    .await;
+
+                // Execute the tool.
+                let output = tools::execute_tool(&tc.function_name, &tc.arguments);
+
+                log::info!("  ← {} chars", output.len());
+
+                tool_results.push(ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: output,
+                });
             }
-            if chunk.done {
-                break;
+
+            // Decide whether to allow further tool calls.
+            let next_tools = if round < MAX_TOOL_ROUNDS {
+                Some(onde_tools.as_slice())
+            } else {
+                None // force a text response on the last round
+            };
+
+            result = self
+                .engine
+                .send_tool_results(tool_results, next_tools)
+                .await
+                .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
+        }
+
+        // ── Send the final text response ─────────────────────────────────
+        if !result.text.is_empty() {
+            let notification = SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                    result.text,
+                ))),
+            );
+            if self.notification_tx.send(notification).await.is_err() {
+                log::warn!("notification channel closed");
             }
         }
 
-        log::info!("prompt({}) complete", session_id);
+        log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
         Ok(PromptResponse::new(StopReason::EndTurn))
     }
 
@@ -244,8 +327,8 @@ fn print_banner() {
 async fn run_interactive() -> anyhow::Result<()> {
     println!("  Loading model...");
 
-    let engine = ChatEngine::new();
-    let config = GgufModelConfig::platform_default();
+    let engine = Arc::new(ChatEngine::new());
+    let config = GgufModelConfig::qwen3_4b();
     engine
         .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
         .await
@@ -258,7 +341,7 @@ async fn run_interactive() -> anyhow::Result<()> {
         info.approx_memory.as_deref().unwrap_or("?"),
     );
 
-    chat::run(&engine).await
+    chat::run(engine).await
 }
 
 // ── ACP server mode ──────────────────────────────────────────────────────────
@@ -312,16 +395,29 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logs always go to stderr (stdout is either the TUI or the ACP wire).
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stderr)
-        .init();
+    let interactive = std::io::stdin().is_terminal();
+
+    // In interactive/TUI mode, logs go to a file so they don't scribble over
+    // the alternate screen buffer. In ACP mode they go to stderr as usual.
+    if interactive {
+        let log_file = File::create("sigit.log").unwrap_or_else(|_| {
+            // Fall back to /tmp if cwd is not writable.
+            File::create(std::env::temp_dir().join("sigit.log")).expect("cannot open any log file")
+        });
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .target(env_logger::Target::Pipe(Box::new(log_file)))
+            .init();
+    } else {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .target(env_logger::Target::Stderr)
+            .init();
+    }
 
     // Shared model cache (macOS App Group) — must run before anything
     // touches hf-hub or ChatEngine.
     setup::setup_shared_model_cache();
 
-    if std::io::stdin().is_terminal() {
+    if interactive {
         // Interactive mode — full-screen chat TUI.
         print_banner();
         run_interactive().await
