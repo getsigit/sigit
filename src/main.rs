@@ -1,5 +1,12 @@
 //! siGit Code — AI coding agent powered by a local LLM via Onde Inference.
 //!
+//! In interactive (TTY) mode **all** process output — `log::` crate events,
+//! `tracing` events from mistralrs_core, and even raw `println!` calls buried
+//! inside third-party crates — is redirected to `$TMPDIR/sigit.log` by
+//! rewiring the stdout/stderr file descriptors with `dup2(2)` before any
+//! library code runs.  Ratatui receives a private copy of the original
+//! terminal fd so its rendering is unaffected.
+//!
 //! Two modes of operation:
 //!
 //! - **Interactive** (stdin is a TTY): full-screen chat UI built on ratatui.
@@ -25,7 +32,7 @@
 mod chat;
 mod setup;
 
-use std::io::IsTerminal;
+use std::io::{BufWriter, IsTerminal, Write};
 use std::sync::Arc;
 
 use agent_client_protocol::{
@@ -36,8 +43,12 @@ use agent_client_protocol::{
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 const SYSTEM_PROMPT: &str = "\
 Your name is siGit — spelled exactly that way: lowercase 's', uppercase 'G', \
@@ -213,52 +224,131 @@ impl Agent for SiGitAgent {
     }
 }
 
-// ── Banner ───────────────────────────────────────────────────────────────────
+// ── Output capture ────────────────────────────────────────────────────────────
 
-fn print_banner() {
-    const BANNER: &str = r#"
-77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777
-77777777322222222222222222222222222222223777389969902208431358831999699051111177777777777777
-1111111125555555555555555555555511113222311159    5002         088    3081771691111111111111
-1111111111111111111111111111131136841   1482853332007    05    9043332891    400811111111111
-1111111111111111111111111111111201        109    304    40     00    79      100041111111111
-333333255555555555555555555552392   102   503    90    7000000005    903    0000023333333333
-333333245454545454545454545433381    7600000    302    61    780    109    20009533333333333
-3333333333333333333333333333333402      7001    08    761    202    902    90003333333333333
-2222255555555555555555555555250899901    49    304    403    08    108    300042222222222222
-2222222222222222222222222222269   106    03    901    06    505    402    000052222222222222
-2222255555555555555555555555299        708    1002          80     00      90852222222222222
-55555555555555555555555555555560953258000866660000051140866908666600008966900065555555555555
-88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+/// Redirect **both** stdout and stderr to `$TMPDIR/sigit.log` at the
+/// file-descriptor level and return a [`std::fs::File`] handle to the *real*
+/// terminal (the original stdout) so ratatui can still render to it.
+///
+/// This is the nuclear option — it catches absolutely everything that any
+/// library writes to stdout (`println!` in mistralrs `print_metadata`) or
+/// stderr (`tracing::info!`, `log::info!`, raw `eprintln!`).
+///
+/// Returns **two** `File` handles to the real terminal (both created via
+/// `dup(STDOUT)` *before* the redirect):
+///
+/// 1. **`tui`** — given to ratatui's `CrosstermBackend` for rendering.
+/// 2. **`cleanup`** — kept by the caller for writing `LeaveAlternateScreen`
+///    and restoring stdout/stderr after the TUI exits (since ratatui 0.29
+///    does not expose `writer_mut()` on the backend).
+#[cfg(unix)]
+fn redirect_output_to_log() -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    let log_path = std::env::temp_dir().join("sigit.log");
+    let log_file = std::fs::File::create(&log_path)?;
+    let log_fd = log_file.as_raw_fd();
 
-    siGit Code v%VERSION%
-"#;
+    // Save TWO copies of the real terminal fd before we clobber stdout.
+    let saved_tui = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    anyhow::ensure!(
+        saved_tui >= 0,
+        "dup(stdout) for tui failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let saved_cleanup = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    anyhow::ensure!(
+        saved_cleanup >= 0,
+        "dup(stdout) for cleanup failed: {}",
+        std::io::Error::last_os_error()
+    );
 
-    let art = BANNER.replace("%VERSION%", env!("CARGO_PKG_VERSION"));
-    eprintln!("{art}");
+    // Point stdout and stderr at the log file.
+    unsafe {
+        libc::dup2(log_fd, libc::STDOUT_FILENO);
+        libc::dup2(log_fd, libc::STDERR_FILENO);
+    }
+
+    // `log_file` can drop — dup2 created independent references to the
+    // underlying file description, so stdout/stderr keep it alive.
+
+    Ok((unsafe { std::fs::File::from_raw_fd(saved_tui) }, unsafe {
+        std::fs::File::from_raw_fd(saved_cleanup)
+    }))
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+/// Initialise `tracing-subscriber` as the single logging backend.
+///
+/// In TUI mode stdout/stderr have already been redirected to the log file by
+/// [`redirect_output_to_log`], so the subscriber simply writes to stderr
+/// (which *is* the log file).  In ACP mode stderr is the real stderr.
+fn init_logging(is_tty: bool) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_fmt::Subscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(!is_tty)
+        .try_init();
 }
 
 // ── Interactive mode ─────────────────────────────────────────────────────────
 
-/// Load the model, then hand off to the ratatui chat TUI.
-async fn run_interactive() -> anyhow::Result<()> {
-    println!("  Loading model...");
-
+/// Start the TUI immediately, load the model concurrently, signal completion
+/// via a oneshot channel so the TUI can animate the banner while waiting.
+///
+/// The terminal is set up *manually* against the saved real-terminal `File`
+/// returned by [`redirect_output_to_log`].  Because stdout/stderr have
+/// already been redirected to the log file at that point, any `println!`,
+/// `eprintln!`, `log::info!`, or `tracing::info!` emitted by mistralrs or
+/// onde goes straight to `$TMPDIR/sigit.log` and never touches the screen.
+///
+/// `tty` is given to ratatui; `cleanup_tty` is a second fd to the same
+/// terminal, used for `LeaveAlternateScreen` and restoring stdout/stderr
+/// (we cannot access the backend's writer because `writer_mut()` is private
+/// in ratatui 0.29).
+async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = ChatEngine::new();
     let config = GgufModelConfig::platform_default();
-    engine
-        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("model load failed: {e}"))?;
+    let (load_tx, load_rx) = oneshot::channel::<Result<(), String>>();
 
-    let info = engine.info().await;
-    println!(
-        "  \x1b[32m✓\x1b[0m {} ({})\n",
-        info.model_name.as_deref().unwrap_or("unknown"),
-        info.approx_memory.as_deref().unwrap_or("?"),
+    // Set up the terminal manually on the real tty fd.
+    crossterm::terminal::enable_raw_mode()?;
+    let mut tty = BufWriter::new(tty);
+    crossterm::execute!(tty, crossterm::terminal::EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(tty);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    // Drive model loading and the TUI concurrently.  Both futures hold a
+    // shared `&engine` reference, which is valid because ChatEngine is Sync
+    // and all its methods take `&self`.
+    let (_, chat_result) = tokio::join!(
+        async {
+            let result = engine
+                .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
+                .await;
+            // Ignore send errors — the TUI may have already quit (Ctrl+C).
+            let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+        },
+        chat::run_with(&mut terminal, &engine, load_rx),
     );
 
-    chat::run(&engine).await
+    // Restore the terminal before exiting.
+    // Use the separate cleanup fd — the backend's writer is private.
+    crossterm::execute!(cleanup_tty, crossterm::terminal::LeaveAlternateScreen)?;
+    cleanup_tty.flush()?;
+    crossterm::terminal::disable_raw_mode()?;
+
+    // Restore stdout/stderr so any post-TUI error messages are visible.
+    #[cfg(unix)]
+    {
+        let cleanup_fd = cleanup_tty.as_raw_fd();
+        unsafe {
+            libc::dup2(cleanup_fd, libc::STDOUT_FILENO);
+            libc::dup2(cleanup_fd, libc::STDERR_FILENO);
+        }
+    }
+
+    chat_result
 }
 
 // ── ACP server mode ──────────────────────────────────────────────────────────
@@ -312,21 +402,23 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logs always go to stderr (stdout is either the TUI or the ACP wire).
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stderr)
-        .init();
+    let is_tty = std::io::stdin().is_terminal();
 
-    // Shared model cache (macOS App Group) — must run before anything
-    // touches hf-hub or ChatEngine.
-    setup::setup_shared_model_cache();
+    if is_tty {
+        // Redirect stdout/stderr to $TMPDIR/sigit.log *first* — before any
+        // library code can println!/eprintln!/log to the real terminal.
+        #[cfg(unix)]
+        let (tty, cleanup_tty) = redirect_output_to_log()?;
+        #[cfg(not(unix))]
+        anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
 
-    if std::io::stdin().is_terminal() {
-        // Interactive mode — full-screen chat TUI.
-        print_banner();
-        run_interactive().await
+        init_logging(true);
+        setup::setup_shared_model_cache();
+        run_interactive(tty, cleanup_tty).await
     } else {
-        // Editor spawned us — speak ACP over stdio.
+        // ACP mode: no redirect needed, logs go to stderr.
+        init_logging(false);
+        setup::setup_shared_model_cache();
         log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));
         run_acp_server().await
     }

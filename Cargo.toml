@@ -19,7 +19,7 @@ onde = "0.1.1"
 
 # Async runtime
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 
@@ -29,6 +29,7 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 
 # Utilities
 anyhow = "1"
+libc = "0.2"
 log = "0.4"
-env_logger = "0.11"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
