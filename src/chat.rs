@@ -25,6 +25,8 @@ enum Role {
     User,
     Assistant,
     System,
+    /// Banner art — rendered with per-character digit colorization.
+    Banner,
 }
 
 struct ChatMessage {
@@ -50,6 +52,13 @@ impl ChatMessage {
     fn system(text: impl Into<String>) -> Self {
         Self {
             role: Role::System,
+            text: text.into(),
+        }
+    }
+
+    fn banner(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Banner,
             text: text.into(),
         }
     }
@@ -89,7 +98,7 @@ impl App {
     fn new() -> Self {
         let mut messages = Vec::new();
         for line in BANNER_ART.lines() {
-            messages.push(ChatMessage::system(line));
+            messages.push(ChatMessage::banner(line));
         }
         messages.push(ChatMessage::system(""));
         messages.push(ChatMessage::system(format!(
@@ -161,12 +170,16 @@ impl App {
     }
 }
 
+fn banner_char_color(_ch: char) -> Color {
+    Color::White
+}
+
 /// Estimate how many terminal rows a message takes once wrapped.
 fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
     let prefix_len = match role {
         Role::User => 6,      // "you > "
-        Role::Assistant => 7, // "siGit > "  — wait, that's 8. Let's just use 7 for "siGit> "
-        Role::System => 0,
+        Role::Assistant => 8, // "siGit > "
+        Role::System | Role::Banner => 0,
     };
     let effective = if width > prefix_len {
         width - prefix_len
@@ -341,6 +354,17 @@ fn render_chat_message<'a>(lines: &mut Vec<Line<'a>>, msg: &ChatMessage) {
                     segment.to_string(),
                     Style::default().fg(Color::DarkGray),
                 )));
+            }
+        }
+        Role::Banner => {
+            for segment in &text_lines {
+                let spans: Vec<Span<'_>> = segment
+                    .chars()
+                    .map(|ch| {
+                        Span::styled(ch.to_string(), Style::default().fg(banner_char_color(ch)))
+                    })
+                    .collect();
+                lines.push(Line::from(spans));
             }
         }
     }
