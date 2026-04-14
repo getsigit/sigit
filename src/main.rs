@@ -1,9 +1,9 @@
-//! siGit Code — AI coding agent powered by a local LLM via Onde Inference.
+//! siGit Code — local LLM coding agent built on Onde.
 //!
-//! Two modes of operation:
+//! Two modes:
 //!
-//! - **Interactive** (stdin is a TTY): full-screen chat UI built on ratatui.
-//! - **ACP server** (stdin is piped): JSON-RPC over stdio for editors like Zed.
+//! - Interactive (stdin is a TTY): full-screen TUI via ratatui.
+//! - ACP server (stdin is piped): JSON-RPC over stdio for Zed and friends.
 //!
 //! On macOS the model cache is shared with the siGit desktop app through an
 //! App Group container. See [`setup`].
@@ -58,8 +58,7 @@ root cause, not the symptom. Correct beats clever.";
 
 // ── Per-session state ────────────────────────────────────────────────────────
 
-/// One active session at a time. We store the `SessionId` directly (not as a
-/// `String`) so `==` just works.
+/// One active session. `SessionId` stored directly (not `String`) so `==` works.
 struct Session {
     id: SessionId,
 }
@@ -70,7 +69,7 @@ struct Session {
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     active_session: Arc<Mutex<Option<Session>>>,
-    /// Sends streaming chunks to the forwarder task, which writes them out.
+    /// Streaming chunks go here; a separate task drains this and writes to the editor.
     notification_tx: mpsc::Sender<SessionNotification>,
 }
 
@@ -116,7 +115,7 @@ impl Agent for SiGitAgent {
         log::info!("new_session: id={session_id}");
 
         if self.engine.is_loaded().await {
-            // Model is already warm — just wipe the conversation.
+            // Already loaded — just clear history for the new session.
             log::info!("model already loaded — clearing history for new session");
             self.engine.clear_history().await;
         } else {
@@ -215,14 +214,20 @@ impl Agent for SiGitAgent {
 
 // ── Interactive mode ─────────────────────────────────────────────────────────
 
-/// Load the model, then hand off to the ratatui chat TUI.
+/// Loads the model and starts the TUI.
 async fn run_interactive() -> anyhow::Result<()> {
     println!("  Loading siGit...");
 
     let engine = ChatEngine::new();
-    let config = GgufModelConfig::platform_default();
+    let config = GgufModelConfig::qwen3_4b();
+    // Qwen 3's <think>…</think> block burns 300-400 tokens before the actual reply.
+    // The default 512 isn't enough — the model outputs nothing. 4096 fixes it.
+    let sampling = onde::inference::SamplingConfig {
+        max_tokens: Some(4096),
+        ..onde::inference::SamplingConfig::default()
+    };
     engine
-        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
+        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
         .await
         .map_err(|e| anyhow::anyhow!("model load failed: {e}"))?;
 
@@ -238,9 +243,9 @@ async fn run_interactive() -> anyhow::Result<()> {
 
 // ── ACP server mode ──────────────────────────────────────────────────────────
 
-/// The editor spawns us and talks ACP over stdio.
+/// The editor spawns us as a subprocess and speaks ACP over stdio.
 async fn run_acp_server() -> anyhow::Result<()> {
-    // Agent::prompt sends chunks here; the forwarder task writes them out.
+    // Chunks from Agent::prompt land here; a forwarder task ships them to the editor.
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
 
     let agent = SiGitAgent::new(notification_tx);
@@ -254,7 +259,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
     local
         .run_until(async move {
-            // Wire up the ACP connection.
+            // Connect stdin/stdout to the ACP layer.
             let (conn, io_task) = AgentSideConnection::new(
                 agent,
                 stdout,
@@ -264,7 +269,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 },
             );
 
-            // Forwarder: drains the mpsc channel and pushes chunks to the client.
+            // Pull chunks off the channel and push them to the editor as they arrive.
             tokio::task::spawn_local(async move {
                 while let Some(notification) = notification_rx.recv().await {
                     if let Err(err) = conn.session_notification(notification).await {
@@ -273,7 +278,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 }
             });
 
-            // Blocks until the editor disconnects.
+            // Runs until the editor closes the connection.
             if let Err(err) = io_task.await {
                 log::error!("ACP IO error: {err}");
             }
@@ -287,13 +292,12 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logs always go to stderr (stdout is either the TUI or the ACP wire).
+    // stderr for logs — stdout belongs to either the TUI or the ACP wire.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
         .init();
 
-    // Shared model cache (macOS App Group) — must run before anything
-    // touches hf-hub or ChatEngine.
+    // Set up the shared model cache before anything tries to hit hf-hub.
     setup::setup_shared_model_cache();
 
     if std::io::stdin().is_terminal() {
