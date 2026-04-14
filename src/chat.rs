@@ -675,9 +675,20 @@ async fn run_inference_task(
         }
     }
 
-    // Send the final text response.
-    if !result.text.is_empty() && result.tool_calls.is_empty() {
-        let _ = tx.send(InferenceUpdate::Response(result.text)).await;
+    // Send the final text response, or a fallback if the model returned nothing.
+    if result.tool_calls.is_empty() {
+        if result.text.is_empty() {
+            log::warn!("model returned empty reply — may have exhausted max_tokens on thinking");
+            let _ = tx
+                .send(InferenceUpdate::Error(
+                    "(empty response — the model may have used all tokens on internal reasoning. \
+                     Try a shorter or simpler prompt.)"
+                        .to_string(),
+                ))
+                .await;
+        } else {
+            let _ = tx.send(InferenceUpdate::Response(result.text)).await;
+        }
     }
 
     log::info!("inference complete — {} tool round(s)", round);

@@ -30,6 +30,8 @@ use std::fs::File;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
+use onde::inference::SamplingConfig;
+
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, Client, ContentBlock, ContentChunk, Implementation, InitializeRequest,
@@ -145,8 +147,12 @@ impl Agent for SiGitAgent {
             // Qwen 3 4B is required for tool calling support.
             log::info!("loading Qwen 3 4B model (this may take a minute on first run)...");
             let config = GgufModelConfig::qwen3_4b();
+            let sampling = SamplingConfig {
+                max_tokens: Some(4096),
+                ..SamplingConfig::default()
+            };
             self.engine
-                .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
+                .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
                 .await
                 .map_err(|e| {
                     log::error!("model load failed: {e}");
@@ -329,8 +335,17 @@ async fn run_interactive() -> anyhow::Result<()> {
 
     let engine = Arc::new(ChatEngine::new());
     let config = GgufModelConfig::qwen3_4b();
+
+    // Qwen 3 uses a thinking mode (<think>…</think>) that can easily
+    // consume 300-400 tokens before the real response.  The default 512
+    // leaves almost nothing for tool calls or text — bump to 4096.
+    let sampling = SamplingConfig {
+        max_tokens: Some(4096),
+        ..SamplingConfig::default()
+    };
+
     engine
-        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
+        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
         .await
         .map_err(|e| anyhow::anyhow!("model load failed: {e}"))?;
 
