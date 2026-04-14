@@ -24,6 +24,7 @@
 //! }
 //! ```
 
+mod chat;
 mod setup;
 
 use std::sync::Arc;
@@ -197,6 +198,16 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("model load failed: {error}"))?;
 
     log::info!("model loaded and ready");
+
+    // If stdin is a terminal, run the interactive chat UI instead of the ACP agent.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        log::info!("interactive mode — starting chat UI");
+        chat::run(&engine).await?;
+        log::info!("siGit shutting down");
+        return Ok(());
+    }
+
+    log::info!("ACP mode — starting agent server");
 
     // ACP server
 
