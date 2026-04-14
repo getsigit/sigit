@@ -15,7 +15,7 @@ path = "src/main.rs"
 agent-client-protocol = "0.10.4"
 
 # Onde Inference engine (local LLM)
-onde = "0.1.1"
+onde = { path = "../onde" }
 
 # Async runtime
 async-trait = "0.1"
