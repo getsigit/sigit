@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: sigit-darwin-aarch64
+            binary: sigit
+            archive_ext: tar.gz
+
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: sigit-darwin-x86_64
+            binary: sigit
+            archive_ext: tar.gz
+
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: sigit-linux-x86_64
+            binary: sigit
+            archive_ext: tar.gz
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact: sigit-linux-aarch64
+            binary: sigit
+            archive_ext: tar.gz
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: sigit-windows-x86_64
+            binary: sigit.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Verify Cargo.toml version matches tag
+        shell: bash
+        run: |
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "sigit") | .version')
+
+          echo "Cargo.toml version : ${CARGO_VERSION}"
+          echo "Release tag version: ${RELEASE_VERSION}"
+
+          if [[ "${CARGO_VERSION}" != "${RELEASE_VERSION}" ]]; then
+            echo "::error::Version mismatch — bump Cargo.toml version before tagging."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          archive="${{ matrix.artifact }}.tar.gz"
+
+          tar -czf "${archive}" -C "$(dirname "${binary}")" "${{ matrix.binary }}"
+
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $binary = "target\${{ matrix.target }}\release\${{ matrix.binary }}"
+          $archive = "${{ matrix.artifact }}.zip"
+
+          Compress-Archive -Path $binary -DestinationPath $archive
+
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set release version and tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_tag="${{ github.event.inputs.tag }}"
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+
+          echo "RELEASE_TAG=${release_tag}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: archives
+          merge-multiple: true
+
+      - name: Check whether release already exists
+        id: release-check
+        shell: bash
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists — skipping."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release and upload archives
+        if: steps.release-check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            --title "siGit ${RELEASE_TAG}" \
+            --generate-notes \
+            archives/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

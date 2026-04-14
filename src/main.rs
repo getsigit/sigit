@@ -1,83 +1,67 @@
-//! siGit Code — local LLM coding agent built on Onde.
+//! siGit Code — an ACP coding agent that runs a local LLM via Onde.
 //!
-//! Two modes:
+//! Talks the Agent Client Protocol over stdio. Zed (or any ACP client) spawns
+//! the binary and communicates through stdin/stdout.
 //!
-//! - Interactive (stdin is a TTY): full-screen TUI via ratatui.
-//! - ACP server (stdin is piped): JSON-RPC over stdio for Zed and friends.
+//! The model loads before the ACP `LocalSet` starts. This matters because
+//! `mistralrs` calls `block_in_place` internally, which panics inside
+//! `spawn_local` tasks. Loading on a normal multi-thread worker avoids that.
 //!
-//! On macOS the model cache is shared with the siGit desktop app through an
-//! App Group container. See [`setup`].
+//! On macOS, the HF cache points at the App Group container shared with the
+//! siGit desktop app. See [`setup`].
 //!
-//! # Zed setup (ACP mode)
+//! # Zed setup
 //!
 //! Add to `~/.config/zed/settings.json`:
 //! ```json
 //! {
 //!   "agent_servers": {
 //!     "siGit": {
-//!       "command": "sigit",
-//!       "args": []
+//!       "type": "custom",
+//!       "command": "/absolute/path/to/target/release/sigit"
 //!     }
 //!   }
 //! }
 //! ```
 
-mod chat;
 mod setup;
 
-use std::io::IsTerminal;
 use std::sync::Arc;
 
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, Client, ContentBlock, ContentChunk, Implementation, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason,
+    Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
+    ContentChunk, Implementation, InitializeRequest, InitializeResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionId,
+    SessionNotification, SessionUpdate, StopReason,
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const SYSTEM_PROMPT: &str = "\
-Your name is siGit — spelled exactly that way: lowercase 's', uppercase 'G', \
-no spaces. Never write it as 'SiGit', 'Sigit', or any other variation. \
-When introducing yourself, say 'I am siGit'.
+Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
+Not 'SiGit', not 'Sigit'. Say 'I am siGit' when asked.
 
-You are an AI coding agent built into the editor via the Agent Client Protocol. \
-You help with:
+You are a coding agent running inside the user's editor. \
+You read and write code, debug problems, review patches, \
+suggest architecture, and help with git.
 
-- Code analysis, writing, and refactoring
-- Bug hunting and debugging
-- Git workflows and commit messages
-- Software architecture and design patterns
-- Code review
+Keep answers short. Write idiomatic code. \
+Fix root causes, not symptoms.";
 
-Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever.";
+// Agent
 
-// ── Per-session state ────────────────────────────────────────────────────────
-
-/// One active session. `SessionId` stored directly (not `String`) so `==` works.
-struct Session {
-    id: SessionId,
-}
-
-// ── Agent implementation ─────────────────────────────────────────────────────
-
-/// The agent. One `ChatEngine`, loaded on the first session.
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
-    active_session: Arc<Mutex<Option<Session>>>,
-    /// Streaming chunks go here; a separate task drains this and writes to the editor.
     notification_tx: mpsc::Sender<SessionNotification>,
 }
 
 impl SiGitAgent {
-    fn new(notification_tx: mpsc::Sender<SessionNotification>) -> Self {
+    fn new(engine: Arc<ChatEngine>, notification_tx: mpsc::Sender<SessionNotification>) -> Self {
         Self {
-            engine: Arc::new(ChatEngine::new()),
-            active_session: Arc::new(Mutex::new(None)),
+            engine,
             notification_tx,
         }
     }
@@ -87,15 +71,18 @@ impl SiGitAgent {
 impl Agent for SiGitAgent {
     async fn initialize(
         &self,
-        args: InitializeRequest,
+        _args: InitializeRequest,
     ) -> agent_client_protocol::Result<InitializeResponse> {
-        log::info!("initialize: protocol_version={}", args.protocol_version);
+        log::info!("initialize");
 
-        Ok(InitializeResponse::new(args.protocol_version)
+        Ok(InitializeResponse::new(ProtocolVersion::V1)
             .agent_info(
                 Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
                     .title("siGit — AI Coding Agent"),
             )
+            .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
+                "sigit", "siGit",
+            ))])
             .agent_capabilities(AgentCapabilities::default()))
     }
 
@@ -103,7 +90,7 @@ impl Agent for SiGitAgent {
         &self,
         _args: AuthenticateRequest,
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
-        // Local LLM, no credentials needed.
+        log::info!("authenticate");
         Ok(AuthenticateResponse::default())
     }
 
@@ -114,28 +101,8 @@ impl Agent for SiGitAgent {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         log::info!("new_session: id={session_id}");
 
-        if self.engine.is_loaded().await {
-            // Already loaded — just clear history for the new session.
-            log::info!("model already loaded — clearing history for new session");
-            self.engine.clear_history().await;
-        } else {
-            // First session — pull the model (if needed) and load it.
-            log::info!("loading default model (this may take a minute on first run)...");
-            let config = GgufModelConfig::platform_default();
-            self.engine
-                .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
-                .await
-                .map_err(|e| {
-                    log::error!("model load failed: {e}");
-                    agent_client_protocol::Error::new(-32603, format!("model load failed: {e}"))
-                })?;
-            log::info!("model loaded and ready");
-        }
-
-        let mut active = self.active_session.lock().await;
-        *active = Some(Session {
-            id: session_id.clone(),
-        });
+        // Clear history — the model is already loaded.
+        self.engine.clear_history().await;
 
         Ok(NewSessionResponse::new(session_id))
     }
@@ -143,18 +110,6 @@ impl Agent for SiGitAgent {
     async fn prompt(&self, args: PromptRequest) -> agent_client_protocol::Result<PromptResponse> {
         let session_id = args.session_id.clone();
 
-        // Make sure this session actually exists.
-        {
-            let active = self.active_session.lock().await;
-            match active.as_ref() {
-                Some(s) if s.id == session_id => {}
-                _ => {
-                    return Err(agent_client_protocol::Error::invalid_params());
-                }
-            }
-        }
-
-        // Pull out the text blocks; ignore images/resources for now.
         let user_text: String = args
             .prompt
             .iter()
@@ -175,13 +130,17 @@ impl Agent for SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
-        let mut rx = self
+        // Stream tokens from the LLM and forward each one as an ACP update.
+        let mut token_rx = self
             .engine
             .stream_message(user_text)
             .await
-            .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
+            .map_err(|error| {
+                log::error!("stream_message failed: {error}");
+                agent_client_protocol::Error::new(-32603, format!("inference failed: {error}"))
+            })?;
 
-        while let Some(chunk) = rx.recv().await {
+        while let Some(chunk) = token_rx.recv().await {
             if !chunk.delta.is_empty() {
                 let notification = SessionNotification::new(
                     session_id.clone(),
@@ -189,12 +148,13 @@ impl Agent for SiGitAgent {
                         chunk.delta,
                     ))),
                 );
-                // Forwarder gone (client disconnected?) — stop.
+
                 if self.notification_tx.send(notification).await.is_err() {
                     log::warn!("notification channel closed — stopping stream");
                     break;
                 }
             }
+
             if chunk.done {
                 break;
             }
@@ -205,61 +165,53 @@ impl Agent for SiGitAgent {
     }
 
     async fn cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
-        // ChatEngine can't cancel mid-stream yet, so the stream just drains
-        // when the receiver drops. Good enough for now.
         log::info!("cancel requested for session {}", args.session_id);
         Ok(())
     }
 }
 
-// ── Interactive mode ─────────────────────────────────────────────────────────
+// Entry point
 
-/// Loads the model and starts the TUI.
-async fn run_interactive() -> anyhow::Result<()> {
-    println!("  Loading siGit...");
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // ACP uses stdout, so logs go to stderr.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Stderr)
+        .init();
 
-    let engine = ChatEngine::new();
-    let config = GgufModelConfig::qwen3_4b();
-    // Qwen 3's <think>…</think> block burns 300-400 tokens before the actual reply.
-    // The default 512 isn't enough — the model outputs nothing. 4096 fixes it.
-    let sampling = onde::inference::SamplingConfig {
-        max_tokens: Some(4096),
-        ..onde::inference::SamplingConfig::default()
-    };
+    log::info!("siGit v{} starting", env!("CARGO_PKG_VERSION"));
+
+    // On macOS, share the HF cache with the desktop app via App Group container.
+    setup::setup_shared_model_cache();
+
+    // Load before the LocalSet. block_in_place panics inside spawn_local,
+    // so the model must load on a regular worker thread.
+    log::info!("loading model (this may take a minute on first run)...");
+
+    let engine = Arc::new(ChatEngine::new());
+    let config = GgufModelConfig::platform_default();
+
     engine
-        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
+        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
         .await
-        .map_err(|e| anyhow::anyhow!("model load failed: {e}"))?;
+        .map_err(|error| anyhow::anyhow!("model load failed: {error}"))?;
 
-    let info = engine.info().await;
-    println!(
-        "  \x1b[32m✓\x1b[0m {} ({})\n",
-        info.model_name.as_deref().unwrap_or("unknown"),
-        info.approx_memory.as_deref().unwrap_or("?"),
-    );
+    log::info!("model loaded and ready");
 
-    chat::run(&engine).await
-}
+    // ACP server
 
-// ── ACP server mode ──────────────────────────────────────────────────────────
-
-/// The editor spawns us as a subprocess and speaks ACP over stdio.
-async fn run_acp_server() -> anyhow::Result<()> {
-    // Chunks from Agent::prompt land here; a forwarder task ships them to the editor.
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
-
-    let agent = SiGitAgent::new(notification_tx);
+    let agent = SiGitAgent::new(engine, notification_tx);
 
     // AgentSideConnection wants futures-io, not tokio-io.
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
 
-    // ACP futures are !Send, so we need a LocalSet.
+    // ACP futures are !Send — needs a LocalSet.
     let local = tokio::task::LocalSet::new();
 
     local
         .run_until(async move {
-            // Connect stdin/stdout to the ACP layer.
             let (conn, io_task) = AgentSideConnection::new(
                 agent,
                 stdout,
@@ -269,7 +221,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 },
             );
 
-            // Pull chunks off the channel and push them to the editor as they arrive.
+            // Forward streamed chunks to the editor.
             tokio::task::spawn_local(async move {
                 while let Some(notification) = notification_rx.recv().await {
                     if let Err(err) = conn.session_notification(notification).await {
@@ -278,34 +230,13 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 }
             });
 
-            // Runs until the editor closes the connection.
+            // Runs until the editor disconnects.
             if let Err(err) = io_task.await {
                 log::error!("ACP IO error: {err}");
             }
         })
         .await;
 
+    log::info!("siGit shutting down");
     Ok(())
-}
-
-// ── Entry point ──────────────────────────────────────────────────────────────
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // stderr for logs — stdout belongs to either the TUI or the ACP wire.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stderr)
-        .init();
-
-    // Set up the shared model cache before anything tries to hit hf-hub.
-    setup::setup_shared_model_cache();
-
-    if std::io::stdin().is_terminal() {
-        // Interactive mode — full-screen chat TUI.
-        run_interactive().await
-    } else {
-        // Editor spawned us — speak ACP over stdio.
-        log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));
-        run_acp_server().await
-    }
 }
