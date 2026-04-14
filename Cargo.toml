@@ -1,9 +1,10 @@
 [package]
 name = "sigit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "siGit Code — ACP-compatible AI coding agent for smbCloud platform."
-license = "MIT OR Apache-2.0"
+documentation = "https://github.com/getsigit/sigit"
+license = "Apache-2.0"
 
 [[bin]]
 name = "sigit"
@@ -14,11 +15,12 @@ path = "src/main.rs"
 agent-client-protocol = "0.10.4"
 
 # Onde Inference engine (local LLM)
-onde = { path = "../onde" }
+# Can't use crates.io (core2 0.4.0 yanked). Git dep so CI builds without ../onde.
+onde = { git = "https://github.com/ondeinference/onde", branch = "development" }
 
 # Async runtime
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 
@@ -27,3 +29,8 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 uuid = { version = "1", features = ["v4"] }
+
+# Workaround: core2 0.4.0 was yanked from crates.io but is still needed by
+# bitstream-io → rav1e → ravif → image → mistralrs → onde.
+[patch.crates-io]
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bc" }

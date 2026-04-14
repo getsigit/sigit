@@ -2,9 +2,9 @@
 
 ## Overview
 
-ACP is a JSON-RPC 2.0 protocol over **stdio** that lets AI coding agents integrate
-with editors (Zed, JetBrains, Neovim, etc.). The agent is a subprocess; the editor
-is the client. Communication is newline-delimited JSON on stdin/stdout.
+ACP is a JSON-RPC 2.0 protocol over **stdio** for integrating AI coding agents
+with editors (Zed, JetBrains, Neovim, etc.). The agent runs as a subprocess;
+the editor is the client. Communication is newline-delimited JSON on stdin/stdout.
 
 Crate: `agent-client-protocol = "0.10.4"` (latest as of 2025)
 Docs:  https://docs.rs/agent-client-protocol
@@ -18,7 +18,7 @@ Spec:  https://agentclientprotocol.com
 [dependencies]
 agent-client-protocol = "0.10.4"
 async-trait           = "0.1"
-tokio                 = { version = "1", features = ["rt", "macros", "io-std", "io-util", "sync"] }
+tokio                 = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync"] }
 tokio-util            = { version = "0.7", features = ["compat"] }
 futures               = "0.3"
 ```
@@ -27,8 +27,8 @@ futures               = "0.3"
 
 ## The `Agent` trait
 
-Defined as `#[async_trait::async_trait(?Send)]` — futures are `!Send`.
-You **must** annotate your impl the same way:
+Declared `#[async_trait::async_trait(?Send)]` — futures are `!Send`.
+Your impl needs the same annotation:
 
 ```rust
 #[async_trait::async_trait(?Send)]
@@ -42,30 +42,33 @@ impl Agent for MyAgent {
 }
 ```
 
-**Mandatory** to implement: `initialize`, `authenticate`, `new_session`, `prompt`, `cancel`.
-All others (`load_session`, `set_session_mode`, etc.) have default `Err(method_not_found)` impls.
+You must implement `initialize`, `authenticate`, `new_session`, `prompt`, and `cancel`.
+Everything else (`load_session`, `set_session_mode`, etc.) defaults to `Err(method_not_found)`.
 
 ---
 
-## Key types and their builders
+## Types and their builders
 
-All `#[non_exhaustive]` structs must be constructed via their builder methods, NOT
-struct literal syntax.
+All `#[non_exhaustive]` structs require builder methods — struct literal syntax won't compile.
 
 ### `InitializeRequest` / `InitializeResponse`
 
 ```rust
-// Request field you need:
-args.protocol_version  // type: ProtocolVersion — echo it back
-
-// Response builder:
-InitializeResponse::new(args.protocol_version)
+// Response builder — use ProtocolVersion::V1, NOT args.protocol_version:
+InitializeResponse::new(ProtocolVersion::V1)
     .agent_info(
         Implementation::new("my-agent", env!("CARGO_PKG_VERSION"))
-            .title("My Agent — Description"),
+            .title("My Agent"),
     )
+    .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
+        "my-agent", "My Agent",
+    ))])
     .agent_capabilities(AgentCapabilities::default())
 ```
+
+`auth_methods` must include at least one `AuthMethod::Agent` or Zed hangs on
+"Loading…" forever. Import `AuthMethod`, `AuthMethodAgent`, and `ProtocolVersion`
+from the crate.
 
 ### `AuthenticateResponse`
 
@@ -80,8 +83,8 @@ let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
 Ok(NewSessionResponse::new(session_id))
 ```
 
-`SessionId` is a newtype. It implements `Clone`, `PartialEq`, `Display`, `Into<String>`,
-and `AsRef<str>`. Store it directly (not as `String`) so `==` comparisons work.
+`SessionId` is a newtype with `Clone`, `PartialEq`, `Display`, `Into<String>`,
+and `AsRef<str>`. Store it as-is (not as `String`) so `==` works directly.
 
 ### `PromptRequest`
 
@@ -119,11 +122,11 @@ match block {
     ContentBlock::Text(t)         => t.text.as_str(),
     ContentBlock::ResourceLink(_) => ...,
     ContentBlock::Resource(_)     => ...,
-    _ => ...,  // non_exhaustive — always need wildcard
+    _ => ...,  // non_exhaustive — always need a wildcard
 }
 ```
 
-### `ContentChunk` + `SessionUpdate` — for streaming
+### `ContentChunk` + `SessionUpdate` — streaming
 
 ```rust
 let chunk = ContentChunk::new(ContentBlock::from(delta_text));
@@ -135,7 +138,7 @@ let update = SessionUpdate::AgentMessageChunk(chunk);
 
 ```rust
 let notification = SessionNotification::new(session_id.clone(), update);
-// Then deliver via AgentSideConnection::session_notification()
+// Deliver via AgentSideConnection::session_notification()
 ```
 
 ### `Error`
@@ -155,17 +158,17 @@ agent_client_protocol::Error::method_not_found()
 
 ## Running the agent — `AgentSideConnection`
 
-The ACP connection wraps stdin/stdout with JSON-RPC machinery.
+Wraps stdin/stdout with JSON-RPC machinery.
 
 ```rust
 use futures::future::LocalBoxFuture;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-// Adapt tokio I/O to futures AsyncRead/AsyncWrite (required by the SDK)
+// Adapt tokio I/O to futures AsyncRead/AsyncWrite (the SDK expects these)
 let stdin  = tokio::io::stdin().compat();
 let stdout = tokio::io::stdout().compat_write();
 
-// MUST run inside a LocalSet because the spawn fn takes LocalBoxFuture (!Send)
+// Must run inside a LocalSet — the spawn fn takes LocalBoxFuture (!Send)
 let local = tokio::task::LocalSet::new();
 local.run_until(async move {
     let (conn, io_task) = AgentSideConnection::new(
@@ -183,19 +186,18 @@ local.run_until(async move {
 }).await;
 ```
 
-**Key facts:**
-- `AgentSideConnection::new` returns `(conn, io_task)` — both are needed.
-- `io_task` drives the actual IO. `conn` is used to send notifications.
-- The `spawn` closure receives `LocalBoxFuture<'static, ()>` (not Send) — use
-  `tokio::task::spawn_local`, not `tokio::spawn`.
-- The whole thing must run inside `tokio::task::LocalSet::new().run_until(...)`.
+`AgentSideConnection::new` returns `(conn, io_task)` — you need both. `io_task`
+drives the actual IO; `conn` sends notifications. The spawn closure gets
+`LocalBoxFuture<'static, ()>` (not Send), so use `tokio::task::spawn_local`,
+not `tokio::spawn`. Everything must sit inside
+`tokio::task::LocalSet::new().run_until(...)`.
 
 ---
 
 ## Streaming — circular dependency pattern
 
-`Agent::prompt()` needs to send `SessionNotification` via the connection, but the
-connection is created *from* the agent. Solve with an **mpsc channel forwarder**:
+`Agent::prompt()` needs to send `SessionNotification` through the connection,
+but the connection is built *from* the agent. Break the cycle with an mpsc channel:
 
 ```rust
 // 1. Create channel BEFORE the agent
@@ -220,7 +222,7 @@ tokio::task::spawn_local(async move {
 io_task.await;
 ```
 
-Inside `prompt()`, send chunks through the channel:
+Inside `prompt()`, push chunks through the channel:
 ```rust
 self.notification_tx.send(SessionNotification::new(
     session_id.clone(),
@@ -232,7 +234,7 @@ self.notification_tx.send(SessionNotification::new(
 
 ## Logging
 
-Always log to **stderr** — stdout is reserved for ACP JSON-RPC:
+Log to **stderr** — stdout is the ACP JSON-RPC wire:
 
 ```rust
 env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -242,13 +244,16 @@ env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info
 
 ---
 
-## Complete protocol flow
+## Protocol flow
 
 ```
-Editor                          siGit
+Editor                          Agent
   │                               │
   │── initialize ────────────────►│  (negotiate version + capabilities)
   │◄─ InitializeResponse ─────────│
+  │                               │
+  │── authenticate ──────────────►│  (method_id from authMethods)
+  │◄─ AuthenticateResponse ───────│
   │                               │
   │── session/new ───────────────►│  (create session, load model)
   │◄─ NewSessionResponse ─────────│
@@ -270,8 +275,8 @@ Editor                          siGit
 {
   "agent_servers": {
     "MyAgent": {
-      "command": "/path/to/binary",
-      "args": []
+      "type": "custom",
+      "command": "/path/to/binary"
     }
   }
 }
@@ -281,15 +286,29 @@ Editor                          siGit
 
 ## Gotchas
 
-1. **`Error::internal()` does NOT exist** — use `Error::new(-32603, msg)`.
-2. **All protocol structs are `#[non_exhaustive]`** — always use builder methods,
-   never struct literal syntax. Always add `_ => ...` wildcard when matching.
+1. **`Error::internal()` doesn't exist** — use `Error::new(-32603, msg)`.
+2. **All protocol structs are `#[non_exhaustive]`** — use builder methods,
+   never struct literals. Add `_ => ...` wildcards when matching.
 3. **`LocalBoxFuture` is `!Send`** — `tokio::spawn` won't work; use
    `tokio::task::spawn_local` inside a `LocalSet`.
-4. **`tokio::task::spawn_local` panics outside a `LocalSet`** — wrap everything
-   in `LocalSet::new().run_until(async { ... }).await`.
-5. **`SessionId` should be stored as `SessionId`**, not converted to `String`,
-   so `==` comparisons work directly.
-6. **One session per connection is the MVP norm** — reuse the model with
-   `clear_history()` rather than loading it again.
-7. **`AgentCapabilities::default()` exists** — returns all capabilities as None/false.
+4. **`tokio::task::spawn_local` panics outside a `LocalSet`** — wrap with
+   `LocalSet::new().run_until(async { ... }).await`.
+5. **Store `SessionId` as `SessionId`**, not `String` — otherwise `==`
+   comparisons get annoying.
+6. **One session per connection is fine for MVP** — reuse the model with
+   `clear_history()` instead of reloading.
+7. **`AgentCapabilities::default()` exists** — all capabilities None/false.
+8. **`block_in_place` panics inside `spawn_local`** — dependencies that call
+   `tokio::task::block_in_place` internally (e.g. `mistralrs`) will blow up
+   with "can call blocking only when running on the multi-threaded runtime"
+   from a `spawn_local` task. Fix: do the blocking work *before* entering
+   the `LocalSet`, while you're still on a normal multi-thread worker, then
+   pass the result into your agent struct.
+9. **Empty `authMethods` hangs Zed** — `InitializeResponse` with an empty
+   `auth_methods` vec makes Zed show "Loading…" forever. Always include at
+   least one `AuthMethod::Agent(AuthMethodAgent::new("id", "Name"))`.
+   Import `AuthMethod`, `AuthMethodAgent`, and `ProtocolVersion` from the crate.
+10. **Never write to stdout except JSON-RPC** — any library that prints to
+    stdout (`mistralrs` model metadata, stray `println!`, whatever) will
+    corrupt the wire. Redirect diagnostics to stderr. If a dependency writes
+    to stdout internally, fix it or suppress it before shipping.

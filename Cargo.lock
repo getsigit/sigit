@@ -649,7 +649,7 @@ dependencies = [
  "num_cpus",
  "objc2-foundation",
  "objc2-metal",
- "rand 0.9.3",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
  "rayon",
  "safetensors 0.7.0",
@@ -986,8 +986,7 @@ dependencies = [
 [[package]]
 name = "core2"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
+source = "git+https://github.com/bbqsrc/core2?rev=545e84bc#545e84bcb0f235b12e21351e0c69767958efe2a7"
 dependencies = [
  "memchr",
 ]
@@ -1037,17 +1036,15 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossterm"
-version = "0.29.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
+checksum = "e64e6c0fbe2c17357405f7c758c1ef960fce08bdfb2c03d88d2a18d7e09c4b67"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 1.3.2",
  "crossterm_winapi",
- "derive_more",
- "document-features",
- "mio",
+ "libc",
+ "mio 0.8.11",
  "parking_lot",
- "rustix",
  "signal-hook",
  "signal-hook-mio",
  "winapi",
@@ -1402,15 +1399,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
 
 [[package]]
-name = "document-features"
-version = "0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
-dependencies = [
- "litrs",
-]
-
-[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1698,7 +1686,7 @@ checksum = "c2d1f04709a8ac06e8e8042875a3c466cc4832d3c1a18dbcb9dba3c6e83046bc"
 dependencies = [
  "half",
  "num-traits",
- "rand 0.9.3",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
 ]
 
@@ -2254,7 +2242,7 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "num-traits",
- "rand 0.9.3",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
  "zerocopy",
 ]
@@ -2344,7 +2332,7 @@ dependencies = [
  "libc",
  "log",
  "num_cpus",
- "rand 0.9.3",
+ "rand 0.9.4",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2463,15 +2451,14 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.7"
+version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
+checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http",
  "hyper",
  "hyper-util",
  "rustls",
- "rustls-pki-types",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2955,12 +2942,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
-name = "litrs"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
-
-[[package]]
 name = "llguidance"
 version = "1.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3207,12 +3188,23 @@ dependencies = [
 
 [[package]]
 name = "mio"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
+dependencies = [
+ "libc",
+ "log",
+ "wasi",
+ "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
 dependencies = [
  "libc",
- "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -3220,7 +3212,8 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bb0a83340b4492ebba9760ba6845364de369c7e10c1f91af8733d574c7405fa"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3232,7 +3225,7 @@ dependencies = [
  "indexmap 2.14.0",
  "mistralrs-core",
  "mistralrs-macros",
- "rand 0.9.3",
+ "rand 0.9.4",
  "reqwest 0.13.2",
  "schemars 1.2.1",
  "serde",
@@ -3247,7 +3240,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ac5d36f634c7c20c45845bc995be3b6387ab01048410386a5b180cfeaf89c72"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3258,7 +3252,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2b8b9e5c94491d9ceeded3a30291cb6af6ae74810a5776dd55e3bbb8b3429d4"
 dependencies = [
  "ahash",
  "akin",
@@ -3312,7 +3307,7 @@ dependencies = [
  "ordered-float",
  "parking_lot",
  "radix_trie",
- "rand 0.9.3",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
  "rand_isaac",
  "rayon",
@@ -3355,7 +3350,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aa9b4794322d3f89fe61d21f33f67be494c16d5bd869604b111218f32544d32"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3366,7 +3362,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fa97d4e3189ed80ebbc730b7da5b2356df0ae004ab489066249340c33c089ab"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3386,7 +3383,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e53ddf1537426997b46abdadbe6ca8a7ce7668004ed2b7cf00115016558bae8"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3402,7 +3400,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "980715493d252e9aaf0779c4c101576d67ef4dd9812bfd77a54987f6f17526f4"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3431,7 +3430,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#a27af8ea01123e5d5777120619413345989f4006"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10046a3da2de5b702d3e829b5ddef7aa829ad454819dcc4876dea481a6cb5456"
 dependencies = [
  "candle-core",
  "image",
@@ -3745,7 +3745,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onde"
-version = "0.1.3"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "939495589fec914220491600a00bddedcba437e5fd5e3926ca1af2e8da681bb0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3945,9 +3947,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkg-config"
-version = "0.3.32"
+version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plain"
@@ -4172,7 +4174,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
- "rand 0.9.3",
+ "rand 0.9.4",
  "ring",
  "rustc-hash 2.1.2",
  "rustls",
@@ -4242,9 +4244,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
+checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -4305,7 +4307,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
 dependencies = [
  "num-traits",
- "rand 0.9.3",
+ "rand 0.9.4",
 ]
 
 [[package]]
@@ -4344,7 +4346,7 @@ dependencies = [
  "num-traits",
  "paste",
  "profiling",
- "rand 0.9.3",
+ "rand 0.9.4",
  "rand_chacha 0.9.0",
  "simd_helpers",
  "thiserror 2.0.18",
@@ -4384,9 +4386,9 @@ checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
 
 [[package]]
 name = "rayon"
-version = "1.11.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368f01d005bf8fd9b1206fb6fa653e6c4a81ceb1466406b81792d87c5677a58f"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
 dependencies = [
  "either",
  "rayon-core",
@@ -4695,9 +4697,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4760,9 +4762,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.11"
+version = "0.103.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20a6af516fea4b20eccceaf166e8aa666ac996208e8a644ce3ef5aa783bc7cd4"
+checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5176,7 +5178,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sigit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -5207,7 +5209,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
- "mio",
+ "mio 0.8.11",
  "signal-hook",
 ]
 
@@ -5911,7 +5913,7 @@ dependencies = [
  "macro_rules_attribute",
  "monostate",
  "paste",
- "rand 0.9.3",
+ "rand 0.9.4",
  "rayon",
  "rayon-cond",
  "regex",
@@ -5944,7 +5946,7 @@ dependencies = [
  "monostate",
  "onig",
  "paste",
- "rand 0.9.3",
+ "rand 0.9.4",
  "rayon",
  "rayon-cond",
  "regex",
@@ -5966,7 +5968,7 @@ checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
 dependencies = [
  "bytes",
  "libc",
- "mio",
+ "mio 1.2.0",
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
@@ -6146,7 +6148,8 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 [[package]]
 name = "tqdm"
 version = "0.8.0"
-source = "git+https://github.com/setoelkahfi/tqdm?branch=deps%2Fbump-crossterm#41e4182829136e6dadbdd1c36af824d19219147a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b316d5c2ac649ca856dacd487d0ebb94f3b746bada51355d93dd2c007ab62a2e"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -6263,7 +6266,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "rand 0.9.3",
+ "rand 0.9.4",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",
@@ -7113,6 +7116,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75283be5efb2831d37ea142365f009c02ec203cd29a3ebecbc093d52315b66d0"
 dependencies = [
  "windows-targets 0.42.2",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "677d2418bec65e3338edb076e806bc1ec15693c5d0104683f2efe857f61056a9"
+dependencies = [
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
