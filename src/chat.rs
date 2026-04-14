@@ -394,7 +394,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             format!(" {key} "),
             Style::default()
-                .fg(Color::Black)
+                .fg(Color::White)
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         ));
