@@ -25,34 +25,16 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-26
             artifact: sigit-darwin-aarch64
             binary: sigit
             archive_ext: tar.gz
 
           - target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-26-intel
             artifact: sigit-darwin-x86_64
             binary: sigit
             archive_ext: tar.gz
-
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: sigit-linux-x86_64
-            binary: sigit
-            archive_ext: tar.gz
-
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            artifact: sigit-linux-aarch64
-            binary: sigit
-            archive_ext: tar.gz
-
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: sigit-windows-x86_64
-            binary: sigit.exe
-            archive_ext: zip
 
     steps:
       - name: Checkout
