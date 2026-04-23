@@ -5,6 +5,12 @@ edition = "2024"
 description = "siGit Code — ACP-compatible AI coding agent for smbCloud platform."
 documentation = "https://github.com/getsigit/sigit"
 license = "Apache-2.0"
+repository = "https://github.com/getsigit/sigit"
+homepage = "https://smbcloud.xyz"
+readme = "README.md"
+keywords = ["sigit", "cli", "ai", "coding-agent", "llm"]
+categories = ["command-line-utilities"]
+authors = ["Seto Elkahfi <hej@setoelkahfi.se>"]
 
 [[bin]]
 name = "sigit"
@@ -16,11 +22,11 @@ agent-client-protocol = "0.10.4"
 
 # Onde Inference engine (local LLM)
 # Can't use crates.io (core2 0.4.0 yanked). Git dep so CI builds without ../onde.
-onde = { git = "https://github.com/ondeinference/onde", branch = "development" }
-
+# onde = { git = "https://github.com/ondeinference/onde", branch = "development" }
+onde = { version = "0.1" }
 # Async runtime
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 
@@ -30,11 +36,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Utilities
 anyhow = "1"
+libc = "0.2"
 log = "0.4"
-env_logger = "0.11"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-
-# Workaround: core2 0.4.0 was yanked from crates.io but is still needed by
-# bitstream-io → rav1e → ravif → image → mistralrs → onde.
-[patch.crates-io]
-core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bc" }

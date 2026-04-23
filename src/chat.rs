@@ -1,8 +1,17 @@
-//! Full-screen chat TUI. Runs on the alternate screen so nothing leaks into
-//! the main terminal buffer. Streaming tokens and key events share the loop
-//! via `tokio::select!`.
+//! Full-screen terminal chat UI for siGit Code.
+//!
+//! Takes over the alternate screen and multiplexes terminal events with
+//! streaming LLM tokens via `tokio::select!`.
+//!
+//! The UI has two phases:
+//!
+//! 1. **Loading phase** — a centered spinner is shown while the model loads
+//!    in the background.  The oneshot channel from the caller signals
+//!    completion or failure.
+//! 2. **Chat phase** — normal interactive chat once `load_rx` resolves.
 
 use std::future::pending;
+use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -16,8 +25,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant, interval};
 
-// ── Message types ────────────────────────────────────────────────────────────
+// ── Message types ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -63,7 +73,7 @@ impl ChatMessage {
     }
 }
 
-// ── App state ────────────────────────────────────────────────────────────────
+// ── App state ─────────────────────────────────────────────────────────────────
 
 struct App {
     messages: Vec<ChatMessage>,
@@ -76,6 +86,19 @@ struct App {
     /// Flips every few ticks while streaming to make the cursor blink.
     blink_on: bool,
     blink_counter: u8,
+
+    // ── Loading-phase state ───────────────────────────────────────────────────
+    /// True while the model is still loading; switches to false on completion.
+    is_loading: bool,
+    /// Monotonic counter incremented on every animation tick.  Drives the
+    /// braille spinner shown during loading.
+    load_tick: u32,
+    /// Set when model loading fails; keeps the loading view up with the error.
+    load_error: Option<String>,
+    /// When loading started — drives the elapsed-time counter.
+    load_start: Instant,
+    /// Display name of the model being loaded (shown in the spinner line).
+    load_model_name: String,
 }
 
 const BANNER_ART: &str = "\
@@ -94,23 +117,9 @@ const BANNER_ART: &str = "\
 88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888";
 
 impl App {
-    fn new() -> Self {
-        let mut messages = Vec::new();
-        for line in BANNER_ART.lines() {
-            messages.push(ChatMessage::banner(line));
-        }
-        messages.push(ChatMessage::system(""));
-        messages.push(ChatMessage::system(format!(
-            "siGit Code v{}",
-            env!("CARGO_PKG_VERSION"),
-        )));
-        messages.push(ChatMessage::system(
-            "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
-        ));
-        messages.push(ChatMessage::system("Type /help for commands."));
-
+    fn new(load_model_name: String) -> Self {
         Self {
-            messages,
+            messages: Vec::new(),
             input: String::new(),
             cursor: 0,
             scroll_offset: 0,
@@ -119,6 +128,11 @@ impl App {
             quit: false,
             blink_on: true,
             blink_counter: 0,
+            is_loading: true,
+            load_tick: 0,
+            load_error: None,
+            load_start: Instant::now(),
+            load_model_name,
         }
     }
 
@@ -137,12 +151,38 @@ impl App {
 
     fn push_stream_delta(&mut self, delta: &str) {
         self.stream_buf.push_str(delta);
-        // tick the blink
         self.blink_counter = self.blink_counter.wrapping_add(1);
         self.blink_on = self.blink_counter % 4 < 2;
     }
 
-    /// Rough line count for the messages area — used to drive auto-scroll.
+    /// Advance the spinner tick counter.
+    fn tick(&mut self) {
+        self.load_tick = self.load_tick.wrapping_add(1);
+    }
+
+    /// Transition from loading phase to normal chat.
+    /// Adds the banner art and welcome messages to the message log.
+    fn finish_loading(&mut self) {
+        self.is_loading = false;
+        for line in BANNER_ART.lines() {
+            self.messages.push(ChatMessage::banner(line));
+        }
+        self.messages.push(ChatMessage::system(""));
+        self.messages.push(ChatMessage::system(
+            "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
+        ));
+        self.messages
+            .push(ChatMessage::system("Type /help for commands."));
+    }
+
+    /// Record a loading error.  The loading view stays visible so the user can
+    /// read the message before pressing Ctrl+C.
+    fn set_load_error(&mut self, error: String) {
+        self.load_error = Some(error);
+        // is_loading stays true so render_loading() keeps rendering.
+    }
+
+    /// Total lines the messages area would need (rough estimate for scrolling).
     fn total_message_lines(&self, width: u16) -> u16 {
         if width == 0 {
             return 0;
@@ -169,9 +209,7 @@ impl App {
     }
 }
 
-fn banner_char_color(_ch: char) -> Color {
-    Color::White
-}
+
 
 /// How many terminal rows a message takes up after line-wrapping.
 fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
@@ -235,7 +273,7 @@ const SIGIT_MODELS: &[ModelOption] = &[
     },
 ];
 
-// ── Slash commands ───────────────────────────────────────────────────────────
+// ── Slash commands ────────────────────────────────────────────────────────────
 
 enum SlashCommand {
     Help,
@@ -265,24 +303,38 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
     })
 }
 
-// ── Rendering ────────────────────────────────────────────────────────────────
+// ── Rendering ─────────────────────────────────────────────────────────────────
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    // Layout: title(1) | messages(flex) | input(3) | footer(1)
-    let zones = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    if app.is_loading {
+        // Loading phase: title bar with spinner | loading info | footer hint.
+        let zones = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
 
-    render_title(frame, zones[0]);
-    render_messages(frame, app, zones[1]);
-    render_input(frame, app, zones[2]);
-    render_footer(frame, app, zones[3]);
+        render_loading_title(frame, app, zones[0]);
+        render_loading(frame, app, zones[1]);
+        render_loading_footer(frame, zones[2]);
+    } else {
+        // Chat phase: title | messages | input | footer.
+        let zones = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+        render_title(frame, zones[0]);
+        render_messages(frame, app, zones[1]);
+        render_input(frame, app, zones[2]);
+        render_footer(frame, app, zones[3]);
+    }
 }
 
 fn render_title(frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -295,12 +347,98 @@ fn render_title(frame: &mut Frame, area: ratatui::layout::Rect) {
         ),
         Span::styled(" Code", Style::default().fg(Color::White)),
         Span::styled(
-            " — maybe deploy later?",
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
     frame.render_widget(
         Paragraph::new(title).style(Style::default().bg(Color::Black)),
+        area,
+    );
+}
+
+/// Title bar during loading: `⠹ siGit Code v0.1.1`
+fn render_loading_title(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner = SPINNER[(app.load_tick as usize) % SPINNER.len()];
+
+    let title = Line::from(vec![
+        Span::styled(
+            format!("{spinner} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "siGit",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Code", Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(title).style(Style::default().bg(Color::Black)),
+        area,
+    );
+}
+
+/// Loading body — model name, elapsed time, or error message.
+fn render_loading(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let elapsed = app.load_start.elapsed();
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    } else {
+        format!("{}s", elapsed.as_secs())
+    };
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    if let Some(ref err) = app.load_error {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " ✘ ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(err.clone(), Style::default().fg(Color::Red)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" Loading ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.load_model_name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {elapsed_str}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// One-line footer shown only during the loading phase.
+fn render_loading_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
+    let spans = vec![
+        Span::styled(
+            " Ctrl+C ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black)),
         area,
     );
 }
@@ -312,7 +450,7 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         render_chat_message(&mut lines, msg);
     }
 
-    // streaming partial response
+    // Streaming partial response.
     if !app.stream_buf.is_empty() || app.is_streaming() {
         let mut spans = vec![Span::styled(
             "siGit > ",
@@ -321,17 +459,17 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
                 .add_modifier(Modifier::BOLD),
         )];
 
-        // split on newlines so multi-line streaming renders correctly
+        // Split on newlines so multi-line streaming renders correctly.
         let buf_lines: Vec<&str> = app.stream_buf.split('\n').collect();
         for (i, segment) in buf_lines.iter().enumerate() {
             if i > 0 {
                 lines.push(Line::from(std::mem::take(&mut spans)));
-                // continuation lines get no prefix
+                // Continuation lines get no prefix.
             }
             spans.push(Span::raw(segment.to_string()));
         }
 
-        // blinking cursor while streaming
+        // Blinking block cursor while streaming.
         if app.is_streaming() && app.blink_on {
             spans.push(Span::styled("█", Style::default().fg(Color::Green)));
         }
@@ -339,7 +477,6 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         lines.push(Line::from(spans));
     }
 
-    // auto-scroll
     app.auto_scroll(area.height, area.width);
 
     let paragraph = Paragraph::new(lines)
@@ -400,13 +537,10 @@ fn render_chat_message<'a>(lines: &mut Vec<Line<'a>>, msg: &ChatMessage) {
         }
         Role::Banner => {
             for segment in &text_lines {
-                let spans: Vec<Span<'_>> = segment
-                    .chars()
-                    .map(|ch| {
-                        Span::styled(ch.to_string(), Style::default().fg(banner_char_color(ch)))
-                    })
-                    .collect();
-                lines.push(Line::from(spans));
+                lines.push(Line::from(Span::styled(
+                    segment.to_string(),
+                    Style::default().fg(Color::White),
+                )));
             }
         }
     }
@@ -437,7 +571,7 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     frame.render_widget(input_text, area);
 
-    // place cursor inside the input block (1 for border padding)
+    // Place cursor inside the input block (offset by 1 for the border).
     if !app.is_streaming() {
         let x = area.x + app.cursor as u16 + 1;
         let y = area.y + 1;
@@ -476,7 +610,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
-// ── Input handling ───────────────────────────────────────────────────────────
+// ── Input handling ────────────────────────────────────────────────────────────
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<String> {
     if key.kind != KeyEventKind::Press {
@@ -540,13 +674,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<String> {
     }
 }
 
-// ── Slash command execution ──────────────────────────────────────────────────
+// ── Slash command execution ───────────────────────────────────────────────────
 
-async fn exec_slash(
+async fn exec_slash<B: ratatui::backend::Backend>(
     app: &mut App,
     cmd: SlashCommand,
     engine: &ChatEngine,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
 ) {
     match cmd {
         SlashCommand::Help => {
@@ -657,21 +791,52 @@ async fn exec_slash(
     }
 }
 
-// ── Main loop ────────────────────────────────────────────────────────────────
+// ── Main loop ─────────────────────────────────────────────────────────────────
 
-/// Starts the TUI and blocks until the user quits. Model must be loaded first.
-pub async fn run(engine: &ChatEngine) -> Result<()> {
-    let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, engine).await;
-    ratatui::restore();
-    result
+/// Run the interactive chat UI.  Blocks until the user quits.
+///
+/// Accepts a terminal that has already been initialised by the caller —
+/// [`ratatui::init`] and [`ratatui::restore`] are the caller's responsibility.
+///
+/// `load_rx` is the receiving end of a [`std::sync::mpsc`] channel.  A
+/// dedicated OS thread loads the model and sends `Ok(())` or `Err(msg)` when
+/// done.  The event loop polls `try_recv()` on every tick — non-blocking,
+/// zero contention with the tokio runtime.
+pub async fn run_with<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    engine: &ChatEngine,
+    load_rx: std_mpsc::Receiver<Result<(), String>>,
+) -> Result<()> {
+    let config = GgufModelConfig::platform_default();
+    let model_name = config.display_name.clone();
+    event_loop(terminal, engine, load_rx, model_name).await
 }
 
-async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine) -> Result<()> {
-    let mut app = App::new();
+async fn event_loop<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    engine: &ChatEngine,
+    load_rx: std_mpsc::Receiver<Result<(), String>>,
+    load_model_name: String,
+) -> Result<()> {
+    let mut app = App::new(load_model_name);
     let mut event_stream = EventStream::new();
 
+    // 100 ms per tick ≈ 10 fps — enough for a smooth spinner.
+    let mut ticker = interval(Duration::from_millis(100));
+
     loop {
+        // ── Poll the loader channel (non-blocking) ────────────────────────
+        if app.is_loading {
+            match load_rx.try_recv() {
+                Ok(Ok(())) => app.finish_loading(),
+                Ok(Err(e)) => app.set_load_error(e),
+                Err(std_mpsc::TryRecvError::Empty) => {}
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    app.set_load_error("Model loader thread crashed.".to_string());
+                }
+            }
+        }
+
         // redraw every iteration
         terminal.draw(|frame| render(frame, &mut app))?;
 
@@ -679,11 +844,15 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
             break;
         }
 
-        // multiplex terminal events and streaming tokens
         tokio::select! {
             biased;
 
-            // streaming tokens — only polls when there's an active receiver
+            // ── Spinner tick (loading phase only) ─────────────────────────
+            _ = ticker.tick(), if app.is_loading => {
+                app.tick();
+            }
+
+            // ── Streaming LLM tokens ──────────────────────────────────────
             chunk = async {
                 match app.stream_rx.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -699,27 +868,42 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
                             app.finalize_stream();
                         }
                     }
-                    // sender dropped without done=true
+                    // Sender dropped without sending done=true.
                     None => {
                         app.finalize_stream();
                     }
                 }
             }
 
-            // terminal events
+            // ── Terminal events ───────────────────────────────────────────
             maybe_event = event_stream.next() => {
                 let Some(Ok(event)) = maybe_event else {
-                    // stream ended or error — bail
                     break;
                 };
 
                 if let Event::Key(key) = event {
-                    // ignore everything except Ctrl+C while a response is coming in
+                    // During loading, only Ctrl+C / Ctrl+D are accepted.
+                    if app.is_loading {
+                        if key.kind == KeyEventKind::Press {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            if ctrl
+                                && (key.code == KeyCode::Char('c')
+                                    || key.code == KeyCode::Char('d'))
+                            {
+                                app.quit = true;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // While streaming, only Ctrl+C / Ctrl+D cancel the stream.
                     if app.is_streaming() {
                         if key.kind == KeyEventKind::Press {
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            if ctrl && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d')) {
-                                // dropping the receiver makes the stream drain itself
+                            if ctrl
+                                && (key.code == KeyCode::Char('c')
+                                    || key.code == KeyCode::Char('d'))
+                            {
                                 app.finalize_stream();
                                 app.messages.push(ChatMessage::system("(cancelled)"));
                             }
@@ -728,13 +912,11 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
                     }
 
                     if let Some(text) = handle_key(&mut app, key) {
-                        // check for slash command first
                         if let Some(cmd) = parse_slash(&text) {
                             exec_slash(&mut app, cmd, engine, terminal).await;
                             continue;
                         }
 
-                        // regular message — send to engine
                         app.messages.push(ChatMessage::user(&text));
 
                         match engine.stream_message(text).await {
@@ -745,9 +927,8 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, engine: &ChatEngine
                                 app.blink_on = true;
                             }
                             Err(err) => {
-                                app.messages.push(ChatMessage::system(format!(
-                                    "error: {err}"
-                                )));
+                                app.messages
+                                    .push(ChatMessage::system(format!("error: {err}")));
                             }
                         }
                     }

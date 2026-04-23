@@ -1,0 +1,41 @@
+{
+    "name": "@smbcloud/sigit",
+    "version": "${release_version}",
+    "keywords": [
+        "sigit",
+        "cli",
+        "ai",
+        "coding-agent",
+        "llm",
+        "on-device",
+        "smbcloud",
+        "acp"
+    ],
+    "bin": {
+        "sigit": "lib/index.js"
+    },
+    "files": ["lib", "README.md"],
+    "description": "AI coding agent powered by local LLM via Onde Inference.",
+    "license": "Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/getsigit/sigit.git"
+    },
+    "scripts": {
+        "typecheck": "tsc --noEmit",
+        "build": "tsc",
+        "dev": "npm run build && node lib/index.js"
+    },
+    "devDependencies": {
+        "@types/node": "^18.15.11",
+        "typescript": "^5.0.0"
+    },
+    "optionalDependencies": {
+        "@smbcloud/sigit-darwin-arm64": "${release_version}",
+        "@smbcloud/sigit-darwin-x64": "${release_version}",
+        "@smbcloud/sigit-linux-arm64": "${release_version}",
+        "@smbcloud/sigit-linux-x64": "${release_version}",
+        "@smbcloud/sigit-windows-arm64": "${release_version}",
+        "@smbcloud/sigit-windows-x64": "${release_version}"
+    }
+}
