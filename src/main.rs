@@ -45,7 +45,7 @@ use agent_client_protocol::{
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 
@@ -265,9 +265,22 @@ fn init_logging(is_tty: bool) {
 /// (we cannot access the backend's writer because `writer_mut()` is private
 /// in ratatui 0.29).
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
-    let engine = ChatEngine::new();
+    let engine = Arc::new(ChatEngine::new());
     let config = GgufModelConfig::platform_default();
-    let (load_tx, load_rx) = oneshot::channel::<Result<(), String>>();
+
+    // std::sync::mpsc — the loader runs on a dedicated OS thread, completely
+    // decoupled from the tokio runtime so it can't starve the TUI draw loop.
+    let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    let loader_engine = Arc::clone(&engine);
+    let system_prompt = SYSTEM_PROMPT.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
+        let result = rt.block_on(
+            loader_engine.load_gguf_model(config, Some(system_prompt), None),
+        );
+        let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+    });
 
     // Set up the terminal manually on the real tty fd.
     crossterm::terminal::enable_raw_mode()?;
@@ -276,19 +289,9 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let backend = ratatui::backend::CrosstermBackend::new(tty);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    // Drive model loading and the TUI concurrently.  Both futures hold a
-    // shared `&engine` reference, which is valid because ChatEngine is Sync
-    // and all its methods take `&self`.
-    let (_, chat_result) = tokio::join!(
-        async {
-            let result = engine
-                .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
-                .await;
-            // Ignore send errors — the TUI may have already quit (Ctrl+C).
-            let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
-        },
-        chat::run_with(&mut terminal, &engine, load_rx),
-    );
+    // The TUI runs here on the main tokio runtime.  It polls load_rx via
+    // try_recv() on every tick — non-blocking, zero contention.
+    let chat_result = chat::run_with(&mut terminal, &engine, load_rx).await;
 
     // Restore the terminal before exiting.
     // Use the separate cleanup fd — the backend's writer is private.
