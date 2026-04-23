@@ -1136,7 +1136,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
                     if let Some(text) = handle_key(&mut app, key) {
                         if let Some(cmd) = parse_slash(&text) {
-                            exec_slash(&mut app, cmd, &*engine, terminal).await;
+                            exec_slash(&mut app, cmd, &engine, terminal).await;
                             continue;
                         }
 
