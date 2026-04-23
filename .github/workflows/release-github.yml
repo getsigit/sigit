@@ -1,0 +1,187 @@
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  PROJECT_NAME: sigit
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build binary (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: win-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: win-arm64
+            runner: windows-latest
+            target: aarch64-pc-windows-msvc
+          - name: macos-amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Read Rust toolchain
+        shell: bash
+        run: |
+          rust_toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -n 1)"
+          if [ -z "$rust_toolchain" ]; then
+            echo "Failed to read Rust toolchain from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "RUST_TOOLCHAIN=${rust_toolchain}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: github-${{ matrix.target }}
+
+      - name: Build binary
+        shell: bash
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          BIN_SUFFIX=""
+          if [[ "${{ matrix.runner }}" == "windows-latest" ]]; then
+            BIN_SUFFIX=".exe"
+          fi
+
+          BIN_OUTPUT="target/${{ matrix.target }}/release/${PROJECT_NAME}${BIN_SUFFIX}"
+          BIN_RELEASE="${PROJECT_NAME}-${{ matrix.name }}${BIN_SUFFIX}"
+
+          mkdir -p ./release
+          mv "${BIN_OUTPUT}" "./release/${BIN_RELEASE}"
+
+      - name: Package macOS tarball for Homebrew
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          ARCHIVE_NAME="${PROJECT_NAME}-${{ matrix.name }}.tar.gz"
+
+          mkdir -p staging-brew
+          cp "./release/${PROJECT_NAME}-${{ matrix.name }}" "staging-brew/${PROJECT_NAME}"
+          strip "staging-brew/${PROJECT_NAME}"
+
+          tar -C staging-brew -czf "${ARCHIVE_NAME}" "${PROJECT_NAME}"
+
+          shasum -a 256 "${ARCHIVE_NAME}" | awk '{print $1}' > "${ARCHIVE_NAME}.sha256"
+
+          echo "Archive: ${ARCHIVE_NAME}"
+          echo "SHA256:  $(cat "${ARCHIVE_NAME}.sha256")"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.name }}
+          path: release/*
+
+      - name: Upload macOS Homebrew artifacts
+        if: contains(matrix.target, 'apple-darwin')
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-${{ matrix.name }}
+          path: |
+            ${{ env.PROJECT_NAME }}-${{ matrix.name }}.tar.gz
+            ${{ env.PROJECT_NAME }}-${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "binary-*"
+          path: release
+          merge-multiple: true
+
+      - name: Download Homebrew artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "homebrew-*"
+          path: release
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: release/*
+
+      - name: Trigger Homebrew release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'release-homebrew.yml',
+              ref: 'main',
+              inputs: {
+                tag: '${{ steps.tag.outputs.tag }}'
+              }
+            })
+            console.log('Dispatched release-homebrew.yml for tag ${{ steps.tag.outputs.tag }}')

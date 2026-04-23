@@ -1,0 +1,116 @@
+name: Homebrew CLI Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  REPO: getsigit/sigit
+
+jobs:
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve tag and version
+        id: release
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Read SHA256 checksums from release
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p artifacts
+
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo "${{ env.REPO }}" \
+            --pattern "sigit-macos-*.tar.gz.sha256" \
+            --dir artifacts/
+
+          ARM64_SHA=$(cat artifacts/sigit-macos-arm64.tar.gz.sha256)
+          AMD64_SHA=$(cat artifacts/sigit-macos-amd64.tar.gz.sha256)
+
+          echo "arm64=${ARM64_SHA}" >> "$GITHUB_OUTPUT"
+          echo "amd64=${AMD64_SHA}" >> "$GITHUB_OUTPUT"
+
+          echo "ARM64 SHA256: ${ARM64_SHA}"
+          echo "AMD64 SHA256: ${AMD64_SHA}"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: getsigit/sigit-homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Generate formula
+        shell: bash
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          TAG="${{ steps.release.outputs.tag }}"
+          ARM64_SHA="${{ steps.sha.outputs.arm64 }}"
+          AMD64_SHA="${{ steps.sha.outputs.amd64 }}"
+
+          mkdir -p homebrew-tap/Formula
+
+          cat > homebrew-tap/Formula/sigit.rb <<FORMULA
+          # frozen_string_literal: true
+
+          # Homebrew formula for siGit Code (\`sigit\` binary).
+          class Sigit < Formula
+            desc 'AI coding agent powered by local LLM via Onde Inference'
+            homepage 'https://github.com/getsigit/sigit'
+            version '${VERSION}'
+            license 'Apache-2.0'
+
+            on_macos do
+              on_arm do
+                url 'https://github.com/${REPO}/releases/download/${TAG}/sigit-macos-arm64.tar.gz'
+                sha256 '${ARM64_SHA}'
+              end
+              on_intel do
+                url 'https://github.com/${REPO}/releases/download/${TAG}/sigit-macos-amd64.tar.gz'
+                sha256 '${AMD64_SHA}'
+              end
+            end
+
+            def install
+              bin.install 'sigit'
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/sigit --version", 1)
+            end
+          end
+          FORMULA
+
+          echo "Generated formula:"
+          cat homebrew-tap/Formula/sigit.rb
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sigit.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update sigit to ${VERSION}"
+          git push
