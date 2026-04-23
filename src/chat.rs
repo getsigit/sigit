@@ -209,8 +209,6 @@ impl App {
     }
 }
 
-
-
 /// How many terminal rows a message takes up after line-wrapping.
 fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
     let prefix_len = match role {

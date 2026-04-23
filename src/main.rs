@@ -276,9 +276,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let system_prompt = SYSTEM_PROMPT.to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        let result = rt.block_on(
-            loader_engine.load_gguf_model(config, Some(system_prompt), None),
-        );
+        let result = rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), None));
         let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
     });
 
