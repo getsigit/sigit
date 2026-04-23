@@ -220,18 +220,6 @@ impl Agent for SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Notify the editor that we're calling a tool.
-                let status_text = format!("🔧 `{}`\n", tc.function_name);
-                let _ = self
-                    .notification_tx
-                    .send(SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                            status_text,
-                        ))),
-                    ))
-                    .await;
-
                 // Execute the tool.
                 let output = tools::execute_tool(&tc.function_name, &tc.arguments);
 
