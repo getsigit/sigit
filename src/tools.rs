@@ -17,11 +17,16 @@
 //! - `create_file` — create a new file (fails if it already exists)
 //! - `edit_file` — replace an exact old-text span with new text in an existing file
 //! - `delete_file` — delete a file or empty directory at the given path
+//!
+//! # Shell Tools
+//!
+//! - `run_command` — run a shell command and return its combined stdout/stderr output
 
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 /// Maximum characters returned from `read_file` before truncation.
 const READ_FILE_CHAR_LIMIT: usize = 10_000;
@@ -165,6 +170,30 @@ pub fn all_tools() -> Vec<AgentTool> {
                 "additionalProperties": false
             }),
         },
+        AgentTool {
+            name: "run_command",
+            description: "Run a shell command and return its combined stdout and stderr output. \
+                           The command runs in the given working directory (defaults to \".\"). \
+                           Use this for build tools (cargo, npm, make), version control (git), \
+                           package managers, linters, test runners, and other CLI tasks. \
+                           Commands that run indefinitely (servers, watchers) will be killed \
+                           after 120 seconds.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute (e.g. \"cargo update\", \"git status\")."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the command. Defaults to \".\" (current directory)."
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -182,6 +211,7 @@ pub fn execute_tool(name: &str, arguments: &str) -> String {
         "create_file" => exec_create_file(arguments),
         "edit_file" => exec_edit_file(arguments),
         "delete_file" => exec_delete_file(arguments),
+        "run_command" => exec_run_command(arguments),
         _ => format!("Unknown tool: {name}"),
     }
 }
@@ -557,6 +587,114 @@ fn exec_delete_file(arguments: &str) -> String {
     }
 }
 
+// ── run_command ──────────────────────────────────────────────────────────────
+
+/// Maximum time a command is allowed to run before being killed.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Maximum bytes of combined output returned from a command.
+const COMMAND_OUTPUT_LIMIT: usize = 50_000;
+
+/// Run a shell command and return its combined stdout + stderr output.
+///
+/// The command is executed via `sh -c` (Unix) or `cmd /C` (Windows) so shell
+/// features like pipes, redirects, and chaining work out of the box.
+///
+/// Long-running commands are killed after [`COMMAND_TIMEOUT`] seconds.
+fn exec_run_command(arguments: &str) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let command_str = match args.get("command").and_then(Value::as_str) {
+        Some(c) => c,
+        None => return "Error: missing required parameter \"command\"".to_string(),
+    };
+
+    let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+
+    let cwd_path = Path::new(cwd);
+    if !cwd_path.exists() {
+        return format!("Error: working directory does not exist: {cwd}");
+    }
+
+    log::info!("run_command: `{command_str}` in `{cwd}`");
+
+    #[cfg(unix)]
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        .arg(command_str)
+        .current_dir(cwd_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => return format!("Error: failed to spawn command: {err}"),
+    };
+
+    #[cfg(windows)]
+    let mut child = match Command::new("cmd")
+        .arg("/C")
+        .arg(command_str)
+        .current_dir(cwd_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => return format!("Error: failed to spawn command: {err}"),
+    };
+
+    // Wait with a timeout.
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if start.elapsed() >= COMMAND_TIMEOUT {
+                    let _ = child.kill();
+                    return format!(
+                        "Error: command timed out after {} seconds and was killed.",
+                        COMMAND_TIMEOUT.as_secs()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(err) => return format!("Error: failed to wait on command: {err}"),
+        }
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(err) => return format!("Error: failed to read command output: {err}"),
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    // Truncate if output is huge.
+    let truncated = if combined.len() > COMMAND_OUTPUT_LIMIT {
+        let truncated_str = &combined[..COMMAND_OUTPUT_LIMIT];
+        format!("{truncated_str}\n\n… (output truncated at {COMMAND_OUTPUT_LIMIT} bytes)")
+    } else {
+        combined
+    };
+
+    if output.status.success() {
+        if truncated.is_empty() {
+            format!("Command succeeded (exit code {exit_code}) with no output.")
+        } else {
+            format!("Exit code {exit_code}:\n{truncated}")
+        }
+    } else {
+        format!("Command failed (exit code {exit_code}):\n{truncated}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,13 +809,14 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         assert_eq!(tools[0].name, "read_file");
         assert_eq!(tools[1].name, "list_directory");
         assert_eq!(tools[2].name, "search_files");
         assert_eq!(tools[3].name, "create_file");
         assert_eq!(tools[4].name, "edit_file");
         assert_eq!(tools[5].name, "delete_file");
+        assert_eq!(tools[6].name, "run_command");
     }
 
     #[test]
@@ -898,5 +1037,59 @@ mod tests {
         assert!(dir.exists(), "directory should not have been deleted");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── run_command tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_run_command_missing_command() {
+        let result = exec_run_command("{}");
+        assert!(
+            result.contains("missing required parameter"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_run_command_success() {
+        let result = exec_run_command(r#"{"command": "echo hello"}"#);
+        assert!(result.contains("hello"), "got: {result}");
+        assert!(result.contains("Exit code 0"), "got: {result}");
+    }
+
+    #[test]
+    fn test_run_command_failure() {
+        let result = exec_run_command(r#"{"command": "false"}"#);
+        assert!(result.contains("failed"), "got: {result}");
+    }
+
+    #[test]
+    fn test_run_command_with_cwd() {
+        let dir = std::env::temp_dir().join("sigit_test_run_cmd_cwd");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let args = format!(r#"{{"command": "pwd", "cwd": "{}"}}"#, dir.display());
+        let result = exec_run_command(&args);
+        // The output should contain the temp dir path.
+        assert!(
+            result.contains(&dir.to_string_lossy().to_string()),
+            "got: {result}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_command_bad_cwd() {
+        let result =
+            exec_run_command(r#"{"command": "echo hi", "cwd": "/tmp/sigit_no_such_dir_xyz"}"#);
+        assert!(result.contains("does not exist"), "got: {result}");
+    }
+
+    #[test]
+    fn test_run_command_captures_stderr() {
+        let result = exec_run_command(r#"{"command": "echo err >&2"}"#);
+        assert!(result.contains("err"), "got: {result}");
     }
 }
