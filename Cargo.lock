@@ -5418,7 +5418,7 @@ version = "0.3.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c236db19d4cea01cf48b584838fcc898745514c8e01c1c0cad0cba976cabefb"
 dependencies = [
- "clap 4.6.0",
+ "clap 4.6.1",
  "log",
  "reqwest 0.12.28",
  "serde",

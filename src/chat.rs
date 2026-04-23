@@ -17,7 +17,9 @@ use std::sync::mpsc as std_mpsc;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use onde::inference::{ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk, ToolDefinition, ToolResult};
+use onde::inference::{
+    ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk, ToolDefinition, ToolResult,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position},

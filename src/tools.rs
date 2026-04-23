@@ -1,4 +1,4 @@
-//! Tool definitions and execution for the siGit coding agent.
+//! Tool definitions and execution for the siGit Code.
 //!
 //! Each tool has:
 //! - A schema (JSON Schema) that describes its parameters for the LLM
@@ -16,6 +16,7 @@
 //!
 //! - `create_file` — create a new file (fails if it already exists)
 //! - `edit_file` — replace an exact old-text span with new text in an existing file
+//! - `delete_file` — delete a file or empty directory at the given path
 
 use regex::Regex;
 use serde_json::{Value, json};
@@ -147,6 +148,23 @@ pub fn all_tools() -> Vec<AgentTool> {
                 "additionalProperties": false
             }),
         },
+        AgentTool {
+            name: "delete_file",
+            description: "Delete a file or empty directory at the given path. \
+                           Refuses to delete non-empty directories to prevent accidental data loss. \
+                           Use read_file or list_directory first to confirm the target.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the file or empty directory to delete."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -163,6 +181,7 @@ pub fn execute_tool(name: &str, arguments: &str) -> String {
         "search_files" => exec_search_files(arguments),
         "create_file" => exec_create_file(arguments),
         "edit_file" => exec_edit_file(arguments),
+        "delete_file" => exec_delete_file(arguments),
         _ => format!("Unknown tool: {name}"),
     }
 }
@@ -499,6 +518,45 @@ fn exec_edit_file(arguments: &str) -> String {
     }
 }
 
+// ── delete_file ──────────────────────────────────────────────────────────────
+
+/// Delete a file or empty directory at the given path.
+///
+/// Refuses to remove non-empty directories to guard against accidental
+/// recursive deletes.
+fn exec_delete_file(arguments: &str) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let path_str = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return "Error: missing required parameter \"path\"".to_string(),
+    };
+
+    let path = Path::new(path_str);
+
+    if !path.exists() {
+        return format!("Error: path does not exist: {path_str}");
+    }
+
+    if path.is_dir() {
+        match fs::remove_dir(path) {
+            Ok(()) => format!("Deleted empty directory: {path_str}"),
+            Err(err) => format!(
+                "Error: could not delete directory: {err}. \
+                 Only empty directories can be deleted."
+            ),
+        }
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => format!("Deleted file: {path_str}"),
+            Err(err) => format!("Error: could not delete file: {err}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,12 +671,13 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         assert_eq!(tools[0].name, "read_file");
         assert_eq!(tools[1].name, "list_directory");
         assert_eq!(tools[2].name, "search_files");
         assert_eq!(tools[3].name, "create_file");
         assert_eq!(tools[4].name, "edit_file");
+        assert_eq!(tools[5].name, "delete_file");
     }
 
     #[test]
@@ -775,6 +834,68 @@ mod tests {
             fs::read_to_string(&file_path).unwrap(),
             "foo bar foo bar foo"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── delete_file tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_delete_file_missing_path() {
+        let result = exec_delete_file("{}");
+        assert!(
+            result.contains("missing required parameter"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_delete_file_nonexistent() {
+        let result = exec_delete_file(r#"{"path": "/tmp/sigit_test_no_such_file_xyz"}"#);
+        assert!(result.contains("does not exist"), "got: {result}");
+    }
+
+    #[test]
+    fn test_delete_file_success() {
+        let dir = std::env::temp_dir().join("sigit_test_delete_file");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let file_path = dir.join("to_delete.txt");
+        fs::write(&file_path, "bye").unwrap();
+        assert!(file_path.exists());
+
+        let args = format!(r#"{{"path": "{}"}}"#, file_path.display());
+        let result = exec_delete_file(&args);
+        assert!(result.contains("Deleted file"), "got: {result}");
+        assert!(!file_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_empty_directory() {
+        let dir = std::env::temp_dir().join("sigit_test_delete_empty_dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let args = format!(r#"{{"path": "{}"}}"#, dir.display());
+        let result = exec_delete_file(&args);
+        assert!(result.contains("Deleted empty directory"), "got: {result}");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_delete_nonempty_directory() {
+        let dir = std::env::temp_dir().join("sigit_test_delete_nonempty_dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("child.txt"), "content").unwrap();
+
+        let args = format!(r#"{{"path": "{}"}}"#, dir.display());
+        let result = exec_delete_file(&args);
+        assert!(result.contains("Error"), "got: {result}");
+        assert!(dir.exists(), "directory should not have been deleted");
 
         let _ = fs::remove_dir_all(&dir);
     }
