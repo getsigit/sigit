@@ -15,7 +15,7 @@ use std::future::pending;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use onde::inference::{ChatEngine, StreamChunk};
+use onde::inference::{ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position},
@@ -33,6 +33,8 @@ enum Role {
     User,
     Assistant,
     System,
+    /// Banner art — each character gets its own color.
+    Banner,
 }
 
 struct ChatMessage {
@@ -61,6 +63,13 @@ impl ChatMessage {
             text: text.into(),
         }
     }
+
+    fn banner(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Banner,
+            text: text.into(),
+        }
+    }
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -73,7 +82,7 @@ struct App {
     stream_rx: Option<mpsc::Receiver<StreamChunk>>,
     stream_buf: String,
     quit: bool,
-    /// Toggled every other tick while streaming — drives the blinking cursor.
+    /// Flips every few ticks while streaming to make the cursor blink.
     blink_on: bool,
     blink_counter: u8,
 
@@ -186,11 +195,12 @@ impl App {
         if width == 0 {
             return 0;
         }
-        let w = width.saturating_sub(2) as usize; // account for block borders
+        let w = width.saturating_sub(2) as usize; // subtract border columns
         let mut lines: u16 = 0;
         for msg in &self.messages {
             lines += wrapped_line_count(&msg.text, msg.role, w);
         }
+        // count any in-progress streaming text too
         if !self.stream_buf.is_empty() {
             lines += wrapped_line_count(&self.stream_buf, Role::Assistant, w);
         }
@@ -207,12 +217,16 @@ impl App {
     }
 }
 
-/// Estimate how many terminal rows a message takes once wrapped.
+fn banner_char_color(_ch: char) -> Color {
+    Color::White
+}
+
+/// How many terminal rows a message takes up after line-wrapping.
 fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
     let prefix_len = match role {
         Role::User => 6,      // "you > "
-        Role::Assistant => 7, // "siGit > "
-        Role::System => 0,
+        Role::Assistant => 8, // "siGit > "
+        Role::System | Role::Banner => 0,
     };
     let effective = if width > prefix_len {
         width - prefix_len
@@ -231,12 +245,52 @@ fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
     count.max(1)
 }
 
+// ── Model table ──────────────────────────────────────────────────────────────
+
+struct ModelOption {
+    /// Name shown in `/models`. Must match `GgufModelConfig::display_name`.
+    name: &'static str,
+    /// Short blurb shown next to the name, e.g. "~2.7 GB".
+    description: &'static str,
+    /// True if this model actually handles tool calls.
+    tool_calling: bool,
+    /// Token budget for generation. Qwen 3 needs 4096+ or it outputs nothing.
+    max_tokens: u64,
+    config_fn: fn() -> GgufModelConfig,
+}
+
+const SIGIT_MODELS: &[ModelOption] = &[
+    ModelOption {
+        name: "Qwen 3 4B (Q4_K_M)",
+        description: "~2.7 GB",
+        tool_calling: true,
+        max_tokens: 4096,
+        config_fn: GgufModelConfig::qwen3_4b,
+    },
+    ModelOption {
+        name: "Qwen 2.5 Coder 3B (Q4_K_M)",
+        description: "~1.93 GB",
+        tool_calling: false,
+        max_tokens: 512,
+        config_fn: GgufModelConfig::qwen25_coder_3b,
+    },
+    ModelOption {
+        name: "Qwen 2.5 Coder 1.5B (Q4_K_M)",
+        description: "~941 MB",
+        tool_calling: false,
+        max_tokens: 512,
+        config_fn: GgufModelConfig::qwen25_coder_1_5b,
+    },
+];
+
 // ── Slash commands ────────────────────────────────────────────────────────────
 
 enum SlashCommand {
     Help,
     Clear,
     Status,
+    /// `/models` lists models. `/models N` switches to model N (1-based).
+    Models(Option<usize>),
     Exit,
     Unknown(String),
 }
@@ -246,11 +300,14 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
     if !trimmed.starts_with('/') {
         return None;
     }
-    let cmd = trimmed.split_whitespace().next().unwrap_or("");
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().map(|s| s.trim());
     Some(match cmd {
         "/help" => SlashCommand::Help,
         "/clear" => SlashCommand::Clear,
         "/status" => SlashCommand::Status,
+        "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -475,6 +532,17 @@ fn render_chat_message<'a>(lines: &mut Vec<Line<'a>>, msg: &ChatMessage) {
                 )));
             }
         }
+        Role::Banner => {
+            for segment in &text_lines {
+                let spans: Vec<Span<'_>> = segment
+                    .chars()
+                    .map(|ch| {
+                        Span::styled(ch.to_string(), Style::default().fg(banner_char_color(ch)))
+                    })
+                    .collect();
+                lines.push(Line::from(spans));
+            }
+        }
     }
 }
 
@@ -526,7 +594,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             format!(" {key} "),
             Style::default()
-                .fg(Color::Black)
+                .fg(Color::White)
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         ));
@@ -608,14 +676,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<String> {
 
 // ── Slash command execution ───────────────────────────────────────────────────
 
-async fn exec_slash(app: &mut App, cmd: SlashCommand, engine: &ChatEngine) {
+async fn exec_slash<B: ratatui::backend::Backend>(
+    app: &mut App,
+    cmd: SlashCommand,
+    engine: &ChatEngine,
+    terminal: &mut ratatui::Terminal<B>,
+) {
     match cmd {
         SlashCommand::Help => {
             app.messages.push(ChatMessage::system(
-                "/help    — show this message\n\
-                 /clear   — wipe conversation history\n\
-                 /status  — show engine status\n\
-                 /exit    — quit chat",
+                "/help      — show this message\n\
+                 /models    — list available models\n\
+                 /models N  — switch to model N\n\
+                 /clear     — wipe conversation history\n\
+                 /status    — show engine status\n\
+                 /exit      — quit chat",
             ));
         }
         SlashCommand::Clear => {
@@ -635,6 +710,77 @@ async fn exec_slash(app: &mut App, cmd: SlashCommand, engine: &ChatEngine) {
                 info.status, model, mem, info.history_length,
             )));
         }
+        SlashCommand::Models(selection) => match selection {
+            None => {
+                // Show the model list.
+                let info = engine.info().await;
+                let current = info.model_name.clone().unwrap_or_default();
+
+                let mut text = String::from("Available models — type /models <n> to switch:\n");
+                for (i, model) in SIGIT_MODELS.iter().enumerate() {
+                    let current_marker = if current == model.name {
+                        "  ← current"
+                    } else {
+                        ""
+                    };
+                    let tool_badge = if model.tool_calling {
+                        "  ✓ tool calling"
+                    } else {
+                        ""
+                    };
+                    text.push_str(&format!(
+                        "\n  {}  {}  {}{}{}",
+                        i + 1,
+                        model.name,
+                        model.description,
+                        tool_badge,
+                        current_marker,
+                    ));
+                }
+                app.messages.push(ChatMessage::system(text));
+            }
+            Some(n) => {
+                let idx = n.saturating_sub(1);
+                match SIGIT_MODELS.get(idx) {
+                    None => {
+                        app.messages.push(ChatMessage::system(format!(
+                            "error: no model #{n} — type /models to see the list."
+                        )));
+                    }
+                    Some(model) => {
+                        // Redraw first — "Loading…" has to be on screen before
+                        // we block for however long the load takes.
+                        app.messages
+                            .push(ChatMessage::system(format!("Loading {}…", model.name)));
+                        terminal.draw(|frame| render(frame, app)).ok();
+
+                        engine.unload_model().await;
+
+                        let config = (model.config_fn)();
+                        let sampling = SamplingConfig {
+                            max_tokens: Some(model.max_tokens),
+                            ..SamplingConfig::default()
+                        };
+
+                        match engine.load_gguf_model(config, None, Some(sampling)).await {
+                            Ok(_) => {
+                                engine.clear_history().await;
+                                app.messages.push(ChatMessage::system(format!(
+                                    "✓ Switched to {}",
+                                    model.name
+                                )));
+                            }
+                            Err(err) => {
+                                app.messages.push(ChatMessage::system(format!(
+                                    "error loading {}: {err}",
+                                    model.name
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        },
         SlashCommand::Exit => {
             app.quit = true;
         }
@@ -681,6 +827,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
     let mut load_rx = Some(load_rx);
 
     loop {
+        // redraw every iteration
         terminal.draw(|frame| render(frame, &mut app))?;
 
         if app.quit {
@@ -774,7 +921,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
                     if let Some(text) = handle_key(&mut app, key) {
                         if let Some(cmd) = parse_slash(&text) {
-                            exec_slash(&mut app, cmd, engine).await;
+                            exec_slash(&mut app, cmd, engine, terminal).await;
                             continue;
                         }
 

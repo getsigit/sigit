@@ -1,0 +1,51 @@
+name: CI
+
+# Runs on every push.
+# Covers fmt (aarch64 only — platform-agnostic), clippy, and tests
+# on both supported macOS targets.
+
+on: push
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS aarch64 — fmt / clippy / test
+            os: macos-26
+            target: aarch64-apple-darwin
+
+          - name: macOS x86_64 — clippy / test
+            os: macos-26-intel
+            target: x86_64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.target }}
+
+      # fmt output is identical on every platform — only run it once.
+      - name: Check formatting
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --tests -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
