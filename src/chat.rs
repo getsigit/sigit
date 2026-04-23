@@ -169,7 +169,7 @@ impl App {
     fn finish_loading(&mut self) {
         self.is_loading = false;
         for line in BANNER_ART.lines() {
-            self.messages.push(ChatMessage::system(line));
+            self.messages.push(ChatMessage::banner(line));
         }
         self.messages.push(ChatMessage::system(""));
         self.messages.push(ChatMessage::system(format!(
@@ -460,7 +460,7 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         let buf_lines: Vec<&str> = app.stream_buf.split('\n').collect();
         for (i, segment) in buf_lines.iter().enumerate() {
             if i > 0 {
-                lines.push(Line::from(spans.drain(..).collect::<Vec<_>>()));
+                lines.push(Line::from(std::mem::take(&mut spans)));
                 // Continuation lines get no prefix.
             }
             spans.push(Span::raw(segment.to_string()));

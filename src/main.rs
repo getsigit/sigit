@@ -22,7 +22,7 @@
 //! ```json
 //! {
 //!   "agent_servers": {
-//!     "siGit": {
+//!     "siGit Code": {
 //!       "type": "custom",
 //!       "command": "/absolute/path/to/target/release/sigit"
 //!     }
