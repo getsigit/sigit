@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sigit-code"
+description = "AI coding agent powered by local LLM via Onde Inference."
+readme = "README.md"
+requires-python = ">=3.8"
+dynamic = ["version"]
+license = { text = "Apache-2.0" }
+authors = [{ name = "Seto Elkahfi", email = "hej@setoelkahfi.se" }]
+keywords = ["sigit", "cli", "ai", "coding-agent", "llm", "on-device"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://smbcloud.xyz"
+Documentation = "https://github.com/getsigit/sigit"
+Repository = "https://github.com/getsigit/sigit"
+Issues = "https://github.com/getsigit/sigit/issues"
+
+[tool.maturin]
+manifest-path = "../Cargo.toml"
+bindings = "bin"
+strip = true

@@ -5,6 +5,12 @@ edition = "2024"
 description = "siGit Code — ACP-compatible AI coding agent for smbCloud platform."
 documentation = "https://github.com/getsigit/sigit"
 license = "Apache-2.0"
+repository = "https://github.com/getsigit/sigit"
+homepage = "https://smbcloud.xyz"
+readme = "README.md"
+keywords = ["sigit", "cli", "ai", "coding-agent", "llm"]
+categories = ["command-line-utilities"]
+authors = ["Seto Elkahfi <hej@setoelkahfi.se>"]
 
 [[bin]]
 name = "sigit"
