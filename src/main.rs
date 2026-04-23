@@ -1,4 +1,4 @@
-//! siGit Code — an ACP coding agent that runs a local LLM via Onde.
+//! siGit Code — an ACP coding agent that runs a local LLM via Onde Inference platform.
 //!
 //! In interactive (TTY) mode **all** process output — `log::` crate events,
 //! `tracing` events from mistralrs_core, and even raw `println!` calls buried
@@ -42,9 +42,9 @@ use onde::inference::SamplingConfig;
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
     AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
-    ContentChunk, Implementation, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionId,
-    SessionNotification, SessionUpdate, StopReason,
+    ContentChunk, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ProtocolVersion, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
@@ -121,7 +121,7 @@ impl Agent for SiGitAgent {
             .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
                 "sigit", "siGit",
             ))])
-            .agent_capabilities(AgentCapabilities::default()))
+            .agent_capabilities(AgentCapabilities::default().load_session(true)))
     }
 
     async fn authenticate(
@@ -130,6 +130,19 @@ impl Agent for SiGitAgent {
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
         log::info!("authenticate");
         Ok(AuthenticateResponse::default())
+    }
+
+    async fn load_session(
+        &self,
+        args: LoadSessionRequest,
+    ) -> agent_client_protocol::Result<LoadSessionResponse> {
+        log::info!("load_session: id={}", args.session_id);
+
+        // Clear conversation history — siGit doesn't persist sessions, so a
+        // "load" is effectively a fresh start with the same session ID.
+        self.engine.clear_history().await;
+
+        Ok(LoadSessionResponse::new())
     }
 
     async fn new_session(
