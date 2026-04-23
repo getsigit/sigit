@@ -1047,13 +1047,29 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossterm"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e64e6c0fbe2c17357405f7c758c1ef960fce08bdfb2c03d88d2a18d7e09c4b67"
+dependencies = [
+ "bitflags 1.3.2",
+ "crossterm_winapi",
+ "libc",
+ "mio 0.8.11",
+ "parking_lot",
+ "signal-hook",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags 2.11.1",
  "crossterm_winapi",
- "mio",
+ "mio 1.2.0",
  "parking_lot",
  "rustix 0.38.44",
  "signal-hook",
@@ -1072,7 +1088,7 @@ dependencies = [
  "derive_more",
  "document-features",
  "futures-core",
- "mio",
+ "mio 1.2.0",
  "parking_lot",
  "rustix 1.1.4",
  "signal-hook",
@@ -1535,29 +1551,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "env_filter"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e90c2accc4b07a8456ea0debdc2e7587bdd890680d71173a15d4ae604f6eef"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
-name = "env_logger"
-version = "0.11.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0621c04f2196ac3f488dd583365b9c09be011a4ab8b9f37248ffcc8f6198b56a"
-dependencies = [
- "anstream",
- "anstyle",
- "env_filter",
- "jiff",
- "log",
 ]
 
 [[package]]
@@ -2851,30 +2844,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jiff"
-version = "0.2.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a3546dc96b6d42c5f24902af9e2538e82e39ad350b0c766eb3fbf2d8f3d8359"
-dependencies = [
- "jiff-static",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde_core",
-]
-
-[[package]]
-name = "jiff-static"
-version = "0.2.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a8c8b344124222efd714b73bb41f8b5120b27a7cc1c75593a6ff768d9d05aa4"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3279,6 +3248,18 @@ dependencies = [
 
 [[package]]
 name = "mio"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
+dependencies = [
+ "libc",
+ "log",
+ "wasi",
+ "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
@@ -3292,7 +3273,8 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bb0a83340b4492ebba9760ba6845364de369c7e10c1f91af8733d574c7405fa"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3319,7 +3301,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ac5d36f634c7c20c45845bc995be3b6387ab01048410386a5b180cfeaf89c72"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3330,7 +3313,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2b8b9e5c94491d9ceeded3a30291cb6af6ae74810a5776dd55e3bbb8b3429d4"
 dependencies = [
  "ahash",
  "akin",
@@ -3427,7 +3411,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aa9b4794322d3f89fe61d21f33f67be494c16d5bd869604b111218f32544d32"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3438,7 +3423,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fa97d4e3189ed80ebbc730b7da5b2356df0ae004ab489066249340c33c089ab"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3458,7 +3444,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e53ddf1537426997b46abdadbe6ca8a7ce7668004ed2b7cf00115016558bae8"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3474,7 +3461,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "980715493d252e9aaf0779c4c101576d67ef4dd9812bfd77a54987f6f17526f4"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3503,7 +3491,8 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10046a3da2de5b702d3e829b5ddef7aa829ad454819dcc4876dea481a6cb5456"
 dependencies = [
  "candle-core",
  "image",
@@ -3827,7 +3816,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "onde"
 version = "0.1.4"
-source = "git+https://github.com/ondeinference/onde?branch=development#0cf8325b4b9ebcc7278bfc29c5a3d229ab05d632"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "939495589fec914220491600a00bddedcba437e5fd5e3926ca1af2e8da681bb0"
 dependencies = [
  "anyhow",
  "cc",
@@ -4055,15 +4045,6 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
-
-[[package]]
-name = "portable-atomic-util"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "091397be61a01d4be58e7841595bd4bfedb15f1cd54977d79b8271e94ed799a3"
-dependencies = [
- "portable-atomic",
-]
 
 [[package]]
 name = "potential_utf"
@@ -5298,13 +5279,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "crossterm 0.29.0",
- "env_logger",
  "futures",
+ "libc",
  "log",
  "onde",
  "ratatui",
  "tokio",
  "tokio-util",
+ "tracing-subscriber",
  "uuid 1.23.0",
 ]
 
@@ -5325,7 +5307,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
- "mio",
+ "mio 0.8.11",
+ "mio 1.2.0",
  "signal-hook",
 ]
 
@@ -6106,7 +6089,7 @@ checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
 dependencies = [
  "bytes",
  "libc",
- "mio",
+ "mio 1.2.0",
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
@@ -6286,10 +6269,11 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 [[package]]
 name = "tqdm"
 version = "0.8.0"
-source = "git+https://github.com/setoelkahfi/tqdm?branch=deps%2Fbump-crossterm#41e4182829136e6dadbdd1c36af824d19219147a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b316d5c2ac649ca856dacd487d0ebb94f3b746bada51355d93dd2c007ab62a2e"
 dependencies = [
  "anyhow",
- "crossterm 0.29.0",
+ "crossterm 0.25.0",
  "once_cell",
 ]
 
@@ -7268,6 +7252,15 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
+version = "0.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "677d2418bec65e3338edb076e806bc1ec15693c5d0104683f2efe857f61056a9"
+dependencies = [
+ "windows-targets 0.48.5",
+]
+
+[[package]]
+name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
@@ -7837,8 +7830,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "core2"
-version = "0.4.0"
-source = "git+https://github.com/bbqsrc/core2?rev=545e84bc#545e84bcb0f235b12e21351e0c69767958efe2a7"

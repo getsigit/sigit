@@ -1,4 +1,4 @@
-# siGit
+# siGit Code
 
 [![Crates.io Version](https://img.shields.io/crates/v/sigit)](https://crates.io/crates/sigit)
 
@@ -25,7 +25,7 @@ Add to `~/.config/zed/settings.json`:
 ```json
 {
   "agent_servers": {
-    "siGit": {
+    "siGit Code": {
       "type": "custom",
       "command": "/absolute/path/to/sigit"
     }
@@ -41,4 +41,4 @@ Running `sigit` directly in a terminal opens an interactive chat UI. Same model,
 
 ## Copyright
 
-2026 Seto Elkahfi.
+2026 smbCloud (Splitfire AB).
