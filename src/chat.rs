@@ -5,12 +5,13 @@
 //!
 //! The UI has two phases:
 //!
-//! 1. **Loading phase** — banner art lines are revealed one by one while the
-//!    model loads in the background.  A braille spinner follows once all lines
-//!    are visible.
+//! 1. **Loading phase** — a centered spinner is shown while the model loads
+//!    in the background.  The oneshot channel from the caller signals
+//!    completion or failure.
 //! 2. **Chat phase** — normal interactive chat once `load_rx` resolves.
 
 use std::future::pending;
+use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -23,8 +24,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, interval};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant, interval};
 
 // ── Message types ─────────────────────────────────────────────────────────────
 
@@ -89,13 +90,15 @@ struct App {
     // ── Loading-phase state ───────────────────────────────────────────────────
     /// True while the model is still loading; switches to false on completion.
     is_loading: bool,
-    /// How many banner art lines have been revealed so far.
-    banner_reveal: usize,
-    /// Monotonic counter incremented on every animation tick.
-    /// Drives the braille spinner and the trailing-dot animation.
+    /// Monotonic counter incremented on every animation tick.  Drives the
+    /// braille spinner shown during loading.
     load_tick: u32,
     /// Set when model loading fails; keeps the loading view up with the error.
     load_error: Option<String>,
+    /// When loading started — drives the elapsed-time counter.
+    load_start: Instant,
+    /// Display name of the model being loaded (shown in the spinner line).
+    load_model_name: String,
 }
 
 const BANNER_ART: &str = "\
@@ -114,9 +117,8 @@ const BANNER_ART: &str = "\
 88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888";
 
 impl App {
-    fn new() -> Self {
+    fn new(load_model_name: String) -> Self {
         Self {
-            // Messages start empty; banner lines are added in finish_loading().
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -127,9 +129,10 @@ impl App {
             blink_on: true,
             blink_counter: 0,
             is_loading: true,
-            banner_reveal: 0,
             load_tick: 0,
             load_error: None,
+            load_start: Instant::now(),
+            load_model_name,
         }
     }
 
@@ -152,30 +155,19 @@ impl App {
         self.blink_on = self.blink_counter % 4 < 2;
     }
 
-    /// Reveal the next banner line and advance the animation tick counter.
-    /// Called on every ticker firing during the loading phase.
-    fn advance_banner(&mut self) {
-        let total = BANNER_ART.lines().count();
-        if self.banner_reveal < total {
-            self.banner_reveal += 1;
-        }
-        // Keep ticking even after all lines are revealed so the spinner moves.
+    /// Advance the spinner tick counter.
+    fn tick(&mut self) {
         self.load_tick = self.load_tick.wrapping_add(1);
     }
 
     /// Transition from loading phase to normal chat.
-    /// Adds the banner lines and welcome messages to the message log so they
-    /// appear naturally in the chat scroll buffer.
+    /// Adds the banner art and welcome messages to the message log.
     fn finish_loading(&mut self) {
         self.is_loading = false;
         for line in BANNER_ART.lines() {
             self.messages.push(ChatMessage::banner(line));
         }
         self.messages.push(ChatMessage::system(""));
-        self.messages.push(ChatMessage::system(format!(
-            "siGit Code v{}",
-            env!("CARGO_PKG_VERSION"),
-        )));
         self.messages.push(ChatMessage::system(
             "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
         ));
@@ -217,9 +209,7 @@ impl App {
     }
 }
 
-fn banner_char_color(_ch: char) -> Color {
-    Color::White
-}
+
 
 /// How many terminal rows a message takes up after line-wrapping.
 fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
@@ -319,7 +309,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     if app.is_loading {
-        // Loading phase: title | animated banner area | slim footer (no input).
+        // Loading phase: title bar with spinner | loading info | footer hint.
         let zones = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -327,7 +317,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-        render_title(frame, zones[0]);
+        render_loading_title(frame, app, zones[0]);
         render_loading(frame, app, zones[1]);
         render_loading_footer(frame, zones[2]);
     } else {
@@ -357,7 +347,7 @@ fn render_title(frame: &mut Frame, area: ratatui::layout::Rect) {
         ),
         Span::styled(" Code", Style::default().fg(Color::White)),
         Span::styled(
-            " — maybe deploy later?",
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -367,59 +357,72 @@ fn render_title(frame: &mut Frame, area: ratatui::layout::Rect) {
     );
 }
 
-/// Animated loading screen.
-///
-/// Reveals banner art lines one at a time (`banner_reveal` grows on each tick).
-/// Once every line is visible a braille spinner and trailing dots indicate that
-/// the model is still being pulled into memory.  If loading fails, a red error
-/// message replaces the spinner.
-fn render_loading(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    const DOTS: &[&str] = &["", ".", "..", "..."];
+/// Title bar during loading: `⠹ siGit Code v0.1.1`
+fn render_loading_title(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner = SPINNER[(app.load_tick as usize) % SPINNER.len()];
 
-    let banner_lines: Vec<&str> = BANNER_ART.lines().collect();
-    let total = banner_lines.len();
+    let title = Line::from(vec![
+        Span::styled(
+            format!("{spinner} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "siGit",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Code", Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(title).style(Style::default().bg(Color::Black)),
+        area,
+    );
+}
+
+/// Loading body — model name, elapsed time, or error message.
+fn render_loading(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let elapsed = app.load_start.elapsed();
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    } else {
+        format!("{}s", elapsed.as_secs())
+    };
+
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    // Reveal lines up to the current animation frame.
-    for line in banner_lines.iter().take(app.banner_reveal) {
-        lines.push(Line::from(Span::styled(
-            *line,
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
     if let Some(ref err) = app.load_error {
-        // Error state — show message and prompt the user to quit.
         lines.push(Line::from(vec![
             Span::styled(
-                "  ✘ ",
+                " ✘ ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::styled(err.clone(), Style::default().fg(Color::Red)),
         ]));
-        lines.push(Line::from(Span::styled(
-            "  Press Ctrl+C to quit.",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else if app.banner_reveal >= total {
-        // All lines visible — show spinner while the model finishes loading.
-        let spinner = SPINNER[(app.load_tick as usize) % SPINNER.len()];
-        let dots = DOTS[(app.load_tick as usize / 3) % DOTS.len()];
-
+    } else {
         lines.push(Line::from(vec![
+            Span::styled(" Loading ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("  {spinner} "),
+                app.load_model_name.clone(),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("Loading model", Style::default().fg(Color::White)),
-            Span::styled(dots, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {elapsed_str}"),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
     }
 
-    frame.render_widget(Paragraph::new(lines).style(Style::default()), area);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// One-line footer shown only during the loading phase.
@@ -534,13 +537,10 @@ fn render_chat_message<'a>(lines: &mut Vec<Line<'a>>, msg: &ChatMessage) {
         }
         Role::Banner => {
             for segment in &text_lines {
-                let spans: Vec<Span<'_>> = segment
-                    .chars()
-                    .map(|ch| {
-                        Span::styled(ch.to_string(), Style::default().fg(banner_char_color(ch)))
-                    })
-                    .collect();
-                lines.push(Line::from(spans));
+                lines.push(Line::from(Span::styled(
+                    segment.to_string(),
+                    Style::default().fg(Color::White),
+                )));
             }
         }
     }
@@ -797,36 +797,46 @@ async fn exec_slash<B: ratatui::backend::Backend>(
 ///
 /// Accepts a terminal that has already been initialised by the caller —
 /// [`ratatui::init`] and [`ratatui::restore`] are the caller's responsibility.
-/// Initialising the terminal *before* starting concurrent model loading
-/// guarantees the alternate screen is active before any log line can fire.
 ///
-/// `load_rx` resolves to `Ok(())` when the model finishes loading, or to
-/// `Err(message)` if loading failed.  The TUI animates the banner art while
-/// waiting for this signal, then transitions to the normal chat view.
+/// `load_rx` is the receiving end of a [`std::sync::mpsc`] channel.  A
+/// dedicated OS thread loads the model and sends `Ok(())` or `Err(msg)` when
+/// done.  The event loop polls `try_recv()` on every tick — non-blocking,
+/// zero contention with the tokio runtime.
 pub async fn run_with<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     engine: &ChatEngine,
-    load_rx: oneshot::Receiver<Result<(), String>>,
+    load_rx: std_mpsc::Receiver<Result<(), String>>,
 ) -> Result<()> {
-    event_loop(terminal, engine, load_rx).await
+    let config = GgufModelConfig::platform_default();
+    let model_name = config.display_name.clone();
+    event_loop(terminal, engine, load_rx, model_name).await
 }
 
 async fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     engine: &ChatEngine,
-    load_rx: oneshot::Receiver<Result<(), String>>,
+    load_rx: std_mpsc::Receiver<Result<(), String>>,
+    load_model_name: String,
 ) -> Result<()> {
-    let mut app = App::new();
+    let mut app = App::new(load_model_name);
     let mut event_stream = EventStream::new();
 
-    // 80 ms per tick ≈ 12.5 fps — snappy enough for the banner reveal without
-    // burning the CPU.
-    let mut ticker = interval(Duration::from_millis(80));
-
-    // Wrap in Option so we can "disarm" it once the oneshot resolves.
-    let mut load_rx = Some(load_rx);
+    // 100 ms per tick ≈ 10 fps — enough for a smooth spinner.
+    let mut ticker = interval(Duration::from_millis(100));
 
     loop {
+        // ── Poll the loader channel (non-blocking) ────────────────────────
+        if app.is_loading {
+            match load_rx.try_recv() {
+                Ok(Ok(())) => app.finish_loading(),
+                Ok(Err(e)) => app.set_load_error(e),
+                Err(std_mpsc::TryRecvError::Empty) => {}
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    app.set_load_error("Model loader thread crashed.".to_string());
+                }
+            }
+        }
+
         // redraw every iteration
         terminal.draw(|frame| render(frame, &mut app))?;
 
@@ -837,27 +847,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
         tokio::select! {
             biased;
 
-            // ── Model load signal ─────────────────────────────────────────
-            // Polls the oneshot receiver until it fires, then disarms it.
-            result = async {
-                match load_rx.as_mut() {
-                    Some(rx) => match rx.await {
-                        Ok(r) => r,
-                        Err(_) => Err("Model load task was dropped unexpectedly.".to_string()),
-                    },
-                    None => pending::<Result<(), String>>().await,
-                }
-            }, if load_rx.is_some() => {
-                load_rx = None;
-                match result {
-                    Ok(()) => app.finish_loading(),
-                    Err(e) => app.set_load_error(e),
-                }
-            }
-
-            // ── Animation tick (loading phase only) ───────────────────────
+            // ── Spinner tick (loading phase only) ─────────────────────────
             _ = ticker.tick(), if app.is_loading => {
-                app.advance_banner();
+                app.tick();
             }
 
             // ── Streaming LLM tokens ──────────────────────────────────────
