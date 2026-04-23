@@ -1,0 +1,220 @@
+name: NPM Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1)"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-npm-binaries:
+    name: Publish NPM platform packages
+    runs-on: ${{ matrix.build.OS }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - {
+              NAME: linux-x64-glibc,
+              OS: ubuntu-latest,
+              TARGET: x86_64-unknown-linux-gnu,
+            }
+          - {
+              NAME: linux-arm64-glibc,
+              OS: ubuntu-24.04-arm,
+              TARGET: aarch64-unknown-linux-gnu,
+            }
+          - {
+              NAME: win32-x64-msvc,
+              OS: windows-2022,
+              TARGET: x86_64-pc-windows-msvc,
+            }
+          - {
+              NAME: win32-arm64-msvc,
+              OS: windows-2022,
+              TARGET: aarch64-pc-windows-msvc,
+            }
+          - {
+              NAME: darwin-x64,
+              OS: macos-15-intel,
+              TARGET: x86_64-apple-darwin,
+            }
+          - {
+              NAME: darwin-arm64,
+              OS: macos-latest,
+              TARGET: aarch64-apple-darwin,
+            }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Read Rust toolchain
+        shell: bash
+        run: |
+          rust_toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -n 1)"
+          if [ -z "$rust_toolchain" ]; then
+            echo "Failed to read Rust toolchain from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "RUST_TOOLCHAIN=${rust_toolchain}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.build.TARGET }} --toolchain ${{ env.RUST_TOOLCHAIN }}
+          rustup target list --installed
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: npm-${{ matrix.build.TARGET }}
+
+      - name: Build binary
+        shell: bash
+        run: cargo build --locked --release --target ${{ matrix.build.TARGET }}
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish platform package to NPM
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          cd npm
+
+          # Binary name from Cargo.toml
+          cargo_bin="sigit"
+
+          # Prefix used for optional dependency package names
+          node_pkg_prefix="sigit"
+
+          # Derive OS and architecture from the build matrix name
+          # Matrix name format: <os>-<arch>[-<extra>]
+          node_os=$(echo "${{ matrix.build.NAME }}" | cut -d '-' -f1)
+          export node_os
+          node_arch=$(echo "${{ matrix.build.NAME }}" | cut -d '-' -f2)
+          export node_arch
+
+          # Set the version
+          export node_version="${{ env.RELEASE_VERSION }}"
+
+          # Build the platform package name; normalise win32 → windows
+          if [ "${{ matrix.build.OS }}" = "windows-2022" ]; then
+            export node_pkg="${node_pkg_prefix}-windows-${node_arch}"
+          else
+            export node_pkg="${node_pkg_prefix}-${node_os}-${node_arch}"
+          fi
+
+          # Create the package directory
+          mkdir -p "${node_pkg}/bin"
+
+          # Generate package.json + README for this platform slice
+          node ./scripts/render-platform-package.cjs \
+            "${node_pkg}" \
+            "${node_version}" \
+            "${node_os}" \
+            "${node_arch}"
+
+          # Windows binaries carry a .exe extension
+          if [ "${{ matrix.build.OS }}" = "windows-2022" ]; then
+            cargo_bin="${cargo_bin}.exe"
+          fi
+
+          cp "../target/${{ matrix.build.TARGET }}/release/${cargo_bin}" "${node_pkg}/bin"
+
+          cd "${node_pkg}"
+
+          npm_package_name="@smbcloud/${node_pkg}"
+          if npm view "${npm_package_name}@${node_version}" version >/dev/null 2>&1; then
+            echo "${npm_package_name}@${node_version} already exists on npm, skipping publish"
+            exit 0
+          fi
+
+          npm publish --access public --provenance
+
+  publish-npm-base:
+    name: Publish base NPM package (@smbcloud/sigit)
+    needs: publish-npm-binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish base package to NPM
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          cd npm/sigit
+
+          # Rewrite package.json with the correct release version and
+          # matching optionalDependency versions
+          node ../scripts/render-main-package.cjs \
+            "./package.json" \
+            "${{ env.RELEASE_VERSION }}"
+
+          npm_package_name="@smbcloud/sigit"
+          npm_package_version="${{ env.RELEASE_VERSION }}"
+
+          if npm view "${npm_package_name}@${npm_package_version}" version >/dev/null 2>&1; then
+            echo "${npm_package_name}@${npm_package_version} already exists on npm, skipping publish"
+            exit 0
+          fi
+
+          npm install
+          npm run build
+          npm publish --access public --provenance
