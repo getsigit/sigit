@@ -485,8 +485,6 @@ fn search_file(path: &Path, re: &Regex, matches: &mut Vec<String>) {
     }
 }
 
-/// ── create_directory ─────────────────────────────────────────────────────────
-
 /// Create a directory and any missing parent directories.
 fn exec_create_directory(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
@@ -515,8 +513,6 @@ fn exec_create_directory(arguments: &str) -> String {
         Err(err) => format!("Error: could not create directory: {err}"),
     }
 }
-
-/// ── create_file ──────────────────────────────────────────────────────────────
 
 /// Create a new file with the provided content.
 ///
