@@ -446,7 +446,22 @@ fn init_logging(is_tty: bool) {
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::platform_default();
+
+    let startup_selection = setup::startup_model_selection();
+    let startup_model_name = startup_selection
+        .as_ref()
+        .map(|selection| selection.display_name.clone())
+        .unwrap_or_else(|| GgufModelConfig::platform_default().display_name);
+
+    let config = startup_selection
+        .as_ref()
+        .and_then(|selection| {
+            chat::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.display_name == selection.display_name)
+                .map(|item| item.config)
+        })
+        .unwrap_or_else(GgufModelConfig::platform_default);
 
     // std::sync::mpsc — the loader runs on a dedicated OS thread, completely
     // decoupled from the tokio runtime so it can't starve the TUI draw loop.
@@ -469,7 +484,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 
     // The TUI runs here on the main tokio runtime.  It polls load_rx via
     // try_recv() on every tick — non-blocking, zero contention.
-    let chat_result = chat::run_with(&mut terminal, engine, load_rx).await;
+    let chat_result = chat::run_with(&mut terminal, engine, load_rx, startup_model_name).await;
 
     // Restore the terminal before exiting.
     // Use the separate cleanup fd — the backend's writer is private.
@@ -500,11 +515,30 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("loading model (this may take a minute on first run)...");
 
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::qwen3_4b();
+
+    let startup_selection = setup::startup_model_selection();
+    let config = startup_selection
+        .as_ref()
+        .and_then(|selection| {
+            chat::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.display_name == selection.display_name)
+                .map(|item| item.config)
+        })
+        .unwrap_or_else(GgufModelConfig::qwen3_4b);
+
+    let max_tokens = if config.display_name == "Qwen 3 4B (Q4_K_M)" {
+        4096
+    } else {
+        512
+    };
+
     let sampling = SamplingConfig {
-        max_tokens: Some(4096),
+        max_tokens: Some(max_tokens),
         ..SamplingConfig::default()
     };
+
+    log::info!("ACP startup model: {}", config.display_name);
 
     engine
         .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
