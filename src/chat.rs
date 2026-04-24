@@ -11,12 +11,15 @@
 //! 2. **Chat phase** — normal interactive chat once `load_rx` resolves.
 
 use std::future::pending;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use onde::inference::{ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk};
+use onde::inference::{
+    ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk, ToolDefinition, ToolResult,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position},
@@ -73,6 +76,18 @@ impl ChatMessage {
     }
 }
 
+// ── Inference updates from background task ───────────────────────────────────
+
+/// Messages sent from the spawned inference task back to the event loop.
+enum InferenceUpdate {
+    /// The model is calling a tool — show its name in the chat.
+    ToolUse(String),
+    /// The model produced a final text response.
+    Response(String),
+    /// Something went wrong during inference.
+    Error(String),
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 struct App {
@@ -82,6 +97,12 @@ struct App {
     scroll_offset: u16,
     stream_rx: Option<mpsc::Receiver<StreamChunk>>,
     stream_buf: String,
+    /// Channel for receiving results from the background inference task.
+    inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
+    /// True while waiting for inference to finish.
+    thinking: bool,
+    /// Counter driving the thinking spinner animation.
+    thinking_tick: u8,
     quit: bool,
     /// Flips every few ticks while streaming to make the cursor blink.
     blink_on: bool,
@@ -116,6 +137,9 @@ const BANNER_ART: &str = "\
 55555555555555555555555555555560953258000866660000051140866908666600008966900065555555555555
 88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888";
 
+/// Spinner frames for the "thinking" animation.
+const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 impl App {
     fn new(load_model_name: String) -> Self {
         Self {
@@ -125,6 +149,9 @@ impl App {
             scroll_offset: 0,
             stream_rx: None,
             stream_buf: String::new(),
+            inference_rx: None,
+            thinking: false,
+            thinking_tick: 0,
             quit: false,
             blink_on: true,
             blink_counter: 0,
@@ -134,6 +161,11 @@ impl App {
             load_start: Instant::now(),
             load_model_name,
         }
+    }
+
+    /// True when either streaming tokens or waiting for inference.
+    fn is_busy(&self) -> bool {
+        self.is_streaming() || self.thinking
     }
 
     fn is_streaming(&self) -> bool {
@@ -153,6 +185,25 @@ impl App {
         self.stream_buf.push_str(delta);
         self.blink_counter = self.blink_counter.wrapping_add(1);
         self.blink_on = self.blink_counter % 4 < 2;
+    }
+
+    fn start_thinking(&mut self) {
+        self.thinking = true;
+        self.thinking_tick = 0;
+    }
+
+    fn stop_thinking(&mut self) {
+        self.thinking = false;
+        self.inference_rx = None;
+    }
+
+    fn tick_thinking(&mut self) {
+        self.thinking_tick = self.thinking_tick.wrapping_add(1);
+    }
+
+    fn thinking_frame(&self) -> &'static str {
+        let idx = (self.thinking_tick as usize) % THINKING_FRAMES.len();
+        THINKING_FRAMES[idx]
     }
 
     /// Advance the spinner tick counter.
@@ -195,6 +246,10 @@ impl App {
         // count any in-progress streaming text too
         if !self.stream_buf.is_empty() {
             lines += wrapped_line_count(&self.stream_buf, Role::Assistant, w);
+        }
+        // thinking indicator
+        if self.thinking {
+            lines += 1;
         }
         lines
     }
@@ -475,6 +530,26 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         lines.push(Line::from(spans));
     }
 
+    // thinking indicator (animated spinner)
+    if app.thinking {
+        let frame_char = app.thinking_frame();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "siGit > ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{frame_char} thinking…"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+
+    // auto-scroll
     app.auto_scroll(area.height, area.width);
 
     let paragraph = Paragraph::new(lines)
@@ -548,19 +623,21 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(if app.is_streaming() {
+        .title(if app.thinking {
+            " thinking… "
+        } else if app.is_streaming() {
             " streaming… "
         } else {
             " message "
         })
-        .title_style(Style::default().fg(if app.is_streaming() {
+        .title_style(Style::default().fg(if app.is_busy() {
             Color::Yellow
         } else {
             Color::DarkGray
         }));
 
     let input_text = Paragraph::new(app.input.as_str())
-        .style(Style::default().fg(if app.is_streaming() {
+        .style(Style::default().fg(if app.is_busy() {
             Color::DarkGray
         } else {
             Color::White
@@ -570,7 +647,7 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(input_text, area);
 
     // Place cursor inside the input block (offset by 1 for the border).
-    if !app.is_streaming() {
+    if !app.is_busy() {
         let x = area.x + app.cursor as u16 + 1;
         let y = area.y + 1;
         frame.set_cursor_position(Position::new(x.min(area.right().saturating_sub(1)), y));
@@ -578,7 +655,7 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let hints: &[(&str, &str)] = if app.is_streaming() {
+    let hints: &[(&str, &str)] = if app.is_busy() {
         &[("Ctrl+C", "cancel")]
     } else {
         &[("Enter", "send"), ("/help", "commands"), ("Ctrl+C", "quit")]
@@ -598,7 +675,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ));
         spans.push(Span::styled(
             format!(" {label}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ));
     }
 
@@ -789,6 +866,109 @@ async fn exec_slash<B: ratatui::backend::Backend>(
     }
 }
 
+// ── Background inference task ────────────────────────────────────────────────
+
+/// Maximum number of tool-calling rounds before forcing a text response.
+const MAX_TOOL_ROUNDS: usize = 10;
+
+/// Build onde `ToolDefinition`s from our agent tools.
+fn build_onde_tools() -> Vec<ToolDefinition> {
+    crate::tools::all_tools()
+        .into_iter()
+        .map(|t| ToolDefinition {
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+            parameters_schema: t.parameters_schema.to_string(),
+        })
+        .collect()
+}
+
+/// Runs the agentic tool-calling loop on a background task and sends
+/// progress updates back through `tx`.
+///
+/// The sender is dropped when the task finishes, which the event loop
+/// detects as `None` from `rx.recv()`.
+async fn run_inference_task(
+    engine: Arc<ChatEngine>,
+    text: String,
+    tx: mpsc::Sender<InferenceUpdate>,
+) {
+    let onde_tools = build_onde_tools();
+
+    let mut result = match engine.send_message_with_tools(&text, &onde_tools).await {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+            return;
+        }
+    };
+
+    let mut round = 0;
+
+    while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+        round += 1;
+        log::info!("tool round {} — {} call(s)", round, result.tool_calls.len());
+
+        let mut tool_results = Vec::new();
+
+        for tc in &result.tool_calls {
+            log::info!(
+                "  → {}({})",
+                tc.function_name,
+                tc.arguments.chars().take(120).collect::<String>()
+            );
+
+            // Notify the UI about the tool call.
+            let _ = tx
+                .send(InferenceUpdate::ToolUse(tc.function_name.clone()))
+                .await;
+
+            // Execute the tool (synchronous / blocking-ok for file I/O).
+            let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments);
+            log::info!("  ← {} chars", output.len());
+
+            tool_results.push(ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: output,
+            });
+        }
+
+        // Allow further tool calls unless we've hit the limit.
+        let next_tools = if round < MAX_TOOL_ROUNDS {
+            Some(onde_tools.as_slice())
+        } else {
+            None // force a text response on the last round
+        };
+
+        match engine.send_tool_results(tool_results, next_tools).await {
+            Ok(r) => result = r,
+            Err(err) => {
+                let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+                return;
+            }
+        }
+    }
+
+    // Send the final text response, or a fallback if the model returned nothing.
+    if result.tool_calls.is_empty() {
+        if result.text.is_empty() {
+            log::warn!("model returned empty reply — may have exhausted max_tokens on thinking");
+            let _ = tx
+                .send(InferenceUpdate::Error(
+                    "(empty response — the model may have used all tokens on internal reasoning. \
+                     Try a shorter or simpler prompt.)"
+                        .to_string(),
+                ))
+                .await;
+        } else {
+            let _ = tx.send(InferenceUpdate::Response(result.text)).await;
+        }
+    }
+
+    log::info!("inference complete — {} tool round(s)", round);
+    // Sender drops here → event loop sees `None`.
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 /// Run the interactive chat UI.  Blocks until the user quits.
@@ -802,7 +982,7 @@ async fn exec_slash<B: ratatui::backend::Backend>(
 /// zero contention with the tokio runtime.
 pub async fn run_with<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
-    engine: &ChatEngine,
+    engine: Arc<ChatEngine>,
     load_rx: std_mpsc::Receiver<Result<(), String>>,
 ) -> Result<()> {
     let config = GgufModelConfig::platform_default();
@@ -812,7 +992,7 @@ pub async fn run_with<B: ratatui::backend::Backend>(
 
 async fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
-    engine: &ChatEngine,
+    engine: Arc<ChatEngine>,
     load_rx: std_mpsc::Receiver<Result<(), String>>,
     load_model_name: String,
 ) -> Result<()> {
@@ -842,6 +1022,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
             break;
         }
 
+        // multiplex terminal events, streaming tokens, inference updates,
+        // and the thinking-spinner timer.
         tokio::select! {
             biased;
 
@@ -873,6 +1055,44 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 }
             }
 
+            // ── inference updates from background task ───────────────────
+            update = async {
+                match app.inference_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => pending().await,
+                }
+            } => {
+                match update {
+                    Some(InferenceUpdate::ToolUse(name)) => {
+                        app.messages.push(ChatMessage::system(format!("🔧 {name}")));
+                    }
+                    Some(InferenceUpdate::Response(text)) => {
+                        app.stop_thinking();
+                        app.messages.push(ChatMessage::assistant(text));
+                    }
+                    Some(InferenceUpdate::Error(msg)) => {
+                        app.stop_thinking();
+                        app.messages.push(ChatMessage::system(format!("error: {msg}")));
+                    }
+                    None => {
+                        // Sender dropped — task finished (possibly with no
+                        // text response, e.g. all tool calls with empty final).
+                        app.stop_thinking();
+                    }
+                }
+            }
+
+            // ── thinking spinner tick (100ms) ────────────────────────────
+            _ = async {
+                if app.thinking {
+                    tokio::time::sleep(Duration::from_millis(100)).await
+                } else {
+                    pending().await
+                }
+            } => {
+                app.tick_thinking();
+            }
+
             // ── Terminal events ───────────────────────────────────────────
             maybe_event = event_stream.next() => {
                 let Some(Ok(event)) = maybe_event else {
@@ -894,16 +1114,21 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         continue;
                     }
 
-                    // While streaming, only Ctrl+C / Ctrl+D cancel the stream.
-                    if app.is_streaming() {
+                    // While busy (streaming or thinking), only Ctrl+C/D work.
+                    if app.is_busy() {
                         if key.kind == KeyEventKind::Press {
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            if ctrl
-                                && (key.code == KeyCode::Char('c')
-                                    || key.code == KeyCode::Char('d'))
-                            {
-                                app.finalize_stream();
-                                app.messages.push(ChatMessage::system("(cancelled)"));
+                            if ctrl && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d')) {
+                                if app.is_streaming() {
+                                    app.finalize_stream();
+                                    app.messages.push(ChatMessage::system("(cancelled)"));
+                                }
+                                if app.thinking {
+                                    // Drop the receiver — the background task
+                                    // will see a closed channel and stop.
+                                    app.stop_thinking();
+                                    app.messages.push(ChatMessage::system("(cancelled)"));
+                                }
                             }
                         }
                         continue;
@@ -911,24 +1136,22 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
                     if let Some(text) = handle_key(&mut app, key) {
                         if let Some(cmd) = parse_slash(&text) {
-                            exec_slash(&mut app, cmd, engine, terminal).await;
+                            exec_slash(&mut app, cmd, &engine, terminal).await;
                             continue;
                         }
 
+                        // ── Spawn inference on a background task ─────────
                         app.messages.push(ChatMessage::user(&text));
+                        app.start_thinking();
 
-                        match engine.stream_message(text).await {
-                            Ok(rx) => {
-                                app.stream_rx = Some(rx);
-                                app.stream_buf.clear();
-                                app.blink_counter = 0;
-                                app.blink_on = true;
-                            }
-                            Err(err) => {
-                                app.messages
-                                    .push(ChatMessage::system(format!("error: {err}")));
-                            }
-                        }
+                        let (tx, rx) = mpsc::channel::<InferenceUpdate>(64);
+                        app.inference_rx = Some(rx);
+
+                        let engine_handle = Arc::clone(&engine);
+                        let user_text = text.clone();
+                        tokio::spawn(async move {
+                            run_inference_task(engine_handle, user_text, tx).await;
+                        });
                     }
                 }
             }
