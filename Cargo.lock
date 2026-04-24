@@ -5283,6 +5283,7 @@ dependencies = [
  "onde",
  "ratatui",
  "regex",
+ "reqwest 0.12.28",
  "serde_json",
  "tokio",
  "tokio-util",
