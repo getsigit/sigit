@@ -139,7 +139,16 @@ protocol-facing output and tool arguments. Create directories when needed. Run \
 builds, tests, and git commands after making changes. Ground your answers in \
 the actual code or fetched page content, not in guesses.
 
+CRITICAL — you CAN access websites. You are NOT a typical LLM without internet \
+access. You have a read_website tool that fetches any http or https URL and \
+returns the page text. When the user gives you a URL or asks you to read, \
+summarize, or inspect a web page, you MUST call the read_website tool with that \
+URL. Never say \"I cannot access websites\" or \"I cannot browse the internet\". \
+You can. Use the tool.
+
 Tool-use heuristics:
+- when the user provides a URL or asks about a web page, ALWAYS call \
+  read_website — never refuse or claim you lack internet access
 - prefer absolute paths over relative paths when you mention, return, or pass \
   file and directory paths
 - if a path does not exist yet, create the directory before creating files in it
@@ -338,8 +347,8 @@ impl Agent for SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Execute the tool.
-                let output = tools::execute_tool(&tc.function_name, &tc.arguments);
+                // Execute the tool (async — read_website uses spawn_blocking internally).
+                let output = tools::execute_tool(&tc.function_name, &tc.arguments).await;
 
                 log::info!("  ← {} chars", output.len());
 
@@ -374,6 +383,12 @@ impl Agent for SiGitAgent {
             if self.notification_tx.send(notification).await.is_err() {
                 log::warn!("notification channel closed");
             }
+        } else if result.tool_calls.is_empty() {
+            log::warn!(
+                "prompt({}) — model returned empty reply after {} tool round(s)",
+                session_id,
+                round
+            );
         }
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
@@ -471,7 +486,11 @@ fn init_logging(is_tty: bool) {
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::platform_default();
+    let config = GgufModelConfig::qwen3_4b();
+    let sampling = SamplingConfig {
+        max_tokens: Some(4096),
+        ..SamplingConfig::default()
+    };
 
     // std::sync::mpsc — the loader runs on a dedicated OS thread, completely
     // decoupled from the tokio runtime so it can't starve the TUI draw loop.
@@ -481,7 +500,8 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let system_prompt = SYSTEM_PROMPT.to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        let result = rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), None));
+        let result =
+            rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), Some(sampling)));
         let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
     });
 

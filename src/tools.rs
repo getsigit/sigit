@@ -266,12 +266,20 @@ pub fn all_tools() -> Vec<AgentTool> {
 ///
 /// Returns the tool output as a human-readable string. Errors are returned as
 /// descriptive strings rather than panicking.
-pub fn execute_tool(name: &str, arguments: &str) -> String {
+pub async fn execute_tool(name: &str, arguments: &str) -> String {
     match name {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
         "search_files" => exec_search_files(arguments),
-        "read_website" => exec_read_website(arguments),
+        "read_website" => {
+            // reqwest::blocking panics if called inside a tokio runtime
+            // ("Cannot start a runtime from within a runtime"), so we
+            // off-load it to the blocking thread pool.
+            let args = arguments.to_owned();
+            tokio::task::spawn_blocking(move || exec_read_website(&args))
+                .await
+                .unwrap_or_else(|err| format!("Error: read_website task failed: {err}"))
+        }
         "create_directory" => exec_create_directory(arguments),
         "create_file" => exec_create_file(arguments),
         "edit_file" => exec_edit_file(arguments),
@@ -949,9 +957,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn test_execute_unknown_tool() {
-        let result = execute_tool("nonexistent", "{}");
+    #[tokio::test]
+    async fn test_execute_unknown_tool() {
+        let result = execute_tool("nonexistent", "{}").await;
         assert!(result.starts_with("Unknown tool:"));
     }
 

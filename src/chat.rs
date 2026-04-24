@@ -120,6 +120,8 @@ struct App {
     load_start: Instant,
     /// Display name of the model being loaded (shown in the spinner line).
     load_model_name: String,
+    /// Whether the currently loaded model supports tool calling.
+    tool_calling: bool,
 }
 
 const BANNER_ART: &str = "\
@@ -142,6 +144,11 @@ const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 impl App {
     fn new(load_model_name: String) -> Self {
+        let tool_calling = SIGIT_MODELS
+            .iter()
+            .find(|m| m.name == load_model_name)
+            .map(|m| m.tool_calling)
+            .unwrap_or(true);
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -160,6 +167,7 @@ impl App {
             load_error: None,
             load_start: Instant::now(),
             load_model_name,
+            tool_calling,
         }
     }
 
@@ -840,6 +848,7 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                         match engine.load_gguf_model(config, None, Some(sampling)).await {
                             Ok(_) => {
                                 engine.clear_history().await;
+                                app.tool_calling = model.tool_calling;
                                 app.messages.push(ChatMessage::system(format!(
                                     "✓ Switched to {}",
                                     model.name
@@ -892,8 +901,13 @@ async fn run_inference_task(
     engine: Arc<ChatEngine>,
     text: String,
     tx: mpsc::Sender<InferenceUpdate>,
+    tools_enabled: bool,
 ) {
-    let onde_tools = build_onde_tools();
+    let onde_tools = if tools_enabled {
+        build_onde_tools()
+    } else {
+        vec![]
+    };
 
     let mut result = match engine.send_message_with_tools(&text, &onde_tools).await {
         Ok(r) => r,
@@ -923,8 +937,8 @@ async fn run_inference_task(
                 .send(InferenceUpdate::ToolUse(tc.function_name.clone()))
                 .await;
 
-            // Execute the tool (synchronous / blocking-ok for file I/O).
-            let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments);
+            // Execute the tool (async — read_website uses spawn_blocking internally).
+            let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments).await;
             log::info!("  ← {} chars", output.len());
 
             tool_results.push(ToolResult {
@@ -985,7 +999,7 @@ pub async fn run_with<B: ratatui::backend::Backend>(
     engine: Arc<ChatEngine>,
     load_rx: std_mpsc::Receiver<Result<(), String>>,
 ) -> Result<()> {
-    let config = GgufModelConfig::platform_default();
+    let config = GgufModelConfig::qwen3_4b();
     let model_name = config.display_name.clone();
     event_loop(terminal, engine, load_rx, model_name).await
 }
@@ -1149,8 +1163,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
                         let engine_handle = Arc::clone(&engine);
                         let user_text = text.clone();
+                        let tools_enabled = app.tool_calling;
                         tokio::spawn(async move {
-                            run_inference_task(engine_handle, user_text, tx).await;
+                            run_inference_task(engine_handle, user_text, tx, tools_enabled).await;
                         });
                     }
                 }
