@@ -69,13 +69,35 @@ pub fn setup_shared_model_cache() {
 /// Preference key used to remember the last selected model.
 const SELECTED_MODEL_FILE_NAME: &str = "selected-model.txt";
 
+/// Stable persisted identifier for a selected local model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedModel {
+    /// Hugging Face repo ID, e.g. `bartowski/Qwen_Qwen3-4B-GGUF`.
+    pub model_id: String,
+    /// GGUF filename inside the snapshot.
+    pub gguf_file: String,
+}
+
+impl SelectedModel {
+    fn from_discovered(model: &DiscoveredModel) -> Self {
+        Self {
+            model_id: model.model_id.clone(),
+            gguf_file: model.gguf_file.clone(),
+        }
+    }
+
+    fn matches(&self, model: &DiscoveredModel) -> bool {
+        self.model_id == model.model_id && self.gguf_file == model.gguf_file
+    }
+}
+
 /// Minimal startup model selection info used before the full UI is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupModelSelection {
     /// Human-friendly model name shown in the loading UI.
     pub display_name: String,
-    /// The saved model name if one was found.
-    pub selected_name: Option<String>,
+    /// The saved model identifier if one was found.
+    pub selected_model: Option<SelectedModel>,
 }
 
 /// A locally discovered GGUF model candidate.
@@ -93,6 +115,14 @@ pub struct DiscoveredModel {
     pub gguf_path: PathBuf,
     /// True when the model came from the Onde app group cache.
     pub from_app_group: bool,
+    /// Whether the snapshot looks complete enough to load.
+    pub cache_health: ModelCacheHealth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModelCacheHealth {
+    Complete,
+    Incomplete,
 }
 
 /// Return all locally discovered GGUF models.
@@ -112,9 +142,13 @@ pub fn discover_local_models() -> Vec<DiscoveredModel> {
     }
 
     models.sort_by(|left, right| {
-        left.display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase())
+        left.cache_health
+            .cmp(&right.cache_health)
+            .then_with(|| {
+                left.display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase())
+            })
             .then_with(|| left.model_id.cmp(&right.model_id))
             .then_with(|| left.gguf_file.cmp(&right.gguf_file))
     });
@@ -172,10 +206,30 @@ fn collect_models_from_cache_root(
                 Err(_) => continue,
             };
 
+            let mut has_config_json = false;
+            let mut has_tokenizer = false;
+            let mut gguf_files = Vec::new();
+
             for file in files.flatten() {
                 let file_path = file.path();
                 if !file_path.is_file() {
                     continue;
+                }
+
+                let file_name = match file.file_name().to_str() {
+                    Some(name) => name.to_string(),
+                    None => continue,
+                };
+
+                if file_name == "config.json" {
+                    has_config_json = true;
+                }
+
+                if file_name == "tokenizer.json"
+                    || file_name == "tokenizer.model"
+                    || file_name == "tokenizer_config.json"
+                {
+                    has_tokenizer = true;
                 }
 
                 let extension = file_path
@@ -183,15 +237,18 @@ fn collect_models_from_cache_root(
                     .and_then(|ext| ext.to_str())
                     .unwrap_or_default();
 
-                if !extension.eq_ignore_ascii_case("gguf") {
-                    continue;
+                if extension.eq_ignore_ascii_case("gguf") {
+                    gguf_files.push((file_name, file_path));
                 }
+            }
 
-                let gguf_file = match file.file_name().to_str() {
-                    Some(name) => name.to_string(),
-                    None => continue,
-                };
+            let cache_health = if has_config_json && has_tokenizer {
+                ModelCacheHealth::Complete
+            } else {
+                ModelCacheHealth::Incomplete
+            };
 
+            for (gguf_file, file_path) in gguf_files {
                 models.push(DiscoveredModel {
                     display_name: display_name_for_model(&model_id, &gguf_file),
                     model_id: model_id.clone(),
@@ -199,6 +256,7 @@ fn collect_models_from_cache_root(
                     snapshot_path: snapshot_path.clone(),
                     gguf_path: file_path,
                     from_app_group,
+                    cache_health,
                 });
             }
         }
@@ -249,11 +307,34 @@ fn hf_cache_root() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-pub fn load_selected_model_name() -> Option<String> {
+pub fn load_selected_model() -> Option<SelectedModel> {
     let path = selected_model_file_path()?;
     let contents = std::fs::read_to_string(path).ok()?;
     let trimmed = contents.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parts = trimmed.splitn(2, '\n');
+    let model_id = parts.next()?.trim();
+    let gguf_file = parts.next()?.trim();
+
+    if model_id.is_empty() || gguf_file.is_empty() {
+        return None;
+    }
+
+    Some(SelectedModel {
+        model_id: model_id.to_string(),
+        gguf_file: gguf_file.to_string(),
+    })
+}
+
+pub fn load_selected_model_name() -> Option<String> {
+    let selected = load_selected_model()?;
+    discover_local_models()
+        .into_iter()
+        .find(|model| selected.matches(model))
+        .map(|model| model.display_name)
 }
 
 /// Pick the model name siGit should try to load at startup.
@@ -269,28 +350,31 @@ pub fn load_selected_model_name() -> Option<String> {
 pub fn startup_model_selection() -> Option<StartupModelSelection> {
     let discovered = discover_local_models();
 
-    if let Some(saved_name) = load_selected_model_name() {
-        if discovered
-            .iter()
-            .any(|model| model.display_name == saved_name)
-        {
-            return Some(StartupModelSelection {
-                display_name: saved_name.clone(),
-                selected_name: Some(saved_name),
-            });
-        }
+    if let Some(saved_model) = load_selected_model()
+        && let Some(model) = discovered.iter().find(|model| {
+            saved_model.matches(model) && model.cache_health == ModelCacheHealth::Complete
+        })
+    {
+        return Some(StartupModelSelection {
+            display_name: model.display_name.clone(),
+            selected_model: Some(saved_model),
+        });
     }
 
-    discovered.into_iter().next().map(|model| {
-        let _ = save_selected_model_name(&model.display_name);
-        StartupModelSelection {
-            display_name: model.display_name.clone(),
-            selected_name: Some(model.display_name),
-        }
-    })
+    discovered
+        .into_iter()
+        .find(|model| model.cache_health == ModelCacheHealth::Complete)
+        .map(|model| {
+            let selected_model = SelectedModel::from_discovered(&model);
+            let _ = save_selected_model(&selected_model);
+            StartupModelSelection {
+                display_name: model.display_name.clone(),
+                selected_model: Some(selected_model),
+            }
+        })
 }
 
-pub fn save_selected_model_name(model_name: &str) -> Result<(), String> {
+pub fn save_selected_model(selected_model: &SelectedModel) -> Result<(), String> {
     let path = selected_model_file_path()
         .ok_or_else(|| "Could not determine where to store the selected model.".to_string())?;
 
@@ -301,7 +385,12 @@ pub fn save_selected_model_name(model_name: &str) -> Result<(), String> {
             .map_err(|error| format!("Could not create preferences directory: {error}"))?;
     }
 
-    std::fs::write(&path, model_name)
+    let contents = format!(
+        "{}\n{}\n",
+        selected_model.model_id, selected_model.gguf_file
+    );
+
+    std::fs::write(&path, contents)
         .map_err(|error| format!("Could not save selected model: {error}"))
 }
 
@@ -354,4 +443,172 @@ fn resolve_shared_container() -> Option<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn resolve_shared_container() -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("sigit-setup-tests-{name}-{nanos}"))
+    }
+
+    fn create_snapshot(
+        cache_root: &Path,
+        model_id: &str,
+        snapshot_name: &str,
+        gguf_file: &str,
+        complete: bool,
+    ) -> PathBuf {
+        let repo_dir = cache_root.join(format!("models--{}", model_id.replace('/', "--")));
+        let snapshot_dir = repo_dir.join("snapshots").join(snapshot_name);
+        std::fs::create_dir_all(&snapshot_dir).expect("create snapshot dir");
+        std::fs::write(snapshot_dir.join(gguf_file), b"gguf").expect("write gguf");
+
+        if complete {
+            std::fs::write(snapshot_dir.join("config.json"), b"{}").expect("write config");
+            std::fs::write(snapshot_dir.join("tokenizer.json"), b"{}").expect("write tokenizer");
+        }
+
+        snapshot_dir
+    }
+
+    fn with_test_env<T>(hf_hub_cache: &Path, hf_home: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().expect("lock env");
+
+        let old_hf_hub_cache = std::env::var_os("HF_HUB_CACHE");
+        let old_hf_home = std::env::var_os("HF_HOME");
+        let old_home = std::env::var_os("HOME");
+
+        // SAFETY: tests serialize environment mutation with a process-wide mutex.
+        unsafe {
+            std::env::set_var("HF_HUB_CACHE", hf_hub_cache);
+            std::env::set_var("HF_HOME", hf_home);
+            std::env::set_var("HOME", hf_home);
+        }
+
+        let result = f();
+
+        // SAFETY: tests serialize environment mutation with a process-wide mutex.
+        unsafe {
+            match old_hf_hub_cache {
+                Some(value) => std::env::set_var("HF_HUB_CACHE", value),
+                None => std::env::remove_var("HF_HUB_CACHE"),
+            }
+            match old_hf_home {
+                Some(value) => std::env::set_var("HF_HOME", value),
+                None => std::env::remove_var("HF_HOME"),
+            }
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn discover_local_models_marks_complete_and_incomplete_snapshots() {
+        let root = unique_temp_dir("discover-health");
+        let cache_root = root.join("hf-cache");
+        let hf_home = root.join("hf-home");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+        std::fs::create_dir_all(&hf_home).expect("create hf home");
+
+        create_snapshot(
+            &cache_root,
+            "bartowski/Qwen_Qwen3-4B-GGUF",
+            "complete",
+            "Qwen_Qwen3-4B-Q4_K_M.gguf",
+            true,
+        );
+        create_snapshot(
+            &cache_root,
+            "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF",
+            "incomplete",
+            "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
+            false,
+        );
+
+        let models = with_test_env(&cache_root, &hf_home, discover_local_models);
+
+        assert_eq!(models.len(), 2);
+
+        let complete = models
+            .iter()
+            .find(|model| model.model_id == "bartowski/Qwen_Qwen3-4B-GGUF")
+            .expect("complete model discovered");
+        assert_eq!(complete.cache_health, ModelCacheHealth::Complete);
+        assert!(!complete.from_app_group);
+
+        let incomplete = models
+            .iter()
+            .find(|model| model.model_id == "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF")
+            .expect("incomplete model discovered");
+        assert_eq!(incomplete.cache_health, ModelCacheHealth::Incomplete);
+        assert!(!incomplete.from_app_group);
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn startup_model_selection_skips_saved_incomplete_model_and_picks_complete_one() {
+        let root = unique_temp_dir("startup-selection");
+        let cache_root = root.join("hf-cache");
+        let hf_home = root.join("hf-home");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+        std::fs::create_dir_all(&hf_home).expect("create hf home");
+
+        create_snapshot(
+            &cache_root,
+            "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF",
+            "broken",
+            "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
+            false,
+        );
+        create_snapshot(
+            &cache_root,
+            "bartowski/Qwen_Qwen3-4B-GGUF",
+            "ready",
+            "Qwen_Qwen3-4B-Q4_K_M.gguf",
+            true,
+        );
+
+        let selection = with_test_env(&cache_root, &hf_home, || {
+            let selected_path = selected_model_file_path().expect("selected model path");
+            if let Some(parent) = selected_path.parent() {
+                std::fs::create_dir_all(parent).expect("create selected model parent");
+            }
+
+            std::fs::write(
+                &selected_path,
+                "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF\nQwen2.5-Coder-3B-Instruct-Q4_K_M.gguf\n",
+            )
+            .expect("write selected model");
+
+            startup_model_selection().expect("startup selection")
+        });
+
+        assert_eq!(
+            selection.display_name,
+            "Qwen Qwen3-4B-GGUF — Qwen_Qwen3-4B-Q4_K_M"
+        );
+        let selected = selection.selected_model.expect("selected model");
+        assert_eq!(selected.model_id, "bartowski/Qwen_Qwen3-4B-GGUF");
+        assert_eq!(selected.gguf_file, "Qwen_Qwen3-4B-Q4_K_M.gguf");
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
 }

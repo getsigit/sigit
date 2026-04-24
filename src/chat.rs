@@ -21,7 +21,7 @@ use onde::inference::{
     ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk, ToolDefinition, ToolResult,
 };
 
-use crate::setup::DiscoveredModel;
+use crate::setup::{DiscoveredModel, ModelCacheHealth};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position},
@@ -262,17 +262,31 @@ impl App {
     }
 
     fn open_model_picker(&mut self, engine: &ChatEngine) {
-        let current = crate::setup::load_selected_model_name().unwrap_or_else(|| {
+        let current = crate::setup::load_selected_model();
+        let current_name = crate::setup::load_selected_model_name().unwrap_or_else(|| {
             futures::executor::block_on(engine.info())
                 .model_name
                 .unwrap_or_else(|| self.current_model_name.clone())
         });
 
         self.model_picker_items = build_model_picker_items();
-        self.model_picker_index = self
-            .model_picker_items
-            .iter()
-            .position(|item| item.display_name == current)
+        self.model_picker_index = current
+            .as_ref()
+            .and_then(|selected| {
+                self.model_picker_items.iter().position(|item| {
+                    item.config.model_id == selected.model_id
+                        && item
+                            .config
+                            .files
+                            .iter()
+                            .any(|file| file == &selected.gguf_file)
+                })
+            })
+            .or_else(|| {
+                self.model_picker_items
+                    .iter()
+                    .position(|item| item.display_name == current_name)
+            })
             .unwrap_or(0);
         self.show_model_picker = true;
     }
@@ -374,6 +388,7 @@ pub(crate) struct ModelPickerItem {
     local_path: Option<String>,
     brand_mark: &'static str,
     source: ModelSource,
+    cache_health: ModelCacheHealth,
 }
 
 pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
@@ -400,6 +415,7 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
             local_path: None,
             brand_mark: "◎",
             source: ModelSource::Fallback,
+            cache_health: ModelCacheHealth::Complete,
         });
     }
 
@@ -420,6 +436,8 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
 
     let config = match model.model_id.as_str() {
         "bartowski/Qwen_Qwen3-4B-GGUF" => GgufModelConfig::qwen3_4b(),
+        "bartowski/Qwen2.5-3B-Instruct-GGUF" => GgufModelConfig::qwen25_3b(),
+        "bartowski/Qwen2.5-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_1_5b(),
         "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_3b(),
         "bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_1_5b(),
         _ => return None,
@@ -442,6 +460,7 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
         } else {
             ModelSource::HuggingFace
         },
+        cache_health: model.cache_health,
     })
 }
 
@@ -503,7 +522,15 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
         } else {
             ""
         };
+        let health_badge = match item.cache_health {
+            ModelCacheHealth::Complete => "",
+            ModelCacheHealth::Incomplete => "  ! incomplete cache",
+        };
         let current_badge = if current { "  ← current" } else { "" };
+        let disabled_badge = match item.cache_health {
+            ModelCacheHealth::Complete => "",
+            ModelCacheHealth::Incomplete => "  (unselectable)",
+        };
         let source = format!("  [{} {}]", item.brand_mark, item.source_label);
 
         let base_style = if selected {
@@ -522,6 +549,12 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
             }
         };
 
+        let health_style = if selected {
+            Style::default().fg(Color::Red).bg(Color::White)
+        } else {
+            Style::default().fg(Color::Red)
+        };
+
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{marker}{}  {}", item.display_name, item.description),
@@ -533,6 +566,15 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
                     Style::default().fg(Color::Green).bg(Color::White)
                 } else {
                     Style::default().fg(Color::Green)
+                },
+            ),
+            Span::styled(health_badge.to_string(), health_style),
+            Span::styled(
+                disabled_badge.to_string(),
+                if selected {
+                    Style::default().fg(Color::DarkGray).bg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
                 },
             ),
             Span::styled(
@@ -1085,6 +1127,15 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                         )));
                     }
                     Some(model) => {
+                        if model.cache_health == ModelCacheHealth::Incomplete {
+                            app.close_model_picker();
+                            app.messages.push(ChatMessage::system(format!(
+                                "error: {} has an incomplete local cache and cannot be selected yet.",
+                                model.display_name
+                            )));
+                            return;
+                        }
+
                         app.close_model_picker();
                         app.messages.push(ChatMessage::system(format!(
                             "Loading {}…",
@@ -1286,7 +1337,30 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     app.switching_model = false;
                     app.model_load_rx = None;
                     app.current_model_name = model_name.clone();
-                    if let Err(error) = crate::setup::save_selected_model_name(&model_name) {
+
+                    let save_result = app
+                        .model_picker_items
+                        .iter()
+                        .find(|item| item.display_name == model_name)
+                        .map(|item| crate::setup::SelectedModel {
+                            model_id: item.config.model_id.clone(),
+                            gguf_file: item
+                                .config
+                                .files
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(String::new),
+                        })
+                        .filter(|selected| !selected.gguf_file.is_empty())
+                        .map(|selected| crate::setup::save_selected_model(&selected))
+                        .unwrap_or_else(|| {
+                            Err(format!(
+                                "could not determine a stable identifier for {}",
+                                model_name
+                            ))
+                        });
+
+                    if let Err(error) = save_result {
                         app.messages.push(ChatMessage::system(format!(
                             "warning: switched to {} but could not save the selection: {}",
                             model_name, error

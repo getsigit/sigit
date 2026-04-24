@@ -56,7 +56,7 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
     AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
     ContentChunk, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
     NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
     SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
@@ -161,6 +161,54 @@ fn agent_tools_as_onde() -> Vec<ToolDefinition> {
         .collect()
 }
 
+fn initialize_meta() -> Meta {
+    let startup_selection = setup::startup_model_selection();
+
+    let active_model_name = startup_selection
+        .as_ref()
+        .map(|selection| selection.display_name.clone())
+        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().display_name);
+
+    let active_model_id = startup_selection
+        .as_ref()
+        .and_then(|selection| selection.selected_model.as_ref())
+        .map(|selected| selected.model_id.clone())
+        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().model_id);
+
+    let active_model_file = startup_selection
+        .as_ref()
+        .and_then(|selection| selection.selected_model.as_ref())
+        .map(|selected| selected.gguf_file.clone())
+        .unwrap_or_else(|| {
+            GgufModelConfig::qwen3_4b()
+                .files
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        });
+
+    let mut model = serde_json::Map::new();
+    model.insert(
+        "display_name".to_string(),
+        serde_json::Value::String(active_model_name),
+    );
+    model.insert(
+        "model_id".to_string(),
+        serde_json::Value::String(active_model_id),
+    );
+    model.insert(
+        "gguf_file".to_string(),
+        serde_json::Value::String(active_model_file),
+    );
+
+    let mut sigit = serde_json::Map::new();
+    sigit.insert("active_model".to_string(), serde_json::Value::Object(model));
+
+    let mut meta = Meta::new();
+    meta.insert("sigit".to_string(), serde_json::Value::Object(sigit));
+    meta
+}
+
 // Agent
 
 struct SiGitAgent {
@@ -199,7 +247,8 @@ impl Agent for SiGitAgent {
                     .session_capabilities(
                         SessionCapabilities::new().fork(SessionForkCapabilities::new()),
                     ),
-            ))
+            )
+            .meta(initialize_meta()))
     }
 
     async fn authenticate(
@@ -458,7 +507,20 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
         .and_then(|selection| {
             chat::build_model_picker_items()
                 .into_iter()
-                .find(|item| item.display_name == selection.display_name)
+                .find(|item| {
+                    selection
+                        .selected_model
+                        .as_ref()
+                        .map(|selected| {
+                            item.config.model_id == selected.model_id
+                                && item
+                                    .config
+                                    .files
+                                    .iter()
+                                    .any(|file| file == &selected.gguf_file)
+                        })
+                        .unwrap_or(false)
+                })
                 .map(|item| item.config)
         })
         .unwrap_or_else(GgufModelConfig::platform_default);
@@ -522,7 +584,20 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .and_then(|selection| {
             chat::build_model_picker_items()
                 .into_iter()
-                .find(|item| item.display_name == selection.display_name)
+                .find(|item| {
+                    selection
+                        .selected_model
+                        .as_ref()
+                        .map(|selected| {
+                            item.config.model_id == selected.model_id
+                                && item
+                                    .config
+                                    .files
+                                    .iter()
+                                    .any(|file| file == &selected.gguf_file)
+                        })
+                        .unwrap_or(false)
+                })
                 .map(|item| item.config)
         })
         .unwrap_or_else(GgufModelConfig::qwen3_4b);
