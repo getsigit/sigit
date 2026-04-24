@@ -14,18 +14,19 @@
 //!
 //! # Write Tools
 //!
+//! - `create_directory` — create a directory and any missing parent directories
 //! - `create_file` — create a new file (fails if it already exists)
 //! - `edit_file` — replace an exact old-text span with new text in an existing file
 //! - `delete_file` — delete a file or empty directory at the given path
 //!
 //! # Shell Tools
 //!
-//! - `run_command` — run a shell command and return its combined stdout/stderr output
+//! - `run_command` — run shell commands, including git porcelain and plumbing commands
 
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Maximum characters returned from `read_file` before truncation.
@@ -52,8 +53,9 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "read_file",
             description: "Read the contents of a file at the given path. \
-                           Returns the file text, or an error message if the file cannot be read. \
-                           Output is truncated to 10 000 characters.",
+                           Prefer an absolute path when possible. Returns the file text, \
+                           or an error message if the file cannot be read. Output is \
+                           truncated to 10 000 characters.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -67,10 +69,30 @@ pub fn all_tools() -> Vec<AgentTool> {
             }),
         },
         AgentTool {
+            name: "create_directory",
+            description: "Create a directory at the given path. \
+                           Prefer an absolute path when possible. Missing parent \
+                           directories are created automatically. Use this before \
+                           create_file when the parent path does not exist. Succeeds \
+                           if the directory already exists.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the directory to create."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        AgentTool {
             name: "list_directory",
             description: "List files and directories at the given path. \
-                           Each entry is prefixed with [DIR] or [FILE]. \
-                           Directories are listed first, sorted alphabetically.",
+                           Prefer an absolute path when possible. Each entry is \
+                           prefixed with [DIR] or [FILE]. Directories are listed \
+                           first, sorted alphabetically.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -86,9 +108,9 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "search_files",
             description: "Search for a regex pattern across files in a directory tree. \
-                           Returns matching lines in `file:line_number: content` format. \
-                           Skips binary files and hidden directories. \
-                           Limited to the first 50 matches.",
+                           Prefer an absolute root path when possible. Returns matching \
+                           lines in `file:line_number: content` format. Skips binary \
+                           files and hidden directories. Limited to the first 50 matches.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -108,8 +130,9 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "create_file",
             description: "Create a new file at the given path with the provided content. \
-                           Parent directories are created automatically if they do not exist. \
-                           Fails if the file already exists — use edit_file to modify existing files.",
+                           Prefer an absolute path when possible. Parent directories are \
+                           created automatically if they do not exist. Fails if the file \
+                           already exists — use edit_file to modify existing files.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -129,10 +152,11 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "edit_file",
             description: "Edit an existing file by replacing an exact substring (old_text) with \
-                           new text (new_text). The old_text must appear exactly once in the file. \
-                           Use read_file first to see the current content and identify the exact \
-                           text to replace. To append to a file, match the last few lines as \
-                           old_text and include them plus the new content as new_text.",
+                           new text (new_text). Prefer an absolute path when possible. The \
+                           old_text must appear exactly once in the file. Use read_file first \
+                           to see the current content and identify the exact text to replace. \
+                           To append to a file, match the last few lines as old_text and \
+                           include them plus the new content as new_text.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -156,7 +180,8 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "delete_file",
             description: "Delete a file or empty directory at the given path. \
-                           Refuses to delete non-empty directories to prevent accidental data loss. \
+                           Prefer an absolute path when possible. Refuses to delete \
+                           non-empty directories to prevent accidental data loss. \
                            Use read_file or list_directory first to confirm the target.",
             parameters_schema: json!({
                 "type": "object",
@@ -173,9 +198,19 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "run_command",
             description: "Run a shell command and return its combined stdout and stderr output. \
-                           The command runs in the given working directory (defaults to \".\"). \
-                           Use this for build tools (cargo, npm, make), version control (git), \
-                           package managers, linters, test runners, and other CLI tasks. \
+                           The command runs in the given working directory (defaults to the \
+                           user's home directory). Always use an absolute working directory \
+                           path. Use this for build tools (cargo, npm, make), package managers, \
+                           linters, test runners, and git commands, including git init, \
+                           porcelain commands like status/add/commit/checkout, and plumbing \
+                           commands like rev-parse, hash-object, update-ref, and cat-file. \
+                           For `git clone`, always specify the full absolute destination path \
+                           as the last argument (e.g. `git clone <url> /absolute/path/to/dir`) \
+                           and set cwd to the parent directory. Never run `git clone` without \
+                           an explicit destination. If the user asks for a new repo or scaffold, \
+                           use this for `git clone`, `git init`, and normal repo setup steps. \
+                           In smbCloud repos, prefer existing workspace commands, Rails \
+                           conventions, and deploy flows over inventing new command sequences. \
                            Commands that run indefinitely (servers, watchers) will be killed \
                            after 120 seconds.",
             parameters_schema: json!({
@@ -183,7 +218,7 @@ pub fn all_tools() -> Vec<AgentTool> {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute (e.g. \"cargo update\", \"git status\")."
+                        "description": "The shell command to execute (e.g. \"cargo update\", \"git status\", \"git rev-parse HEAD\")."
                     },
                     "cwd": {
                         "type": "string",
@@ -208,12 +243,27 @@ pub fn execute_tool(name: &str, arguments: &str) -> String {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
         "search_files" => exec_search_files(arguments),
+        "create_directory" => exec_create_directory(arguments),
         "create_file" => exec_create_file(arguments),
         "edit_file" => exec_edit_file(arguments),
         "delete_file" => exec_delete_file(arguments),
         "run_command" => exec_run_command(arguments),
         _ => format!("Unknown tool: {name}"),
     }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn absolute_path_string(path: &Path) -> String {
+    absolute_path(path).display().to_string()
 }
 
 // ── read_file ────────────────────────────────────────────────────────────────
@@ -231,16 +281,18 @@ fn exec_read_file(arguments: &str) -> String {
     };
 
     let path = Path::new(path_str);
+    let absolute_path = absolute_path(path);
+    let absolute_path_str = absolute_path.display().to_string();
 
-    if !path.exists() {
-        return format!("Error: path does not exist: {path_str}");
+    if !absolute_path.exists() {
+        return format!("Error: path does not exist: {absolute_path_str}");
     }
 
-    if !path.is_file() {
-        return format!("Error: path is not a file: {path_str}");
+    if !absolute_path.is_file() {
+        return format!("Error: path is not a file: {absolute_path_str}");
     }
 
-    match fs::read_to_string(path) {
+    match fs::read_to_string(&absolute_path) {
         Ok(contents) => {
             if contents.len() > READ_FILE_CHAR_LIMIT {
                 let truncated: String = contents.chars().take(READ_FILE_CHAR_LIMIT).collect();
@@ -271,16 +323,18 @@ fn exec_list_directory(arguments: &str) -> String {
     };
 
     let path = Path::new(path_str);
+    let absolute_path = absolute_path(path);
+    let absolute_path_str = absolute_path.display().to_string();
 
-    if !path.exists() {
-        return format!("Error: path does not exist: {path_str}");
+    if !absolute_path.exists() {
+        return format!("Error: path does not exist: {absolute_path_str}");
     }
 
-    if !path.is_dir() {
-        return format!("Error: path is not a directory: {path_str}");
+    if !absolute_path.is_dir() {
+        return format!("Error: path is not a directory: {absolute_path_str}");
     }
 
-    let entries = match fs::read_dir(path) {
+    let entries = match fs::read_dir(&absolute_path) {
         Ok(rd) => rd,
         Err(err) => return format!("Error: could not read directory: {err}"),
     };
@@ -318,7 +372,7 @@ fn exec_list_directory(arguments: &str) -> String {
     dirs.extend(files);
 
     if dirs.is_empty() {
-        return format!("(empty directory: {path_str})");
+        return format!("(empty directory: {absolute_path_str})");
     }
 
     dirs.join("\n")
@@ -346,17 +400,19 @@ fn exec_search_files(arguments: &str) -> String {
     };
 
     let root = Path::new(root_str);
+    let absolute_root = absolute_path(root);
+    let absolute_root_str = absolute_root.display().to_string();
 
-    if !root.exists() {
-        return format!("Error: path does not exist: {root_str}");
+    if !absolute_root.exists() {
+        return format!("Error: path does not exist: {absolute_root_str}");
     }
 
-    if !root.is_dir() {
-        return format!("Error: path is not a directory: {root_str}");
+    if !absolute_root.is_dir() {
+        return format!("Error: path is not a directory: {absolute_root_str}");
     }
 
     let mut matches: Vec<String> = Vec::new();
-    walk_and_search(root, &re, &mut matches);
+    walk_and_search(&absolute_root, &re, &mut matches);
 
     if matches.is_empty() {
         return format!("No matches found for pattern: {pattern_str}");
@@ -423,7 +479,7 @@ fn search_file(path: &Path, re: &Regex, matches: &mut Vec<String>) {
         Err(_) => return,
     };
 
-    let display_path = path.display();
+    let display_path = absolute_path_string(path);
 
     for (line_idx, line) in contents.lines().enumerate() {
         if re.is_match(line) {
@@ -433,7 +489,34 @@ fn search_file(path: &Path, re: &Regex, matches: &mut Vec<String>) {
     }
 }
 
-// ── create_file ──────────────────────────────────────────────────────────────
+/// Create a directory and any missing parent directories.
+fn exec_create_directory(arguments: &str) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let path_str = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return "Error: missing required parameter \"path\"".to_string(),
+    };
+
+    let path = Path::new(path_str);
+    let absolute_path = absolute_path(path);
+    let absolute_path_str = absolute_path.display().to_string();
+
+    if absolute_path.exists() {
+        if absolute_path.is_dir() {
+            return format!("Directory already exists: {absolute_path_str}");
+        }
+        return format!("Error: path exists and is not a directory: {absolute_path_str}");
+    }
+
+    match fs::create_dir_all(&absolute_path) {
+        Ok(()) => format!("Created directory: {absolute_path_str}"),
+        Err(err) => format!("Error: could not create directory: {err}"),
+    }
+}
 
 /// Create a new file with the provided content.
 ///
@@ -457,15 +540,17 @@ fn exec_create_file(arguments: &str) -> String {
     };
 
     let path = Path::new(path_str);
+    let absolute_path = absolute_path(path);
+    let absolute_path_str = absolute_path.display().to_string();
 
-    if path.exists() {
+    if absolute_path.exists() {
         return format!(
-            "Error: file already exists: {path_str} — use edit_file to modify existing files"
+            "Error: file already exists: {absolute_path_str} — use edit_file to modify existing files"
         );
     }
 
     // Create parent directories if needed.
-    if let Some(parent) = path.parent()
+    if let Some(parent) = absolute_path.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
         && let Err(err) = fs::create_dir_all(parent)
@@ -473,8 +558,11 @@ fn exec_create_file(arguments: &str) -> String {
         return format!("Error: could not create parent directories: {err}");
     }
 
-    match fs::write(path, content) {
-        Ok(()) => format!("Created file: {path_str} ({} bytes)", content.len()),
+    match fs::write(&absolute_path, content) {
+        Ok(()) => format!(
+            "Created file: {absolute_path_str} ({} bytes)",
+            content.len()
+        ),
         Err(err) => format!("Error: could not write file: {err}"),
     }
 }
@@ -509,16 +597,20 @@ fn exec_edit_file(arguments: &str) -> String {
     };
 
     let path = Path::new(path_str);
+    let absolute_path = absolute_path(path);
+    let absolute_path_str = absolute_path.display().to_string();
 
-    if !path.exists() {
-        return format!("Error: file does not exist: {path_str} — use create_file for new files");
+    if !absolute_path.exists() {
+        return format!(
+            "Error: file does not exist: {absolute_path_str} — use create_file for new files"
+        );
     }
 
-    if !path.is_file() {
-        return format!("Error: path is not a file: {path_str}");
+    if !absolute_path.is_file() {
+        return format!("Error: path is not a file: {absolute_path_str}");
     }
 
-    let contents = match fs::read_to_string(path) {
+    let contents = match fs::read_to_string(&absolute_path) {
         Ok(c) => c,
         Err(err) => return format!("Error: could not read file: {err}"),
     };
@@ -528,22 +620,25 @@ fn exec_edit_file(arguments: &str) -> String {
 
     if occurrences == 0 {
         return format!(
-            "Error: old_text not found in {path_str}. \
+            "Error: old_text not found in {absolute_path_str}. \
              Use read_file to see the current content and copy the exact text to replace."
         );
     }
 
     if occurrences > 1 {
         return format!(
-            "Error: old_text appears {occurrences} times in {path_str}. \
+            "Error: old_text appears {occurrences} times in {absolute_path_str}. \
              Include more surrounding context in old_text so it matches exactly once."
         );
     }
 
     let updated = contents.replacen(old_text, new_text, 1);
 
-    match fs::write(path, &updated) {
-        Ok(()) => format!("Edited file: {path_str} ({} bytes written)", updated.len()),
+    match fs::write(&absolute_path, &updated) {
+        Ok(()) => format!(
+            "Edited file: {absolute_path_str} ({} bytes written)",
+            updated.len()
+        ),
         Err(err) => format!("Error: could not write file: {err}"),
     }
 }
@@ -566,22 +661,24 @@ fn exec_delete_file(arguments: &str) -> String {
     };
 
     let path = Path::new(path_str);
+    let absolute_path = absolute_path(path);
+    let absolute_path_str = absolute_path.display().to_string();
 
-    if !path.exists() {
-        return format!("Error: path does not exist: {path_str}");
+    if !absolute_path.exists() {
+        return format!("Error: path does not exist: {absolute_path_str}");
     }
 
-    if path.is_dir() {
-        match fs::remove_dir(path) {
-            Ok(()) => format!("Deleted empty directory: {path_str}"),
+    if absolute_path.is_dir() {
+        match fs::remove_dir(&absolute_path) {
+            Ok(()) => format!("Deleted empty directory: {absolute_path_str}"),
             Err(err) => format!(
                 "Error: could not delete directory: {err}. \
                  Only empty directories can be deleted."
             ),
         }
     } else {
-        match fs::remove_file(path) {
-            Ok(()) => format!("Deleted file: {path_str}"),
+        match fs::remove_file(&absolute_path) {
+            Ok(()) => format!("Deleted file: {absolute_path_str}"),
             Err(err) => format!("Error: could not delete file: {err}"),
         }
     }
@@ -612,20 +709,25 @@ fn exec_run_command(arguments: &str) -> String {
         None => return "Error: missing required parameter \"command\"".to_string(),
     };
 
-    let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+    let default_cwd = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let cwd = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or(&default_cwd);
+    let cwd_path = absolute_path(Path::new(cwd));
+    let cwd_str = cwd_path.display().to_string();
 
-    let cwd_path = Path::new(cwd);
     if !cwd_path.exists() {
-        return format!("Error: working directory does not exist: {cwd}");
+        return format!("Error: working directory does not exist: {cwd_str}");
     }
 
-    log::info!("run_command: `{command_str}` in `{cwd}`");
+    log::info!("run_command: `{command_str}` in `{cwd_str}`");
 
     #[cfg(unix)]
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(command_str)
-        .current_dir(cwd_path)
+        .current_dir(&cwd_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -638,7 +740,7 @@ fn exec_run_command(arguments: &str) -> String {
     let mut child = match Command::new("cmd")
         .arg("/C")
         .arg(command_str)
-        .current_dir(cwd_path)
+        .current_dir(&cwd_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -814,14 +916,15 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         assert_eq!(tools[0].name, "read_file");
-        assert_eq!(tools[1].name, "list_directory");
-        assert_eq!(tools[2].name, "search_files");
-        assert_eq!(tools[3].name, "create_file");
-        assert_eq!(tools[4].name, "edit_file");
-        assert_eq!(tools[5].name, "delete_file");
-        assert_eq!(tools[6].name, "run_command");
+        assert_eq!(tools[1].name, "create_directory");
+        assert_eq!(tools[2].name, "list_directory");
+        assert_eq!(tools[3].name, "search_files");
+        assert_eq!(tools[4].name, "create_file");
+        assert_eq!(tools[5].name, "edit_file");
+        assert_eq!(tools[6].name, "delete_file");
+        assert_eq!(tools[7].name, "run_command");
     }
 
     #[test]
@@ -837,6 +940,44 @@ mod tests {
             assert!(obj.contains_key("properties"));
             assert!(obj.contains_key("required"));
         }
+    }
+
+    // ── create_directory tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_create_directory_missing_path() {
+        let result = exec_create_directory("{}");
+        assert!(result.contains("missing required parameter"));
+    }
+
+    #[test]
+    fn test_create_directory_success() {
+        let dir = std::env::temp_dir()
+            .join("sigit_test_create_directory")
+            .join("nested")
+            .join("child");
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+
+        let args = serde_json::json!({ "path": dir }).to_string();
+        let result = exec_create_directory(&args);
+        assert!(result.starts_with("Created directory:"), "got: {result}");
+        assert!(dir.exists());
+        assert!(dir.is_dir());
+
+        let _ = fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn test_create_directory_already_exists() {
+        let dir = std::env::temp_dir().join("sigit_test_create_directory_exists");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let args = serde_json::json!({ "path": dir }).to_string();
+        let result = exec_create_directory(&args);
+        assert!(result.contains("Directory already exists"), "got: {result}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ── create_file tests ────────────────────────────────────────────────
