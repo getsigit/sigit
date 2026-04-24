@@ -22,7 +22,7 @@ jobs:
             target: aarch64-apple-darwin
 
           - name: macOS x86_64 — clippy / test
-            os: macos-26-intel
+            os: macos-26
             target: x86_64-apple-darwin
 
     steps:
