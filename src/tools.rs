@@ -198,17 +198,21 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "run_command",
             description: "Run a shell command and return its combined stdout and stderr output. \
-                           The command runs in the given working directory (defaults to \".\"). \
-                           Prefer an absolute working directory when possible. Use this for \
-                           build tools (cargo, npm, make), package managers, linters, test \
-                           runners, and git commands, including git init, porcelain commands \
-                           like status/add/commit/checkout, and plumbing commands like \
-                           rev-parse, hash-object, update-ref, and cat-file. If the user asks \
-                           for a new repo or scaffold, it is fine to use this for `git init` \
-                           and normal repo setup steps. In smbCloud repos, prefer existing \
-                           workspace commands, Rails conventions, and deploy flows over \
-                           inventing new command sequences. Commands that run indefinitely \
-                           (servers, watchers) will be killed after 120 seconds.",
+                           The command runs in the given working directory (defaults to the \
+                           user's home directory). Always use an absolute working directory \
+                           path. Use this for build tools (cargo, npm, make), package managers, \
+                           linters, test runners, and git commands, including git init, \
+                           porcelain commands like status/add/commit/checkout, and plumbing \
+                           commands like rev-parse, hash-object, update-ref, and cat-file. \
+                           For `git clone`, always specify the full absolute destination path \
+                           as the last argument (e.g. `git clone <url> /absolute/path/to/dir`) \
+                           and set cwd to the parent directory. Never run `git clone` without \
+                           an explicit destination. If the user asks for a new repo or scaffold, \
+                           use this for `git clone`, `git init`, and normal repo setup steps. \
+                           In smbCloud repos, prefer existing workspace commands, Rails \
+                           conventions, and deploy flows over inventing new command sequences. \
+                           Commands that run indefinitely (servers, watchers) will be killed \
+                           after 120 seconds.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -705,7 +709,11 @@ fn exec_run_command(arguments: &str) -> String {
         None => return "Error: missing required parameter \"command\"".to_string(),
     };
 
-    let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+    let default_cwd = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let cwd = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or(&default_cwd);
     let cwd_path = absolute_path(Path::new(cwd));
     let cwd_str = cwd_path.display().to_string();
 
