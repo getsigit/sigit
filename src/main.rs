@@ -42,9 +42,10 @@ use onde::inference::SamplingConfig;
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
     AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
-    ContentChunk, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ProtocolVersion, SessionId, SessionNotification, SessionUpdate, StopReason,
+    ContentChunk, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
+    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
@@ -121,7 +122,13 @@ impl Agent for SiGitAgent {
             .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
                 "sigit", "siGit",
             ))])
-            .agent_capabilities(AgentCapabilities::default().load_session(true)))
+            .agent_capabilities(
+                AgentCapabilities::default()
+                    .load_session(true)
+                    .session_capabilities(
+                        SessionCapabilities::new().fork(SessionForkCapabilities::new()),
+                    ),
+            ))
     }
 
     async fn authenticate(
@@ -143,6 +150,21 @@ impl Agent for SiGitAgent {
         self.engine.clear_history().await;
 
         Ok(LoadSessionResponse::new())
+    }
+
+    async fn fork_session(
+        &self,
+        args: ForkSessionRequest,
+    ) -> agent_client_protocol::Result<ForkSessionResponse> {
+        let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        log::info!("fork_session: from={} new={new_id}", args.session_id);
+
+        // siGit doesn't persist history, so a fork is effectively a fresh
+        // session — clear the conversation and let the user start over from
+        // their edited message.
+        self.engine.clear_history().await;
+
+        Ok(ForkSessionResponse::new(new_id))
     }
 
     async fn new_session(
