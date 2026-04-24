@@ -725,7 +725,7 @@ mod tests {
         let file_path = dir.join("hello.txt");
         fs::write(&file_path, "hello world").unwrap();
 
-        let args = format!(r#"{{"path": "{}"}}"#, file_path.display());
+        let args = serde_json::json!({ "path": file_path }).to_string();
         let result = exec_read_file(&args);
         assert_eq!(result, "hello world");
 
@@ -746,7 +746,7 @@ mod tests {
         fs::write(dir.join("aaa.txt"), "").unwrap();
         fs::write(dir.join("bbb.rs"), "").unwrap();
 
-        let args = format!(r#"{{"path": "{}"}}"#, dir.display());
+        let args = serde_json::json!({ "path": dir }).to_string();
         let result = exec_list_directory(&args);
 
         assert!(result.contains("[DIR]  subdir"));
@@ -779,7 +779,11 @@ mod tests {
         .unwrap();
         fs::write(dir.join("other.txt"), "no match here\n").unwrap();
 
-        let args = format!(r#"{{"pattern": "println", "path": "{}"}}"#, dir.display());
+        let args = serde_json::json!({
+            "pattern": "println",
+            "path": dir
+        })
+        .to_string();
         let result = exec_search_files(&args);
 
         assert!(result.contains("code.rs:2:"));
@@ -796,10 +800,11 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("empty.txt"), "nothing special").unwrap();
 
-        let args = format!(
-            r#"{{"pattern": "zzz_will_not_match_42", "path": "{}"}}"#,
-            dir.display()
-        );
+        let args = serde_json::json!({
+            "pattern": "zzz_will_not_match_42",
+            "path": dir
+        })
+        .to_string();
         let result = exec_search_files(&args);
         assert!(result.contains("No matches found"));
 
@@ -854,10 +859,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         let file_path = dir.join("sub").join("new_file.txt");
-        let args = format!(
-            r#"{{"path": "{}", "content": "hello world"}}"#,
-            file_path.display()
-        );
+        let args = serde_json::json!({
+            "path": file_path,
+            "content": "hello world"
+        })
+        .to_string();
 
         let result = exec_create_file(&args);
         assert!(result.starts_with("Created file:"), "got: {result}");
@@ -876,10 +882,11 @@ mod tests {
         let file_path = dir.join("existing.txt");
         fs::write(&file_path, "original").unwrap();
 
-        let args = format!(
-            r#"{{"path": "{}", "content": "overwrite attempt"}}"#,
-            file_path.display()
-        );
+        let args = serde_json::json!({
+            "path": file_path,
+            "content": "overwrite attempt"
+        })
+        .to_string();
 
         let result = exec_create_file(&args);
         assert!(result.contains("already exists"), "got: {result}");
@@ -917,10 +924,12 @@ mod tests {
         let file_path = dir.join("code.rs");
         fs::write(&file_path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
 
-        let args = format!(
-            r#"{{"path": "{}", "old_text": "println!(\"hello\")", "new_text": "println!(\"world\")"}}"#,
-            file_path.display()
-        );
+        let args = serde_json::json!({
+            "path": file_path,
+            "old_text": "println!(\"hello\")",
+            "new_text": "println!(\"world\")"
+        })
+        .to_string();
 
         let result = exec_edit_file(&args);
         assert!(result.starts_with("Edited file:"), "got: {result}");
@@ -941,10 +950,12 @@ mod tests {
         let file_path = dir.join("data.txt");
         fs::write(&file_path, "aaa bbb ccc").unwrap();
 
-        let args = format!(
-            r#"{{"path": "{}", "old_text": "zzz", "new_text": "yyy"}}"#,
-            file_path.display()
-        );
+        let args = serde_json::json!({
+            "path": file_path,
+            "old_text": "zzz",
+            "new_text": "yyy"
+        })
+        .to_string();
 
         let result = exec_edit_file(&args);
         assert!(result.contains("old_text not found"), "got: {result}");
@@ -961,10 +972,12 @@ mod tests {
         let file_path = dir.join("repeat.txt");
         fs::write(&file_path, "foo bar foo bar foo").unwrap();
 
-        let args = format!(
-            r#"{{"path": "{}", "old_text": "foo", "new_text": "baz"}}"#,
-            file_path.display()
-        );
+        let args = serde_json::json!({
+            "path": file_path,
+            "old_text": "foo",
+            "new_text": "baz"
+        })
+        .to_string();
 
         let result = exec_edit_file(&args);
         assert!(result.contains("appears 3 times"), "got: {result}");
@@ -1004,7 +1017,7 @@ mod tests {
         fs::write(&file_path, "bye").unwrap();
         assert!(file_path.exists());
 
-        let args = format!(r#"{{"path": "{}"}}"#, file_path.display());
+        let args = serde_json::json!({ "path": file_path }).to_string();
         let result = exec_delete_file(&args);
         assert!(result.contains("Deleted file"), "got: {result}");
         assert!(!file_path.exists());
@@ -1018,7 +1031,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let args = format!(r#"{{"path": "{}"}}"#, dir.display());
+        let args = serde_json::json!({ "path": dir }).to_string();
         let result = exec_delete_file(&args);
         assert!(result.contains("Deleted empty directory"), "got: {result}");
         assert!(!dir.exists());
@@ -1031,7 +1044,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("child.txt"), "content").unwrap();
 
-        let args = format!(r#"{{"path": "{}"}}"#, dir.display());
+        let args = serde_json::json!({ "path": dir }).to_string();
         let result = exec_delete_file(&args);
         assert!(result.contains("Error"), "got: {result}");
         assert!(dir.exists(), "directory should not have been deleted");
@@ -1059,7 +1072,13 @@ mod tests {
 
     #[test]
     fn test_run_command_failure() {
-        let result = exec_run_command(r#"{"command": "false"}"#);
+        #[cfg(unix)]
+        let command = "false";
+        #[cfg(windows)]
+        let command = "exit /b 1";
+
+        let args = serde_json::json!({ "command": command }).to_string();
+        let result = exec_run_command(&args);
         assert!(result.contains("failed"), "got: {result}");
     }
 
@@ -1069,7 +1088,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let args = format!(r#"{{"command": "pwd", "cwd": "{}"}}"#, dir.display());
+        #[cfg(unix)]
+        let command = "pwd";
+        #[cfg(windows)]
+        let command = "cd";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": dir
+        })
+        .to_string();
         let result = exec_run_command(&args);
         // The output should contain the temp dir path.
         assert!(
@@ -1082,14 +1110,27 @@ mod tests {
 
     #[test]
     fn test_run_command_bad_cwd() {
-        let result =
-            exec_run_command(r#"{"command": "echo hi", "cwd": "/tmp/sigit_no_such_dir_xyz"}"#);
+        let missing_dir = std::env::temp_dir().join("sigit_no_such_dir_xyz");
+        let _ = fs::remove_dir_all(&missing_dir);
+
+        let args = serde_json::json!({
+            "command": "echo hi",
+            "cwd": missing_dir
+        })
+        .to_string();
+        let result = exec_run_command(&args);
         assert!(result.contains("does not exist"), "got: {result}");
     }
 
     #[test]
     fn test_run_command_captures_stderr() {
-        let result = exec_run_command(r#"{"command": "echo err >&2"}"#);
+        #[cfg(unix)]
+        let command = "echo err >&2";
+        #[cfg(windows)]
+        let command = "echo err 1>&2";
+
+        let args = serde_json::json!({ "command": command }).to_string();
+        let result = exec_run_command(&args);
         assert!(result.contains("err"), "got: {result}");
     }
 }

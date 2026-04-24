@@ -40,11 +40,14 @@
 //! }
 //! ```
 
+#[cfg(unix)]
 mod chat;
 mod setup;
 mod tools;
 
-use std::io::{BufWriter, IsTerminal, Write};
+use std::io::IsTerminal;
+#[cfg(unix)]
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 use onde::inference::SamplingConfig;
@@ -383,6 +386,7 @@ fn init_logging(is_tty: bool) {
 /// terminal, used for `LeaveAlternateScreen` and restoring stdout/stderr
 /// (we cannot access the backend's writer because `writer_mut()` is private
 /// in ratatui 0.29).
+#[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
     let config = GgufModelConfig::platform_default();
