@@ -102,6 +102,6 @@ Licensed under **Apache 2.0**.
 
 ---
 
-<p align="center">
-  <sub>Built by <a href="https://smbcloud.xyz">smbCloud</a> (Splitfire AB) · © 2026</sub>
-</p>
+## Copyright
+
+2026 smbCloud (Splitfire AB).

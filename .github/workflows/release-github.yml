@@ -40,10 +40,10 @@ jobs:
             runner: windows-latest
             target: aarch64-pc-windows-msvc
           - name: macos-amd64
-            runner: macos-15-intel
+            runner: macos-26
             target: x86_64-apple-darwin
           - name: macos-arm64
-            runner: macos-latest
+            runner: macos-26
             target: aarch64-apple-darwin
 
     steps:

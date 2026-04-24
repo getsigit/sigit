@@ -4,7 +4,16 @@
 
 A coding agent for [smbCloud](https://smbcloud.xyz/) that runs entirely on your machine. No API keys. No cloud round-trips. The model lives in your local HuggingFace cache.
 
-Two modes: an ACP agent that Zed (and other ACP-compatible editors) spawns over stdio, or an interactive terminal chat when you run it directly.
+siGit has two modes:
+
+- ACP mode, where Zed or another ACP-compatible editor starts it over stdio
+- an interactive terminal chat when you run `sigit` yourself
+
+Current platform support:
+
+- macOS: ACP mode and interactive terminal mode
+- Linux: ACP mode and interactive terminal mode
+- Windows: ACP mode only for now
 
 ## Install
 
@@ -16,7 +25,7 @@ cargo install sigit
 
 The first time siGit starts, it downloads a GGUF model (~1–2 GB) from HuggingFace. Subsequent starts load from disk in a few seconds.
 
-On macOS, siGit shares the model cache with the siGit desktop app via an App Group container — if you've already downloaded it there, the CLI picks it up automatically.
+On macOS, siGit shares its model cache with the siGit desktop app through an App Group container. If the desktop app already downloaded the model, the CLI will reuse it.
 
 ## Zed setup
 
@@ -33,11 +42,13 @@ Add to `~/.config/zed/settings.json`:
 }
 ```
 
-Use the absolute path — `~` expansion won't work here.
+Use the full absolute path. `~` will not be expanded here.
 
 ## Terminal mode
 
-Running `sigit` directly in a terminal opens an interactive chat UI. Same model, same system prompt — handy for quick questions without opening an editor.
+If you run `sigit` directly in a terminal, it opens an interactive chat UI. It uses the same model and system prompt as the editor integration, so it is useful for quick questions when you do not want to open Zed first.
+
+That terminal mode currently depends on Unix terminal behavior, so it works on macOS and Linux. On Windows, siGit supports ACP/editor mode only right now.
 
 ## Copyright
 

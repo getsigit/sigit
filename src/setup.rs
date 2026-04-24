@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 /// App Group ID shared across all Onde apps (siGit, Rumi, GT8, …).
+#[cfg(target_os = "macos")]
 const APP_GROUP_IDENTIFIER: &str = "group.com.ondeinference.apps";
 
 /// Find the shared container and set `HF_HOME` / `HF_HUB_CACHE` to point

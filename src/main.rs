@@ -1,17 +1,27 @@
-//! siGit Code — an ACP coding agent that runs a local LLM via Onde Inference platform.
+//! siGit Code is a local coding agent built on Onde Inference.
 //!
-//! In interactive (TTY) mode **all** process output — `log::` crate events,
-//! `tracing` events from mistralrs_core, and even raw `println!` calls buried
-//! inside third-party crates — is redirected to `$TMPDIR/sigit.log` by
-//! rewiring the stdout/stderr file descriptors with `dup2(2)` before any
-//! library code runs.  Ratatui receives a private copy of the original
-//! terminal fd so its rendering is unaffected.
+//! When you run it in an interactive terminal, all process output goes to
+//! `$TMPDIR/sigit.log` first. That includes `log::` events, `tracing` output
+//! from mistralrs_core, and even stray `println!` calls from dependencies.
+//! Ratatui gets its own copy of the real terminal handle, so the UI can keep
+//! drawing normally while the noisy stuff goes to the log file.
 //!
-//! Two modes of operation:
+//! siGit has two modes:
+//! - ACP mode over stdio for editors like Zed
+//! - interactive terminal mode when you run it directly in a TTY
 //!
-//! The model loads before the ACP `LocalSet` starts. This matters because
-//! `mistralrs` calls `block_in_place` internally, which panics inside
-//! `spawn_local` tasks. Loading on a normal multi-thread worker avoids that.
+//! Current platform support:
+//! - macOS: ACP mode and interactive terminal mode
+//! - Linux: ACP mode and interactive terminal mode
+//! - Windows: ACP mode only for now
+//!
+//! The interactive terminal path is still Unix-only because it relies on
+//! Unix file-descriptor redirection to keep logs away from the TUI.
+//!
+//! The model loads before the ACP `LocalSet` starts. That is important because
+//! `mistralrs` calls `block_in_place` internally, and that blows up inside
+//! `spawn_local` tasks. Loading it on a normal multi-thread worker avoids the
+//! problem.
 //!
 //! On macOS, the HF cache points at the App Group container shared with the
 //! siGit desktop app. See [`setup`].
@@ -30,11 +40,14 @@
 //! }
 //! ```
 
+#[cfg(unix)]
 mod chat;
 mod setup;
 mod tools;
 
-use std::io::{BufWriter, IsTerminal, Write};
+use std::io::IsTerminal;
+#[cfg(unix)]
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 use onde::inference::SamplingConfig;
@@ -373,6 +386,7 @@ fn init_logging(is_tty: bool) {
 /// terminal, used for `LeaveAlternateScreen` and restoring stdout/stderr
 /// (we cannot access the backend's writer because `writer_mut()` is private
 /// in ratatui 0.29).
+#[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
     let config = GgufModelConfig::platform_default();
@@ -493,13 +507,16 @@ async fn main() -> anyhow::Result<()> {
         // Redirect stdout/stderr to $TMPDIR/sigit.log *first* — before any
         // library code can println!/eprintln!/log to the real terminal.
         #[cfg(unix)]
-        let (tty, cleanup_tty) = redirect_output_to_log()?;
+        {
+            let (tty, cleanup_tty) = redirect_output_to_log()?;
+            init_logging(true);
+            setup::setup_shared_model_cache();
+            run_interactive(tty, cleanup_tty).await
+        }
         #[cfg(not(unix))]
-        anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
-
-        init_logging(true);
-        setup::setup_shared_model_cache();
-        run_interactive(tty, cleanup_tty).await
+        {
+            anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
+        }
     } else {
         // ACP mode: no redirect needed, logs go to stderr.
         init_logging(false);
