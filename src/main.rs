@@ -1,17 +1,27 @@
-//! siGit Code — an ACP coding agent that runs a local LLM via Onde.
+//! siGit Code is a local coding agent built on Onde Inference.
 //!
-//! In interactive (TTY) mode **all** process output — `log::` crate events,
-//! `tracing` events from mistralrs_core, and even raw `println!` calls buried
-//! inside third-party crates — is redirected to `$TMPDIR/sigit.log` by
-//! rewiring the stdout/stderr file descriptors with `dup2(2)` before any
-//! library code runs.  Ratatui receives a private copy of the original
-//! terminal fd so its rendering is unaffected.
+//! When you run it in an interactive terminal, all process output goes to
+//! `$TMPDIR/sigit.log` first. That includes `log::` events, `tracing` output
+//! from mistralrs_core, and even stray `println!` calls from dependencies.
+//! Ratatui gets its own copy of the real terminal handle, so the UI can keep
+//! drawing normally while the noisy stuff goes to the log file.
 //!
-//! Two modes of operation:
+//! siGit has two modes:
+//! - ACP mode over stdio for editors like Zed
+//! - interactive terminal mode when you run it directly in a TTY
 //!
-//! The model loads before the ACP `LocalSet` starts. This matters because
-//! `mistralrs` calls `block_in_place` internally, which panics inside
-//! `spawn_local` tasks. Loading on a normal multi-thread worker avoids that.
+//! Current platform support:
+//! - macOS: ACP mode and interactive terminal mode
+//! - Linux: ACP mode and interactive terminal mode
+//! - Windows: ACP mode only for now
+//!
+//! The interactive terminal path is still Unix-only because it relies on
+//! Unix file-descriptor redirection to keep logs away from the TUI.
+//!
+//! The model loads before the ACP `LocalSet` starts. That is important because
+//! `mistralrs` calls `block_in_place` internally, and that blows up inside
+//! `spawn_local` tasks. Loading it on a normal multi-thread worker avoids the
+//! problem.
 //!
 //! On macOS, the HF cache points at the App Group container shared with the
 //! siGit desktop app. See [`setup`].
@@ -30,21 +40,28 @@
 //! }
 //! ```
 
+#[cfg(unix)]
 mod chat;
 mod setup;
+mod tools;
 
-use std::io::{BufWriter, IsTerminal, Write};
+use std::io::IsTerminal;
+#[cfg(unix)]
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
+
+use onde::inference::SamplingConfig;
 
 use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
     AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
-    ContentChunk, Implementation, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionId,
-    SessionNotification, SessionUpdate, StopReason,
+    ContentChunk, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
+    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use futures::future::LocalBoxFuture;
-use onde::inference::{ChatEngine, GgufModelConfig};
+use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
@@ -54,14 +71,38 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 
 const SYSTEM_PROMPT: &str = "\
 Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
-Not 'SiGit', not 'Sigit'. Say 'I am siGit' when asked.
+Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
 
 You are the official coding agent for smbCloud (https://smbcloud.xyz), \
 a cloud platform for deploying and managing projects. \
 You help developers build, debug, and ship software on the smbCloud platform.
 
+Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
-Fix root causes, not symptoms.";
+Fix root causes, not symptoms.
+
+You have access to tools that let you read files, list directories, search \
+code, create new files, edit existing files, delete files, and run shell \
+commands. Use them proactively — read the code before answering, run builds \
+and tests after making changes. Always ground your answers in the actual code.
+
+Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
+root cause, not the symptom. Correct beats clever.";
+
+/// Maximum number of tool-calling rounds before forcing a text response.
+const MAX_TOOL_ROUNDS: usize = 10;
+
+/// Convert the agent tool definitions into onde's `ToolDefinition` type.
+fn agent_tools_as_onde() -> Vec<ToolDefinition> {
+    tools::all_tools()
+        .into_iter()
+        .map(|t| ToolDefinition {
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+            parameters_schema: t.parameters_schema.to_string(),
+        })
+        .collect()
+}
 
 // Agent
 
@@ -95,7 +136,13 @@ impl Agent for SiGitAgent {
             .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
                 "sigit", "siGit",
             ))])
-            .agent_capabilities(AgentCapabilities::default()))
+            .agent_capabilities(
+                AgentCapabilities::default()
+                    .load_session(true)
+                    .session_capabilities(
+                        SessionCapabilities::new().fork(SessionForkCapabilities::new()),
+                    ),
+            ))
     }
 
     async fn authenticate(
@@ -104,6 +151,34 @@ impl Agent for SiGitAgent {
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
         log::info!("authenticate");
         Ok(AuthenticateResponse::default())
+    }
+
+    async fn load_session(
+        &self,
+        args: LoadSessionRequest,
+    ) -> agent_client_protocol::Result<LoadSessionResponse> {
+        log::info!("load_session: id={}", args.session_id);
+
+        // Clear conversation history — siGit doesn't persist sessions, so a
+        // "load" is effectively a fresh start with the same session ID.
+        self.engine.clear_history().await;
+
+        Ok(LoadSessionResponse::new())
+    }
+
+    async fn fork_session(
+        &self,
+        args: ForkSessionRequest,
+    ) -> agent_client_protocol::Result<ForkSessionResponse> {
+        let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        log::info!("fork_session: from={} new={new_id}", args.session_id);
+
+        // siGit doesn't persist history, so a fork is effectively a fresh
+        // session — clear the conversation and let the user start over from
+        // their edited message.
+        self.engine.clear_history().await;
+
+        Ok(ForkSessionResponse::new(new_id))
     }
 
     async fn new_session(
@@ -142,37 +217,84 @@ impl Agent for SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
-        // Stream tokens from the LLM and forward each one as an ACP update.
-        let mut token_rx = self
+        // ── Agentic tool-calling loop ────────────────────────────────────
+        //
+        // 1. Send the user message with tool definitions (non-streaming).
+        // 2. If the model responds with tool calls, execute them, feed
+        //    results back, and repeat (up to MAX_TOOL_ROUNDS).
+        // 3. Once the model produces a text response (no tool calls),
+        //    stream it to the editor.
+
+        let onde_tools = agent_tools_as_onde();
+
+        let mut result = self
             .engine
-            .stream_message(user_text)
+            .send_message_with_tools(&user_text, &onde_tools)
             .await
             .map_err(|error| {
-                log::error!("stream_message failed: {error}");
+                log::error!("send_message_with_tools failed: {error}");
                 agent_client_protocol::Error::new(-32603, format!("inference failed: {error}"))
             })?;
 
-        while let Some(chunk) = token_rx.recv().await {
-            if !chunk.delta.is_empty() {
-                let notification = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                        chunk.delta,
-                    ))),
+        let mut round = 0;
+
+        while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+            round += 1;
+            log::info!(
+                "prompt({}) tool round {} — {} call(s)",
+                session_id,
+                round,
+                result.tool_calls.len()
+            );
+
+            let mut tool_results = Vec::new();
+
+            for tc in &result.tool_calls {
+                log::info!(
+                    "  → {}({})",
+                    tc.function_name,
+                    tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                if self.notification_tx.send(notification).await.is_err() {
-                    log::warn!("notification channel closed — stopping stream");
-                    break;
-                }
+                // Execute the tool.
+                let output = tools::execute_tool(&tc.function_name, &tc.arguments);
+
+                log::info!("  ← {} chars", output.len());
+
+                tool_results.push(ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: output,
+                });
             }
 
-            if chunk.done {
-                break;
+            // Decide whether to allow further tool calls.
+            let next_tools = if round < MAX_TOOL_ROUNDS {
+                Some(onde_tools.as_slice())
+            } else {
+                None // force a text response on the last round
+            };
+
+            result = self
+                .engine
+                .send_tool_results(tool_results, next_tools)
+                .await
+                .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
+        }
+
+        // ── Send the final text response ─────────────────────────────────
+        if !result.text.is_empty() {
+            let notification = SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                    result.text,
+                ))),
+            );
+            if self.notification_tx.send(notification).await.is_err() {
+                log::warn!("notification channel closed");
             }
         }
 
-        log::info!("prompt({}) complete", session_id);
+        log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
         Ok(PromptResponse::new(StopReason::EndTurn))
     }
 
@@ -264,6 +386,7 @@ fn init_logging(is_tty: bool) {
 /// terminal, used for `LeaveAlternateScreen` and restoring stdout/stderr
 /// (we cannot access the backend's writer because `writer_mut()` is private
 /// in ratatui 0.29).
+#[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
     let config = GgufModelConfig::platform_default();
@@ -276,9 +399,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let system_prompt = SYSTEM_PROMPT.to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        let result = rt.block_on(
-            loader_engine.load_gguf_model(config, Some(system_prompt), None),
-        );
+        let result = rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), None));
         let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
     });
 
@@ -291,7 +412,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 
     // The TUI runs here on the main tokio runtime.  It polls load_rx via
     // try_recv() on every tick — non-blocking, zero contention.
-    let chat_result = chat::run_with(&mut terminal, &engine, load_rx).await;
+    let chat_result = chat::run_with(&mut terminal, engine, load_rx).await;
 
     // Restore the terminal before exiting.
     // Use the separate cleanup fd — the backend's writer is private.
@@ -322,10 +443,14 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("loading model (this may take a minute on first run)...");
 
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::platform_default();
+    let config = GgufModelConfig::qwen3_4b();
+    let sampling = SamplingConfig {
+        max_tokens: Some(4096),
+        ..SamplingConfig::default()
+    };
 
     engine
-        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), None)
+        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
         .await
         .map_err(|error| anyhow::anyhow!("model load failed: {error}"))?;
 
@@ -382,13 +507,16 @@ async fn main() -> anyhow::Result<()> {
         // Redirect stdout/stderr to $TMPDIR/sigit.log *first* — before any
         // library code can println!/eprintln!/log to the real terminal.
         #[cfg(unix)]
-        let (tty, cleanup_tty) = redirect_output_to_log()?;
+        {
+            let (tty, cleanup_tty) = redirect_output_to_log()?;
+            init_logging(true);
+            setup::setup_shared_model_cache();
+            run_interactive(tty, cleanup_tty).await
+        }
         #[cfg(not(unix))]
-        anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
-
-        init_logging(true);
-        setup::setup_shared_model_cache();
-        run_interactive(tty, cleanup_tty).await
+        {
+            anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
+        }
     } else {
         // ACP mode: no redirect needed, logs go to stderr.
         init_logging(false);

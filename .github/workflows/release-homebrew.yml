@@ -54,7 +54,7 @@ jobs:
       - name: Checkout Homebrew tap
         uses: actions/checkout@v6
         with:
-          repository: getsigit/sigit-homebrew-tap
+          repository: getsigit/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 

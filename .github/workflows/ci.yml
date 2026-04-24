@@ -1,8 +1,8 @@
 name: CI
 
 # Runs on every push.
-# Covers fmt (aarch64 only — platform-agnostic), clippy, and tests
-# on both supported macOS targets.
+# Splits formatting, clippy, and tests into separate jobs for clearer reporting
+# across supported desktop targets.
 
 on: push
 
@@ -10,42 +10,104 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: ${{ matrix.name }}
+  fmt:
+    name: Format
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  clippy:
+    name: Clippy — ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: macOS aarch64 — fmt / clippy / test
+          - name: macOS aarch64
             os: macos-26
             target: aarch64-apple-darwin
 
-          - name: macOS x86_64 — clippy / test
-            os: macos-26-intel
+          - name: macOS x86_64
+            os: macos-26
             target: x86_64-apple-darwin
+
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+          components: clippy
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ci-${{ matrix.target }}
-
-      # fmt output is identical on every platform — only run it once.
-      - name: Check formatting
-        if: matrix.target == 'aarch64-apple-darwin'
-        run: cargo fmt -- --check
+          key: clippy-${{ matrix.target }}
 
       - name: Clippy
-        run: cargo clippy --tests -- -D warnings
+        run: cargo clippy --tests --target ${{ matrix.target }} -- -D warnings
+
+  test:
+    name: Test — ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS aarch64
+            os: macos-26
+            target: aarch64-apple-darwin
+
+          - name: macOS x86_64
+            os: macos-26
+            target: x86_64-apple-darwin
+
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.target }}
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --target ${{ matrix.target }}

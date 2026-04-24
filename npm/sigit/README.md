@@ -80,6 +80,6 @@ Add siGit as an agent in Zed by adding this to your settings:
 
 [Apache-2.0](https://github.com/getsigit/sigit/blob/main/LICENSE)
 
-<p align="center">
-  <sub>© 2026 <a href="https://www.smbcloud.xyz">smbCloud</a> · <a href="https://apps.apple.com/se/developer/splitfire-ab/id1831430993">Splitfire AB</a></sub>
-</p>
+## Copyright
+
+2026 smbCloud (Splitfire AB).
