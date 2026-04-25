@@ -312,6 +312,13 @@ struct ModelOption {
 
 const SIGIT_MODELS: &[ModelOption] = &[
     ModelOption {
+        name: "Qwen 3 8B (Q4_K_M)",
+        description: "~5 GB",
+        tool_calling: true,
+        max_tokens: 4096,
+        config_fn: GgufModelConfig::qwen3_8b,
+    },
+    ModelOption {
         name: "Qwen 3 4B (Q4_K_M)",
         description: "~2.7 GB",
         tool_calling: true,
@@ -999,7 +1006,7 @@ pub async fn run_with<B: ratatui::backend::Backend>(
     engine: Arc<ChatEngine>,
     load_rx: std_mpsc::Receiver<Result<(), String>>,
 ) -> Result<()> {
-    let config = GgufModelConfig::qwen3_4b();
+    let config = GgufModelConfig::qwen3_8b();
     let model_name = config.display_name.clone();
     event_loop(terminal, engine, load_rx, model_name).await
 }

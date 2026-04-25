@@ -215,15 +215,6 @@ impl SiGitAgent {
             session_cwd: std::sync::Mutex::new(None),
         }
     }
-
-    /// Return the session working directory, falling back to the process cwd.
-    fn cwd(&self) -> PathBuf {
-        self.session_cwd
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -280,10 +271,10 @@ impl Agent for SiGitAgent {
 
         // Set the process cwd so tool calls using relative paths land in the
         // correct project directory.
-        if args.cwd.is_dir() {
-            if let Err(err) = std::env::set_current_dir(&args.cwd) {
-                log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-            }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
         // Clear conversation history — siGit doesn't persist sessions, so a
@@ -323,10 +314,10 @@ impl Agent for SiGitAgent {
         if let Ok(mut guard) = self.session_cwd.lock() {
             *guard = Some(args.cwd.clone());
         }
-        if args.cwd.is_dir() {
-            if let Err(err) = std::env::set_current_dir(&args.cwd) {
-                log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-            }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
         // siGit doesn't persist history, so a fork is effectively a fresh
@@ -365,10 +356,10 @@ impl Agent for SiGitAgent {
         if let Ok(mut guard) = self.session_cwd.lock() {
             *guard = Some(args.cwd.clone());
         }
-        if args.cwd.is_dir() {
-            if let Err(err) = std::env::set_current_dir(&args.cwd) {
-                log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-            }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
         // Clear history — the model is already loaded.
@@ -718,7 +709,7 @@ fn init_logging(is_tty: bool) {
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::qwen3_4b();
+    let config = GgufModelConfig::qwen3_8b();
     let sampling = SamplingConfig {
         max_tokens: Some(4096),
         ..SamplingConfig::default()
@@ -777,7 +768,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("loading model (this may take a minute on first run)...");
 
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::qwen3_4b();
+    let config = GgufModelConfig::qwen3_8b();
     let sampling = SamplingConfig {
         max_tokens: Some(4096),
         ..SamplingConfig::default()

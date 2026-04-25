@@ -526,7 +526,7 @@ fn search_file(path: &Path, re: &Regex, matches: &mut Vec<String>) {
     }
 }
 
-/// ── read_website ─────────────────────────────────────────────────────────────
+// ── read_website ─────────────────────────────────────────────────────────────
 
 fn exec_read_website(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
@@ -642,7 +642,7 @@ fn exec_read_website(arguments: &str) -> String {
     output
 }
 
-/// ── create_directory ─────────────────────────────────────────────────────────
+// ── create_directory ─────────────────────────────────────────────────────────
 
 /// Create a directory and any missing parent directories.
 fn exec_create_directory(arguments: &str) -> String {
