@@ -132,18 +132,30 @@ pub enum ModelCacheHealth {
 /// 2. Standard Hugging Face cache
 pub fn discover_local_models() -> Vec<DiscoveredModel> {
     let mut models = Vec::new();
+    let mut seen_roots = Vec::new();
 
     if let Some(app_group_models) = app_group_models_root() {
+        seen_roots.push(app_group_models.clone());
         collect_models_from_cache_root(&app_group_models, true, &mut models);
     }
 
-    if let Some(hf_cache) = hf_cache_root() {
+    if let Some(hf_cache) = hf_cache_root()
+        && !seen_roots.iter().any(|root| root == &hf_cache)
+    {
+        seen_roots.push(hf_cache.clone());
         collect_models_from_cache_root(&hf_cache, false, &mut models);
     }
 
+    if let Some(default_hf_cache) = default_hf_cache_root()
+        && !seen_roots.iter().any(|root| root == &default_hf_cache)
+    {
+        collect_models_from_cache_root(&default_hf_cache, false, &mut models);
+    }
+
     models.sort_by(|left, right| {
-        left.cache_health
-            .cmp(&right.cache_health)
+        right
+            .from_app_group
+            .cmp(&left.from_app_group)
             .then_with(|| {
                 left.display_name
                     .to_lowercase()
@@ -206,8 +218,6 @@ fn collect_models_from_cache_root(
                 Err(_) => continue,
             };
 
-            let mut has_config_json = false;
-            let mut has_tokenizer = false;
             let mut gguf_files = Vec::new();
 
             for file in files.flatten() {
@@ -221,17 +231,6 @@ fn collect_models_from_cache_root(
                     None => continue,
                 };
 
-                if file_name == "config.json" {
-                    has_config_json = true;
-                }
-
-                if file_name == "tokenizer.json"
-                    || file_name == "tokenizer.model"
-                    || file_name == "tokenizer_config.json"
-                {
-                    has_tokenizer = true;
-                }
-
                 let extension = file_path
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -242,22 +241,35 @@ fn collect_models_from_cache_root(
                 }
             }
 
-            let cache_health = if has_config_json && has_tokenizer {
-                ModelCacheHealth::Complete
-            } else {
-                ModelCacheHealth::Incomplete
-            };
-
-            for (gguf_file, file_path) in gguf_files {
+            if gguf_files.is_empty() {
+                // No GGUF file found — the snapshot exists on disk (e.g. only
+                // metadata arrived, or the download is still in progress).
+                // Push a sentinel entry with Incomplete health so the model
+                // picker can show it as disabled rather than hiding it entirely.
                 models.push(DiscoveredModel {
-                    display_name: display_name_for_model(&model_id, &gguf_file),
+                    display_name: display_name_for_model(&model_id, ""),
                     model_id: model_id.clone(),
-                    gguf_file,
+                    gguf_file: String::new(),
                     snapshot_path: snapshot_path.clone(),
-                    gguf_path: file_path,
+                    // Point at the snapshot directory itself; this path is
+                    // never used for loading because Incomplete models are
+                    // filtered out before any GgufModelConfig is built.
+                    gguf_path: snapshot_path.clone(),
                     from_app_group,
-                    cache_health,
+                    cache_health: ModelCacheHealth::Incomplete,
                 });
+            } else {
+                for (gguf_file, file_path) in gguf_files {
+                    models.push(DiscoveredModel {
+                        display_name: display_name_for_model(&model_id, &gguf_file),
+                        model_id: model_id.clone(),
+                        gguf_file,
+                        snapshot_path: snapshot_path.clone(),
+                        gguf_path: file_path,
+                        from_app_group,
+                        cache_health: ModelCacheHealth::Complete,
+                    });
+                }
             }
         }
     }
@@ -298,6 +310,10 @@ fn hf_cache_root() -> Option<PathBuf> {
         }
     }
 
+    None
+}
+
+fn default_hf_cache_root() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let path = PathBuf::from(home)
         .join(".cache")
@@ -475,11 +491,16 @@ mod tests {
         let repo_dir = cache_root.join(format!("models--{}", model_id.replace('/', "--")));
         let snapshot_dir = repo_dir.join("snapshots").join(snapshot_name);
         std::fs::create_dir_all(&snapshot_dir).expect("create snapshot dir");
-        std::fs::write(snapshot_dir.join(gguf_file), b"gguf").expect("write gguf");
 
+        // Health is determined solely by the presence of a .gguf file.
+        // A complete snapshot has one; an incomplete snapshot has none
+        // (e.g. a partial download where only metadata files arrived).
         if complete {
-            std::fs::write(snapshot_dir.join("config.json"), b"{}").expect("write config");
-            std::fs::write(snapshot_dir.join("tokenizer.json"), b"{}").expect("write tokenizer");
+            std::fs::write(snapshot_dir.join(gguf_file), b"gguf placeholder").expect("write gguf");
+        } else {
+            // Simulate a snapshot directory that exists but has no GGUF yet.
+            std::fs::write(snapshot_dir.join("config.json"), b"{}")
+                .expect("write config placeholder");
         }
 
         snapshot_dir

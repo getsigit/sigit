@@ -27,7 +27,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval};
@@ -389,15 +389,14 @@ enum ModelSource {
 #[derive(Clone)]
 pub(crate) struct ModelPickerItem {
     pub(crate) display_name: String,
-    description: String,
-    tool_calling: bool,
-    max_tokens: u64,
+    pub(crate) description: String,
+    pub(crate) tool_calling: bool,
+    pub(crate) max_tokens: u64,
     pub(crate) config: GgufModelConfig,
-    source_label: String,
-    local_path: Option<String>,
+    pub(crate) source_label: String,
     brand_mark: &'static str,
     source: ModelSource,
-    cache_health: ModelCacheHealth,
+    pub(crate) cache_health: ModelCacheHealth,
 }
 
 pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
@@ -421,7 +420,6 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
             max_tokens,
             config,
             source_label: "Platform default".to_string(),
-            local_path: None,
             brand_mark: "◎",
             source: ModelSource::Fallback,
             cache_health: ModelCacheHealth::Complete,
@@ -438,9 +436,9 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
 
 fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPickerItem> {
     let source_label = if model.from_app_group {
-        "Onde app group".to_string()
+        "Onde".to_string()
     } else {
-        "Hugging Face cache".to_string()
+        "HuggingFace".to_string()
     };
 
     let config = match model.model_id.as_str() {
@@ -464,7 +462,6 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
         max_tokens,
         config,
         source_label,
-        local_path: Some(model.gguf_path.display().to_string()),
         brand_mark: if model.from_app_group { "◉" } else { "○" },
         source: if model.from_app_group {
             ModelSource::Onde
@@ -476,11 +473,16 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
 }
 
 fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let popup = centered_rect(72, 72, area);
+    let popup = centered_rect(82, 72, area);
+
+    // Erase whatever is behind the popup so the panel is fully readable.
+    frame.render_widget(Clear, popup);
+
     let block = Block::default()
         .title(" Select a model… ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().bg(Color::Black));
 
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -491,7 +493,7 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
     for (index, item) in app.model_picker_items.iter().enumerate() {
         if last_section != Some(item.source) {
             if last_section.is_some() {
-                lines.push(Line::from(""));
+                lines.push(Line::from("").style(Style::default().bg(Color::Black)));
             }
 
             let (section_mark, section_name, section_style) = match item.source {
@@ -500,6 +502,7 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
                     "Onde Inference",
                     Style::default()
                         .fg(Color::Green)
+                        .bg(Color::Black)
                         .add_modifier(Modifier::BOLD),
                 ),
                 ModelSource::HuggingFace => (
@@ -507,6 +510,7 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
                     "Hugging Face cache",
                     Style::default()
                         .fg(Color::Cyan)
+                        .bg(Color::Black)
                         .add_modifier(Modifier::BOLD),
                 ),
                 ModelSource::Fallback => (
@@ -514,14 +518,18 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
                     "Fallback",
                     Style::default()
                         .fg(Color::Yellow)
+                        .bg(Color::Black)
                         .add_modifier(Modifier::BOLD),
                 ),
             };
 
-            lines.push(Line::from(vec![
-                Span::styled(format!("{section_mark} "), section_style),
-                Span::styled(section_name, section_style),
-            ]));
+            lines.push(
+                Line::from(vec![
+                    Span::styled(format!("{section_mark} "), section_style),
+                    Span::styled(section_name, section_style),
+                ])
+                .style(Style::default().bg(Color::Black)),
+            );
             last_section = Some(item.source);
         }
 
@@ -545,25 +553,25 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
         let source = format!("  [{} {}]", item.brand_mark, item.source_label);
 
         let base_style = if selected {
-            Style::default().fg(Color::Black).bg(Color::White)
+            Style::default().fg(Color::Black).bg(Color::Green)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::White).bg(Color::Black)
         };
 
         let source_style = if selected {
-            Style::default().fg(Color::DarkGray).bg(Color::White)
+            Style::default().fg(Color::Black).bg(Color::Green)
         } else {
             match item.source {
-                ModelSource::Onde => Style::default().fg(Color::Green),
-                ModelSource::HuggingFace => Style::default().fg(Color::Cyan),
-                ModelSource::Fallback => Style::default().fg(Color::Yellow),
+                ModelSource::Onde => Style::default().fg(Color::Green).bg(Color::Black),
+                ModelSource::HuggingFace => Style::default().fg(Color::Cyan).bg(Color::Black),
+                ModelSource::Fallback => Style::default().fg(Color::Yellow).bg(Color::Black),
             }
         };
 
         let health_style = if selected {
-            Style::default().fg(Color::Red).bg(Color::White)
+            Style::default().fg(Color::Red).bg(Color::Green)
         } else {
-            Style::default().fg(Color::Red)
+            Style::default().fg(Color::Red).bg(Color::Black)
         };
 
         lines.push(Line::from(vec![
@@ -574,44 +582,38 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
             Span::styled(
                 tool_badge.to_string(),
                 if selected {
-                    Style::default().fg(Color::Green).bg(Color::White)
+                    Style::default().fg(Color::Black).bg(Color::Green)
                 } else {
-                    Style::default().fg(Color::Green)
+                    Style::default().fg(Color::Green).bg(Color::Black)
                 },
             ),
             Span::styled(health_badge.to_string(), health_style),
             Span::styled(
                 disabled_badge.to_string(),
                 if selected {
-                    Style::default().fg(Color::DarkGray).bg(Color::White)
+                    Style::default().fg(Color::Black).bg(Color::Green)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(Color::DarkGray).bg(Color::Black)
                 },
             ),
             Span::styled(
                 current_badge.to_string(),
                 if selected {
-                    Style::default().fg(Color::Blue).bg(Color::White)
+                    Style::default().fg(Color::Black).bg(Color::Green)
                 } else {
-                    Style::default().fg(Color::Blue)
+                    Style::default().fg(Color::Cyan).bg(Color::Black)
                 },
             ),
             Span::styled(source, source_style),
         ]));
-
-        if let Some(path) = &item.local_path {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", path),
-                if selected {
-                    Style::default().fg(Color::DarkGray).bg(Color::White)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            )));
-        }
     }
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(Color::Black)),
+        inner,
+    );
 }
 
 fn centered_rect(
@@ -1026,7 +1028,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<String> {
                 return None;
             }
             KeyCode::Enter => {
-                return Some("/models __pick__".to_string());
+                return Some(format!("/models {}", app.model_picker_index + 1));
             }
             _ => return None,
         }
@@ -1163,8 +1165,10 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                             ..SamplingConfig::default()
                         };
 
-                        engine.unload_model().await;
-
+                        // load_gguf_model unloads any existing model internally before
+                        // loading the new one.  Calling unload_model() explicitly first
+                        // would create a window where no model is loaded — if a message
+                        // arrived in that gap it would fail with NoModelLoaded.
                         let update = match engine
                             .load_gguf_model(model.config.clone(), None, Some(sampling))
                             .await
