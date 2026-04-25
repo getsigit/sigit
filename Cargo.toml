@@ -21,8 +21,8 @@ path = "src/main.rs"
 agent-client-protocol = { version = "0.10.4", features = ["unstable_session_fork", "unstable_session_additional_directories"] }
 
 # Onde Inference engine (local LLM)
-onde = { path = "../onde" }
-# onde = { git = "https://github.com/ondeinference/onde", branch = "development" }
+# onde = { path = "../onde" }
+onde = { git = "https://github.com/ondeinference/onde", branch = "development" }
 
 # Async runtime
 async-trait = "0.1"
