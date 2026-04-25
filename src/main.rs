@@ -147,6 +147,15 @@ summarize, or inspect a web page, you MUST call the read_website tool with that 
 URL. Never say \"I cannot access websites\" or \"I cannot browse the internet\". \
 You can. Use the tool.
 
+CRITICAL — before every edit_file call, you MUST call read_file on the target \
+file first (or the specific line range if one was given). Never rely on file \
+content you saw in a previous turn — the user may have reverted, edited, or \
+changed the file externally since then. Always re-read to get the current state \
+before constructing old_text. \
+When the user corrects a previous edit (e.g. \"don't remove X, append instead\"), \
+treat it as a fresh task: re-read the file, identify the current content, and \
+plan the edit from scratch. Do not assume the file still reflects your last edit.
+
 Tool-use heuristics:
 - when the user provides a URL or asks about a web page, ALWAYS call \
   read_website — never refuse or claim you lack internet access
@@ -596,22 +605,35 @@ impl Agent for SiGitAgent {
         }
 
         // ── Send the final text response ─────────────────────────────────
-        if !result.text.is_empty() {
+        let reply_text = result.text.trim().to_string();
+
+        let final_text = if reply_text.is_empty() {
+            if round > 0 {
+                log::warn!(
+                    "prompt({}) — model returned empty reply after {} tool round(s)",
+                    session_id,
+                    round
+                );
+                "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
+            } else {
+                log::warn!(
+                    "prompt({}) — model returned empty reply (no tool rounds)",
+                    session_id
+                );
+                String::new()
+            }
+        } else {
+            reply_text
+        };
+
+        if !final_text.is_empty() {
             let notification = SessionNotification::new(
                 session_id.clone(),
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                    result.text,
-                ))),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(final_text))),
             );
             if self.notification_tx.send(notification).await.is_err() {
                 log::warn!("notification channel closed");
             }
-        } else if result.tool_calls.is_empty() {
-            log::warn!(
-                "prompt({}) — model returned empty reply after {} tool round(s)",
-                session_id,
-                round
-            );
         }
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
@@ -711,7 +733,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let engine = Arc::new(ChatEngine::new());
     let config = GgufModelConfig::qwen3_8b();
     let sampling = SamplingConfig {
-        max_tokens: Some(4096),
+        max_tokens: Some(8192),
         ..SamplingConfig::default()
     };
 
@@ -770,7 +792,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
     let config = GgufModelConfig::qwen3_8b();
     let sampling = SamplingConfig {
-        max_tokens: Some(4096),
+        max_tokens: Some(8192),
         ..SamplingConfig::default()
     };
 
