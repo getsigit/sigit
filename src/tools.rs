@@ -226,17 +226,21 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "run_command",
             description: "Run a shell command and return its combined stdout and stderr output. \
-                           The command runs in the given working directory (defaults to \".\"). \
-                           Prefer an absolute working directory when possible. Use this for \
-                           build tools (cargo, npm, make), package managers, linters, test \
-                           runners, and git commands, including git init, porcelain commands \
-                           like status/add/commit/checkout, and plumbing commands like \
-                           rev-parse, hash-object, update-ref, and cat-file. If the user asks \
-                           for a new repo or scaffold, it is fine to use this for `git init` \
-                           and normal repo setup steps. In smbCloud repos, prefer existing \
-                           workspace commands, Rails conventions, and deploy flows over \
-                           inventing new command sequences. Commands that run indefinitely \
-                           (servers, watchers) will be killed after 120 seconds.",
+                           The command runs in the given working directory (defaults to the \
+                           user's home directory). Always use an absolute working directory \
+                           path. Use this for build tools (cargo, npm, make), package managers, \
+                           linters, test runners, and git commands, including git init, \
+                           porcelain commands like status/add/commit/checkout, and plumbing \
+                           commands like rev-parse, hash-object, update-ref, and cat-file. \
+                           For `git clone`, always specify the full absolute destination path \
+                           as the last argument (e.g. `git clone <url> /absolute/path/to/dir`) \
+                           and set cwd to the parent directory. Never run `git clone` without \
+                           an explicit destination. If the user asks for a new repo or scaffold, \
+                           use this for `git clone`, `git init`, and normal repo setup steps. \
+                           In smbCloud repos, prefer existing workspace commands, Rails \
+                           conventions, and deploy flows over inventing new command sequences. \
+                           Commands that run indefinitely (servers, watchers) will be killed \
+                           after 120 seconds.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -262,12 +266,20 @@ pub fn all_tools() -> Vec<AgentTool> {
 ///
 /// Returns the tool output as a human-readable string. Errors are returned as
 /// descriptive strings rather than panicking.
-pub fn execute_tool(name: &str, arguments: &str) -> String {
+pub async fn execute_tool(name: &str, arguments: &str) -> String {
     match name {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
         "search_files" => exec_search_files(arguments),
-        "read_website" => exec_read_website(arguments),
+        "read_website" => {
+            // reqwest::blocking panics if called inside a tokio runtime
+            // ("Cannot start a runtime from within a runtime"), so we
+            // off-load it to the blocking thread pool.
+            let args = arguments.to_owned();
+            tokio::task::spawn_blocking(move || exec_read_website(&args))
+                .await
+                .unwrap_or_else(|err| format!("Error: read_website task failed: {err}"))
+        }
         "create_directory" => exec_create_directory(arguments),
         "create_file" => exec_create_file(arguments),
         "edit_file" => exec_edit_file(arguments),
@@ -848,7 +860,11 @@ fn exec_run_command(arguments: &str) -> String {
         None => return "Error: missing required parameter \"command\"".to_string(),
     };
 
-    let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+    let default_cwd = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let cwd = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or(&default_cwd);
     let cwd_path = absolute_path(Path::new(cwd));
     let cwd_str = cwd_path.display().to_string();
 
@@ -937,9 +953,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn test_execute_unknown_tool() {
-        let result = execute_tool("nonexistent", "{}");
+    #[tokio::test]
+    async fn test_execute_unknown_tool() {
+        let result = execute_tool("nonexistent", "{}").await;
         assert!(result.starts_with("Unknown tool:"));
     }
 

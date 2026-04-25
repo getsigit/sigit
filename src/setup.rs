@@ -329,6 +329,7 @@ pub fn load_selected_model() -> Option<SelectedModel> {
     })
 }
 
+#[allow(dead_code)]
 pub fn load_selected_model_name() -> Option<String> {
     let selected = load_selected_model()?;
     discover_local_models()
@@ -610,5 +611,118 @@ mod tests {
         assert_eq!(selected.gguf_file, "Qwen_Qwen3-4B-Q4_K_M.gguf");
 
         std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn discover_empty_cache_returns_no_models() {
+        let root = unique_temp_dir("discover-empty");
+        let cache_root = root.join("hf-cache");
+        let hf_home = root.join("hf-home");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+        std::fs::create_dir_all(&hf_home).expect("create hf home");
+
+        let models = with_test_env(&cache_root, &hf_home, discover_local_models);
+        assert!(models.is_empty());
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn complete_models_sort_before_incomplete() {
+        let root = unique_temp_dir("sort-order");
+        let cache_root = root.join("hf-cache");
+        let hf_home = root.join("hf-home");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+        std::fs::create_dir_all(&hf_home).expect("create hf home");
+
+        create_snapshot(
+            &cache_root,
+            "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF",
+            "snap1",
+            "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
+            false,
+        );
+        create_snapshot(
+            &cache_root,
+            "bartowski/Qwen_Qwen3-4B-GGUF",
+            "snap2",
+            "Qwen_Qwen3-4B-Q4_K_M.gguf",
+            true,
+        );
+
+        let models = with_test_env(&cache_root, &hf_home, discover_local_models);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].cache_health, ModelCacheHealth::Complete);
+        assert_eq!(models[1].cache_health, ModelCacheHealth::Incomplete);
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn load_selected_model_roundtrip() {
+        let root = unique_temp_dir("persistence-roundtrip");
+        let hf_home = root.join("hf-home");
+        std::fs::create_dir_all(&hf_home).expect("create hf home");
+
+        with_test_env(&hf_home, &hf_home, || {
+            let original = SelectedModel {
+                model_id: "bartowski/Qwen_Qwen3-4B-GGUF".to_string(),
+                gguf_file: "Qwen_Qwen3-4B-Q4_K_M.gguf".to_string(),
+            };
+
+            save_selected_model(&original).expect("save");
+            let loaded = load_selected_model().expect("load");
+
+            assert_eq!(loaded.model_id, original.model_id);
+            assert_eq!(loaded.gguf_file, original.gguf_file);
+        });
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn load_selected_model_empty_file_returns_none() {
+        let root = unique_temp_dir("persistence-empty");
+        let hf_home = root.join("hf-home");
+        std::fs::create_dir_all(&hf_home).expect("create hf home");
+
+        with_test_env(&hf_home, &hf_home, || {
+            let path = selected_model_file_path().expect("path");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent");
+            }
+            std::fs::write(&path, "").expect("write empty");
+
+            assert!(load_selected_model().is_none());
+        });
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn display_name_deduplicates_repo_and_file_name() {
+        // When the file name contains the repo name, only the repo name is shown.
+        let name = display_name_for_model(
+            "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF",
+            "Qwen2.5-Coder-3B-Instruct-GGUF-Q4_K_M.gguf",
+        );
+        assert_eq!(name, "Qwen2.5-Coder-3B-Instruct-GGUF");
+
+        // When the file name does NOT contain the repo name, both are shown.
+        let name = display_name_for_model(
+            "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF",
+            "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
+        );
+        assert_eq!(
+            name,
+            "Qwen2.5-Coder-3B-Instruct-GGUF — Qwen2.5-Coder-3B-Instruct-Q4_K_M"
+        );
+    }
+
+    #[test]
+    fn display_name_includes_file_when_different() {
+        let name =
+            display_name_for_model("bartowski/Qwen_Qwen3-4B-GGUF", "Qwen_Qwen3-4B-Q4_K_M.gguf");
+        assert_eq!(name, "Qwen Qwen3-4B-GGUF — Qwen_Qwen3-4B-Q4_K_M");
     }
 }

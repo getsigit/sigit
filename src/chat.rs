@@ -137,6 +137,8 @@ struct App {
     model_picker_index: usize,
     model_picker_items: Vec<ModelPickerItem>,
     current_model_name: String,
+    /// Whether the currently loaded model supports tool calling.
+    tool_calling: bool,
 }
 
 const BANNER_ART: &str = "\
@@ -159,6 +161,12 @@ const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 impl App {
     fn new(load_model_name: String) -> Self {
+        let items = build_model_picker_items();
+        let tool_calling = items
+            .iter()
+            .find(|m| m.display_name == load_model_name)
+            .map(|m| m.tool_calling)
+            .unwrap_or(true);
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -181,9 +189,10 @@ impl App {
             load_model_name: load_model_name.clone(),
             show_model_picker: false,
             model_picker_index: 0,
-            model_picker_items: build_model_picker_items(),
+            model_picker_items: items,
             current_model_name: crate::setup::load_selected_model_name()
                 .unwrap_or_else(|| load_model_name.clone()),
+            tool_calling,
         }
     }
 
@@ -1160,6 +1169,7 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                         {
                             Ok(_) => {
                                 engine.clear_history().await;
+                                app.tool_calling = model.tool_calling;
                                 ModelLoadUpdate::Loaded(model.display_name.clone())
                             }
                             Err(err) => ModelLoadUpdate::Error(err.to_string()),
@@ -1206,8 +1216,13 @@ async fn run_inference_task(
     engine: Arc<ChatEngine>,
     text: String,
     tx: mpsc::Sender<InferenceUpdate>,
+    tools_enabled: bool,
 ) {
-    let onde_tools = build_onde_tools();
+    let onde_tools = if tools_enabled {
+        build_onde_tools()
+    } else {
+        vec![]
+    };
 
     let mut result = match engine.send_message_with_tools(&text, &onde_tools).await {
         Ok(r) => r,
@@ -1237,8 +1252,8 @@ async fn run_inference_task(
                 .send(InferenceUpdate::ToolUse(tc.function_name.clone()))
                 .await;
 
-            // Execute the tool (synchronous / blocking-ok for file I/O).
-            let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments);
+            // Execute the tool (async — read_website uses spawn_blocking internally).
+            let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments).await;
             log::info!("  ← {} chars", output.len());
 
             tool_results.push(ToolResult {
@@ -1518,8 +1533,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
                         let engine_handle = Arc::clone(&engine);
                         let user_text = text.clone();
+                        let tools_enabled = app.tool_calling;
                         tokio::spawn(async move {
-                            run_inference_task(engine_handle, user_text, tx).await;
+                            run_inference_task(engine_handle, user_text, tx, tools_enabled).await;
                         });
                     }
                 }
