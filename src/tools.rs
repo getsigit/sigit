@@ -62,15 +62,24 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "read_file",
             description: "Read the contents of a file at the given path. \
-                           Prefer an absolute path when possible. Returns the file text, \
-                           or an error message if the file cannot be read. Output is \
-                           truncated to 10 000 characters.",
+                           Prefer an absolute path when possible. Use start_line and \
+                           end_line to read a specific range instead of the whole file — \
+                           strongly prefer this when you already know which lines matter. \
+                           Output is truncated to 10 000 characters.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Absolute or relative path to the file to read."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to read (1-based, inclusive). Omit to start from the beginning."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to read (1-based, inclusive). Omit to read to the end."
                     }
                 },
                 "required": ["path"],
@@ -317,6 +326,15 @@ fn exec_read_file(arguments: &str) -> String {
         None => return "Error: missing required parameter \"path\"".to_string(),
     };
 
+    let start_line = args
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    let end_line = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+
     let path = Path::new(path_str);
     let absolute_path = absolute_path(path);
     let absolute_path_str = absolute_path.display().to_string();
@@ -331,7 +349,22 @@ fn exec_read_file(arguments: &str) -> String {
 
     match fs::read_to_string(&absolute_path) {
         Ok(contents) => {
-            if contents.len() > READ_FILE_CHAR_LIMIT {
+            if start_line.is_some() || end_line.is_some() {
+                let lines: Vec<&str> = contents.lines().collect();
+                let total = lines.len();
+                let start = start_line.unwrap_or(1).max(1);
+                let end = end_line.unwrap_or(total).min(total);
+
+                if start > total {
+                    return format!(
+                        "Error: start_line {start} is beyond end of file ({total} lines)"
+                    );
+                }
+
+                let selected: Vec<&str> = lines[(start - 1)..end].to_vec();
+                let range_text = selected.join("\n");
+                format!("Lines {start}-{end} of {total} in {absolute_path_str}:\n{range_text}")
+            } else if contents.len() > READ_FILE_CHAR_LIMIT {
                 let truncated: String = contents.chars().take(READ_FILE_CHAR_LIMIT).collect();
                 format!(
                     "{truncated}\n\n--- truncated (showing {READ_FILE_CHAR_LIMIT} of {} characters) ---",
@@ -526,6 +559,8 @@ fn search_file(path: &Path, re: &Regex, matches: &mut Vec<String>) {
     }
 }
 
+// ── read_website ─────────────────────────────────────────────────────────────
+
 fn exec_read_website(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -639,6 +674,8 @@ fn exec_read_website(arguments: &str) -> String {
 
     output
 }
+
+// ── create_directory ─────────────────────────────────────────────────────────
 
 /// Create a directory and any missing parent directories.
 fn exec_create_directory(arguments: &str) -> String {

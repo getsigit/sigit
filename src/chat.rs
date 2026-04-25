@@ -445,6 +445,7 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
 
     let config = match model.model_id.as_str() {
         "bartowski/Qwen_Qwen3-4B-GGUF" => GgufModelConfig::qwen3_4b(),
+        "bartowski/Qwen_Qwen3-8B-GGUF" => GgufModelConfig::qwen3_8b(),
         "bartowski/Qwen2.5-3B-Instruct-GGUF" => GgufModelConfig::qwen25_3b(),
         "bartowski/Qwen2.5-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_1_5b(),
         "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_3b(),
@@ -452,7 +453,8 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
         _ => return None,
     };
 
-    let tool_calling = model.model_id == "bartowski/Qwen_Qwen3-4B-GGUF";
+    let tool_calling = model.model_id == "bartowski/Qwen_Qwen3-4B-GGUF"
+        || model.model_id == "bartowski/Qwen_Qwen3-8B-GGUF";
     let max_tokens = if tool_calling { 4096 } else { 512 };
 
     Some(ModelPickerItem {
