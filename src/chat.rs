@@ -17,11 +17,9 @@ use std::sync::mpsc as std_mpsc;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use onde::inference::{
-    ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk, ToolDefinition, ToolResult,
-};
+use onde::inference::{ChatEngine, SamplingConfig, StreamChunk, ToolDefinition, ToolResult};
 
-use crate::setup::{DiscoveredModel, ModelCacheHealth};
+use crate::models::{ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position},
@@ -379,98 +377,9 @@ fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
 
 // ── Model table ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ModelSource {
-    Onde,
-    HuggingFace,
-    Fallback,
-}
-
-#[derive(Clone)]
-pub(crate) struct ModelPickerItem {
-    pub(crate) display_name: String,
-    pub(crate) description: String,
-    pub(crate) tool_calling: bool,
-    pub(crate) max_tokens: u64,
-    pub(crate) config: GgufModelConfig,
-    pub(crate) source_label: String,
-    brand_mark: &'static str,
-    source: ModelSource,
-    pub(crate) cache_health: ModelCacheHealth,
-}
-
-pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
-    let mut items = Vec::new();
-
-    for discovered in crate::setup::discover_local_models() {
-        if let Some(item) = discovered_model_to_picker_item(discovered) {
-            items.push(item);
-        }
-    }
-
-    if items.is_empty() {
-        let config = GgufModelConfig::platform_default();
-        let tool_calling = config.display_name == "Qwen 3 4B (Q4_K_M)";
-        let max_tokens = if tool_calling { 4096 } else { 512 };
-
-        items.push(ModelPickerItem {
-            display_name: config.display_name.clone(),
-            description: config.approx_memory.clone(),
-            tool_calling,
-            max_tokens,
-            config,
-            source_label: "Platform default".to_string(),
-            brand_mark: "◎",
-            source: ModelSource::Fallback,
-            cache_health: ModelCacheHealth::Complete,
-        });
-    }
-
-    items.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
-            .then_with(|| left.display_name.cmp(&right.display_name))
-    });
-    items
-}
-
-fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPickerItem> {
-    let source_label = if model.from_app_group {
-        "Onde".to_string()
-    } else {
-        "HuggingFace".to_string()
-    };
-
-    let config = match model.model_id.as_str() {
-        "bartowski/Qwen_Qwen3-4B-GGUF" => GgufModelConfig::qwen3_4b(),
-        "bartowski/Qwen_Qwen3-8B-GGUF" => GgufModelConfig::qwen3_8b(),
-        "bartowski/Qwen2.5-3B-Instruct-GGUF" => GgufModelConfig::qwen25_3b(),
-        "bartowski/Qwen2.5-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_1_5b(),
-        "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_3b(),
-        "bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_1_5b(),
-        _ => return None,
-    };
-
-    let tool_calling = model.model_id == "bartowski/Qwen_Qwen3-4B-GGUF"
-        || model.model_id == "bartowski/Qwen_Qwen3-8B-GGUF";
-    let max_tokens = if tool_calling { 4096 } else { 512 };
-
-    Some(ModelPickerItem {
-        display_name: config.display_name.clone(),
-        description: config.approx_memory.clone(),
-        tool_calling,
-        max_tokens,
-        config,
-        source_label,
-        brand_mark: if model.from_app_group { "◉" } else { "○" },
-        source: if model.from_app_group {
-            ModelSource::Onde
-        } else {
-            ModelSource::HuggingFace
-        },
-        cache_health: model.cache_health,
-    })
-}
+// ModelSource, ModelPickerItem, and build_model_picker_items live in
+// crate::models so they are available on all platforms (including Windows),
+// not just unix where this chat module is compiled.
 
 fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let popup = centered_rect(82, 72, area);

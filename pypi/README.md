@@ -23,8 +23,11 @@
 
 ## Install
 
+Use `pip` or `uv`:
+
 ```sh
 pip install sigit-code
+uvx --from sigit-code sigit
 ```
 
 Installs the native `sigit` binary for your platform — no compiler, no Node.js, no runtime dependencies.
@@ -45,15 +48,10 @@ siGit works as an [ACP-compatible](https://github.com/nicobailon/agent-client-pr
 
 ```json
 {
-  "agent": {
-    "profiles": {
-      "sigit": {
-        "provider": "acp",
-        "binary": {
-          "path": "sigit",
-          "args": ["--acp"]
-        }
-      }
+  "agent_servers": {
+    "siGit Code": {
+      "type": "custom",
+      "command": "/absolute/path/to/sigit"
     }
   }
 }
@@ -66,7 +64,7 @@ Then select **sigit** as your agent profile in the Zed assistant panel.
 | Method | Command |
 |--------|---------|
 | npm | `npm install -g @smbcloud/sigit` |
-| Homebrew | `brew install getsigit/sigit/sigit` |
+| Homebrew | `brew tap getsigit/tap && brew install sigit` |
 | Cargo | `cargo install sigit` |
 
 ### From source

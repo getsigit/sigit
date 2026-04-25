@@ -42,6 +42,7 @@
 
 #[cfg(unix)]
 mod chat;
+mod models;
 mod setup;
 mod tools;
 
@@ -351,7 +352,7 @@ impl SiGitAgent {
                 agent_client_protocol::Error::new(-32603, format!("model switch failed: {error}"))
             })?;
 
-        if let Some(item) = chat::build_model_picker_items()
+        if let Some(item) = models::build_model_picker_items()
             .iter()
             .find(|item| item.config.model_id == new_config.model_id)
             && let Err(err) = setup::save_selected_model(&setup::SelectedModel {
@@ -388,7 +389,7 @@ const MODEL_CONFIG_ID: &str = "sigit-model";
 
 /// Build the `SessionConfigOption` list for model selection.
 fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
-    let items = chat::build_model_picker_items();
+    let items = models::build_model_picker_items();
 
     let options: Vec<SessionConfigSelectOption> = items
         .iter()
@@ -428,7 +429,7 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
 
 /// Look up the GgufModelConfig for a given model_id value from the picker items.
 fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64)> {
-    let items = chat::build_model_picker_items();
+    let items = models::build_model_picker_items();
     items
         .into_iter()
         .find(|item| {
@@ -467,7 +468,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
 }
 
 fn format_models_list(current_model: &GgufModelConfig) -> String {
-    let items = chat::build_model_picker_items();
+    let items = models::build_model_picker_items();
     if items.is_empty() {
         return "No local models found. siGit will use the platform default model.".to_string();
     }
@@ -576,7 +577,7 @@ async fn exec_slash_acp(
                 .await;
         }
         SlashCommand::Models(Some(number)) => {
-            let items = chat::build_model_picker_items();
+            let items = models::build_model_picker_items();
             let index = number.saturating_sub(1);
             match items.get(index).cloned() {
                 None => {
@@ -1201,7 +1202,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let config = startup_selection
         .as_ref()
         .and_then(|selection| {
-            chat::build_model_picker_items()
+            models::build_model_picker_items()
                 .into_iter()
                 .find(|item| {
                     selection
@@ -1283,7 +1284,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
     let config = startup_selection
         .as_ref()
         .and_then(|selection| {
-            chat::build_model_picker_items()
+            models::build_model_picker_items()
                 .into_iter()
                 .find(|item| {
                     selection
