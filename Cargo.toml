@@ -1,6 +1,6 @@
 [package]
 name = "sigit"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "siGit Code — ACP-compatible AI coding agent for smbCloud platform."
 documentation = "https://github.com/getsigit/sigit"
