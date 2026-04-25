@@ -2,7 +2,7 @@
 
 ## Overview
 
-siGit Code supports **agentic tool calling** — the LLM can invoke tools (read files, list directories, search code) to ground its answers in the actual codebase. This works in both **interactive TUI mode** and **ACP server mode** (Zed editor).
+siGit Code supports **agentic tool calling** — the LLM invokes tools (read/write files, run commands, read websites) to operate on the user's codebase. This works in both **interactive TUI mode** and **ACP server mode** (Zed editor).
 
 Tool calling spans three layers:
 
@@ -18,14 +18,19 @@ siGit (agent loop + tool execution)
 
 **Only Qwen 3 supports tool calling.** Qwen 2.5 does NOT — mistral.rs only has a parser for Qwen 3's `<tool_call>...</tool_call>` XML format.
 
-| Model | Constructor | Size | Tool calling |
-|-------|-----------|------|:---:|
-| Qwen 3 4B (Q4_K_M) | `GgufModelConfig::qwen3_4b()` | ~2.6 GB | ✅ |
-| Qwen 3 1.7B (Q4_K_M) | `GgufModelConfig::qwen3_1_7b()` | ~1.2 GB | ✅ |
-| Qwen 2.5 Coder 3B | `GgufModelConfig::qwen25_coder_3b()` | ~1.9 GB | ❌ |
-| Qwen 2.5 1.5B | `GgufModelConfig::qwen25_1_5b()` | ~0.9 GB | ❌ |
+| Model | Constructor | Size | Tool calling | Default |
+|-------|-----------|------|:---:|:---:|
+| Qwen 3 8B (Q4_K_M) | `GgufModelConfig::qwen3_8b()` | ~5 GB | ✅ | ✅ **default** |
+| Qwen 3 4B (Q4_K_M) | `GgufModelConfig::qwen3_4b()` | ~2.7 GB | ✅ | |
+| Qwen 3 1.7B (Q4_K_M) | `GgufModelConfig::qwen3_1_7b()` | ~1.3 GB | ✅ | |
+| Qwen 2.5 Coder 3B | `GgufModelConfig::qwen25_coder_3b()` | ~1.93 GB | ❌ | |
+| Qwen 2.5 Coder 1.5B | `GgufModelConfig::qwen25_coder_1_5b()` | ~941 MB | ❌ | |
 
-siGit uses **Qwen 3 4B** by default (set in `main.rs` via `GgufModelConfig::qwen3_4b()`).
+siGit uses **Qwen 3 8B** by default with `max_tokens: 8192` (set in `main.rs` for both TUI and ACP modes).
+
+### Why 8B over 4B
+
+4B can't do `edit_file` reliably. It reads a file, then fails to reproduce the exact `old_text` it just saw. This spirals into 7+ retry rounds that burn through `max_tokens` on `<think>` blocks and return nothing. 8B is the smallest model that actually lands edits.
 
 ### bartowski GGUF naming convention
 
@@ -33,12 +38,40 @@ bartowski's repos use the publisher name as a prefix with an underscore:
 
 | Constant | Value |
 |----------|-------|
+| `BARTOWSKI_QWEN3_8B_GGUF` | `"bartowski/Qwen_Qwen3-8B-GGUF"` |
+| `QWEN3_8B_GGUF_FILE` | `"Qwen_Qwen3-8B-Q4_K_M.gguf"` |
 | `BARTOWSKI_QWEN3_4B_GGUF` | `"bartowski/Qwen_Qwen3-4B-GGUF"` |
 | `QWEN3_4B_GGUF_FILE` | `"Qwen_Qwen3-4B-Q4_K_M.gguf"` |
-| `BARTOWSKI_QWEN3_1_7B_GGUF` | `"bartowski/Qwen_Qwen3-1.7B-GGUF"` |
-| `QWEN3_1_7B_GGUF_FILE` | `"Qwen_Qwen3-1.7B-Q4_K_M.gguf"` |
 
 These constants live in `onde/src/inference/models.rs`.
+
+---
+
+## Tools (9 total)
+
+Defined in `sigit/src/tools.rs` via `all_tools()`:
+
+| # | Tool | Parameters | Behavior |
+|---|------|-----------|----------|
+| 1 | `read_file` | `path` | Reads file contents, truncates at 10,000 chars |
+| 2 | `create_directory` | `path` | Creates directory and all parents |
+| 3 | `list_directory` | `path` | Lists entries with `[DIR]`/`[FILE]` prefix, dirs first |
+| 4 | `search_files` | `pattern`, `path` (optional) | Recursive regex search, max 50 matches |
+| 5 | `read_website` | `url` | Fetches HTTP/HTTPS, strips HTML, returns text |
+| 6 | `create_file` | `path`, `content` | Creates new file (fails if exists) |
+| 7 | `edit_file` | `path`, `old_text`, `new_text` | Find-and-replace (must match exactly once) |
+| 8 | `delete_file` | `path` | Deletes file or empty directory |
+| 9 | `run_command` | `command`, `cwd` (optional) | Shell command with 120s timeout |
+
+### Async handling
+
+`execute_tool()` is `async`. Most tools run synchronously, except:
+
+- **`read_website`** — uses `tokio::task::spawn_blocking` because `reqwest::blocking::Client` panics inside a tokio runtime ("Cannot start a runtime from within a runtime")
+
+### Tool gating by model
+
+In TUI mode, `run_inference_task()` takes a `tools_enabled: bool` parameter. When the model's `ModelOption.tool_calling` is `false` (Qwen 2.5), an empty tool list is passed so the model doesn't receive tool schemas it can't use.
 
 ---
 
@@ -46,225 +79,201 @@ These constants live in `onde/src/inference/models.rs`.
 
 ### Layer 1: mistral.rs (model-level)
 
-mistral.rs handles the low-level tool calling protocol:
-
-- **`RequestBuilder::set_tools(Vec<Tool>)`** — attach tool definitions (JSON Schema) to a request
-- **`RequestBuilder::set_tool_choice(ToolChoice::Auto)`** — let the model decide whether to call tools
-- **`RequestBuilder::add_message_with_tool_call(role, content, tool_calls)`** — replay an assistant message that contained tool calls
-- **`RequestBuilder::add_tool_message(content, tool_call_id)`** — send a tool execution result back
-
-Key types (all re-exported from `mistralrs` crate, accessible via `onde::mistralrs::*`):
-
-| Type | Purpose |
-|------|---------|
-| `Tool` | A tool definition: `{ tp: ToolType::Function, function: Function }` |
-| `Function` | Name, description, JSON Schema parameters, `strict` flag |
-| `ToolChoice` | `None`, `Auto`, or `Tool(...)` |
-| `ToolCallResponse` | Model's tool call: `{ id, function: CalledFunction }` |
-| `CalledFunction` | `{ name, arguments }` where arguments is a JSON string |
-| `ToolCallType` | Currently only `Function` |
+- `RequestBuilder::set_tools(Vec<Tool>)` — attach tool definitions
+- `RequestBuilder::set_tool_choice(ToolChoice::Auto)` — let model decide
+- `QwenParser` detects `<tool_call>...</tool_call>` tags in output
+- Grammar-constrained decoding forces valid JSON inside tool calls
+- `<think>...</think>` reasoning is separated from tool calls by the reasoning parser
+- Works identically for GGUF and full-precision models
 
 ### Layer 2: onde (engine-level)
 
-onde's `ChatEngine` wraps mistral.rs with conversation history management. The tool calling API is **Rust-only** (no UniFFI annotations — Swift/Kotlin bindings are not affected).
-
-#### Types (`onde/src/inference/types.rs`)
+#### Key types (`onde/src/inference/types.rs`)
 
 | Type | Purpose |
 |------|---------|
-| `ToolDefinition` | `{ name, description, parameters_schema: String }` — tool schema for the model |
-| `ToolCallRequest` | `{ id, function_name, arguments: String }` — parsed tool call from model response |
-| `ToolResult` | `{ tool_call_id, content: String }` — execution result to feed back |
-| `ToolAwareResult` | `{ text, tool_calls: Vec<ToolCallRequest>, duration_secs, ... }` — inference result that may contain tool calls |
+| `ToolDefinition` | `{ name, description, parameters_schema: String }` |
+| `ToolCallRequest` | `{ id, function_name, arguments: String }` |
+| `ToolResult` | `{ tool_call_id, content: String }` |
+| `ToolAwareResult` | `{ text, tool_calls: Vec<ToolCallRequest>, duration_secs, ... }` |
 
-#### Methods (`onde/src/inference/engine.rs`)
+#### Key methods (`onde/src/inference/engine.rs`)
 
 | Method | Purpose |
 |--------|---------|
-| `send_message_with_tools(&self, msg, &[ToolDefinition])` | Send user message with tools available. Returns `ToolAwareResult`. If `tool_calls` is non-empty, the model wants to call tools. |
-| `send_tool_results(&self, Vec<ToolResult>, Option<&[ToolDefinition]>)` | Feed tool execution results back. Pass tools to allow further rounds, or `None` to force a text response. |
-| `stream_tool_results(&self, Vec<ToolResult>, Option<Vec<ToolDefinition>>)` | Streaming variant for the final text response after tool rounds. |
+| `send_message_with_tools(msg, &[ToolDefinition])` | Returns `ToolAwareResult` with possible tool calls |
+| `send_tool_results(Vec<ToolResult>, Option<&[ToolDefinition]>)` | Feed results back; `None` forces text response |
 
-#### Internal history
+#### Internal details
 
-`LoadedModel.history` uses `Vec<HistoryEntry>` (not `Vec<ChatMessage>`) to support tool-related messages:
-
-```rust
-enum HistoryEntry {
-    Text(ChatMessage),                          // regular user/assistant/system
-    AssistantToolCall { content, tool_calls },   // assistant response with tool calls
-    ToolResult { tool_call_id, content },        // tool execution result
-}
-```
-
-The existing `history()` public method converts back to `Vec<ChatMessage>` for backward compatibility. All existing methods (`send_message`, `stream_message`, etc.) work unchanged — they use `HistoryEntry::Text` internally.
-
-When replaying history in requests:
-- `build_request()` (no tools) — `AssistantToolCall` replays as plain assistant text, `ToolResult` is skipped
-- `build_request_with_tools()` — uses `add_message_with_tool_call()` and `add_tool_message()` for full fidelity
+- `attach_tools()` converts `ToolDefinition` → mistral.rs `Tool`, sets `ToolChoice::Auto` and `strict: Some(true)`
+- `parse_tool_calls()` extracts tool calls from `choice.message.tool_calls`, generates fallback IDs if empty
+- `replay_history_with_tools()` uses `.enumerate()` for correct sequential `index` values
+- Malformed `parameters_schema` JSON logs a warning instead of silently producing empty params
+- Malformed tool call `arguments` JSON logs a warning for debugging
 
 ### Layer 3: siGit (agent-level)
 
-#### Tool definitions (`sigit/src/tools.rs`)
+#### ACP session handling (`src/main.rs`)
 
-Three coding tools with JSON Schema definitions and execution functions:
+All session handlers (`load_session`, `fork_session`, `new_session`) do:
 
-| Tool | Parameters | Behavior |
-|------|-----------|----------|
-| `read_file` | `path` (required) | Reads file contents, truncates at 10,000 chars |
-| `list_directory` | `path` (required) | Lists entries with `[DIR]`/`[FILE]` prefix, dirs first, sorted |
-| `search_files` | `pattern` (required), `path` (optional) | Recursive regex search, max 50 matches, skips hidden dirs |
+1. **Store `args.cwd`** in `session_cwd: Mutex<Option<PathBuf>>`
+2. **`std::env::set_current_dir(&args.cwd)`** — so relative paths in tool calls resolve correctly
+3. **`engine.clear_history()`** — siGit doesn't persist sessions
+4. **`engine.push_history(ChatMessage::system(...))`** — injects: *"The user's project working directory is {cwd}. Always use absolute paths..."*
 
-Public API:
-- `all_tools() -> Vec<AgentTool>` — returns tool schemas (name, description, JSON Schema)
-- `execute_tool(name: &str, arguments: &str) -> String` — dispatches by name, returns result string
+Without step 4, the model uses the process `cwd` (often `$HOME`) and creates files in the wrong directory.
 
-#### Conversion to onde types
+#### ACP content block handling (`prompt()`)
 
-In both `main.rs` and `chat.rs`, `AgentTool` is converted to `ToolDefinition`:
+The `prompt()` handler processes all ACP content block types:
 
-```rust
-let onde_tools: Vec<ToolDefinition> = tools::all_tools()
-    .into_iter()
-    .map(|t| ToolDefinition {
-        name: t.name.to_string(),
-        description: t.description.to_string(),
-        parameters_schema: t.parameters_schema.to_string(),
-    })
-    .collect();
+- **`ContentBlock::Text`** — passed through as-is
+- **`ContentBlock::Resource` (EmbeddedResource)** — `TextResourceContents` inlined as `--- {uri} ---\n{text}\n--- end ---`
+- **`ContentBlock::ResourceLink`** — `file://` URIs are read from disk. **Line range fragments** like `#L207:219` are parsed: the `#` fragment is stripped from the path, and only lines 207–219 are extracted and sent to the model
+
+Example: Zed sends `@ index.html (207:219)` as:
 ```
+ResourceLink(name="index.html (207:219)", uri="file:///path/to/index.html#L207:219")
+```
+siGit parses this into path `/path/to/index.html` + lines 207–219.
 
 ---
 
 ## The Agentic Loop
 
-Both ACP mode (`main.rs` → `SiGitAgent::prompt()`) and TUI mode (`chat.rs` → event loop) implement the same pattern:
+Both ACP mode (`SiGitAgent::prompt()`) and TUI mode (`run_inference_task()`) implement:
 
 ```
-1. engine.send_message_with_tools(user_text, &tools)  → ToolAwareResult
+1. engine.send_message_with_tools(user_text, &tools) → ToolAwareResult
 2. while result.tool_calls is non-empty AND round < MAX_TOOL_ROUNDS (10):
    a. For each tool_call:
-      - Show status to user (🔧 tool_name)
-      - Execute: tools::execute_tool(name, arguments)
+      - Log: → tool_name(arguments)
+      - Execute: tools::execute_tool(name, arguments).await
+      - Log: ← N chars
       - Collect ToolResult { tool_call_id, content }
    b. Decide next_tools:
-      - If round < MAX_TOOL_ROUNDS → Some(&tools)  (allow more calls)
-      - Else → None  (force text response)
+      - round < MAX_TOOL_ROUNDS → Some(&tools)  (allow more calls)
+      - else → None  (force text response)
    c. engine.send_tool_results(results, next_tools) → ToolAwareResult
 3. Send final result.text to user
+   - Empty reply after tool rounds → log warning (ACP) or show error (TUI)
 ```
-
-### ACP mode specifics (`main.rs`)
-
-- Tool status is sent as `SessionUpdate::AgentMessageChunk` with a 🔧 prefix
-- Final text is sent as a single `AgentMessageChunk`
-- Returns `StopReason::EndTurn`
-
-### TUI mode specifics (`chat.rs`)
-
-- Tool status shown as `ChatMessage::system("🔧 tool_name")`
-- Forces a `terminal.draw()` after each tool call for visual feedback
-- Final text added as `ChatMessage::assistant(result.text)`
-- The tool loop is **blocking** (non-streaming) — the TUI doesn't accept input during tool execution
 
 ---
 
 ## System Prompt
 
-The system prompt in `main.rs` (`SYSTEM_PROMPT`) includes tool-awareness instructions:
+The `SYSTEM_PROMPT` in `main.rs` (~122 lines) includes critical instructions:
+
+- **Never tell the user to run commands** — use `run_command` tool instead
+- **Can access websites** — use `read_website` tool (overrides RLHF refusal training)
+- **Prefer absolute paths** in all tool arguments
+- **Git operations** — always use `run_command` with absolute cwd
+- **smbCloud domain knowledge** — auth boundaries, deploy flows, project structure
+
+The session `cwd` is injected as a separate system message at session creation time (not part of the static prompt).
+
+---
+
+## Model Cache
+
+Models are stored in the shared Onde App Group container on macOS:
 
 ```
-You have access to tools that let you read files, list directories, and search
-code. Use them proactively to understand the codebase before answering questions
-or writing code. Always ground your answers in the actual code.
+~/Library/Group Containers/group.com.ondeinference.apps/models/hub/
 ```
 
-This is critical — without it, the model may not use the tools even when they're available.
+`setup.rs` sets `HF_HOME` and `HF_HUB_CACHE` to point there at startup, so siGit reuses models downloaded by the Onde desktop app (and vice versa).
 
 ---
 
 ## Adding a New Tool
 
-1. **Define the schema** in `sigit/src/tools.rs`:
-   - Add an `AgentTool` entry to `all_tools()` with name, description, and JSON Schema
-   - The `parameters_schema` must be a valid JSON Schema object with `type`, `properties`, and `required`
+1. Add an `AgentTool` entry to `all_tools()` in `src/tools.rs`
+2. Add a match arm to `execute_tool()` — use `spawn_blocking` if the implementation blocks
+3. Write `exec_your_tool(arguments: &str) -> String`
+4. Update `test_all_tools_count` test (currently expects 9)
 
-2. **Implement execution** in `sigit/src/tools.rs`:
-   - Add a case to `execute_tool()` match
-   - Write `exec_your_tool(arguments: &str) -> String`
-   - Parse arguments with `serde_json::from_str::<Value>(arguments)`
-   - Return results as a string, handle errors gracefully (never panic)
+No changes needed in onde or mistral.rs — tool definitions are passed dynamically.
 
-3. **No changes needed** in onde or mistral.rs — the tool definitions are passed dynamically via `send_message_with_tools()`.
+---
 
-### Example: adding a `write_file` tool
+## Adding a New Model
 
-```rust
-// In all_tools():
-AgentTool {
-    name: "write_file",
-    description: "Create or overwrite a file with the given content.",
-    parameters_schema: json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string", "description": "File path to write" },
-            "content": { "type": "string", "description": "File content" }
-        },
-        "required": ["path", "content"]
-    }),
-}
+1. **`onde/src/inference/models.rs`** — add `pub const` for repo ID and GGUF filename, add to `SUPPORTED_MODELS` array and `SUPPORTED_MODEL_INFO`
+2. **`onde/src/inference/engine.rs`** — add `pub fn model_name() -> Self` constructor to `impl GgufModelConfig`
+3. **`sigit/src/chat.rs`** — add `ModelOption` entry to `SIGIT_MODELS` with `tool_calling: true/false`
+4. **`sigit/src/main.rs`** — update `run_interactive()` and `run_acp_server()` if changing the default
 
-// In execute_tool():
-"write_file" => exec_write_file(arguments),
+---
 
-// Implementation:
-fn exec_write_file(arguments: &str) -> String {
-    let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-    let path = args["path"].as_str().unwrap_or("");
-    let content = args["content"].as_str().unwrap_or("");
-    match std::fs::write(path, content) {
-        Ok(()) => format!("Successfully wrote {} bytes to {}", content.len(), path),
-        Err(e) => format!("Error writing {}: {}", path, e),
-    }
-}
+## Debugging
+
+### Log locations
+
+- **TUI mode:** `$TMPDIR/sigit.log` (e.g. `/var/folders/.../sigit.log`)
+- **ACP mode (Zed):** `~/Library/Logs/Zed/Zed.log` — grep for `agent stderr:.*sigit`
+
+### Key log patterns
+
+```
+# Model loaded successfully
+ChatEngine: model Qwen 3 8B loaded in 6.9s
+
+# Session cwd captured
+load_session: id=..., cwd=/path/to/project, additional_directories=[...]
+
+# Tool call parsed by mistral.rs
+ChatEngine: tool inference END — 12.3s — tool_calls: 1
+
+# Tool executed
+→ read_file({"path":"/absolute/path/to/file.rs"})
+← 6506 chars
+
+# Tool result sent back
+ChatEngine: tool results inference START — 1 results
+
+# Model returned empty (exhausted max_tokens on thinking)
+model returned empty reply after 7 tool round(s)
+
+# ResourceLink received from Zed
+block[1]: ResourceLink(name=index.html (207:219), uri=file:///path/to/index.html#L207:219)
+
+# ResourceLink read failed (fragment not stripped — old bug, now fixed)
+could not read ResourceLink file:///path/to/index.html#L207:219: No such file or directory
 ```
 
----
+### Common issues
 
-## Dependencies
-
-### onde (`Cargo.toml`)
-
-- `serde_json = "1.0"` — parsing `parameters_schema` JSON strings into `HashMap<String, Value>` for mistral.rs `Function.parameters`
-
-### siGit (`Cargo.toml`)
-
-- `onde = { path = "../onde" }` — local path dep (required during development for the tool calling API)
-- `serde_json = "1"` — parsing tool call arguments
-- `regex = "1"` — used by the `search_files` tool
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Model says "I cannot access websites" | RLHF refusal override not in system prompt | System prompt now has CRITICAL block about `read_website` |
+| `0 tool call(s)` for every prompt | Wrong model loaded (Qwen 2.5) | Check log for `loading GGUF model` — must be Qwen 3 |
+| `edit_file` returns `← 161 chars` repeatedly | `old_text not found` — model can't match exact text | Use Qwen 3 8B (not 4B); consider line-based edit tool |
+| Files created in wrong directory | `cwd` not captured from ACP session | Session handlers must call `set_current_dir` + `push_history` with cwd |
+| `@ file.html (207:219)` context missing | `#L207:219` fragment not stripped from file path | `prompt()` now parses URI fragments and extracts line ranges |
+| `read_website` panics/hangs | `reqwest::blocking` inside tokio runtime | `exec_read_website` wrapped in `spawn_blocking` |
+| Empty reply after many tool rounds | Model exhausted `max_tokens` on `<think>` blocks | Set `max_tokens: 8192`; 8B model wastes fewer tokens on thinking |
 
 ---
 
-## Debugging Tool Calling
+## Cargo Dependency Note
 
-### Model doesn't call tools
+For local development, `sigit/Cargo.toml` must use the path dependency:
 
-- Verify the model is Qwen 3 (check `GgufModelConfig::qwen3_4b()` in both `main.rs` load sites)
-- Check the system prompt includes tool-awareness instructions
-- Check logs: `ChatEngine: tool inference END — tool_calls: 0` means the model chose not to use tools
-- Try a more explicit prompt: *"Use the read_file tool to read src/main.rs"*
+```toml
+onde = { path = "../onde" }
+```
 
-### Tool calls fail / wrong arguments
+For CI/release, switch to the git dependency (after pushing Onde changes):
 
-- Check `ToolDefinition.parameters_schema` is valid JSON Schema
-- Check `strict: Some(true)` is set in onde's `attach_tools()` (it is by default) — this enables constrained decoding
-- Check logs for the raw arguments: `→ read_file({"path":"..."})`
+```toml
+onde = { git = "https://github.com/ondeinference/onde", branch = "development" }
+```
 
-### History replay issues
-
-- Tool call history is replayed via `replay_history_with_tools()` which uses `add_message_with_tool_call()` and `add_tool_message()`
-- If history gets corrupted, `/clear` in the TUI or `engine.clear_history()` resets it
-- The non-tool `build_request()` gracefully degrades: `AssistantToolCall` replays as plain text, `ToolResult` entries are skipped
+The `qwen3_8b()` constructor only exists in the local Onde SDK until it's pushed to the `development` branch.
 
 ---
 
@@ -272,12 +281,10 @@ fn exec_write_file(arguments: &str) -> String {
 
 | File | What it does |
 |------|-------------|
-| `onde/src/inference/types.rs` | `ToolDefinition`, `ToolCallRequest`, `ToolResult`, `ToolAwareResult` types |
-| `onde/src/inference/engine.rs` | `HistoryEntry` enum, `send_message_with_tools()`, `send_tool_results()`, `stream_tool_results()`, helper functions (`build_request_with_tools`, `replay_history_with_tools`, `attach_tools`, `parse_tool_calls`) |
-| `onde/src/inference/models.rs` | Qwen 3 model constants (`BARTOWSKI_QWEN3_4B_GGUF`, `QWEN3_4B_GGUF_FILE`, etc.) and `GgufModelConfig::qwen3_4b()` / `qwen3_1_7b()` constructors |
-| `onde/src/inference/mod.rs` | Re-exports `ToolAwareResult`, `ToolCallRequest`, `ToolDefinition`, `ToolResult` |
-| `sigit/src/tools.rs` | `AgentTool` struct, `all_tools()`, `execute_tool()`, implementations for `read_file`, `list_directory`, `search_files` |
-| `sigit/src/main.rs` | `agent_tools_as_onde()` converter, agentic loop in `SiGitAgent::prompt()`, `MAX_TOOL_ROUNDS` constant, Qwen 3 4B model selection |
-| `sigit/src/chat.rs` | TUI agentic loop (same pattern as ACP), tool status display as system messages |
-| `mistral.rs/docs/TOOL_CALLING.md` | Upstream docs for supported models and API |
-| `mistral.rs/mistralrs/examples/advanced/tools/main.rs` | Reference example for mistral.rs tool calling |
+| `sigit/src/tools.rs` | 9 tool schemas (`all_tools()`), `execute_tool()` dispatch, all `exec_*` implementations |
+| `sigit/src/main.rs` | `SYSTEM_PROMPT`, `SiGitAgent` struct with `session_cwd`, ACP session handlers (cwd + push_history), `prompt()` with content block parsing, model selection (`qwen3_8b`), `MAX_TOOL_ROUNDS` |
+| `sigit/src/chat.rs` | `SIGIT_MODELS` array (4 models), `run_inference_task()` with `tools_enabled` gate, TUI tool loop |
+| `sigit/src/setup.rs` | HF cache setup pointing to shared App Group container |
+| `onde/src/inference/types.rs` | `ToolDefinition`, `ToolCallRequest`, `ToolResult`, `ToolAwareResult` |
+| `onde/src/inference/engine.rs` | `send_message_with_tools()`, `send_tool_results()`, `attach_tools()`, `parse_tool_calls()`, `replay_history_with_tools()`, `GgufModelConfig::qwen3_8b()` |
+| `onde/src/inference/models.rs` | Model constants and `SUPPORTED_MODELS` array |

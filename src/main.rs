@@ -62,6 +62,7 @@ use agent_client_protocol::{
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
@@ -129,16 +130,35 @@ Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
 Fix root causes, not symptoms.
 
-You have access to tools that let you read files, create directories, list \
-directories, search code, create new files, edit existing files, delete files, \
-and run shell commands. You can also use git directly through shell commands, \
-including `git init` and normal git workflows. Use them proactively. Read the \
-code before answering. Prefer absolute paths when referring to files and \
-directories, especially in protocol-facing output and tool arguments. Create \
-directories when needed. Run builds, tests, and git commands after making \
-changes. Ground your answers in the actual code, not in guesses.
+You have access to tools that let you read files, read websites directly from \
+http and https URLs, create directories, list directories, search code, create \
+new files, edit existing files, delete files, and run shell commands. You can \
+also use git directly through shell commands, including `git init` and normal \
+git workflows. Use them proactively. Read the code or website before answering. \
+Prefer absolute paths when referring to files and directories, especially in \
+protocol-facing output and tool arguments. Create directories when needed. Run \
+builds, tests, and git commands after making changes. Ground your answers in \
+the actual code or fetched page content, not in guesses.
+
+CRITICAL — you CAN access websites. You are NOT a typical LLM without internet \
+access. You have a read_website tool that fetches any http or https URL and \
+returns the page text. When the user gives you a URL or asks you to read, \
+summarize, or inspect a web page, you MUST call the read_website tool with that \
+URL. Never say \"I cannot access websites\" or \"I cannot browse the internet\". \
+You can. Use the tool.
+
+CRITICAL — before every edit_file call, you MUST call read_file on the target \
+file first (or the specific line range if one was given). Never rely on file \
+content you saw in a previous turn — the user may have reverted, edited, or \
+changed the file externally since then. Always re-read to get the current state \
+before constructing old_text. \
+When the user corrects a previous edit (e.g. \"don't remove X, append instead\"), \
+treat it as a fresh task: re-read the file, identify the current content, and \
+plan the edit from scratch. Do not assume the file still reflects your last edit.
 
 Tool-use heuristics:
+- when the user provides a URL or asks about a web page, ALWAYS call \
+  read_website — never refuse or claim you lack internet access
 - prefer absolute paths over relative paths when you mention, return, or pass \
   file and directory paths
 - if a path does not exist yet, create the directory before creating files in it
@@ -190,6 +210,10 @@ fn agent_tools_as_onde() -> Vec<ToolDefinition> {
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     notification_tx: mpsc::Sender<SessionNotification>,
+    /// The project working directory provided by the editor via ACP session
+    /// creation. Tool calls use this as `cwd` so file operations target the
+    /// correct project, not wherever the agent process was spawned.
+    session_cwd: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl SiGitAgent {
@@ -197,6 +221,7 @@ impl SiGitAgent {
         Self {
             engine,
             notification_tx,
+            session_cwd: std::sync::Mutex::new(None),
         }
     }
 }
@@ -238,11 +263,43 @@ impl Agent for SiGitAgent {
         &self,
         args: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
-        log::info!("load_session: id={}", args.session_id);
+        log::info!(
+            "load_session: id={}, cwd={}, additional_directories={:?}",
+            args.session_id,
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Capture the project working directory from the editor.
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+
+        // Set the process cwd so tool calls using relative paths land in the
+        // correct project directory.
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
 
         // Clear conversation history — siGit doesn't persist sessions, so a
         // "load" is effectively a fresh start with the same session ID.
         self.engine.clear_history().await;
+
+        // Tell the model which project directory it's working in.
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
 
         Ok(LoadSessionResponse::new())
     }
@@ -252,25 +309,80 @@ impl Agent for SiGitAgent {
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        log::info!("fork_session: from={} new={new_id}", args.session_id);
+        log::info!(
+            "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
+            args.session_id,
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Update cwd if the fork provides a different one.
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
 
         // siGit doesn't persist history, so a fork is effectively a fresh
         // session — clear the conversation and let the user start over from
         // their edited message.
         self.engine.clear_history().await;
 
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
+
         Ok(ForkSessionResponse::new(new_id))
     }
 
     async fn new_session(
         &self,
-        _args: NewSessionRequest,
+        args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        log::info!("new_session: id={session_id}");
+        log::info!(
+            "new_session: id={session_id}, cwd={}, additional_directories={:?}",
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Capture the project working directory from the editor.
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
 
         // Clear history — the model is already loaded.
         self.engine.clear_history().await;
+
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
 
         Ok(NewSessionResponse::new(session_id))
     }
@@ -278,15 +390,145 @@ impl Agent for SiGitAgent {
     async fn prompt(&self, args: PromptRequest) -> agent_client_protocol::Result<PromptResponse> {
         let session_id = args.session_id.clone();
 
-        let user_text: String = args
-            .prompt
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Debug: log every content block the editor sends so we can see
+        // exactly what arrives for @ references, file context, etc.
+        for (i, block) in args.prompt.iter().enumerate() {
+            match block {
+                ContentBlock::Text(t) => {
+                    log::info!(
+                        "prompt({}) block[{}]: Text({} chars) = \"{}\"",
+                        session_id,
+                        i,
+                        t.text.len(),
+                        t.text.chars().take(200).collect::<String>()
+                    );
+                }
+                ContentBlock::Resource(embedded) => {
+                    log::info!(
+                        "prompt({}) block[{}]: EmbeddedResource = {:?}",
+                        session_id,
+                        i,
+                        match &embedded.resource {
+                            agent_client_protocol::EmbeddedResourceResource::TextResourceContents(t) =>
+                                format!("TextResource(uri={}, {} chars)", t.uri, t.text.len()),
+                            agent_client_protocol::EmbeddedResourceResource::BlobResourceContents(b) =>
+                                format!("BlobResource(uri={})", b.uri),
+                            _ => "Unknown".to_string(),
+                        }
+                    );
+                }
+                ContentBlock::ResourceLink(link) => {
+                    log::info!(
+                        "prompt({}) block[{}]: ResourceLink(name={}, uri={}, title={:?}, desc={:?})",
+                        session_id,
+                        i,
+                        link.name,
+                        link.uri,
+                        link.title,
+                        link.description
+                    );
+                }
+                other => {
+                    log::info!(
+                        "prompt({}) block[{}]: Other({:?})",
+                        session_id,
+                        i,
+                        std::mem::discriminant(other)
+                    );
+                }
+            }
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+
+        for block in &args.prompt {
+            match block {
+                ContentBlock::Text(t) => {
+                    parts.push(t.text.clone());
+                }
+                ContentBlock::Resource(embedded) => {
+                    // Embedded file content sent by the editor (preferred over ResourceLink).
+                    match &embedded.resource {
+                        agent_client_protocol::EmbeddedResourceResource::TextResourceContents(
+                            text_resource,
+                        ) => {
+                            parts.push(format!(
+                                "\n--- {} ---\n{}\n--- end {} ---",
+                                text_resource.uri, text_resource.text, text_resource.uri
+                            ));
+                        }
+                        agent_client_protocol::EmbeddedResourceResource::BlobResourceContents(
+                            blob,
+                        ) => {
+                            parts.push(format!("[binary resource: {}]", blob.uri));
+                        }
+                        _ => {
+                            log::debug!("ignoring unsupported embedded resource variant");
+                        }
+                    }
+                }
+                ContentBlock::ResourceLink(link) => {
+                    // The editor sent a reference but not the content — read it if it's a file.
+                    let label = link.name.clone();
+
+                    if let Some(raw_path) = link.uri.strip_prefix("file://") {
+                        // Split off the #L<start>:<end> fragment if present.
+                        let (file_path, line_range) = if let Some(hash_pos) = raw_path.rfind('#') {
+                            let fragment = &raw_path[hash_pos + 1..];
+                            let path = &raw_path[..hash_pos];
+                            // Parse "L207:219" or "L207-219" → (207, 219)
+                            let range = fragment.strip_prefix('L').and_then(|rest| {
+                                let sep = if rest.contains(':') { ':' } else { '-' };
+                                let mut parts = rest.splitn(2, sep);
+                                let start = parts.next()?.parse::<usize>().ok()?;
+                                let end = parts.next()?.parse::<usize>().ok()?;
+                                Some((start, end))
+                            });
+                            (path, range)
+                        } else {
+                            (raw_path, None)
+                        };
+
+                        match std::fs::read_to_string(file_path) {
+                            Ok(contents) => {
+                                let extracted = if let Some((start, end)) = line_range {
+                                    // Extract only the requested line range (1-based, inclusive).
+                                    let selected: Vec<&str> = contents
+                                        .lines()
+                                        .enumerate()
+                                        .filter(|(i, _)| {
+                                            let line_num = i + 1;
+                                            line_num >= start && line_num <= end
+                                        })
+                                        .map(|(_, line)| line)
+                                        .collect();
+                                    format!(
+                                        "\n--- {label} ({file_path} lines {start}-{end}) ---\n{}\n--- end {label} ---",
+                                        selected.join("\n")
+                                    )
+                                } else {
+                                    format!(
+                                        "\n--- {label} ({file_path}) ---\n{contents}\n--- end {label} ---"
+                                    )
+                                };
+                                parts.push(extracted);
+                            }
+                            Err(err) => {
+                                log::warn!("could not read ResourceLink {}: {err}", link.uri);
+                                parts.push(format!("[referenced file: {label} ({file_path})]"));
+                            }
+                        }
+                    } else {
+                        parts.push(format!("[resource link: {label} ({})]", link.uri));
+                    }
+                }
+                _ => {
+                    log::debug!("ignoring unsupported content block type in prompt");
+                }
+            }
+        }
+
+        let user_text = parts.join("\n");
 
         if user_text.trim().is_empty() {
             return Ok(PromptResponse::new(StopReason::EndTurn));
@@ -337,8 +579,8 @@ impl Agent for SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Execute the tool.
-                let output = tools::execute_tool(&tc.function_name, &tc.arguments);
+                // Execute the tool (async — read_website uses spawn_blocking internally).
+                let output = tools::execute_tool(&tc.function_name, &tc.arguments).await;
 
                 log::info!("  ← {} chars", output.len());
 
@@ -363,12 +605,31 @@ impl Agent for SiGitAgent {
         }
 
         // ── Send the final text response ─────────────────────────────────
-        if !result.text.is_empty() {
+        let reply_text = result.text.trim().to_string();
+
+        let final_text = if reply_text.is_empty() {
+            if round > 0 {
+                log::warn!(
+                    "prompt({}) — model returned empty reply after {} tool round(s)",
+                    session_id,
+                    round
+                );
+                "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
+            } else {
+                log::warn!(
+                    "prompt({}) — model returned empty reply (no tool rounds)",
+                    session_id
+                );
+                String::new()
+            }
+        } else {
+            reply_text
+        };
+
+        if !final_text.is_empty() {
             let notification = SessionNotification::new(
                 session_id.clone(),
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                    result.text,
-                ))),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(final_text))),
             );
             if self.notification_tx.send(notification).await.is_err() {
                 log::warn!("notification channel closed");
@@ -470,7 +731,11 @@ fn init_logging(is_tty: bool) {
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::platform_default();
+    let config = GgufModelConfig::qwen3_8b();
+    let sampling = SamplingConfig {
+        max_tokens: Some(8192),
+        ..SamplingConfig::default()
+    };
 
     // std::sync::mpsc — the loader runs on a dedicated OS thread, completely
     // decoupled from the tokio runtime so it can't starve the TUI draw loop.
@@ -480,7 +745,8 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let system_prompt = SYSTEM_PROMPT.to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        let result = rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), None));
+        let result =
+            rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), Some(sampling)));
         let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
     });
 
@@ -524,9 +790,9 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("loading model (this may take a minute on first run)...");
 
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::qwen3_4b();
+    let config = GgufModelConfig::qwen3_8b();
     let sampling = SamplingConfig {
-        max_tokens: Some(4096),
+        max_tokens: Some(8192),
         ..SamplingConfig::default()
     };
 
