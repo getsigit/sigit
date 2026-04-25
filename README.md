@@ -2,7 +2,7 @@
 
 [![Crates.io Version](https://img.shields.io/crates/v/sigit)](https://crates.io/crates/sigit)
 
-A coding agent for [smbCloud](https://smbcloud.xyz/) that runs entirely on your machine. No API keys. No cloud round-trips. The model lives in your local HuggingFace cache.
+A coding agent for [smbCloud](https://smbcloud.xyz/) that runs entirely on your machine. No API keys. No cloud round-trips.
 
 siGit is meant to be a general coding agent, but it is especially good in smbCloud codebases. It already knows the rough shape of the platform: Rust workspaces with focused crates, Rails services, deploy flows, auth boundaries, and platform-managed services like GresIQ. In smbCloud repos, that means it can usually give more grounded answers with less back-and-forth.
 
@@ -30,6 +30,8 @@ Outside smbCloud, it should still behave like a normal coding agent and not forc
 
 ## Install
 
+Install siGit Code with cargo, Homebrew, PyPi, or NPM:
+
 ```sh
 cargo install sigit
 ```
@@ -56,6 +58,22 @@ Add to `~/.config/zed/settings.json`:
 ```
 
 Use the full absolute path. `~` will not be expanded here.
+
+## VSCode via ACP Client extension
+
+Install [ACP client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client):
+
+```json
+{
+  "acp.agents": {
+    "siGit Code": {
+      "command": "sigit",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
 
 ## Terminal mode
 

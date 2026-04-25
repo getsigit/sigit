@@ -17,15 +17,15 @@ use std::sync::mpsc as std_mpsc;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use onde::inference::{
-    ChatEngine, GgufModelConfig, SamplingConfig, StreamChunk, ToolDefinition, ToolResult,
-};
+use onde::inference::{ChatEngine, SamplingConfig, StreamChunk, ToolDefinition, ToolResult};
+
+use crate::models::{ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval};
@@ -88,6 +88,11 @@ enum InferenceUpdate {
     Error(String),
 }
 
+enum ModelLoadUpdate {
+    Loaded(String),
+    Error(String),
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 struct App {
@@ -99,6 +104,8 @@ struct App {
     stream_buf: String,
     /// Channel for receiving results from the background inference task.
     inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
+    /// Channel for receiving results from a model switch.
+    model_load_rx: Option<mpsc::Receiver<ModelLoadUpdate>>,
     /// True while waiting for inference to finish.
     thinking: bool,
     /// Counter driving the thinking spinner animation.
@@ -107,6 +114,8 @@ struct App {
     /// Flips every few ticks while streaming to make the cursor blink.
     blink_on: bool,
     blink_counter: u8,
+    /// True while a model switch is in progress.
+    switching_model: bool,
 
     // ── Loading-phase state ───────────────────────────────────────────────────
     /// True while the model is still loading; switches to false on completion.
@@ -120,6 +129,12 @@ struct App {
     load_start: Instant,
     /// Display name of the model being loaded (shown in the spinner line).
     load_model_name: String,
+
+    // ── Model picker state ────────────────────────────────────────────────────
+    show_model_picker: bool,
+    model_picker_index: usize,
+    model_picker_items: Vec<ModelPickerItem>,
+    current_model_name: String,
     /// Whether the currently loaded model supports tool calling.
     tool_calling: bool,
 }
@@ -144,9 +159,10 @@ const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 impl App {
     fn new(load_model_name: String) -> Self {
-        let tool_calling = SIGIT_MODELS
+        let items = build_model_picker_items();
+        let tool_calling = items
             .iter()
-            .find(|m| m.name == load_model_name)
+            .find(|m| m.display_name == load_model_name)
             .map(|m| m.tool_calling)
             .unwrap_or(true);
         Self {
@@ -157,23 +173,30 @@ impl App {
             stream_rx: None,
             stream_buf: String::new(),
             inference_rx: None,
+            model_load_rx: None,
             thinking: false,
             thinking_tick: 0,
             quit: false,
             blink_on: true,
             blink_counter: 0,
+            switching_model: false,
             is_loading: true,
             load_tick: 0,
             load_error: None,
             load_start: Instant::now(),
-            load_model_name,
+            load_model_name: load_model_name.clone(),
+            show_model_picker: false,
+            model_picker_index: 0,
+            model_picker_items: items,
+            current_model_name: crate::setup::load_selected_model_name()
+                .unwrap_or_else(|| load_model_name.clone()),
             tool_calling,
         }
     }
 
     /// True when either streaming tokens or waiting for inference.
     fn is_busy(&self) -> bool {
-        self.is_streaming() || self.thinking
+        self.is_streaming() || self.thinking || self.switching_model
     }
 
     fn is_streaming(&self) -> bool {
@@ -230,6 +253,10 @@ impl App {
         self.messages.push(ChatMessage::system(
             "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
         ));
+        self.messages.push(ChatMessage::system(format!(
+            "Current model: {}",
+            self.current_model_name
+        )));
         self.messages
             .push(ChatMessage::system("Type /help for commands."));
     }
@@ -239,6 +266,58 @@ impl App {
     fn set_load_error(&mut self, error: String) {
         self.load_error = Some(error);
         // is_loading stays true so render_loading() keeps rendering.
+    }
+
+    fn open_model_picker(&mut self, engine: &ChatEngine) {
+        let current = crate::setup::load_selected_model();
+        let current_name = crate::setup::load_selected_model_name().unwrap_or_else(|| {
+            futures::executor::block_on(engine.info())
+                .model_name
+                .unwrap_or_else(|| self.current_model_name.clone())
+        });
+
+        self.model_picker_items = build_model_picker_items();
+        self.model_picker_index = current
+            .as_ref()
+            .and_then(|selected| {
+                self.model_picker_items.iter().position(|item| {
+                    item.config.model_id == selected.model_id
+                        && item
+                            .config
+                            .files
+                            .iter()
+                            .any(|file| file == &selected.gguf_file)
+                })
+            })
+            .or_else(|| {
+                self.model_picker_items
+                    .iter()
+                    .position(|item| item.display_name == current_name)
+            })
+            .unwrap_or(0);
+        self.show_model_picker = true;
+    }
+
+    fn close_model_picker(&mut self) {
+        self.show_model_picker = false;
+    }
+
+    fn move_model_picker_up(&mut self) {
+        if self.model_picker_items.is_empty() {
+            return;
+        }
+        if self.model_picker_index == 0 {
+            self.model_picker_index = self.model_picker_items.len().saturating_sub(1);
+        } else {
+            self.model_picker_index -= 1;
+        }
+    }
+
+    fn move_model_picker_down(&mut self) {
+        if self.model_picker_items.is_empty() {
+            return;
+        }
+        self.model_picker_index = (self.model_picker_index + 1) % self.model_picker_items.len();
     }
 
     /// Total lines the messages area would need (rough estimate for scrolling).
@@ -298,48 +377,178 @@ fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
 
 // ── Model table ──────────────────────────────────────────────────────────────
 
-struct ModelOption {
-    /// Name shown in `/models`. Must match `GgufModelConfig::display_name`.
-    name: &'static str,
-    /// Short blurb shown next to the name, e.g. "~2.7 GB".
-    description: &'static str,
-    /// True if this model actually handles tool calls.
-    tool_calling: bool,
-    /// Token budget for generation. Qwen 3 needs 4096+ or it outputs nothing.
-    max_tokens: u64,
-    config_fn: fn() -> GgufModelConfig,
+// ModelSource, ModelPickerItem, and build_model_picker_items live in
+// crate::models so they are available on all platforms (including Windows),
+// not just unix where this chat module is compiled.
+
+fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let popup = centered_rect(82, 72, area);
+
+    // Erase whatever is behind the popup so the panel is fully readable.
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Select a model… ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().bg(Color::Black));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = Vec::new();
+    let mut last_section: Option<ModelSource> = None;
+
+    for (index, item) in app.model_picker_items.iter().enumerate() {
+        if last_section != Some(item.source) {
+            if last_section.is_some() {
+                lines.push(Line::from("").style(Style::default().bg(Color::Black)));
+            }
+
+            let (section_mark, section_name, section_style) = match item.source {
+                ModelSource::Onde => (
+                    "◉",
+                    "Onde Inference",
+                    Style::default()
+                        .fg(Color::Green)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ModelSource::HuggingFace => (
+                    "○",
+                    "Hugging Face cache",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ModelSource::Fallback => (
+                    "◎",
+                    "Fallback",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            };
+
+            lines.push(
+                Line::from(vec![
+                    Span::styled(format!("{section_mark} "), section_style),
+                    Span::styled(section_name, section_style),
+                ])
+                .style(Style::default().bg(Color::Black)),
+            );
+            last_section = Some(item.source);
+        }
+
+        let selected = index == app.model_picker_index;
+        let current = item.display_name == app.current_model_name;
+        let marker = if selected { "› " } else { "  " };
+        let tool_badge = if item.tool_calling {
+            "  ✓ tool calling"
+        } else {
+            ""
+        };
+        let health_badge = match item.cache_health {
+            ModelCacheHealth::Complete => "",
+            ModelCacheHealth::Incomplete => "  ! incomplete cache",
+        };
+        let current_badge = if current { "  ← current" } else { "" };
+        let disabled_badge = match item.cache_health {
+            ModelCacheHealth::Complete => "",
+            ModelCacheHealth::Incomplete => "  (unselectable)",
+        };
+        let brand_mark = match item.source {
+            ModelSource::Onde => "◉",
+            ModelSource::HuggingFace => "○",
+            ModelSource::Fallback => "◎",
+        };
+        let source = format!("  [{} {}]", brand_mark, item.source_label);
+
+        let base_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Green)
+        } else {
+            Style::default().fg(Color::White).bg(Color::Black)
+        };
+
+        let source_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Green)
+        } else {
+            match item.source {
+                ModelSource::Onde => Style::default().fg(Color::Green).bg(Color::Black),
+                ModelSource::HuggingFace => Style::default().fg(Color::Cyan).bg(Color::Black),
+                ModelSource::Fallback => Style::default().fg(Color::Yellow).bg(Color::Black),
+            }
+        };
+
+        let health_style = if selected {
+            Style::default().fg(Color::Red).bg(Color::Green)
+        } else {
+            Style::default().fg(Color::Red).bg(Color::Black)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{}  {}", item.display_name, item.description),
+                base_style,
+            ),
+            Span::styled(
+                tool_badge.to_string(),
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Green).bg(Color::Black)
+                },
+            ),
+            Span::styled(health_badge.to_string(), health_style),
+            Span::styled(
+                disabled_badge.to_string(),
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray).bg(Color::Black)
+                },
+            ),
+            Span::styled(
+                current_badge.to_string(),
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Cyan).bg(Color::Black)
+                },
+            ),
+            Span::styled(source, source_style),
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(Color::Black)),
+        inner,
+    );
 }
 
-const SIGIT_MODELS: &[ModelOption] = &[
-    ModelOption {
-        name: "Qwen 3 8B (Q4_K_M)",
-        description: "~5 GB",
-        tool_calling: true,
-        max_tokens: 4096,
-        config_fn: GgufModelConfig::qwen3_8b,
-    },
-    ModelOption {
-        name: "Qwen 3 4B (Q4_K_M)",
-        description: "~2.7 GB",
-        tool_calling: true,
-        max_tokens: 4096,
-        config_fn: GgufModelConfig::qwen3_4b,
-    },
-    ModelOption {
-        name: "Qwen 2.5 Coder 3B (Q4_K_M)",
-        description: "~1.93 GB",
-        tool_calling: false,
-        max_tokens: 512,
-        config_fn: GgufModelConfig::qwen25_coder_3b,
-    },
-    ModelOption {
-        name: "Qwen 2.5 Coder 1.5B (Q4_K_M)",
-        description: "~941 MB",
-        tool_calling: false,
-        max_tokens: 512,
-        config_fn: GgufModelConfig::qwen25_coder_1_5b,
-    },
-];
+fn centered_rect(
+    percent_x: u16,
+    percent_y: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(area);
+
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(vertical[1])[1]
+}
 
 // ── Slash commands ────────────────────────────────────────────────────────────
 
@@ -347,7 +556,7 @@ enum SlashCommand {
     Help,
     Clear,
     Status,
-    /// `/models` lists models. `/models N` switches to model N (1-based).
+    /// `/models` opens the model picker. `/models N` still works as a shortcut.
     Models(Option<usize>),
     Exit,
     Unknown(String),
@@ -402,6 +611,10 @@ fn render(frame: &mut Frame, app: &mut App) {
         render_messages(frame, app, zones[1]);
         render_input(frame, app, zones[2]);
         render_footer(frame, app, zones[3]);
+
+        if app.show_model_picker {
+            render_model_picker(frame, app, area);
+        }
     }
 }
 
@@ -670,10 +883,17 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let hints: &[(&str, &str)] = if app.is_busy() {
+    let hints: &[(&str, &str)] = if app.show_model_picker {
+        &[("↑↓", "select"), ("Enter", "load"), ("Esc", "close")]
+    } else if app.is_busy() {
         &[("Ctrl+C", "cancel")]
     } else {
-        &[("Enter", "send"), ("/help", "commands"), ("Ctrl+C", "quit")]
+        &[
+            ("Enter", "send"),
+            ("/help", "commands"),
+            ("/models", "models"),
+            ("Ctrl+C", "quit"),
+        ]
     };
 
     let mut spans: Vec<Span<'_>> = Vec::new();
@@ -705,6 +925,27 @@ fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<String> {
     if key.kind != KeyEventKind::Press {
         return None;
+    }
+
+    if app.show_model_picker {
+        match key.code {
+            KeyCode::Esc => {
+                app.close_model_picker();
+                return None;
+            }
+            KeyCode::Up => {
+                app.move_model_picker_up();
+                return None;
+            }
+            KeyCode::Down => {
+                app.move_model_picker_down();
+                return None;
+            }
+            KeyCode::Enter => {
+                return Some(format!("/models {}", app.model_picker_index + 1));
+            }
+            _ => return None,
+        }
     }
 
     match key.code {
@@ -776,7 +1017,7 @@ async fn exec_slash<B: ratatui::backend::Backend>(
         SlashCommand::Help => {
             app.messages.push(ChatMessage::system(
                 "/help      — show this message\n\
-                 /models    — list available models\n\
+                 /models    — open the model picker\n\
                  /models N  — switch to model N\n\
                  /clear     — wipe conversation history\n\
                  /status    — show engine status\n\
@@ -802,72 +1043,59 @@ async fn exec_slash<B: ratatui::backend::Backend>(
         }
         SlashCommand::Models(selection) => match selection {
             None => {
-                // Show the model list.
-                let info = engine.info().await;
-                let current = info.model_name.clone().unwrap_or_default();
-
-                let mut text = String::from("Available models — type /models <n> to switch:\n");
-                for (i, model) in SIGIT_MODELS.iter().enumerate() {
-                    let current_marker = if current == model.name {
-                        "  ← current"
-                    } else {
-                        ""
-                    };
-                    let tool_badge = if model.tool_calling {
-                        "  ✓ tool calling"
-                    } else {
-                        ""
-                    };
-                    text.push_str(&format!(
-                        "\n  {}  {}  {}{}{}",
-                        i + 1,
-                        model.name,
-                        model.description,
-                        tool_badge,
-                        current_marker,
-                    ));
-                }
-                app.messages.push(ChatMessage::system(text));
+                app.open_model_picker(engine);
             }
             Some(n) => {
                 let idx = n.saturating_sub(1);
-                match SIGIT_MODELS.get(idx) {
+                match app.model_picker_items.get(idx).cloned() {
                     None => {
                         app.messages.push(ChatMessage::system(format!(
                             "error: no model #{n} — type /models to see the list."
                         )));
                     }
                     Some(model) => {
-                        // Redraw first — "Loading…" has to be on screen before
-                        // we block for however long the load takes.
-                        app.messages
-                            .push(ChatMessage::system(format!("Loading {}…", model.name)));
+                        if model.cache_health == ModelCacheHealth::Incomplete {
+                            app.close_model_picker();
+                            app.messages.push(ChatMessage::system(format!(
+                                "error: {} has an incomplete local cache and cannot be selected yet.",
+                                model.display_name
+                            )));
+                            return;
+                        }
+
+                        app.close_model_picker();
+                        app.messages.push(ChatMessage::system(format!(
+                            "Loading {}…",
+                            model.display_name
+                        )));
                         terminal.draw(|frame| render(frame, app)).ok();
 
-                        engine.unload_model().await;
+                        let (tx, rx) = mpsc::channel(1);
+                        app.model_load_rx = Some(rx);
+                        app.switching_model = true;
 
-                        let config = (model.config_fn)();
                         let sampling = SamplingConfig {
                             max_tokens: Some(model.max_tokens),
                             ..SamplingConfig::default()
                         };
 
-                        match engine.load_gguf_model(config, None, Some(sampling)).await {
+                        // load_gguf_model unloads any existing model internally before
+                        // loading the new one.  Calling unload_model() explicitly first
+                        // would create a window where no model is loaded — if a message
+                        // arrived in that gap it would fail with NoModelLoaded.
+                        let update = match engine
+                            .load_gguf_model(model.config.clone(), None, Some(sampling))
+                            .await
+                        {
                             Ok(_) => {
                                 engine.clear_history().await;
                                 app.tool_calling = model.tool_calling;
-                                app.messages.push(ChatMessage::system(format!(
-                                    "✓ Switched to {}",
-                                    model.name
-                                )));
+                                ModelLoadUpdate::Loaded(model.display_name.clone())
                             }
-                            Err(err) => {
-                                app.messages.push(ChatMessage::system(format!(
-                                    "error loading {}: {err}",
-                                    model.name
-                                )));
-                            }
-                        }
+                            Err(err) => ModelLoadUpdate::Error(err.to_string()),
+                        };
+
+                        let _ = tx.send(update).await;
                     }
                 }
             }
@@ -1005,10 +1233,9 @@ pub async fn run_with<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     engine: Arc<ChatEngine>,
     load_rx: std_mpsc::Receiver<Result<(), String>>,
+    load_model_name: String,
 ) -> Result<()> {
-    let config = GgufModelConfig::qwen3_8b();
-    let model_name = config.display_name.clone();
-    event_loop(terminal, engine, load_rx, model_name).await
+    event_loop(terminal, engine, load_rx, load_model_name).await
 }
 
 async fn event_loop<B: ratatui::backend::Backend>(
@@ -1038,6 +1265,62 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
         // redraw every iteration
         terminal.draw(|frame| render(frame, &mut app))?;
+
+        if let Some(rx) = app.model_load_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(ModelLoadUpdate::Loaded(model_name)) => {
+                    app.switching_model = false;
+                    app.model_load_rx = None;
+                    app.current_model_name = model_name.clone();
+
+                    let save_result = app
+                        .model_picker_items
+                        .iter()
+                        .find(|item| item.display_name == model_name)
+                        .map(|item| crate::setup::SelectedModel {
+                            model_id: item.config.model_id.clone(),
+                            gguf_file: item
+                                .config
+                                .files
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(String::new),
+                        })
+                        .filter(|selected| !selected.gguf_file.is_empty())
+                        .map(|selected| crate::setup::save_selected_model(&selected))
+                        .unwrap_or_else(|| {
+                            Err(format!(
+                                "could not determine a stable identifier for {}",
+                                model_name
+                            ))
+                        });
+
+                    if let Err(error) = save_result {
+                        app.messages.push(ChatMessage::system(format!(
+                            "warning: switched to {} but could not save the selection: {}",
+                            model_name, error
+                        )));
+                    } else {
+                        app.messages
+                            .push(ChatMessage::system(format!("✓ Switched to {}", model_name)));
+                    }
+                }
+                Ok(ModelLoadUpdate::Error(error)) => {
+                    app.switching_model = false;
+                    app.model_load_rx = None;
+                    app.messages
+                        .push(ChatMessage::system(format!("error loading model: {error}")));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    app.switching_model = false;
+                    app.model_load_rx = None;
+                    app.messages.push(ChatMessage::system(
+                        "error loading model: loader task disconnected".to_string(),
+                    ));
+                }
+            }
+        }
 
         if app.quit {
             break;

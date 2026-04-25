@@ -42,6 +42,7 @@
 
 #[cfg(unix)]
 mod chat;
+mod models;
 mod setup;
 mod tools;
 
@@ -56,9 +57,11 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
     AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
     ContentChunk, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
     NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
-    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
@@ -205,6 +208,54 @@ fn agent_tools_as_onde() -> Vec<ToolDefinition> {
         .collect()
 }
 
+fn initialize_meta() -> Meta {
+    let startup_selection = setup::startup_model_selection();
+
+    let active_model_name = startup_selection
+        .as_ref()
+        .map(|selection| selection.display_name.clone())
+        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().display_name);
+
+    let active_model_id = startup_selection
+        .as_ref()
+        .and_then(|selection| selection.selected_model.as_ref())
+        .map(|selected| selected.model_id.clone())
+        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().model_id);
+
+    let active_model_file = startup_selection
+        .as_ref()
+        .and_then(|selection| selection.selected_model.as_ref())
+        .map(|selected| selected.gguf_file.clone())
+        .unwrap_or_else(|| {
+            GgufModelConfig::qwen3_4b()
+                .files
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        });
+
+    let mut model = serde_json::Map::new();
+    model.insert(
+        "display_name".to_string(),
+        serde_json::Value::String(active_model_name),
+    );
+    model.insert(
+        "model_id".to_string(),
+        serde_json::Value::String(active_model_id),
+    );
+    model.insert(
+        "gguf_file".to_string(),
+        serde_json::Value::String(active_model_file),
+    );
+
+    let mut sigit = serde_json::Map::new();
+    sigit.insert("active_model".to_string(), serde_json::Value::Object(model));
+
+    let mut meta = Meta::new();
+    meta.insert("sigit".to_string(), serde_json::Value::Object(sigit));
+    meta
+}
+
 // Agent
 
 struct SiGitAgent {
@@ -214,16 +265,377 @@ struct SiGitAgent {
     /// creation. Tool calls use this as `cwd` so file operations target the
     /// correct project, not wherever the agent process was spawned.
     session_cwd: std::sync::Mutex<Option<PathBuf>>,
+    /// The currently loaded model config, used for config_options reporting.
+    current_model: std::sync::Mutex<GgufModelConfig>,
 }
 
 impl SiGitAgent {
-    fn new(engine: Arc<ChatEngine>, notification_tx: mpsc::Sender<SessionNotification>) -> Self {
+    fn new(
+        engine: Arc<ChatEngine>,
+        notification_tx: mpsc::Sender<SessionNotification>,
+        initial_model: GgufModelConfig,
+    ) -> Self {
         Self {
             engine,
             notification_tx,
             session_cwd: std::sync::Mutex::new(None),
+            current_model: std::sync::Mutex::new(initial_model),
         }
     }
+
+    async fn send_assistant_message(&self, session_id: SessionId, text: impl Into<String>) {
+        let notification = SessionNotification::new(
+            session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+        );
+        if self.notification_tx.send(notification).await.is_err() {
+            log::warn!("notification channel closed");
+        }
+    }
+
+    async fn switch_model_by_id(
+        &self,
+        model_id: &str,
+    ) -> agent_client_protocol::Result<GgufModelConfig> {
+        let (new_config, max_tokens) = resolve_model_config(model_id).ok_or_else(|| {
+            agent_client_protocol::Error::new(
+                -32602,
+                format!("unknown or unavailable model: {model_id}"),
+            )
+        })?;
+
+        log::info!(
+            "switching model to {} (max_tokens={max_tokens})",
+            new_config.display_name
+        );
+
+        let sampling = SamplingConfig {
+            max_tokens: Some(max_tokens),
+            ..SamplingConfig::default()
+        };
+
+        // load_gguf_model calls block_in_place internally.  Calling it from
+        // inside the ACP LocalSet (spawn_local) panics with "can call blocking
+        // only when running on the multi-threaded runtime".  Fix: run the
+        // unload + load on a dedicated OS thread with its own runtime, then
+        // await the result over a oneshot channel — same pattern used at
+        // startup in run_acp_server.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let loader_engine = Arc::clone(&self.engine);
+        let loader_config = new_config.clone();
+        let loader_system_prompt = SYSTEM_PROMPT.to_string();
+        let loader_sampling = sampling;
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
+            let result = rt.block_on(async move {
+                // load_gguf_model unloads any existing model internally before
+                // loading the new one.  Calling unload_model() explicitly first
+                // would create a window where no model is loaded — if a prompt
+                // arrived in that gap it would fail with NoModelLoaded.
+                loader_engine
+                    .load_gguf_model(
+                        loader_config,
+                        Some(loader_system_prompt),
+                        Some(loader_sampling),
+                    )
+                    .await
+            });
+            let _ = result_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+        });
+
+        result_rx
+            .await
+            .map_err(|_| agent_client_protocol::Error::new(-32603, "model loader thread crashed"))?
+            .map_err(|error| {
+                log::error!("model switch failed: {error}");
+                agent_client_protocol::Error::new(-32603, format!("model switch failed: {error}"))
+            })?;
+
+        if let Some(item) = models::build_model_picker_items()
+            .iter()
+            .find(|item| item.config.model_id == new_config.model_id)
+            && let Err(err) = setup::save_selected_model(&setup::SelectedModel {
+                model_id: item.config.model_id.clone(),
+                gguf_file: item.config.files.first().cloned().unwrap_or_default(),
+            })
+        {
+            log::warn!("failed to persist model selection: {err}");
+        }
+
+        {
+            let mut guard = self.current_model.lock().unwrap();
+            *guard = new_config.clone();
+        }
+
+        if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
+            self.engine
+                .push_history(onde::inference::ChatMessage::system(format!(
+                    "The user's project working directory is {}. \
+                     Always use absolute paths under this directory for all file \
+                     and directory operations. This is the root of the project \
+                     the user has open in their editor.",
+                    cwd.display()
+                )))
+                .await;
+        }
+
+        Ok(new_config)
+    }
+}
+
+/// The config option ID used for the model selector in the Zed agent panel.
+const MODEL_CONFIG_ID: &str = "sigit-model";
+
+/// Build the `SessionConfigOption` list for model selection.
+fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
+    let items = models::build_model_picker_items();
+
+    let options: Vec<SessionConfigSelectOption> = items
+        .iter()
+        .filter(|item| item.cache_health == setup::ModelCacheHealth::Complete)
+        .map(|item| {
+            let description = if item.tool_calling {
+                format!("{} - tool calling", item.description)
+            } else {
+                item.description.clone()
+            };
+            let source_badge = match item.source_label.as_str() {
+                "Onde" => " [◉ Onde]",
+                "HuggingFace" => " [○ HuggingFace]",
+                _ => "",
+            };
+            let name = format!("{}{}", item.display_name, source_badge);
+            SessionConfigSelectOption::new(
+                SessionConfigValueId::new(item.config.model_id.as_str()),
+                name,
+            )
+            .description(description)
+        })
+        .collect();
+
+    if options.is_empty() {
+        return vec![];
+    }
+
+    let current_value = SessionConfigValueId::new(current_model.model_id.as_str());
+
+    vec![
+        SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
+            .category(SessionConfigOptionCategory::Model)
+            .description("Select the local LLM model for inference"),
+    ]
+}
+
+/// Look up the GgufModelConfig for a given model_id value from the picker items.
+fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64)> {
+    let items = models::build_model_picker_items();
+    items
+        .into_iter()
+        .find(|item| {
+            item.config.model_id == model_id
+                && item.cache_health == setup::ModelCacheHealth::Complete
+        })
+        .map(|item| (item.config, item.max_tokens))
+}
+
+#[derive(Debug, Clone)]
+enum SlashCommand {
+    Help,
+    Clear,
+    Status,
+    Models(Option<usize>),
+    Exit,
+    Unknown(String),
+}
+
+fn parse_slash(input: &str) -> Option<SlashCommand> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or("");
+    let argument = parts.next().map(str::trim);
+    Some(match command {
+        "/help" => SlashCommand::Help,
+        "/clear" => SlashCommand::Clear,
+        "/status" => SlashCommand::Status,
+        "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
+        "/exit" | "/quit" | "/q" => SlashCommand::Exit,
+        other => SlashCommand::Unknown(other.to_string()),
+    })
+}
+
+fn format_models_list(current_model: &GgufModelConfig) -> String {
+    let items = models::build_model_picker_items();
+    if items.is_empty() {
+        return "No local models found. siGit will use the platform default model.".to_string();
+    }
+
+    let mut lines = vec!["Available models:".to_string()];
+    let mut last_source: Option<&str> = None;
+
+    for (index, item) in items.iter().enumerate() {
+        let source_key = match item.source_label.as_str() {
+            "Onde" => "Onde",
+            "HuggingFace" => "HuggingFace",
+            _ => "Fallback",
+        };
+
+        if last_source != Some(source_key) {
+            if last_source.is_some() {
+                lines.push(String::new());
+            }
+            let section = match source_key {
+                "Onde" => "Onde Inference",
+                "HuggingFace" => "Hugging Face cache",
+                _ => "Fallback",
+            };
+            lines.push(section.to_string());
+            last_source = Some(source_key);
+        }
+
+        let number = index + 1;
+        let current_badge = if item.config.model_id == current_model.model_id {
+            "  <- current"
+        } else {
+            ""
+        };
+        let tool_badge = if item.tool_calling {
+            "  tool calling"
+        } else {
+            ""
+        };
+        let health_badge = match item.cache_health {
+            setup::ModelCacheHealth::Complete => "",
+            setup::ModelCacheHealth::Incomplete => "  ! incomplete cache",
+        };
+        let source = match source_key {
+            "Onde" => "  [Onde]",
+            "HuggingFace" => "  [HuggingFace]",
+            _ => "  [default]",
+        };
+
+        lines.push(format!(
+            "{number}. {}  {}{}{}{}{}",
+            item.display_name, item.description, tool_badge, health_badge, current_badge, source,
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("Use /models N to switch models.".to_string());
+    lines.join("\n")
+}
+
+async fn exec_slash_acp(
+    agent: &SiGitAgent,
+    session_id: SessionId,
+    command: SlashCommand,
+) -> agent_client_protocol::Result<PromptResponse> {
+    match command {
+        SlashCommand::Help => {
+            agent
+                .send_assistant_message(
+                    session_id,
+                    "/help      - show this message\n\
+                     /models    - list available models\n\
+                     /models N  - switch to model N\n\
+                     /clear     - wipe conversation history\n\
+                     /status    - show engine status\n\
+                     /exit      - end this turn",
+                )
+                .await;
+        }
+        SlashCommand::Clear => {
+            let cleared = agent.engine.clear_history().await;
+            agent
+                .send_assistant_message(
+                    session_id,
+                    format!("Cleared {cleared} turn(s). History is empty."),
+                )
+                .await;
+        }
+        SlashCommand::Status => {
+            let info = agent.engine.info().await;
+            let model = info.model_name.as_deref().unwrap_or("(none)");
+            let memory = info.approx_memory.as_deref().unwrap_or("unknown");
+            agent
+                .send_assistant_message(
+                    session_id,
+                    format!(
+                        "status: {:?}  model: {}  memory: {}  history: {} turns",
+                        info.status, model, memory, info.history_length,
+                    ),
+                )
+                .await;
+        }
+        SlashCommand::Models(None) => {
+            let current_model = agent.current_model.lock().unwrap().clone();
+            agent
+                .send_assistant_message(session_id, format_models_list(&current_model))
+                .await;
+        }
+        SlashCommand::Models(Some(number)) => {
+            let items = models::build_model_picker_items();
+            let index = number.saturating_sub(1);
+            match items.get(index).cloned() {
+                None => {
+                    agent
+                        .send_assistant_message(
+                            session_id,
+                            format!("error: no model #{number} - type /models to see the list."),
+                        )
+                        .await;
+                }
+                Some(model) => {
+                    if model.cache_health == setup::ModelCacheHealth::Incomplete {
+                        agent
+                            .send_assistant_message(
+                                session_id,
+                                format!(
+                                    "error: {} has an incomplete local cache and cannot be selected yet.",
+                                    model.display_name
+                                ),
+                            )
+                            .await;
+                    } else {
+                        agent
+                            .send_assistant_message(
+                                session_id.clone(),
+                                format!("Loading {}...", model.display_name),
+                            )
+                            .await;
+
+                        let switched = agent.switch_model_by_id(&model.config.model_id).await?;
+                        agent.engine.clear_history().await;
+
+                        agent
+                            .send_assistant_message(
+                                session_id,
+                                format!("Switched to {}.", switched.display_name),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        SlashCommand::Exit => {
+            agent
+                .send_assistant_message(
+                    session_id,
+                    "Use the panel controls to close or switch threads.",
+                )
+                .await;
+        }
+        SlashCommand::Unknown(command) => {
+            agent
+                .send_assistant_message(session_id, format!("unknown command: {command}"))
+                .await;
+        }
+    }
+
+    Ok(PromptResponse::new(StopReason::EndTurn))
 }
 
 #[async_trait::async_trait(?Send)]
@@ -248,7 +660,8 @@ impl Agent for SiGitAgent {
                     .session_capabilities(
                         SessionCapabilities::new().fork(SessionForkCapabilities::new()),
                     ),
-            ))
+            )
+            .meta(initialize_meta()))
     }
 
     async fn authenticate(
@@ -301,7 +714,12 @@ impl Agent for SiGitAgent {
             )))
             .await;
 
-        Ok(LoadSessionResponse::new())
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(LoadSessionResponse::new().config_options(config_options))
     }
 
     async fn fork_session(
@@ -344,7 +762,12 @@ impl Agent for SiGitAgent {
             )))
             .await;
 
-        Ok(ForkSessionResponse::new(new_id))
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(ForkSessionResponse::new(new_id).config_options(config_options))
     }
 
     async fn new_session(
@@ -384,7 +807,12 @@ impl Agent for SiGitAgent {
             )))
             .await;
 
-        Ok(NewSessionResponse::new(session_id))
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(NewSessionResponse::new(session_id).config_options(config_options))
     }
 
     async fn prompt(&self, args: PromptRequest) -> agent_client_protocol::Result<PromptResponse> {
@@ -534,6 +962,10 @@ impl Agent for SiGitAgent {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
+        if let Some(command) = parse_slash(&user_text) {
+            return exec_slash_acp(self, session_id, command).await;
+        }
+
         log::info!(
             "prompt({}): \"{}\"",
             session_id,
@@ -644,6 +1076,35 @@ impl Agent for SiGitAgent {
         log::info!("cancel requested for session {}", args.session_id);
         Ok(())
     }
+
+    async fn set_session_config_option(
+        &self,
+        args: SetSessionConfigOptionRequest,
+    ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
+        log::info!(
+            "set_session_config_option: config_id={}, value={:?}",
+            args.config_id,
+            args.value
+        );
+
+        if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!("unknown config option: {}", args.config_id.0),
+            ));
+        }
+
+        let model_id = args.value.0.as_ref();
+        let _new_config = self.switch_model_by_id(model_id).await?;
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        log::info!("model switch complete");
+        Ok(SetSessionConfigOptionResponse::new(config_options))
+    }
 }
 
 // ── Output capture ────────────────────────────────────────────────────────────
@@ -731,7 +1192,35 @@ fn init_logging(is_tty: bool) {
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::qwen3_8b();
+
+    let startup_selection = setup::startup_model_selection();
+    let startup_model_name = startup_selection
+        .as_ref()
+        .map(|selection| selection.display_name.clone())
+        .unwrap_or_else(|| GgufModelConfig::platform_default().display_name);
+
+    let config = startup_selection
+        .as_ref()
+        .and_then(|selection| {
+            models::build_model_picker_items()
+                .into_iter()
+                .find(|item| {
+                    selection
+                        .selected_model
+                        .as_ref()
+                        .map(|selected| {
+                            item.config.model_id == selected.model_id
+                                && item
+                                    .config
+                                    .files
+                                    .iter()
+                                    .any(|file| file == &selected.gguf_file)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|item| item.config)
+        })
+        .unwrap_or_else(GgufModelConfig::platform_default);
     let sampling = SamplingConfig {
         max_tokens: Some(8192),
         ..SamplingConfig::default()
@@ -759,7 +1248,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 
     // The TUI runs here on the main tokio runtime.  It polls load_rx via
     // try_recv() on every tick — non-blocking, zero contention.
-    let chat_result = chat::run_with(&mut terminal, engine, load_rx).await;
+    let chat_result = chat::run_with(&mut terminal, engine, load_rx, startup_model_name).await;
 
     // Restore the terminal before exiting.
     // Use the separate cleanup fd — the backend's writer is private.
@@ -790,12 +1279,47 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("loading model (this may take a minute on first run)...");
 
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::qwen3_8b();
+
+    let startup_selection = setup::startup_model_selection();
+    let config = startup_selection
+        .as_ref()
+        .and_then(|selection| {
+            models::build_model_picker_items()
+                .into_iter()
+                .find(|item| {
+                    selection
+                        .selected_model
+                        .as_ref()
+                        .map(|selected| {
+                            item.config.model_id == selected.model_id
+                                && item
+                                    .config
+                                    .files
+                                    .iter()
+                                    .any(|file| file == &selected.gguf_file)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|item| item.config)
+        })
+        .unwrap_or_else(GgufModelConfig::qwen3_4b);
+
+    let max_tokens = if config.display_name == "Qwen 3 4B (Q4_K_M)"
+        || config.display_name == "Qwen 3 8B (Q4_K_M)"
+    {
+        4096
+    } else {
+        512
+    };
+
     let sampling = SamplingConfig {
-        max_tokens: Some(8192),
+        max_tokens: Some(max_tokens),
         ..SamplingConfig::default()
     };
 
+    log::info!("ACP startup model: {}", config.display_name);
+
+    let startup_config = config.clone();
     engine
         .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
         .await
@@ -804,7 +1328,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("model loaded and ready");
 
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
-    let agent = SiGitAgent::new(engine, notification_tx);
+    let agent = SiGitAgent::new(engine, notification_tx, startup_config);
 
     // AgentSideConnection wants futures-io, not tokio-io.
     let stdin = tokio::io::stdin().compat();

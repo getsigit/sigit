@@ -24,8 +24,9 @@ The right binary for your platform gets pulled in automatically. Works on macOS 
 
 | Method | Command |
 |---|---|
-| **Homebrew** | `brew install getsigit/homebrew-tap/sigit` |
-| **pip** | `pip install sigit` |
+| **Homebrew** | `brew tap getsigit/tap && brew install sigit` |
+| **pip** | `pip install sigit-code` |
+| **uv** | `uvx --from sigit-code sigit` |
 | **Cargo** | `cargo install sigit` |
 
 ---
