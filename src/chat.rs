@@ -459,7 +459,12 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
             ModelCacheHealth::Complete => "",
             ModelCacheHealth::Incomplete => "  (unselectable)",
         };
-        let source = format!("  [{} {}]", item.brand_mark, item.source_label);
+        let brand_mark = match item.source {
+            ModelSource::Onde => "◉",
+            ModelSource::HuggingFace => "○",
+            ModelSource::Fallback => "◎",
+        };
+        let source = format!("  [{} {}]", brand_mark, item.source_label);
 
         let base_style = if selected {
             Style::default().fg(Color::Black).bg(Color::Green)

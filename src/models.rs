@@ -27,7 +27,7 @@ pub(crate) struct ModelPickerItem {
     pub(crate) max_tokens: u64,
     pub(crate) config: GgufModelConfig,
     pub(crate) source_label: String,
-    pub(crate) brand_mark: &'static str,
+
     pub(crate) source: ModelSource,
     pub(crate) cache_health: ModelCacheHealth,
 }
@@ -66,7 +66,7 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
             max_tokens,
             config,
             source_label: "Platform default".to_string(),
-            brand_mark: "◎",
+
             source: ModelSource::Fallback,
             cache_health: ModelCacheHealth::Complete,
         });
@@ -111,7 +111,7 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
         max_tokens,
         config,
         source_label,
-        brand_mark: if model.from_app_group { "◉" } else { "○" },
+
         source: if model.from_app_group {
             ModelSource::Onde
         } else {
