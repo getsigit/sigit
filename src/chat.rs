@@ -165,6 +165,10 @@ struct App {
     /// Tool-calling flag for the model currently being loaded in the background.
     /// Applied to `app.tool_calling` when `ModelLoadUpdate::Loaded` arrives.
     pending_tool_calling: Option<bool>,
+    /// Set to true when the user cancels a model switch with Ctrl+C.
+    /// Suppresses the "loader task disconnected" error message that would
+    /// otherwise appear when we drop model_load_rx to abort the switch.
+    model_load_cancelled: bool,
 
     // ── Loading-phase state ───────────────────────────────────────────────────
     /// True while the model is still loading; switches to false on completion.
@@ -186,6 +190,15 @@ struct App {
     current_model_name: String,
     /// Whether the currently loaded model supports tool calling.
     tool_calling: bool,
+
+    // ── Model-switch download progress ────────────────────────────────────────
+    /// The model_id of the model currently being downloaded/switched to.
+    /// `None` when no switch is in progress.
+    switching_model_id: Option<String>,
+    /// Bytes on disk / expected bytes for the in-progress download.
+    /// Updated every 100 ms tick while `switching_model` is true and the
+    /// selected model was not yet cached.
+    download_progress: Option<(u64, u64)>,
 }
 
 const BANNER_ART: &str = "\
@@ -230,6 +243,9 @@ impl App {
             blink_counter: 0,
             switching_model: false,
             pending_tool_calling: None,
+            model_load_cancelled: false,
+            switching_model_id: None,
+            download_progress: None,
             is_loading: true,
             load_tick: 0,
             load_error: None,
@@ -295,6 +311,26 @@ impl App {
     /// Advance the spinner tick counter.
     fn tick(&mut self) {
         self.load_tick = self.load_tick.wrapping_add(1);
+    }
+
+    /// Poll the HF cache directory for the model being switched to and update
+    /// `download_progress`.  Called on every 100 ms tick while switching.
+    fn poll_download_progress(&mut self) {
+        let Some(ref model_id) = self.switching_model_id else {
+            return;
+        };
+        let cache_path = onde::hf_cache::model_cache_path(model_id);
+        let downloaded = cache_path
+            .as_ref()
+            .filter(|p| p.exists())
+            .map(|p| dir_size_recursive(p))
+            .unwrap_or(0);
+        let expected = onde::inference::models::SUPPORTED_MODEL_INFO
+            .iter()
+            .find(|m| m.id == model_id.as_str())
+            .map(|m| m.expected_size_bytes)
+            .unwrap_or(0);
+        self.download_progress = Some((downloaded, expected));
     }
 
     /// Transition from loading phase to normal chat.
@@ -824,9 +860,32 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         lines.push(Line::from(spans));
     }
 
-    // switching-model indicator (animated spinner)
+    // switching-model indicator (animated spinner + optional download progress)
     if app.switching_model {
         let frame_char = app.switching_frame();
+
+        let status_text = match app.download_progress {
+            Some((downloaded, expected)) if expected > 0 => {
+                let pct = ((downloaded as f64 / expected as f64) * 100.0).min(99.0) as u8;
+                let bar_width: usize = 16;
+                let filled = (pct as usize * bar_width) / 100;
+                let empty = bar_width.saturating_sub(filled);
+                let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(empty));
+                format!(
+                    "{frame_char} downloading… {bar} {pct}%  ({} / {})",
+                    format_size_human(downloaded),
+                    format_size_human(expected),
+                )
+            }
+            Some((downloaded, 0)) if downloaded > 0 => {
+                format!(
+                    "{frame_char} downloading… {} received",
+                    format_size_human(downloaded)
+                )
+            }
+            _ => format!("{frame_char} loading model…"),
+        };
+
         lines.push(Line::from(vec![
             Span::styled(
                 "siGit > ",
@@ -835,7 +894,7 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{frame_char} loading model…"),
+                status_text,
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
             ),
         ]));
@@ -1180,32 +1239,48 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                         let (tx, rx) = mpsc::channel(1);
                         app.model_load_rx = Some(rx);
                         app.switching_model = true;
+                        app.switching_model_id = Some(model.config.model_id.clone());
+                        // Only show download progress for models not yet cached.
+                        app.download_progress =
+                            if model.cache_health == ModelCacheHealth::NotDownloaded {
+                                Some((0, 0))
+                            } else {
+                                None
+                            };
 
                         let sampling = SamplingConfig {
                             max_tokens: Some(model.max_tokens),
                             ..SamplingConfig::default()
                         };
 
-                        // Spawn onto a background task so the event loop keeps
-                        // running (and the spinner keeps animating) during the
-                        // download + load — which can take several minutes for
-                        // a large model fetched from HuggingFace for the first time.
+                        // Use a dedicated OS thread with its own tokio Runtime
+                        // so that load_gguf_model's internal block_in_place
+                        // cannot steal the main runtime's worker threads and
+                        // freeze the TUI draw loop.  This mirrors the pattern
+                        // used at startup in run_interactive / run_acp_server.
                         let system_prompt = crate::system_prompt_for_model(model.tool_calling);
                         let engine_handle = Arc::clone(&engine);
                         let tool_calling = model.tool_calling;
-                        tokio::spawn(async move {
-                            let update = match engine_handle
-                                .load_gguf_model(
-                                    model.config.clone(),
-                                    Some(system_prompt.to_string()),
-                                    Some(sampling),
-                                )
-                                .await
-                            {
-                                Ok(_) => ModelLoadUpdate::Loaded(model.display_name.clone()),
-                                Err(err) => ModelLoadUpdate::Error(err.to_string()),
-                            };
-                            let _ = tx.send(update).await;
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new()
+                                .expect("failed to create model-loader runtime");
+                            let update = rt.block_on(async move {
+                                match engine_handle
+                                    .load_gguf_model(
+                                        model.config.clone(),
+                                        Some(system_prompt.to_string()),
+                                        Some(sampling),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => ModelLoadUpdate::Loaded(model.display_name.clone()),
+                                    Err(err) => ModelLoadUpdate::Error(err.to_string()),
+                                }
+                            });
+                            // blocking_send is fine here — the channel has
+                            // capacity 1 and the receiver is always alive while
+                            // switching_model is true.
+                            let _ = tx.blocking_send(update);
                         });
                         // tool_calling is applied when ModelLoadUpdate::Loaded
                         // arrives in the event loop (see model_load_rx handler).
@@ -1388,6 +1463,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         app.tool_calling = tc;
                     }
                     app.switching_model = false;
+                    app.switching_model_id = None;
+                    app.download_progress = None;
+                    app.model_load_cancelled = false;
                     app.model_load_rx = None;
                     app.current_model_name = model_name.clone();
 
@@ -1425,17 +1503,26 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 }
                 Ok(ModelLoadUpdate::Error(error)) => {
                     app.switching_model = false;
+                    app.switching_model_id = None;
+                    app.download_progress = None;
+                    app.model_load_cancelled = false;
                     app.model_load_rx = None;
                     app.messages
                         .push(ChatMessage::system(format!("error loading model: {error}")));
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    let was_cancelled = app.model_load_cancelled;
                     app.switching_model = false;
+                    app.switching_model_id = None;
+                    app.download_progress = None;
+                    app.model_load_cancelled = false;
                     app.model_load_rx = None;
-                    app.messages.push(ChatMessage::system(
-                        "error loading model: loader task disconnected".to_string(),
-                    ));
+                    if !was_cancelled {
+                        app.messages.push(ChatMessage::system(
+                            "error loading model: loader task disconnected".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -1513,6 +1600,11 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 }
             } => {
                 app.tick_thinking();
+                // Refresh download-progress bytes from the HF cache dir so
+                // the progress bar in render_messages stays current.
+                if app.switching_model {
+                    app.poll_download_progress();
+                }
             }
 
             // ── Terminal events ───────────────────────────────────────────
@@ -1551,6 +1643,18 @@ async fn event_loop<B: ratatui::backend::Backend>(
                                     app.stop_thinking();
                                     app.messages.push(ChatMessage::system("(cancelled)"));
                                 }
+                                if app.switching_model {
+                                    // Mark as cancelled before dropping the
+                                    // receiver so the Disconnected arm in the
+                                    // model_load_rx handler stays silent.
+                                    app.model_load_cancelled = true;
+                                    app.switching_model = false;
+                                    app.switching_model_id = None;
+                                    app.download_progress = None;
+                                    app.model_load_rx = None;
+                                    app.messages
+                                        .push(ChatMessage::system("(download cancelled — model switch aborted)"));
+                                }
                             }
                         }
                         continue;
@@ -1582,6 +1686,42 @@ async fn event_loop<B: ratatui::backend::Backend>(
     }
 
     Ok(())
+}
+
+// ── Download progress helpers (TUI) ──────────────────────────────────────────
+
+/// Recursively sum the on-disk size of all files under `path`, following
+/// symlinks so hf-hub's blob layout is counted correctly.
+fn dir_size_recursive(path: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            total += dir_size_recursive(&entry_path);
+        } else if let Ok(meta) = entry_path.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Format a byte count as a terse human-readable string.
+fn format_size_human(bytes: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1_024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 #[cfg(test)]

@@ -646,6 +646,7 @@ async fn exec_slash_acp(
 
                         match agent.switch_model_by_id(&model.config.model_id).await {
                             Ok(new_config) => {
+                                agent.engine.clear_history().await;
                                 agent
                                     .send_assistant_message(
                                         session_id,
@@ -1211,7 +1212,7 @@ impl Agent for SiGitAgent {
             let poller_model_id = model_id_owned.clone();
             let poller_stop = Arc::clone(&stop_flag);
 
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(4));
                 interval.tick().await; // consume the immediate first tick
@@ -1281,7 +1282,7 @@ impl Agent for SiGitAgent {
             let spinner_stop = Arc::clone(&stop_flag);
             let load_start = std::time::Instant::now();
 
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                 let mut tick: usize = 0;
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
