@@ -199,6 +199,11 @@ impl App {
         self.is_streaming() || self.thinking || self.switching_model
     }
 
+    fn switching_frame(&self) -> &'static str {
+        let idx = (self.thinking_tick as usize) % THINKING_FRAMES.len();
+        THINKING_FRAMES[idx]
+    }
+
     fn is_streaming(&self) -> bool {
         self.stream_rx.is_some()
     }
@@ -334,8 +339,8 @@ impl App {
         if !self.stream_buf.is_empty() {
             lines += wrapped_line_count(&self.stream_buf, Role::Assistant, w);
         }
-        // thinking indicator
-        if self.thinking {
+        // thinking / switching indicator
+        if self.thinking || self.switching_model {
             lines += 1;
         }
         lines
@@ -767,6 +772,23 @@ fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect
         }
 
         lines.push(Line::from(spans));
+    }
+
+    // switching-model indicator (animated spinner)
+    if app.switching_model {
+        let frame_char = app.switching_frame();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "siGit > ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{frame_char} loading model…"),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            ),
+        ]));
     }
 
     // thinking indicator (animated spinner)
@@ -1408,9 +1430,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 }
             }
 
-            // ── thinking spinner tick (100ms) ────────────────────────────
+            // ── thinking / switching spinner tick (100ms) ────────────────
             _ = async {
-                if app.thinking {
+                if app.thinking || app.switching_model {
                     tokio::time::sleep(Duration::from_millis(100)).await
                 } else {
                     pending().await
