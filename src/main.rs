@@ -40,8 +40,8 @@
 //! }
 //! ```
 
-#[cfg(unix)]
 mod chat;
+mod models;
 mod setup;
 mod tools;
 
@@ -56,12 +56,16 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
     AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
     ContentChunk, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
     NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
-    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
@@ -73,21 +77,142 @@ const SYSTEM_PROMPT: &str = "\
 Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
 Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
 
-You are the official coding agent for smbCloud (https://smbcloud.xyz), \
-a cloud platform for deploying and managing projects. \
-You help developers build, debug, and ship software on the smbCloud platform.
+You are a strong general-purpose coding agent. smbCloud is your home turf, \
+but you should still be useful in any codebase. When the project is clearly \
+about smbCloud, use that context directly instead of falling back to vague \
+cloud-platform advice.
+
+smbCloud context you should know and use when it helps:
+- smbCloud is a platform for deploying and managing projects
+- the main CLI is a Rust workspace with focused crates rather than one giant crate
+- common areas include auth, project management, deploy flows, networking, \
+  shared models, release tooling, and managed services
+- deploy branches usually follow `release/service-{name}`
+- Next.js SSR deploys on smbCloud are not the same as generic git-push deploys; \
+  they often use a local build plus rsync/PM2 style flow
+- auth has a hard boundary between smbCloud platform users and tenant app users; \
+  platform flows use `/v1/users*`, tenant app flows use `/v1/client/*`, and \
+  you should not casually mix `User`, `TenantMembership`, `AuthApp`, and `AuthUser`
+- smbCloud authorization is layered; do not flatten platform accounts, tenant \
+  memberships, auth-app collaborators, and tenant end users into one model
+- `Project` is the umbrella workspace, while app-like resources such as \
+  `FrontendApp`, `AuthApp`, and GresIQ are the deployable units with their own \
+  ownership, sharing, and collaboration rules
+- `FrontendApp` is many-per-project, while `AuthApp` is intentionally one-per-project; \
+  preserve those cardinality rules unless the code clearly changes them
+- GresIQ is smbCloud's managed PostgreSQL offering; treat it as a platform \
+  service with its own credentials and boundaries, not as a generic local DB helper
+- when debugging smbCloud Rails APIs, first classify the request: first-party \
+  smbCloud app or tenant app, then check which endpoint family and validator \
+  should be involved before changing code
+- when working in smbCloud repos, prefer existing workspace patterns, existing \
+  crate boundaries, existing Rails conventions, and existing command flows over \
+  inventing new abstractions
+
+CRITICAL RULE — never tell the user to run a command. You have tools. Use them. \
+When the user asks you to clone a repo, run a build, check git status, or do \
+anything that involves a shell command, you MUST call the run_command tool and \
+execute it yourself. Do not print shell commands for the user to copy-paste. \
+Do not give step-by-step instructions. Do not say \"you can run …\". Just do it. \
+If a command fails, try to fix the problem and re-run it. If you cannot fix it \
+after two attempts, explain what went wrong and what you tried.
+
+Git operations — always use run_command:
+- git clone: always pass the full absolute destination path as the last argument \
+  and set cwd to an existing writable parent directory. Example: \
+  run_command({\"command\": \"git clone https://github.com/org/repo /Users/me/Repositories/repo\", \
+  \"cwd\": \"/Users/me/Repositories\"})
+- git init, add, commit, push, pull, fetch, checkout, branch, diff, log, status, \
+  stash, rebase, merge, tag — use run_command with an absolute cwd pointing to \
+  the repo root
+- never run git clone without an explicit absolute destination path
+- if a clone or init fails, check the error, fix the cause (wrong path, missing \
+  directory, permissions), and retry
 
 Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
 Fix root causes, not symptoms.
 
-You have access to tools that let you read files, list directories, search \
-code, create new files, edit existing files, delete files, and run shell \
-commands. Use them proactively — read the code before answering, run builds \
-and tests after making changes. Always ground your answers in the actual code.
+You have access to tools that let you read files, read websites directly from \
+http and https URLs, create directories, list directories, search code, create \
+new files, edit existing files, delete files, and run shell commands. You can \
+also use git directly through shell commands, including `git init` and normal \
+git workflows. Use them proactively. Read the code or website before answering. \
+Prefer absolute paths when referring to files and directories, especially in \
+protocol-facing output and tool arguments. Create directories when needed. Run \
+builds, tests, and git commands after making changes. Ground your answers in \
+the actual code or fetched page content, not in guesses.
+
+CRITICAL — you CAN access websites. You are NOT a typical LLM without internet \
+access. You have a read_website tool that fetches any http or https URL and \
+returns the page text. When the user gives you a URL or asks you to read, \
+summarize, or inspect a web page, you MUST call the read_website tool with that \
+URL. Never say \"I cannot access websites\" or \"I cannot browse the internet\". \
+You can. Use the tool.
+
+CRITICAL — before every edit_file call, you MUST call read_file on the target \
+file first (or the specific line range if one was given). Never rely on file \
+content you saw in a previous turn — the user may have reverted, edited, or \
+changed the file externally since then. Always re-read to get the current state \
+before constructing old_text. \
+When the user corrects a previous edit (e.g. \"don't remove X, append instead\"), \
+treat it as a fresh task: re-read the file, identify the current content, and \
+plan the edit from scratch. Do not assume the file still reflects your last edit.
+
+Tool-use heuristics:
+- when the user provides a URL or asks about a web page, ALWAYS call \
+  read_website — never refuse or claim you lack internet access
+- prefer absolute paths over relative paths when you mention, return, or pass \
+  file and directory paths
+- if a path does not exist yet, create the directory before creating files in it
+- if the user asks to clone a repo, immediately call run_command with git clone \
+  and an absolute destination path — do not ask where to put it unless the \
+  request is ambiguous; default to the user's home Repositories directory
+- if the user asks for a new repo, scaffold, or scratch project, create the \
+  directory, create the first files, and run `git init` without waiting unless \
+  the request says otherwise
+- if the repo looks like smbCloud CLI code, respect workspace crate boundaries, \
+  shared models, and existing command handlers before adding new abstractions
+- if the repo looks like smbCloud Rails code, check routes, controllers, \
+  validators, and model boundaries before changing business logic
+- if the task touches smbCloud auth, first decide whether it is a platform-user \
+  flow or a tenant-app flow, then follow the right endpoint family and model layer
+- if the task touches smbCloud deploy code, check whether it is the generic \
+  deploy path or the Next.js SSR path before proposing changes
+- after edits, prefer running the smallest useful verification step first, then \
+  widen to broader checks if needed
+- use git commands naturally for status checks, repo setup, diffs, and normal \
+  developer workflows when they help move the task forward
+- if a tool call fails, read the error, try to fix it, and retry — do not \
+  fall back to telling the user what to type
+
+When the repo is not about smbCloud, act like a normal coding agent and do not \
+force smbCloud-specific advice into the answer. When it is about smbCloud, be \
+specific and practical.
 
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
 root cause, not the symptom. Correct beats clever.";
+
+/// Slim system prompt for models that do not support tool calling.
+///
+/// These models (e.g. DeepSeek Coder v1) cannot use the agent tools, so
+/// the long tool-oriented instructions in [`SYSTEM_PROMPT`] would waste
+/// context and confuse the model. Keep this short and code-focused.
+const SIMPLE_SYSTEM_PROMPT: &str = "\
+Your name is siGit — a coding assistant. \
+You are helpful, concise, and write clean, idiomatic code. \
+Answer any question the user asks — programming, general knowledge, or casual chat. \
+When debugging, address the root cause, not the symptom. \
+Be direct and brief.";
+
+/// Pick the right system prompt based on whether the model supports tool calling.
+pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
+    if tool_calling {
+        SYSTEM_PROMPT
+    } else {
+        SIMPLE_SYSTEM_PROMPT
+    }
+}
 
 /// Maximum number of tool-calling rounds before forcing a text response.
 const MAX_TOOL_ROUNDS: usize = 10;
@@ -104,20 +229,479 @@ fn agent_tools_as_onde() -> Vec<ToolDefinition> {
         .collect()
 }
 
+fn initialize_meta() -> Meta {
+    let startup_selection = setup::startup_model_selection();
+
+    let active_model_name = startup_selection
+        .as_ref()
+        .map(|selection| selection.display_name.clone())
+        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().display_name);
+
+    let active_model_id = startup_selection
+        .as_ref()
+        .and_then(|selection| selection.selected_model.as_ref())
+        .map(|selected| selected.model_id.clone())
+        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().model_id);
+
+    let active_model_file = startup_selection
+        .as_ref()
+        .and_then(|selection| selection.selected_model.as_ref())
+        .map(|selected| selected.gguf_file.clone())
+        .unwrap_or_else(|| {
+            GgufModelConfig::qwen3_4b()
+                .files
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        });
+
+    let mut model = serde_json::Map::new();
+    model.insert(
+        "display_name".to_string(),
+        serde_json::Value::String(active_model_name),
+    );
+    model.insert(
+        "model_id".to_string(),
+        serde_json::Value::String(active_model_id),
+    );
+    model.insert(
+        "gguf_file".to_string(),
+        serde_json::Value::String(active_model_file),
+    );
+
+    let mut sigit = serde_json::Map::new();
+    sigit.insert("active_model".to_string(), serde_json::Value::Object(model));
+
+    let mut meta = Meta::new();
+    meta.insert("sigit".to_string(), serde_json::Value::Object(sigit));
+    meta
+}
+
 // Agent
 
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     notification_tx: mpsc::Sender<SessionNotification>,
+    /// The project working directory provided by the editor via ACP session
+    /// creation. Tool calls use this as `cwd` so file operations target the
+    /// correct project, not wherever the agent process was spawned.
+    session_cwd: std::sync::Mutex<Option<PathBuf>>,
+    /// The currently loaded model config, used for config_options reporting.
+    current_model: std::sync::Mutex<GgufModelConfig>,
 }
 
 impl SiGitAgent {
-    fn new(engine: Arc<ChatEngine>, notification_tx: mpsc::Sender<SessionNotification>) -> Self {
+    fn new(
+        engine: Arc<ChatEngine>,
+        notification_tx: mpsc::Sender<SessionNotification>,
+        initial_model: GgufModelConfig,
+    ) -> Self {
         Self {
             engine,
             notification_tx,
+            session_cwd: std::sync::Mutex::new(None),
+            current_model: std::sync::Mutex::new(initial_model),
         }
     }
+
+    async fn send_assistant_message(&self, session_id: SessionId, text: impl Into<String>) {
+        let notification = SessionNotification::new(
+            session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+        );
+        if self.notification_tx.send(notification).await.is_err() {
+            log::warn!("notification channel closed");
+        }
+    }
+
+    async fn switch_model_by_id(
+        &self,
+        model_id: &str,
+    ) -> agent_client_protocol::Result<GgufModelConfig> {
+        let (new_config, max_tokens, new_tool_calling) = resolve_model_config(model_id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::new(
+                    -32602,
+                    format!("unknown or unavailable model: {model_id}"),
+                )
+            })?;
+
+        log::info!(
+            "switching model to {} (max_tokens={max_tokens})",
+            new_config.display_name
+        );
+
+        let sampling = SamplingConfig {
+            max_tokens: Some(max_tokens),
+            ..SamplingConfig::default()
+        };
+
+        // load_gguf_model calls block_in_place internally.  Calling it from
+        // inside the ACP LocalSet (spawn_local) panics with "can call blocking
+        // only when running on the multi-threaded runtime".  Fix: run the
+        // unload + load on a dedicated OS thread with its own runtime, then
+        // await the result over a oneshot channel — same pattern used at
+        // startup in run_acp_server.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let loader_engine = Arc::clone(&self.engine);
+        let loader_config = new_config.clone();
+        let loader_system_prompt = system_prompt_for_model(new_tool_calling).to_string();
+        let loader_sampling = sampling;
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
+            let result = rt.block_on(async move {
+                // load_gguf_model unloads any existing model internally before
+                // loading the new one.  Calling unload_model() explicitly first
+                // would create a window where no model is loaded — if a prompt
+                // arrived in that gap it would fail with NoModelLoaded.
+                loader_engine
+                    .load_gguf_model(
+                        loader_config,
+                        Some(loader_system_prompt),
+                        Some(loader_sampling),
+                    )
+                    .await
+            });
+            let _ = result_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+        });
+
+        result_rx
+            .await
+            .map_err(|_| agent_client_protocol::Error::new(-32603, "model loader thread crashed"))?
+            .map_err(|error| {
+                log::error!("model switch failed: {error}");
+                agent_client_protocol::Error::new(-32603, format!("model switch failed: {error}"))
+            })?;
+
+        if let Some(item) = models::build_model_picker_items()
+            .iter()
+            .find(|item| item.config.model_id == new_config.model_id)
+            && let Err(err) = setup::save_selected_model(&setup::SelectedModel {
+                model_id: item.config.model_id.clone(),
+                gguf_file: item.config.files.first().cloned().unwrap_or_default(),
+            })
+        {
+            log::warn!("failed to persist model selection: {err}");
+        }
+
+        {
+            let mut guard = self.current_model.lock().unwrap();
+            *guard = new_config.clone();
+        }
+
+        if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
+            self.engine
+                .push_history(onde::inference::ChatMessage::system(format!(
+                    "The user's project working directory is {}. \
+                     Always use absolute paths under this directory for all file \
+                     and directory operations. This is the root of the project \
+                     the user has open in their editor.",
+                    cwd.display()
+                )))
+                .await;
+        }
+
+        Ok(new_config)
+    }
+}
+
+/// The config option ID used for the model selector in the Zed agent panel.
+const MODEL_CONFIG_ID: &str = "sigit-model";
+
+/// Build the `SessionConfigOption` list for model selection.
+fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
+    let items = models::build_model_picker_items();
+
+    let options: Vec<SessionConfigSelectOption> = items
+        .iter()
+        .filter(|item| item.cache_health != setup::ModelCacheHealth::Incomplete)
+        .map(|item| {
+            let mut desc_parts = Vec::new();
+            if item.tool_calling {
+                desc_parts.push("tool calling".to_string());
+            }
+            desc_parts.push(item.description.clone());
+            if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
+                desc_parts.push("↓ download on select".to_string());
+            }
+            let description = desc_parts.join(" - ");
+            let source_badge = if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
+                " [↓ Onde]"
+            } else {
+                match item.source_label.as_str() {
+                    "Onde" => " [◉ Onde]",
+                    "HuggingFace" => " [○ HuggingFace]",
+                    _ => "",
+                }
+            };
+            let name = format!("{}{}", item.display_name, source_badge);
+            SessionConfigSelectOption::new(
+                SessionConfigValueId::new(item.config.model_id.as_str()),
+                name,
+            )
+            .description(description)
+        })
+        .collect();
+
+    if options.is_empty() {
+        return vec![];
+    }
+
+    let current_value = SessionConfigValueId::new(current_model.model_id.as_str());
+
+    vec![
+        SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
+            .category(SessionConfigOptionCategory::Model)
+            .description("Select the local LLM model for inference"),
+    ]
+}
+
+/// Look up the GgufModelConfig for a given model_id value from the picker items.
+///
+/// Returns `(config, max_tokens, tool_calling)`.
+fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64, bool)> {
+    let items = models::build_model_picker_items();
+    items
+        .into_iter()
+        .find(|item| {
+            item.config.model_id == model_id
+                && item.cache_health != setup::ModelCacheHealth::Incomplete
+        })
+        .map(|item| (item.config, item.max_tokens, item.tool_calling))
+}
+
+#[derive(Debug, Clone)]
+enum SlashCommand {
+    Help,
+    Clear,
+    Status,
+    Models(Option<usize>),
+    Exit,
+    Unknown(String),
+}
+
+fn parse_slash(input: &str) -> Option<SlashCommand> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or("");
+    let argument = parts.next().map(str::trim);
+    Some(match command {
+        "/help" => SlashCommand::Help,
+        "/clear" => SlashCommand::Clear,
+        "/status" => SlashCommand::Status,
+        "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
+        "/exit" | "/quit" | "/q" => SlashCommand::Exit,
+        other => SlashCommand::Unknown(other.to_string()),
+    })
+}
+
+fn format_models_list(current_model: &GgufModelConfig) -> String {
+    let items = models::build_model_picker_items();
+    if items.is_empty() {
+        return "No local models found. siGit will use the platform default model.".to_string();
+    }
+
+    let mut lines = vec!["Available models:".to_string()];
+    let mut last_source: Option<&str> = None;
+
+    for (index, item) in items.iter().enumerate() {
+        let source_key = match item.source_label.as_str() {
+            "Onde" => "Onde",
+            "HuggingFace" => "HuggingFace",
+            _ => "Fallback",
+        };
+
+        if last_source != Some(source_key) {
+            if last_source.is_some() {
+                lines.push(String::new());
+            }
+            let section = match source_key {
+                "Onde" => "Onde Inference",
+                "HuggingFace" => "Hugging Face cache",
+                _ => "Fallback",
+            };
+            lines.push(section.to_string());
+            last_source = Some(source_key);
+        }
+
+        let number = index + 1;
+        let current_badge = if item.config.model_id == current_model.model_id {
+            "  <- current"
+        } else {
+            ""
+        };
+        let tool_badge = if item.tool_calling {
+            "  tool calling"
+        } else {
+            ""
+        };
+        let health_badge = match item.cache_health {
+            setup::ModelCacheHealth::Complete => "",
+            setup::ModelCacheHealth::Incomplete => "  ! incomplete cache",
+            setup::ModelCacheHealth::NotDownloaded => "  ↓ download on select",
+        };
+        let source = match source_key {
+            "Onde" => "  [Onde]",
+            "HuggingFace" => "  [HuggingFace]",
+            _ => "  [default]",
+        };
+
+        lines.push(format!(
+            "{number}. {}  {}{}{}{}{}",
+            item.display_name, item.description, tool_badge, health_badge, current_badge, source,
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("Use /models N to switch models.".to_string());
+    lines.join("\n")
+}
+
+async fn exec_slash_acp(
+    agent: &SiGitAgent,
+    session_id: SessionId,
+    command: SlashCommand,
+) -> agent_client_protocol::Result<PromptResponse> {
+    match command {
+        SlashCommand::Help => {
+            agent
+                .send_assistant_message(
+                    session_id,
+                    "/help      - show this message\n\
+                     /models    - list available models\n\
+                     /models N  - switch to model N\n\
+                     /clear     - wipe conversation history\n\
+                     /status    - show engine status\n\
+                     /exit      - end this turn",
+                )
+                .await;
+        }
+        SlashCommand::Clear => {
+            let cleared = agent.engine.clear_history().await;
+            agent
+                .send_assistant_message(
+                    session_id,
+                    format!("Cleared {cleared} turn(s). History is empty."),
+                )
+                .await;
+        }
+        SlashCommand::Status => {
+            let info = agent.engine.info().await;
+            let model = info.model_name.as_deref().unwrap_or("(none)");
+            let memory = info.approx_memory.as_deref().unwrap_or("unknown");
+            agent
+                .send_assistant_message(
+                    session_id,
+                    format!(
+                        "status: {:?}  model: {}  memory: {}  history: {} turns",
+                        info.status, model, memory, info.history_length,
+                    ),
+                )
+                .await;
+        }
+        SlashCommand::Models(None) => {
+            let current_model = agent.current_model.lock().unwrap().clone();
+            agent
+                .send_assistant_message(session_id, format_models_list(&current_model))
+                .await;
+        }
+        SlashCommand::Models(Some(number)) => {
+            let items = models::build_model_picker_items();
+            let index = number.saturating_sub(1);
+            match items.get(index).cloned() {
+                None => {
+                    agent
+                        .send_assistant_message(
+                            session_id,
+                            format!("error: no model #{number} - type /models to see the list."),
+                        )
+                        .await;
+                }
+                Some(model) => {
+                    if model.cache_health == setup::ModelCacheHealth::Incomplete {
+                        agent
+                            .send_assistant_message(
+                                session_id,
+                                format!(
+                                    "error: {} has an incomplete local cache and cannot be selected yet.",
+                                    model.display_name
+                                ),
+                            )
+                            .await;
+                    } else if model.cache_health == setup::ModelCacheHealth::NotDownloaded {
+                        agent
+                            .send_assistant_message(
+                                session_id.clone(),
+                                format!(
+                                    "Downloading and loading {} ({})… this may take a few minutes.",
+                                    model.display_name, model.description
+                                ),
+                            )
+                            .await;
+
+                        match agent.switch_model_by_id(&model.config.model_id).await {
+                            Ok(new_config) => {
+                                agent.engine.clear_history().await;
+                                agent
+                                    .send_assistant_message(
+                                        session_id,
+                                        format!(
+                                            "✓ Downloaded and switched to {}",
+                                            new_config.display_name
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(err) => {
+                                agent
+                                    .send_assistant_message(
+                                        session_id,
+                                        format!("error downloading model: {}", err.message),
+                                    )
+                                    .await;
+                            }
+                        }
+                    } else {
+                        agent
+                            .send_assistant_message(
+                                session_id.clone(),
+                                format!("Loading {}...", model.display_name),
+                            )
+                            .await;
+
+                        let switched = agent.switch_model_by_id(&model.config.model_id).await?;
+                        agent.engine.clear_history().await;
+
+                        agent
+                            .send_assistant_message(
+                                session_id,
+                                format!("Switched to {}.", switched.display_name),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        SlashCommand::Exit => {
+            agent
+                .send_assistant_message(
+                    session_id,
+                    "Use the panel controls to close or switch threads.",
+                )
+                .await;
+        }
+        SlashCommand::Unknown(command) => {
+            agent
+                .send_assistant_message(session_id, format!("unknown command: {command}"))
+                .await;
+        }
+    }
+
+    Ok(PromptResponse::new(StopReason::EndTurn))
 }
 
 #[async_trait::async_trait(?Send)]
@@ -142,7 +726,8 @@ impl Agent for SiGitAgent {
                     .session_capabilities(
                         SessionCapabilities::new().fork(SessionForkCapabilities::new()),
                     ),
-            ))
+            )
+            .meta(initialize_meta()))
     }
 
     async fn authenticate(
@@ -157,13 +742,50 @@ impl Agent for SiGitAgent {
         &self,
         args: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
-        log::info!("load_session: id={}", args.session_id);
+        log::info!(
+            "load_session: id={}, cwd={}, additional_directories={:?}",
+            args.session_id,
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Capture the project working directory from the editor.
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+
+        // Set the process cwd so tool calls using relative paths land in the
+        // correct project directory.
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
 
         // Clear conversation history — siGit doesn't persist sessions, so a
         // "load" is effectively a fresh start with the same session ID.
         self.engine.clear_history().await;
 
-        Ok(LoadSessionResponse::new())
+        // Tell the model which project directory it's working in.
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(LoadSessionResponse::new().config_options(config_options))
     }
 
     async fn fork_session(
@@ -171,44 +793,243 @@ impl Agent for SiGitAgent {
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        log::info!("fork_session: from={} new={new_id}", args.session_id);
+        log::info!(
+            "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
+            args.session_id,
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Update cwd if the fork provides a different one.
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
 
         // siGit doesn't persist history, so a fork is effectively a fresh
         // session — clear the conversation and let the user start over from
         // their edited message.
         self.engine.clear_history().await;
 
-        Ok(ForkSessionResponse::new(new_id))
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(ForkSessionResponse::new(new_id).config_options(config_options))
     }
 
     async fn new_session(
         &self,
-        _args: NewSessionRequest,
+        args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        log::info!("new_session: id={session_id}");
+        log::info!(
+            "new_session: id={session_id}, cwd={}, additional_directories={:?}",
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Capture the project working directory from the editor.
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
 
         // Clear history — the model is already loaded.
         self.engine.clear_history().await;
 
-        Ok(NewSessionResponse::new(session_id))
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(NewSessionResponse::new(session_id).config_options(config_options))
     }
 
     async fn prompt(&self, args: PromptRequest) -> agent_client_protocol::Result<PromptResponse> {
         let session_id = args.session_id.clone();
 
-        let user_text: String = args
-            .prompt
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Debug: log every content block the editor sends so we can see
+        // exactly what arrives for @ references, file context, etc.
+        for (i, block) in args.prompt.iter().enumerate() {
+            match block {
+                ContentBlock::Text(t) => {
+                    log::info!(
+                        "prompt({}) block[{}]: Text({} chars) = \"{}\"",
+                        session_id,
+                        i,
+                        t.text.len(),
+                        t.text.chars().take(200).collect::<String>()
+                    );
+                }
+                ContentBlock::Resource(embedded) => {
+                    log::info!(
+                        "prompt({}) block[{}]: EmbeddedResource = {:?}",
+                        session_id,
+                        i,
+                        match &embedded.resource {
+                            agent_client_protocol::EmbeddedResourceResource::TextResourceContents(t) =>
+                                format!("TextResource(uri={}, {} chars)", t.uri, t.text.len()),
+                            agent_client_protocol::EmbeddedResourceResource::BlobResourceContents(b) =>
+                                format!("BlobResource(uri={})", b.uri),
+                            _ => "Unknown".to_string(),
+                        }
+                    );
+                }
+                ContentBlock::ResourceLink(link) => {
+                    log::info!(
+                        "prompt({}) block[{}]: ResourceLink(name={}, uri={}, title={:?}, desc={:?})",
+                        session_id,
+                        i,
+                        link.name,
+                        link.uri,
+                        link.title,
+                        link.description
+                    );
+                }
+                other => {
+                    log::info!(
+                        "prompt({}) block[{}]: Other({:?})",
+                        session_id,
+                        i,
+                        std::mem::discriminant(other)
+                    );
+                }
+            }
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+
+        for block in &args.prompt {
+            match block {
+                ContentBlock::Text(t) => {
+                    parts.push(t.text.clone());
+                }
+                ContentBlock::Resource(embedded) => {
+                    // Embedded file content sent by the editor (preferred over ResourceLink).
+                    match &embedded.resource {
+                        agent_client_protocol::EmbeddedResourceResource::TextResourceContents(
+                            text_resource,
+                        ) => {
+                            parts.push(format!(
+                                "\n--- {} ---\n{}\n--- end {} ---",
+                                text_resource.uri, text_resource.text, text_resource.uri
+                            ));
+                        }
+                        agent_client_protocol::EmbeddedResourceResource::BlobResourceContents(
+                            blob,
+                        ) => {
+                            parts.push(format!("[binary resource: {}]", blob.uri));
+                        }
+                        _ => {
+                            log::debug!("ignoring unsupported embedded resource variant");
+                        }
+                    }
+                }
+                ContentBlock::ResourceLink(link) => {
+                    // The editor sent a reference but not the content — read it if it's a file.
+                    let label = link.name.clone();
+
+                    if let Some(raw_path) = link.uri.strip_prefix("file://") {
+                        // Split off the #L<start>:<end> fragment if present.
+                        let (file_path, line_range) = if let Some(hash_pos) = raw_path.rfind('#') {
+                            let fragment = &raw_path[hash_pos + 1..];
+                            let path = &raw_path[..hash_pos];
+                            // Parse "L207:219" or "L207-219" → (207, 219)
+                            let range = fragment.strip_prefix('L').and_then(|rest| {
+                                let sep = if rest.contains(':') { ':' } else { '-' };
+                                let mut parts = rest.splitn(2, sep);
+                                let start = parts.next()?.parse::<usize>().ok()?;
+                                let end = parts.next()?.parse::<usize>().ok()?;
+                                Some((start, end))
+                            });
+                            (path, range)
+                        } else {
+                            (raw_path, None)
+                        };
+
+                        match std::fs::read_to_string(file_path) {
+                            Ok(contents) => {
+                                let extracted = if let Some((start, end)) = line_range {
+                                    // Extract only the requested line range (1-based, inclusive).
+                                    let selected: Vec<&str> = contents
+                                        .lines()
+                                        .enumerate()
+                                        .filter(|(i, _)| {
+                                            let line_num = i + 1;
+                                            line_num >= start && line_num <= end
+                                        })
+                                        .map(|(_, line)| line)
+                                        .collect();
+                                    format!(
+                                        "\n--- {label} ({file_path} lines {start}-{end}) ---\n{}\n--- end {label} ---",
+                                        selected.join("\n")
+                                    )
+                                } else {
+                                    format!(
+                                        "\n--- {label} ({file_path}) ---\n{contents}\n--- end {label} ---"
+                                    )
+                                };
+                                parts.push(extracted);
+                            }
+                            Err(err) => {
+                                log::warn!("could not read ResourceLink {}: {err}", link.uri);
+                                parts.push(format!("[referenced file: {label} ({file_path})]"));
+                            }
+                        }
+                    } else {
+                        parts.push(format!("[resource link: {label} ({})]", link.uri));
+                    }
+                }
+                _ => {
+                    log::debug!("ignoring unsupported content block type in prompt");
+                }
+            }
+        }
+
+        let user_text = parts.join("\n");
 
         if user_text.trim().is_empty() {
             return Ok(PromptResponse::new(StopReason::EndTurn));
+        }
+
+        if let Some(command) = parse_slash(&user_text) {
+            return exec_slash_acp(self, session_id, command).await;
         }
 
         log::info!(
@@ -256,8 +1077,8 @@ impl Agent for SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Execute the tool.
-                let output = tools::execute_tool(&tc.function_name, &tc.arguments);
+                // Execute the tool (async — read_website uses spawn_blocking internally).
+                let output = tools::execute_tool(&tc.function_name, &tc.arguments).await;
 
                 log::info!("  ← {} chars", output.len());
 
@@ -282,12 +1103,34 @@ impl Agent for SiGitAgent {
         }
 
         // ── Send the final text response ─────────────────────────────────
-        if !result.text.is_empty() {
+        let reply_text = result.text.trim().to_string();
+
+        let final_text = if reply_text.is_empty() {
+            if round > 0 {
+                log::warn!(
+                    "prompt({}) — model returned empty reply after {} tool round(s)",
+                    session_id,
+                    round
+                );
+                "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
+            } else {
+                log::warn!(
+                    "prompt({}) — model returned empty reply (no tool rounds)",
+                    session_id
+                );
+                String::new()
+            }
+        } else {
+            // Strip Qwen 3 `<think>…</think>` blocks — the editor doesn't
+            // need to see internal reasoning tokens.
+            let (_think, visible) = chat::strip_think_blocks(&reply_text);
+            visible
+        };
+
+        if !final_text.is_empty() {
             let notification = SessionNotification::new(
                 session_id.clone(),
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                    result.text,
-                ))),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(final_text))),
             );
             if self.notification_tx.send(notification).await.is_err() {
                 log::warn!("notification channel closed");
@@ -302,6 +1145,252 @@ impl Agent for SiGitAgent {
         log::info!("cancel requested for session {}", args.session_id);
         Ok(())
     }
+
+    async fn set_session_config_option(
+        &self,
+        args: SetSessionConfigOptionRequest,
+    ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
+        log::info!(
+            "set_session_config_option: config_id={}, value={:?}",
+            args.config_id,
+            args.value
+        );
+
+        if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!("unknown config option: {}", args.config_id.0),
+            ));
+        }
+
+        let model_id = args.value.0.as_ref();
+
+        // Check if this model needs to be downloaded first so we can show
+        // a progress indicator in Zed while the download + load is happening.
+        let needs_download = models::build_model_picker_items()
+            .into_iter()
+            .find(|item| item.config.model_id == model_id)
+            .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
+            .unwrap_or(false);
+
+        // Spawn a progress-poller task that sends periodic download status
+        // messages to Zed via the notification channel.  A shared flag lets
+        // us stop the poller once the load finishes.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        if needs_download {
+            // Send the initial "downloading" banner immediately.
+            let model_id_owned = model_id.to_string();
+            let expected_bytes = onde::inference::models::SUPPORTED_MODEL_INFO
+                .iter()
+                .find(|m| m.id == model_id_owned)
+                .map(|m| m.expected_size_bytes)
+                .unwrap_or(0);
+
+            let display_name = models::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.config.model_id == model_id_owned)
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| model_id_owned.clone());
+
+            let size_hint = if expected_bytes > 0 {
+                format!(" (~{})", format_size_human(expected_bytes))
+            } else {
+                String::new()
+            };
+
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("⏬ Downloading {display_name}{size_hint}… this may take a few minutes."),
+            )
+            .await;
+
+            // Poller: every 4 seconds report bytes-on-disk / expected.
+            let poller_tx = self.notification_tx.clone();
+            let poller_session = args.session_id.clone();
+            let poller_model_id = model_id_owned.clone();
+            let poller_stop = Arc::clone(&stop_flag);
+
+            tokio::task::spawn_local(async move {
+                let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(4));
+                interval.tick().await; // consume the immediate first tick
+
+                while !poller_stop.load(Ordering::Relaxed) {
+                    interval.tick().await;
+
+                    if poller_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let downloaded = cache_path
+                        .as_ref()
+                        .filter(|p| p.exists())
+                        .map(|p| dir_size_recursive(p))
+                        .unwrap_or(0);
+
+                    let msg = if expected_bytes > 0 {
+                        let pct =
+                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
+                        let bar = progress_bar(pct, 20);
+                        format!(
+                            "⏬ {display_name} — {bar} {pct}%  ({} / {})",
+                            format_size_human(downloaded),
+                            format_size_human(expected_bytes),
+                        )
+                    } else {
+                        format!(
+                            "⏬ {display_name} — {} downloaded…",
+                            format_size_human(downloaded)
+                        )
+                    };
+
+                    let notification = SessionNotification::new(
+                        poller_session.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                            msg,
+                        ))),
+                    );
+                    if poller_tx.send(notification).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // For already-cached models, send a "loading" message and a spinner
+        // so the user sees activity while mistralrs loads the weights (~10-30 s).
+        if !needs_download {
+            let cached_display_name = models::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.config.model_id == model_id)
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| model_id.to_string());
+
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("⏳ Loading {cached_display_name}…"),
+            )
+            .await;
+
+            // Spinner poller: send an elapsed-time update every 5 seconds so
+            // the user can tell siGit is still working.
+            let spinner_tx = self.notification_tx.clone();
+            let spinner_session = args.session_id.clone();
+            let spinner_name = cached_display_name.clone();
+            let spinner_stop = Arc::clone(&stop_flag);
+            let load_start = std::time::Instant::now();
+
+            tokio::task::spawn_local(async move {
+                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let mut tick: usize = 0;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.tick().await; // consume the immediate first tick
+
+                while !spinner_stop.load(Ordering::Relaxed) {
+                    interval.tick().await;
+
+                    if spinner_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let elapsed = load_start.elapsed();
+                    let elapsed_str = if elapsed.as_secs() >= 60 {
+                        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+                    } else {
+                        format!("{}s", elapsed.as_secs())
+                    };
+                    let frame = SPINNER[tick % SPINNER.len()];
+                    tick += 1;
+
+                    let msg = format!("{frame} Loading {spinner_name}… ({elapsed_str})");
+                    let notification = SessionNotification::new(
+                        spinner_session.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                            msg,
+                        ))),
+                    );
+                    if spinner_tx.send(notification).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let switch_result = self.switch_model_by_id(model_id).await;
+
+        // Stop the progress / spinner poller regardless of success/failure.
+        stop_flag.store(true, Ordering::Relaxed);
+
+        let new_config = switch_result?;
+
+        if needs_download {
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("✓ {} downloaded and loaded.", new_config.display_name),
+            )
+            .await;
+        } else {
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("✓ Switched to {}.", new_config.display_name),
+            )
+            .await;
+        }
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        log::info!("model switch complete");
+        Ok(SetSessionConfigOptionResponse::new(config_options))
+    }
+}
+
+// ── Download progress helpers ─────────────────────────────────────────────────
+
+/// Recursively sum the sizes of all files under `path`, following symlinks.
+/// Used by the ACP download-progress poller to report bytes-on-disk before
+/// hf-hub renames the staging files to their final blob names.
+fn dir_size_recursive(path: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            total += dir_size_recursive(&entry_path);
+        } else if let Ok(meta) = entry_path.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Format a byte count as a human-readable string (B / KB / MB / GB).
+fn format_size_human(bytes: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1_024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Build a simple ASCII progress bar string of the given width.
+/// e.g. `[████████░░░░░░░░░░░░]` at 40 %
+fn progress_bar(pct: u8, width: usize) -> String {
+    let filled = ((pct as usize) * width) / 100;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
 }
 
 // ── Output capture ────────────────────────────────────────────────────────────
@@ -389,17 +1478,55 @@ fn init_logging(is_tty: bool) {
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::platform_default();
+
+    let startup_selection = setup::startup_model_selection();
+    let startup_model_name = startup_selection
+        .as_ref()
+        .map(|selection| selection.display_name.clone())
+        .unwrap_or_else(|| GgufModelConfig::platform_default().display_name);
+
+    let config = startup_selection
+        .as_ref()
+        .and_then(|selection| {
+            models::build_model_picker_items()
+                .into_iter()
+                .find(|item| {
+                    selection
+                        .selected_model
+                        .as_ref()
+                        .map(|selected| {
+                            item.config.model_id == selected.model_id
+                                && item
+                                    .config
+                                    .files
+                                    .iter()
+                                    .any(|file| file == &selected.gguf_file)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|item| item.config)
+        })
+        .unwrap_or_else(GgufModelConfig::platform_default);
+    let sampling = SamplingConfig {
+        max_tokens: Some(8192),
+        ..SamplingConfig::default()
+    };
 
     // std::sync::mpsc — the loader runs on a dedicated OS thread, completely
     // decoupled from the tokio runtime so it can't starve the TUI draw loop.
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let loader_engine = Arc::clone(&engine);
-    let system_prompt = SYSTEM_PROMPT.to_string();
+    let tool_calling = models::build_model_picker_items()
+        .iter()
+        .find(|item| item.config.model_id == config.model_id)
+        .map(|item| item.tool_calling)
+        .unwrap_or(false);
+    let system_prompt = system_prompt_for_model(tool_calling).to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        let result = rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), None));
+        let result =
+            rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), Some(sampling)));
         let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
     });
 
@@ -412,7 +1539,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 
     // The TUI runs here on the main tokio runtime.  It polls load_rx via
     // try_recv() on every tick — non-blocking, zero contention.
-    let chat_result = chat::run_with(&mut terminal, engine, load_rx).await;
+    let chat_result = chat::run_with(&mut terminal, engine, load_rx, startup_model_name).await;
 
     // Restore the terminal before exiting.
     // Use the separate cleanup fd — the backend's writer is private.
@@ -443,21 +1570,58 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("loading model (this may take a minute on first run)...");
 
     let engine = Arc::new(ChatEngine::new());
-    let config = GgufModelConfig::qwen3_4b();
+
+    let startup_selection = setup::startup_model_selection();
+    let config = startup_selection
+        .as_ref()
+        .and_then(|selection| {
+            models::build_model_picker_items()
+                .into_iter()
+                .find(|item| {
+                    selection
+                        .selected_model
+                        .as_ref()
+                        .map(|selected| {
+                            item.config.model_id == selected.model_id
+                                && item
+                                    .config
+                                    .files
+                                    .iter()
+                                    .any(|file| file == &selected.gguf_file)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|item| item.config)
+        })
+        .unwrap_or_else(GgufModelConfig::qwen3_4b);
+
+    let acp_tool_calling = models::build_model_picker_items()
+        .iter()
+        .find(|item| item.config.model_id == config.model_id)
+        .map(|item| (item.tool_calling, item.max_tokens))
+        .unwrap_or((true, 4096));
+
+    let max_tokens = acp_tool_calling.1;
+    let tool_calling = acp_tool_calling.0;
+
     let sampling = SamplingConfig {
-        max_tokens: Some(4096),
+        max_tokens: Some(max_tokens),
         ..SamplingConfig::default()
     };
 
+    log::info!("ACP startup model: {}", config.display_name);
+
+    let startup_config = config.clone();
+    let acp_system_prompt = system_prompt_for_model(tool_calling).to_string();
     engine
-        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
+        .load_gguf_model(config, Some(acp_system_prompt), Some(sampling))
         .await
         .map_err(|error| anyhow::anyhow!("model load failed: {error}"))?;
 
     log::info!("model loaded and ready");
 
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
-    let agent = SiGitAgent::new(engine, notification_tx);
+    let agent = SiGitAgent::new(engine, notification_tx, startup_config);
 
     // AgentSideConnection wants futures-io, not tokio-io.
     let stdin = tokio::io::stdin().compat();

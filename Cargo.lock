@@ -741,9 +741,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.60"
+version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c5703da9466b66a946814e1adf53ea2c90f10063b86290cc9eb67ce3478a20"
+checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1264,9 +1264,9 @@ dependencies = [
 
 [[package]]
 name = "data-encoding"
-version = "2.10.0"
+version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "defmac"
@@ -3264,7 +3264,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3291,7 +3291,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3302,7 +3302,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "ahash",
  "akin",
@@ -3399,7 +3399,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3410,7 +3410,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3430,7 +3430,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3446,7 +3446,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3475,7 +3475,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.8.1"
-source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#020dcbf8e2c4147c16bb015e89435811501baa28"
+source = "git+https://github.com/setoelkahfi/mistral.rs?branch=fix%2Fall-platform-fixes#e53956bcd1b40c8221f79b919d78c1e496aba634"
 dependencies = [
  "candle-core",
  "image",
@@ -3799,7 +3799,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "onde"
 version = "0.1.8"
-source = "git+https://github.com/ondeinference/onde?branch=development#f0bb0daad7fb07af951002f1bcae16fbd0bc876d"
+source = "git+https://github.com/ondeinference/onde?branch=development#dfcc6ecfa74ac965af6c33ba0bd06d9cf241fc12"
 dependencies = [
  "anyhow",
  "cc",
@@ -4807,9 +4807,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
+checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
 dependencies = [
  "web-time",
  "zeroize",
@@ -5271,7 +5271,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sigit"
-version = "0.1.1"
+version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -5283,6 +5283,7 @@ dependencies = [
  "onde",
  "ratatui",
  "regex",
+ "reqwest 0.12.28",
  "serde_json",
  "tokio",
  "tokio-util",

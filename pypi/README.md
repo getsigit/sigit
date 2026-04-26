@@ -1,8 +1,4 @@
-<p align="center">
-  <strong>siGit Code</strong>
-</p>
-
-<h1 align="center">sigit</h1>
+<h1 align="center">siGit Code</h1>
 
 <p align="center">
   <strong>AI coding agent powered by local LLM via <a href="https://ondeinference.com">Onde Inference</a>.</strong><br>
@@ -10,10 +6,10 @@
 </p>
 
 <p align="center">
-  <a href="https://smbcloud.xyz"><img src="https://img.shields.io/badge/smbcloud.xyz-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
   <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/v/sigit-code?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
-  <a href="https://www.npmjs.com/package/@smbcloud/sigit"><img src="https://img.shields.io/npm/v/@smbcloud/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
   <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Crates.io"></a>
+  <a href="https://www.npmjs.com/package/@smbcloud/sigit"><img src="https://img.shields.io/npm/v/@smbcloud/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
+  <a href="https://smbcloud.xyz"><img src="https://img.shields.io/badge/smbcloud.xyz-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
@@ -23,8 +19,11 @@
 
 ## Install
 
+Use `pip` or `uv`:
+
 ```sh
 pip install sigit-code
+uvx --from sigit-code sigit
 ```
 
 Installs the native `sigit` binary for your platform — no compiler, no Node.js, no runtime dependencies.
@@ -45,15 +44,10 @@ siGit works as an [ACP-compatible](https://github.com/nicobailon/agent-client-pr
 
 ```json
 {
-  "agent": {
-    "profiles": {
-      "sigit": {
-        "provider": "acp",
-        "binary": {
-          "path": "sigit",
-          "args": ["--acp"]
-        }
-      }
+  "agent_servers": {
+    "siGit Code": {
+      "type": "custom",
+      "command": "/absolute/path/to/sigit"
     }
   }
 }
@@ -66,7 +60,7 @@ Then select **sigit** as your agent profile in the Zed assistant panel.
 | Method | Command |
 |--------|---------|
 | npm | `npm install -g @smbcloud/sigit` |
-| Homebrew | `brew install getsigit/sigit/sigit` |
+| Homebrew | `brew tap getsigit/tap && brew install sigit` |
 | Cargo | `cargo install sigit` |
 
 ### From source
@@ -104,4 +98,4 @@ Licensed under **Apache 2.0**.
 
 ## Copyright
 
-2026 smbCloud (Splitfire AB).
+© 2026 [smbCloud](https://smbcloud.xyz/) (Splitfire AB).
