@@ -1234,13 +1234,13 @@ impl Agent for SiGitAgent {
                             ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
                         let bar = progress_bar(pct, 20);
                         format!(
-                            "⏬ {display_name} — {bar} {pct}%  ({} / {})",
+                            "\n⏬ {display_name} — {bar} {pct}%  ({} / {})",
                             format_size_human(downloaded),
                             format_size_human(expected_bytes),
                         )
                     } else {
                         format!(
-                            "⏬ {display_name} — {} downloaded…",
+                            "\n⏬ {display_name} — {} downloaded…",
                             format_size_human(downloaded)
                         )
                     };
@@ -1303,7 +1303,7 @@ impl Agent for SiGitAgent {
                     let frame = SPINNER[tick % SPINNER.len()];
                     tick += 1;
 
-                    let msg = format!("{frame} Loading {spinner_name}… ({elapsed_str})");
+                    let msg = format!("\n{frame} Loading {spinner_name}… ({elapsed_str})");
                     let notification = SessionNotification::new(
                         spinner_session.clone(),
                         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
@@ -1327,13 +1327,13 @@ impl Agent for SiGitAgent {
         if needs_download {
             self.send_assistant_message(
                 args.session_id.clone(),
-                format!("✓ {} downloaded and loaded.", new_config.display_name),
+                format!("\n✓ {} downloaded and loaded.", new_config.display_name),
             )
             .await;
         } else {
             self.send_assistant_message(
                 args.session_id.clone(),
-                format!("✓ Switched to {}.", new_config.display_name),
+                format!("\n✓ Switched to {}.", new_config.display_name),
             )
             .await;
         }
