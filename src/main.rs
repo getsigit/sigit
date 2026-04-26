@@ -66,6 +66,7 @@ use agent_client_protocol::{
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
@@ -1163,7 +1164,179 @@ impl Agent for SiGitAgent {
         }
 
         let model_id = args.value.0.as_ref();
-        let _new_config = self.switch_model_by_id(model_id).await?;
+
+        // Check if this model needs to be downloaded first so we can show
+        // a progress indicator in Zed while the download + load is happening.
+        let needs_download = models::build_model_picker_items()
+            .into_iter()
+            .find(|item| item.config.model_id == model_id)
+            .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
+            .unwrap_or(false);
+
+        // Spawn a progress-poller task that sends periodic download status
+        // messages to Zed via the notification channel.  A shared flag lets
+        // us stop the poller once the load finishes.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        if needs_download {
+            // Send the initial "downloading" banner immediately.
+            let model_id_owned = model_id.to_string();
+            let expected_bytes = onde::inference::models::SUPPORTED_MODEL_INFO
+                .iter()
+                .find(|m| m.id == model_id_owned)
+                .map(|m| m.expected_size_bytes)
+                .unwrap_or(0);
+
+            let display_name = models::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.config.model_id == model_id_owned)
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| model_id_owned.clone());
+
+            let size_hint = if expected_bytes > 0 {
+                format!(" (~{})", format_size_human(expected_bytes))
+            } else {
+                String::new()
+            };
+
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("⏬ Downloading {display_name}{size_hint}… this may take a few minutes."),
+            )
+            .await;
+
+            // Poller: every 4 seconds report bytes-on-disk / expected.
+            let poller_tx = self.notification_tx.clone();
+            let poller_session = args.session_id.clone();
+            let poller_model_id = model_id_owned.clone();
+            let poller_stop = Arc::clone(&stop_flag);
+
+            tokio::spawn(async move {
+                let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(4));
+                interval.tick().await; // consume the immediate first tick
+
+                while !poller_stop.load(Ordering::Relaxed) {
+                    interval.tick().await;
+
+                    if poller_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let downloaded = cache_path
+                        .as_ref()
+                        .filter(|p| p.exists())
+                        .map(|p| dir_size_recursive(p))
+                        .unwrap_or(0);
+
+                    let msg = if expected_bytes > 0 {
+                        let pct =
+                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
+                        let bar = progress_bar(pct, 20);
+                        format!(
+                            "⏬ {display_name} — {bar} {pct}%  ({} / {})",
+                            format_size_human(downloaded),
+                            format_size_human(expected_bytes),
+                        )
+                    } else {
+                        format!(
+                            "⏬ {display_name} — {} downloaded…",
+                            format_size_human(downloaded)
+                        )
+                    };
+
+                    let notification = SessionNotification::new(
+                        poller_session.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                            msg,
+                        ))),
+                    );
+                    if poller_tx.send(notification).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // For already-cached models, send a "loading" message and a spinner
+        // so the user sees activity while mistralrs loads the weights (~10-30 s).
+        if !needs_download {
+            let cached_display_name = models::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.config.model_id == model_id)
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| model_id.to_string());
+
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("⏳ Loading {cached_display_name}…"),
+            )
+            .await;
+
+            // Spinner poller: send an elapsed-time update every 5 seconds so
+            // the user can tell siGit is still working.
+            let spinner_tx = self.notification_tx.clone();
+            let spinner_session = args.session_id.clone();
+            let spinner_name = cached_display_name.clone();
+            let spinner_stop = Arc::clone(&stop_flag);
+            let load_start = std::time::Instant::now();
+
+            tokio::spawn(async move {
+                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let mut tick: usize = 0;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.tick().await; // consume the immediate first tick
+
+                while !spinner_stop.load(Ordering::Relaxed) {
+                    interval.tick().await;
+
+                    if spinner_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let elapsed = load_start.elapsed();
+                    let elapsed_str = if elapsed.as_secs() >= 60 {
+                        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+                    } else {
+                        format!("{}s", elapsed.as_secs())
+                    };
+                    let frame = SPINNER[tick % SPINNER.len()];
+                    tick += 1;
+
+                    let msg = format!("{frame} Loading {spinner_name}… ({elapsed_str})");
+                    let notification = SessionNotification::new(
+                        spinner_session.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                            msg,
+                        ))),
+                    );
+                    if spinner_tx.send(notification).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let switch_result = self.switch_model_by_id(model_id).await;
+
+        // Stop the progress / spinner poller regardless of success/failure.
+        stop_flag.store(true, Ordering::Relaxed);
+
+        let new_config = switch_result?;
+
+        if needs_download {
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("✓ {} downloaded and loaded.", new_config.display_name),
+            )
+            .await;
+        } else {
+            self.send_assistant_message(
+                args.session_id.clone(),
+                format!("✓ Switched to {}.", new_config.display_name),
+            )
+            .await;
+        }
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1173,6 +1346,51 @@ impl Agent for SiGitAgent {
         log::info!("model switch complete");
         Ok(SetSessionConfigOptionResponse::new(config_options))
     }
+}
+
+// ── Download progress helpers ─────────────────────────────────────────────────
+
+/// Recursively sum the sizes of all files under `path`, following symlinks.
+/// Used by the ACP download-progress poller to report bytes-on-disk before
+/// hf-hub renames the staging files to their final blob names.
+fn dir_size_recursive(path: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            total += dir_size_recursive(&entry_path);
+        } else if let Ok(meta) = entry_path.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Format a byte count as a human-readable string (B / KB / MB / GB).
+fn format_size_human(bytes: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1_024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Build a simple ASCII progress bar string of the given width.
+/// e.g. `[████████░░░░░░░░░░░░]` at 40 %
+fn progress_bar(pct: u8, width: usize) -> String {
+    let filled = ((pct as usize) * width) / 100;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
 }
 
 // ── Output capture ────────────────────────────────────────────────────────────

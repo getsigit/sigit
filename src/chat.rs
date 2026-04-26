@@ -162,6 +162,9 @@ struct App {
     blink_counter: u8,
     /// True while a model switch is in progress.
     switching_model: bool,
+    /// Tool-calling flag for the model currently being loaded in the background.
+    /// Applied to `app.tool_calling` when `ModelLoadUpdate::Loaded` arrives.
+    pending_tool_calling: Option<bool>,
 
     // ── Loading-phase state ───────────────────────────────────────────────────
     /// True while the model is still loading; switches to false on completion.
@@ -226,6 +229,7 @@ impl App {
             blink_on: true,
             blink_counter: 0,
             switching_model: false,
+            pending_tool_calling: None,
             is_loading: true,
             load_tick: 0,
             load_error: None,
@@ -1107,7 +1111,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<String> {
 async fn exec_slash<B: ratatui::backend::Backend>(
     app: &mut App,
     cmd: SlashCommand,
-    engine: &ChatEngine,
+    engine: Arc<ChatEngine>,
     terminal: &mut ratatui::Terminal<B>,
 ) {
     match cmd {
@@ -1130,7 +1134,7 @@ async fn exec_slash<B: ratatui::backend::Backend>(
             )));
         }
         SlashCommand::Status => {
-            let info = engine.info().await;
+            let info = engine.as_ref().info().await;
             let model = info.model_name.as_deref().unwrap_or("(none)");
             let mem = info.approx_memory.as_deref().unwrap_or("unknown");
             app.messages.push(ChatMessage::system(format!(
@@ -1140,7 +1144,7 @@ async fn exec_slash<B: ratatui::backend::Backend>(
         }
         SlashCommand::Models(selection) => match selection {
             None => {
-                app.open_model_picker(engine);
+                app.open_model_picker(&engine);
             }
             Some(n) => {
                 let idx = n.saturating_sub(1);
@@ -1182,28 +1186,30 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                             ..SamplingConfig::default()
                         };
 
-                        // load_gguf_model unloads any existing model internally before
-                        // loading the new one.  Calling unload_model() explicitly first
-                        // would create a window where no model is loaded — if a message
-                        // arrived in that gap it would fail with NoModelLoaded.
+                        // Spawn onto a background task so the event loop keeps
+                        // running (and the spinner keeps animating) during the
+                        // download + load — which can take several minutes for
+                        // a large model fetched from HuggingFace for the first time.
                         let system_prompt = crate::system_prompt_for_model(model.tool_calling);
-                        let update = match engine
-                            .load_gguf_model(
-                                model.config.clone(),
-                                Some(system_prompt.to_string()),
-                                Some(sampling),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                engine.clear_history().await;
-                                app.tool_calling = model.tool_calling;
-                                ModelLoadUpdate::Loaded(model.display_name.clone())
-                            }
-                            Err(err) => ModelLoadUpdate::Error(err.to_string()),
-                        };
-
-                        let _ = tx.send(update).await;
+                        let engine_handle = Arc::clone(&engine);
+                        let tool_calling = model.tool_calling;
+                        tokio::spawn(async move {
+                            let update = match engine_handle
+                                .load_gguf_model(
+                                    model.config.clone(),
+                                    Some(system_prompt.to_string()),
+                                    Some(sampling),
+                                )
+                                .await
+                            {
+                                Ok(_) => ModelLoadUpdate::Loaded(model.display_name.clone()),
+                                Err(err) => ModelLoadUpdate::Error(err.to_string()),
+                            };
+                            let _ = tx.send(update).await;
+                        });
+                        // tool_calling is applied when ModelLoadUpdate::Loaded
+                        // arrives in the event loop (see model_load_rx handler).
+                        app.pending_tool_calling = Some(tool_calling);
                     }
                 }
             }
@@ -1377,6 +1383,10 @@ async fn event_loop<B: ratatui::backend::Backend>(
         if let Some(rx) = app.model_load_rx.as_mut() {
             match rx.try_recv() {
                 Ok(ModelLoadUpdate::Loaded(model_name)) => {
+                    engine.clear_history().await;
+                    if let Some(tc) = app.pending_tool_calling.take() {
+                        app.tool_calling = tc;
+                    }
                     app.switching_model = false;
                     app.model_load_rx = None;
                     app.current_model_name = model_name.clone();
@@ -1548,7 +1558,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
                     if let Some(text) = handle_key(&mut app, key) {
                         if let Some(cmd) = parse_slash(&text) {
-                            exec_slash(&mut app, cmd, &engine, terminal).await;
+                            exec_slash(&mut app, cmd, Arc::clone(&engine), terminal).await;
                             continue;
                         }
 
