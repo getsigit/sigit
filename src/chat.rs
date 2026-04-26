@@ -70,6 +70,7 @@ pub(crate) fn strip_think_blocks(raw: &str) -> (String, String) {
 
 // ── Message types ─────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     User,
@@ -79,6 +80,7 @@ enum Role {
     Banner,
 }
 
+#[cfg(unix)]
 struct ChatMessage {
     role: Role,
     text: String,
@@ -86,6 +88,7 @@ struct ChatMessage {
     think_block: Option<String>,
 }
 
+#[cfg(unix)]
 impl ChatMessage {
     fn user(text: impl Into<String>) -> Self {
         Self {
@@ -125,6 +128,7 @@ impl ChatMessage {
 // ── Inference updates from background task ───────────────────────────────────
 
 /// Messages sent from the spawned inference task back to the event loop.
+#[cfg(unix)]
 enum InferenceUpdate {
     /// The model is calling a tool — show its name in the chat.
     ToolUse(String),
@@ -134,6 +138,7 @@ enum InferenceUpdate {
     Error(String),
 }
 
+#[cfg(unix)]
 enum ModelLoadUpdate {
     Loaded(String),
     Error(String),
@@ -1418,6 +1423,7 @@ async fn run_inference_task(
 /// dedicated OS thread loads the model and sends `Ok(())` or `Err(msg)` when
 /// done.  The event loop polls `try_recv()` on every tick — non-blocking,
 /// zero contention with the tokio runtime.
+#[cfg(unix)]
 pub async fn run_with<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     engine: Arc<ChatEngine>,
@@ -1427,6 +1433,7 @@ pub async fn run_with<B: ratatui::backend::Backend>(
     event_loop(terminal, engine, load_rx, load_model_name).await
 }
 
+#[cfg(unix)]
 async fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     engine: Arc<ChatEngine>,
@@ -1692,6 +1699,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
 /// Recursively sum the on-disk size of all files under `path`, following
 /// symlinks so hf-hub's blob layout is counted correctly.
+#[cfg(unix)]
 fn dir_size_recursive(path: &std::path::Path) -> u64 {
     let mut total: u64 = 0;
     let Ok(entries) = std::fs::read_dir(path) else {
@@ -1709,6 +1717,7 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
 }
 
 /// Format a byte count as a terse human-readable string.
+#[cfg(unix)]
 fn format_size_human(bytes: u64) -> String {
     const GB: u64 = 1_073_741_824;
     const MB: u64 = 1_048_576;
