@@ -49,6 +49,7 @@ pub(crate) fn model_id_to_config(model_id: &str) -> Option<GgufModelConfig> {
         "bartowski/Qwen2.5-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_1_5b(),
         "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_3b(),
         "bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_1_5b(),
+        "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF" => GgufModelConfig::qwen25_coder_7b(),
         "TheBloke/deepseek-coder-6.7B-instruct-GGUF" => GgufModelConfig::deepseek_coder_6_7b(),
         _ => return None,
     })
@@ -61,6 +62,7 @@ fn is_tool_calling(model_id: &str) -> bool {
         "bartowski/Qwen_Qwen3-4B-GGUF"
             | "bartowski/Qwen_Qwen3-8B-GGUF"
             | "bartowski/Qwen_Qwen3-1.7B-GGUF"
+            | "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF"
     )
 }
 
