@@ -1,13 +1,16 @@
 <h1 align="center">siGit Code</h1>
 
 <p align="center">
-  AI coding agent powered by local LLM via Onde Inference.
+  AI coding agent powered by local LLM via <a href="https://ondeinference.com">Onde Inference</a>.<br>
+  Runs entirely on your machine — no API keys, no cloud round-trips.
 </p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@smbcloud/sigit"><img src="https://img.shields.io/npm/v/@smbcloud/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
-  <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="crates.io"></a>
-  <a href="https://pypi.org/project/sigit/"><img src="https://img.shields.io/pypi/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
+  <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Crates.io"></a>
+  <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/v/sigit-code?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
+  <a href="https://smbcloud.xyz"><img src="https://img.shields.io/badge/smbcloud.xyz-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
+  <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
 ---
@@ -18,7 +21,7 @@
 npm install -g @smbcloud/sigit
 ```
 
-The right binary for your platform gets pulled in automatically. Works on macOS (Apple Silicon and Intel), Linux (x64 and arm64), and Windows (x64 and arm64).
+The right binary for your platform is pulled in automatically. Works on macOS (Apple Silicon and Intel), Linux (x64 and arm64), and Windows (x64 and arm64).
 
 ### Other ways to install
 
@@ -39,19 +42,34 @@ sigit
 
 Opens a TUI coding agent that runs entirely on your device using a local LLM.
 
-### Zed ACP (Agent Control Protocol)
+### Zed (ACP agent)
 
-Add siGit as an agent in Zed by adding this to your settings:
+Add this to `~/.config/zed/settings.json`:
 
 ```json
 {
-  "agent": {
-    "profiles": {
-      "sigit": {
-        "provider": "acp",
-        "binary": "sigit",
-        "args": ["--acp"]
-      }
+  "agent_servers": {
+    "siGit Code": {
+      "type": "custom",
+      "command": "sigit"
+    }
+  }
+}
+```
+
+Then select **siGit Code** as your agent in the Zed assistant panel.
+
+### VSCode via ACP Client extension
+
+Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client), then add:
+
+```json
+{
+  "acp.agents": {
+    "siGit Code": {
+      "command": "sigit",
+      "args": [],
+      "env": {}
     }
   }
 }
@@ -63,19 +81,21 @@ Add siGit as an agent in Zed by adding this to your settings:
 
 | Platform | Architecture | Package |
 |---|---|---|
-| macOS | Apple Silicon (arm64) | `@smbcloud/sigit-darwin-arm64` |
-| macOS | Intel (x64) | `@smbcloud/sigit-darwin-x64` |
-| Linux | x64 | `@smbcloud/sigit-linux-x64` |
-| Linux | arm64 | `@smbcloud/sigit-linux-arm64` |
-| Windows | x64 | `@smbcloud/sigit-windows-x64` |
-| Windows | arm64 | `@smbcloud/sigit-windows-arm64` |
+| macOS | Apple Silicon (arm64) | [`@smbcloud/sigit-darwin-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-darwin-arm64) |
+| macOS | Intel (x64) | [`@smbcloud/sigit-darwin-x64`](https://www.npmjs.com/package/@smbcloud/sigit-darwin-x64) |
+| Linux | x64 | [`@smbcloud/sigit-linux-x64`](https://www.npmjs.com/package/@smbcloud/sigit-linux-x64) |
+| Linux | arm64 | [`@smbcloud/sigit-linux-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-linux-arm64) |
+| Windows | x64 | [`@smbcloud/sigit-windows-x64`](https://www.npmjs.com/package/@smbcloud/sigit-windows-x64) |
+| Windows | arm64 | [`@smbcloud/sigit-windows-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-windows-arm64) |
 
 ---
 
 ## Links
 
+- [smbCloud](https://smbcloud.xyz/)
 - [Source code](https://github.com/getsigit/sigit)
 - [Issues](https://github.com/getsigit/sigit/issues)
+- [Onde Inference](https://ondeinference.com)
 
 ## License
 
@@ -83,4 +103,4 @@ Add siGit as an agent in Zed by adding this to your settings:
 
 ## Copyright
 
-2026 smbCloud (Splitfire AB).
+© 2026 [smbCloud](https://smbcloud.xyz/) (Splitfire AB).
