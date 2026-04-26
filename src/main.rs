@@ -40,7 +40,6 @@
 //! }
 //! ```
 
-#[cfg(unix)]
 mod chat;
 mod models;
 mod setup;
