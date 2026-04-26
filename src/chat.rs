@@ -30,6 +30,44 @@ use ratatui::{
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval};
 
+// ── Think-block stripping ─────────────────────────────────────────────────────
+
+/// Strip `<think>…</think>` blocks from a model response.
+///
+/// Qwen 3 models emit `<think>…</think>` before the real answer. This
+/// function separates the thinking content from the visible reply so the
+/// UI can render them differently (dimmed / collapsed).
+///
+/// Returns `(thinking_text, visible_reply)`. Either may be empty.
+pub(crate) fn strip_think_blocks(raw: &str) -> (String, String) {
+    let mut thinking = String::new();
+    let mut remainder = raw;
+
+    while let Some(start) = remainder.find("<think>") {
+        // Text before <think> is visible.
+        let before = &remainder[..start];
+        if let Some(end) = remainder[start..].find("</think>") {
+            let block = &remainder[start + 7..start + end];
+            thinking.push_str(block.trim());
+            remainder = &remainder[start + end + 8..];
+            // Prepend any text before <think> to the leftover.
+            if !before.trim().is_empty() {
+                // Unusual — text before <think>. Keep it visible.
+                let mut combined = before.to_string();
+                combined.push_str(remainder);
+                return (thinking, combined.trim().to_string());
+            }
+        } else {
+            // Unclosed <think> — treat rest as thinking (model ran out of tokens).
+            thinking.push_str(remainder[start + 7..].trim());
+            remainder = before;
+            break;
+        }
+    }
+
+    (thinking, remainder.trim().to_string())
+}
+
 // ── Message types ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,6 +82,8 @@ enum Role {
 struct ChatMessage {
     role: Role,
     text: String,
+    /// Extracted `<think>…</think>` content, if any (Qwen 3 reasoning).
+    think_block: Option<String>,
 }
 
 impl ChatMessage {
@@ -51,13 +91,17 @@ impl ChatMessage {
         Self {
             role: Role::User,
             text: text.into(),
+            think_block: None,
         }
     }
 
     fn assistant(text: impl Into<String>) -> Self {
+        let raw = text.into();
+        let (think, visible) = strip_think_blocks(&raw);
         Self {
             role: Role::Assistant,
-            text: text.into(),
+            text: visible,
+            think_block: if think.is_empty() { None } else { Some(think) },
         }
     }
 
@@ -65,6 +109,7 @@ impl ChatMessage {
         Self {
             role: Role::System,
             text: text.into(),
+            think_block: None,
         }
     }
 
@@ -72,6 +117,7 @@ impl ChatMessage {
         Self {
             role: Role::Banner,
             text: text.into(),
+            think_block: None,
         }
     }
 }
@@ -844,6 +890,24 @@ fn render_chat_message<'a>(lines: &mut Vec<Line<'a>>, msg: &ChatMessage) {
             }
         }
         Role::Assistant => {
+            // Show thinking block dimmed if present.
+            if let Some(ref think) = msg.think_block {
+                let think_summary = if think.len() > 120 {
+                    format!("{}…", &think[..120])
+                } else {
+                    think.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("💭 ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        think_summary,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+
             for (i, segment) in text_lines.iter().enumerate() {
                 let mut spans = Vec::new();
                 if i == 0 {
@@ -1508,4 +1572,36 @@ async fn event_loop<B: ratatui::backend::Backend>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_think_blocks;
+
+    #[test]
+    fn strip_think_blocks_separates_thinking_and_visible_reply() {
+        let raw = "<think>I should inspect the code first.</think>Here is the fix.";
+        let (thinking, visible) = strip_think_blocks(raw);
+
+        assert_eq!(thinking, "I should inspect the code first.");
+        assert_eq!(visible, "Here is the fix.");
+    }
+
+    #[test]
+    fn strip_think_blocks_handles_unclosed_think_block() {
+        let raw = "<think>I am still reasoning about the bug";
+        let (thinking, visible) = strip_think_blocks(raw);
+
+        assert_eq!(thinking, "I am still reasoning about the bug");
+        assert_eq!(visible, "");
+    }
+
+    #[test]
+    fn strip_think_blocks_leaves_plain_text_untouched() {
+        let raw = "No hidden reasoning here.";
+        let (thinking, visible) = strip_think_blocks(raw);
+
+        assert_eq!(thinking, "");
+        assert_eq!(visible, "No hidden reasoning here.");
+    }
 }

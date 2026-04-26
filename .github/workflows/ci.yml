@@ -4,7 +4,10 @@ name: CI
 # Splits formatting, clippy, and tests into separate jobs for clearer reporting
 # across supported desktop targets.
 
-on: push
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

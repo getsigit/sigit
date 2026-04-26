@@ -1120,7 +1120,10 @@ impl Agent for SiGitAgent {
                 String::new()
             }
         } else {
-            reply_text
+            // Strip Qwen 3 `<think>…</think>` blocks — the editor doesn't
+            // need to see internal reasoning tokens.
+            let (_think, visible) = chat::strip_think_blocks(&reply_text);
+            visible
         };
 
         if !final_text.is_empty() {
