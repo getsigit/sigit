@@ -906,10 +906,27 @@ mod tui {
             }
             Role::System => {
                 for text_line in msg.text.split('\n') {
-                    lines.push(Line::from(Span::styled(
-                        text_line.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    let trimmed = text_line.trim();
+                    let (prefix, body) = if trimmed.is_empty() {
+                        ("", "")
+                    } else {
+                        ("  · ", trimmed)
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            prefix.to_string(),
+                            Style::default()
+                                .fg(Color::Rgb(90, 90, 98))
+                                .add_modifier(Modifier::DIM),
+                        ),
+                        Span::styled(
+                            body.to_string(),
+                            Style::default()
+                                .fg(Color::Rgb(132, 132, 145))
+                                .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                        ),
+                    ]));
                 }
             }
             Role::User => {

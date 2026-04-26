@@ -60,7 +60,8 @@ use agent_client_protocol::{
     NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
@@ -309,6 +310,13 @@ impl SiGitAgent {
             session_id,
             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
         );
+        if self.notification_tx.send(notification).await.is_err() {
+            log::warn!("notification channel closed");
+        }
+    }
+
+    async fn send_tool_call_update(&self, session_id: SessionId, update: SessionUpdate) {
+        let notification = SessionNotification::new(session_id, update);
         if self.notification_tx.send(notification).await.is_err() {
             log::warn!("notification channel closed");
         }
@@ -1199,9 +1207,24 @@ impl Agent for SiGitAgent {
                 String::new()
             };
 
-            self.send_assistant_message(
+            let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
+
+            self.send_tool_call_update(
                 args.session_id.clone(),
-                format!("⏬ Downloading {display_name}{size_hint}… this may take a few minutes."),
+                SessionUpdate::ToolCall(
+                    ToolCall::new(
+                        tool_call_id.clone(),
+                        format!("Downloading {display_name}{size_hint}"),
+                    )
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![
+                        format!(
+                            "Preparing download for {display_name}. This may take a few minutes."
+                        )
+                        .into(),
+                    ]),
+                ),
             )
             .await;
 
@@ -1210,6 +1233,7 @@ impl Agent for SiGitAgent {
             let poller_session = args.session_id.clone();
             let poller_model_id = model_id_owned.clone();
             let poller_stop = Arc::clone(&stop_flag);
+            let poller_tool_call_id = tool_call_id.clone();
 
             tokio::task::spawn_local(async move {
                 let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
@@ -1234,22 +1258,25 @@ impl Agent for SiGitAgent {
                             ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
                         let bar = progress_bar(pct, 20);
                         format!(
-                            "\n⏬ {display_name} — {bar} {pct}%  ({} / {})",
+                            "{display_name} — {bar} {pct}%  ({} / {})",
                             format_size_human(downloaded),
                             format_size_human(expected_bytes),
                         )
                     } else {
                         format!(
-                            "\n⏬ {display_name} — {} downloaded…",
+                            "{display_name} — {} downloaded…",
                             format_size_human(downloaded)
                         )
                     };
 
                     let notification = SessionNotification::new(
                         poller_session.clone(),
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                            msg,
-                        ))),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            poller_tool_call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::InProgress)
+                                .content(vec![msg.into()]),
+                        )),
                     );
                     if poller_tx.send(notification).await.is_err() {
                         break;
@@ -1260,6 +1287,8 @@ impl Agent for SiGitAgent {
 
         // For already-cached models, send a "loading" message and a spinner
         // so the user sees activity while mistralrs loads the weights (~10-30 s).
+        let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
+
         if !needs_download {
             let cached_display_name = models::build_model_picker_items()
                 .into_iter()
@@ -1267,9 +1296,17 @@ impl Agent for SiGitAgent {
                 .map(|item| item.display_name.clone())
                 .unwrap_or_else(|| model_id.to_string());
 
-            self.send_assistant_message(
+            self.send_tool_call_update(
                 args.session_id.clone(),
-                format!("⏳ Loading {cached_display_name}…"),
+                SessionUpdate::ToolCall(
+                    ToolCall::new(
+                        tool_call_id.clone(),
+                        format!("Loading {cached_display_name}"),
+                    )
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![format!("Loading {cached_display_name}…").into()]),
+                ),
             )
             .await;
 
@@ -1279,6 +1316,7 @@ impl Agent for SiGitAgent {
             let spinner_session = args.session_id.clone();
             let spinner_name = cached_display_name.clone();
             let spinner_stop = Arc::clone(&stop_flag);
+            let spinner_tool_call_id = tool_call_id.clone();
             let load_start = std::time::Instant::now();
 
             tokio::task::spawn_local(async move {
@@ -1303,12 +1341,15 @@ impl Agent for SiGitAgent {
                     let frame = SPINNER[tick % SPINNER.len()];
                     tick += 1;
 
-                    let msg = format!("\n{frame} Loading {spinner_name}… ({elapsed_str})");
+                    let msg = format!("{frame} Loading {spinner_name}… ({elapsed_str})");
                     let notification = SessionNotification::new(
                         spinner_session.clone(),
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                            msg,
-                        ))),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            spinner_tool_call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::InProgress)
+                                .content(vec![msg.into()]),
+                        )),
                     );
                     if spinner_tx.send(notification).await.is_err() {
                         break;
@@ -1322,29 +1363,55 @@ impl Agent for SiGitAgent {
         // Stop the progress / spinner poller regardless of success/failure.
         stop_flag.store(true, Ordering::Relaxed);
 
-        let new_config = switch_result?;
+        match switch_result {
+            Ok(new_config) => {
+                let completion_title = if needs_download {
+                    format!("{} downloaded and loaded", new_config.display_name)
+                } else {
+                    format!("Switched to {}", new_config.display_name)
+                };
+                let completion_body = if needs_download {
+                    format!("✓ {} downloaded and loaded.", new_config.display_name)
+                } else {
+                    format!("✓ Switched to {}.", new_config.display_name)
+                };
 
-        if needs_download {
-            self.send_assistant_message(
-                args.session_id.clone(),
-                format!("\n✓ {} downloaded and loaded.", new_config.display_name),
-            )
-            .await;
-        } else {
-            self.send_assistant_message(
-                args.session_id.clone(),
-                format!("\n✓ Switched to {}.", new_config.display_name),
-            )
-            .await;
+                self.send_tool_call_update(
+                    args.session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        tool_call_id,
+                        ToolCallUpdateFields::new()
+                            .title(completion_title)
+                            .status(ToolCallStatus::Completed)
+                            .content(vec![completion_body.into()]),
+                    )),
+                )
+                .await;
+
+                let config_options = {
+                    let guard = self.current_model.lock().unwrap();
+                    build_model_config_options(&guard)
+                };
+
+                log::info!("model switch complete");
+                Ok(SetSessionConfigOptionResponse::new(config_options))
+            }
+            Err(err) => {
+                self.send_tool_call_update(
+                    args.session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        tool_call_id,
+                        ToolCallUpdateFields::new()
+                            .title("Model switch failed".to_string())
+                            .status(ToolCallStatus::Failed)
+                            .content(vec![format!("error loading model: {}", err.message).into()]),
+                    )),
+                )
+                .await;
+
+                Err(err)
+            }
         }
-
-        let config_options = {
-            let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
-        };
-
-        log::info!("model switch complete");
-        Ok(SetSessionConfigOptionResponse::new(config_options))
     }
 }
 
