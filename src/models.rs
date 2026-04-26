@@ -44,6 +44,7 @@ pub(crate) fn model_id_to_config(model_id: &str) -> Option<GgufModelConfig> {
     Some(match model_id {
         "bartowski/Qwen_Qwen3-4B-GGUF" => GgufModelConfig::qwen3_4b(),
         "bartowski/Qwen_Qwen3-8B-GGUF" => GgufModelConfig::qwen3_8b(),
+        "bartowski/Qwen_Qwen3-14B-GGUF" => GgufModelConfig::qwen3_14b(),
         "bartowski/Qwen_Qwen3-1.7B-GGUF" => GgufModelConfig::qwen3_1_7b(),
         "bartowski/Qwen2.5-3B-Instruct-GGUF" => GgufModelConfig::qwen25_3b(),
         "bartowski/Qwen2.5-1.5B-Instruct-GGUF" => GgufModelConfig::qwen25_1_5b(),
@@ -61,6 +62,7 @@ fn is_tool_calling(model_id: &str) -> bool {
         model_id,
         "bartowski/Qwen_Qwen3-4B-GGUF"
             | "bartowski/Qwen_Qwen3-8B-GGUF"
+            | "bartowski/Qwen_Qwen3-14B-GGUF"
             | "bartowski/Qwen_Qwen3-1.7B-GGUF"
             | "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF"
     )
