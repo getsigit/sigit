@@ -123,6 +123,7 @@ pub struct DiscoveredModel {
 pub enum ModelCacheHealth {
     Complete,
     Incomplete,
+    NotDownloaded,
 }
 
 /// Return all locally discovered GGUF models.

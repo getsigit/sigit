@@ -422,6 +422,14 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
                         .bg(Color::Black)
                         .add_modifier(Modifier::BOLD),
                 ),
+                ModelSource::Available => (
+                    "↓",
+                    "Available for download",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 ModelSource::Fallback => (
                     "◎",
                     "Fallback",
@@ -453,15 +461,17 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
         let health_badge = match item.cache_health {
             ModelCacheHealth::Complete => "",
             ModelCacheHealth::Incomplete => "  ! incomplete cache",
+            ModelCacheHealth::NotDownloaded => "  ↓ download",
         };
         let current_badge = if current { "  ← current" } else { "" };
         let disabled_badge = match item.cache_health {
-            ModelCacheHealth::Complete => "",
+            ModelCacheHealth::Complete | ModelCacheHealth::NotDownloaded => "",
             ModelCacheHealth::Incomplete => "  (unselectable)",
         };
         let brand_mark = match item.source {
             ModelSource::Onde => "◉",
             ModelSource::HuggingFace => "○",
+            ModelSource::Available => "↓",
             ModelSource::Fallback => "◎",
         };
         let source = format!("  [{} {}]", brand_mark, item.source_label);
@@ -478,6 +488,7 @@ fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
             match item.source {
                 ModelSource::Onde => Style::default().fg(Color::Green).bg(Color::Black),
                 ModelSource::HuggingFace => Style::default().fg(Color::Cyan).bg(Color::Black),
+                ModelSource::Available => Style::default().fg(Color::Blue).bg(Color::Black),
                 ModelSource::Fallback => Style::default().fg(Color::Yellow).bg(Color::Black),
             }
         };
@@ -1063,11 +1074,17 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                             return;
                         }
 
+                        let loading_msg = if model.cache_health == ModelCacheHealth::NotDownloaded {
+                            format!(
+                                "Downloading and loading {} ({})… this may take a few minutes.",
+                                model.display_name, model.description
+                            )
+                        } else {
+                            format!("Loading {}…", model.display_name)
+                        };
+
                         app.close_model_picker();
-                        app.messages.push(ChatMessage::system(format!(
-                            "Loading {}…",
-                            model.display_name
-                        )));
+                        app.messages.push(ChatMessage::system(loading_msg));
                         terminal.draw(|frame| render(frame, app)).ok();
 
                         let (tx, rx) = mpsc::channel(1);
@@ -1083,8 +1100,13 @@ async fn exec_slash<B: ratatui::backend::Backend>(
                         // loading the new one.  Calling unload_model() explicitly first
                         // would create a window where no model is loaded — if a message
                         // arrived in that gap it would fail with NoModelLoaded.
+                        let system_prompt = crate::system_prompt_for_model(model.tool_calling);
                         let update = match engine
-                            .load_gguf_model(model.config.clone(), None, Some(sampling))
+                            .load_gguf_model(
+                                model.config.clone(),
+                                Some(system_prompt.to_string()),
+                                Some(sampling),
+                            )
                             .await
                         {
                             Ok(_) => {

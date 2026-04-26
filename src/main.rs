@@ -193,6 +193,27 @@ specific and practical.
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
 root cause, not the symptom. Correct beats clever.";
 
+/// Slim system prompt for models that do not support tool calling.
+///
+/// These models (e.g. DeepSeek Coder v1) cannot use the agent tools, so
+/// the long tool-oriented instructions in [`SYSTEM_PROMPT`] would waste
+/// context and confuse the model. Keep this short and code-focused.
+const SIMPLE_SYSTEM_PROMPT: &str = "\
+Your name is siGit — a coding assistant. \
+You are helpful, concise, and write clean, idiomatic code. \
+Answer any question the user asks — programming, general knowledge, or casual chat. \
+When debugging, address the root cause, not the symptom. \
+Be direct and brief.";
+
+/// Pick the right system prompt based on whether the model supports tool calling.
+pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
+    if tool_calling {
+        SYSTEM_PROMPT
+    } else {
+        SIMPLE_SYSTEM_PROMPT
+    }
+}
+
 /// Maximum number of tool-calling rounds before forcing a text response.
 const MAX_TOOL_ROUNDS: usize = 10;
 
@@ -297,12 +318,13 @@ impl SiGitAgent {
         &self,
         model_id: &str,
     ) -> agent_client_protocol::Result<GgufModelConfig> {
-        let (new_config, max_tokens) = resolve_model_config(model_id).ok_or_else(|| {
-            agent_client_protocol::Error::new(
-                -32602,
-                format!("unknown or unavailable model: {model_id}"),
-            )
-        })?;
+        let (new_config, max_tokens, new_tool_calling) = resolve_model_config(model_id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::new(
+                    -32602,
+                    format!("unknown or unavailable model: {model_id}"),
+                )
+            })?;
 
         log::info!(
             "switching model to {} (max_tokens={max_tokens})",
@@ -323,7 +345,7 @@ impl SiGitAgent {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let loader_engine = Arc::clone(&self.engine);
         let loader_config = new_config.clone();
-        let loader_system_prompt = SYSTEM_PROMPT.to_string();
+        let loader_system_prompt = system_prompt_for_model(new_tool_calling).to_string();
         let loader_sampling = sampling;
 
         std::thread::spawn(move || {
@@ -393,17 +415,25 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
 
     let options: Vec<SessionConfigSelectOption> = items
         .iter()
-        .filter(|item| item.cache_health == setup::ModelCacheHealth::Complete)
+        .filter(|item| item.cache_health != setup::ModelCacheHealth::Incomplete)
         .map(|item| {
-            let description = if item.tool_calling {
-                format!("{} - tool calling", item.description)
+            let mut desc_parts = Vec::new();
+            if item.tool_calling {
+                desc_parts.push("tool calling".to_string());
+            }
+            desc_parts.push(item.description.clone());
+            if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
+                desc_parts.push("↓ download on select".to_string());
+            }
+            let description = desc_parts.join(" - ");
+            let source_badge = if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
+                " [↓ Onde]"
             } else {
-                item.description.clone()
-            };
-            let source_badge = match item.source_label.as_str() {
-                "Onde" => " [◉ Onde]",
-                "HuggingFace" => " [○ HuggingFace]",
-                _ => "",
+                match item.source_label.as_str() {
+                    "Onde" => " [◉ Onde]",
+                    "HuggingFace" => " [○ HuggingFace]",
+                    _ => "",
+                }
             };
             let name = format!("{}{}", item.display_name, source_badge);
             SessionConfigSelectOption::new(
@@ -428,15 +458,17 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
 }
 
 /// Look up the GgufModelConfig for a given model_id value from the picker items.
-fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64)> {
+///
+/// Returns `(config, max_tokens, tool_calling)`.
+fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64, bool)> {
     let items = models::build_model_picker_items();
     items
         .into_iter()
         .find(|item| {
             item.config.model_id == model_id
-                && item.cache_health == setup::ModelCacheHealth::Complete
+                && item.cache_health != setup::ModelCacheHealth::Incomplete
         })
-        .map(|item| (item.config, item.max_tokens))
+        .map(|item| (item.config, item.max_tokens, item.tool_calling))
 }
 
 #[derive(Debug, Clone)]
@@ -510,6 +542,7 @@ fn format_models_list(current_model: &GgufModelConfig) -> String {
         let health_badge = match item.cache_health {
             setup::ModelCacheHealth::Complete => "",
             setup::ModelCacheHealth::Incomplete => "  ! incomplete cache",
+            setup::ModelCacheHealth::NotDownloaded => "  ↓ download on select",
         };
         let source = match source_key {
             "Onde" => "  [Onde]",
@@ -599,6 +632,38 @@ async fn exec_slash_acp(
                                 ),
                             )
                             .await;
+                    } else if model.cache_health == setup::ModelCacheHealth::NotDownloaded {
+                        agent
+                            .send_assistant_message(
+                                session_id.clone(),
+                                format!(
+                                    "Downloading and loading {} ({})… this may take a few minutes.",
+                                    model.display_name, model.description
+                                ),
+                            )
+                            .await;
+
+                        match agent.switch_model_by_id(&model.config.model_id).await {
+                            Ok(new_config) => {
+                                agent
+                                    .send_assistant_message(
+                                        session_id,
+                                        format!(
+                                            "✓ Downloaded and switched to {}",
+                                            new_config.display_name
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(err) => {
+                                agent
+                                    .send_assistant_message(
+                                        session_id,
+                                        format!("error downloading model: {}", err.message),
+                                    )
+                                    .await;
+                            }
+                        }
                     } else {
                         agent
                             .send_assistant_message(
@@ -1231,7 +1296,12 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let loader_engine = Arc::clone(&engine);
-    let system_prompt = SYSTEM_PROMPT.to_string();
+    let tool_calling = models::build_model_picker_items()
+        .iter()
+        .find(|item| item.config.model_id == config.model_id)
+        .map(|item| item.tool_calling)
+        .unwrap_or(false);
+    let system_prompt = system_prompt_for_model(tool_calling).to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
         let result =
@@ -1304,13 +1374,14 @@ async fn run_acp_server() -> anyhow::Result<()> {
         })
         .unwrap_or_else(GgufModelConfig::qwen3_4b);
 
-    let max_tokens = if config.display_name == "Qwen 3 4B (Q4_K_M)"
-        || config.display_name == "Qwen 3 8B (Q4_K_M)"
-    {
-        4096
-    } else {
-        512
-    };
+    let acp_tool_calling = models::build_model_picker_items()
+        .iter()
+        .find(|item| item.config.model_id == config.model_id)
+        .map(|item| (item.tool_calling, item.max_tokens))
+        .unwrap_or((true, 4096));
+
+    let max_tokens = acp_tool_calling.1;
+    let tool_calling = acp_tool_calling.0;
 
     let sampling = SamplingConfig {
         max_tokens: Some(max_tokens),
@@ -1320,8 +1391,9 @@ async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("ACP startup model: {}", config.display_name);
 
     let startup_config = config.clone();
+    let acp_system_prompt = system_prompt_for_model(tool_calling).to_string();
     engine
-        .load_gguf_model(config, Some(SYSTEM_PROMPT.to_string()), Some(sampling))
+        .load_gguf_model(config, Some(acp_system_prompt), Some(sampling))
         .await
         .map_err(|error| anyhow::anyhow!("model load failed: {error}"))?;
 
