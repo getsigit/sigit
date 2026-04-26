@@ -3799,7 +3799,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "onde"
 version = "0.1.8"
-source = "git+https://github.com/ondeinference/onde?branch=development#8321bc566cfbca8ff1d4b71f187f2b007fd98433"
 dependencies = [
  "anyhow",
  "cc",
