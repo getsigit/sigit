@@ -10,33 +10,31 @@
 
 siGit is a coding agent that runs on your machine. No API keys. No cloud round-trips.
 
-It is meant to be useful anywhere, but it is especially good in smbCloud codebases. It already knows the rough shape of the platform: Rust workspaces with focused crates, Rails services, deploy flows, auth boundaries, and platform-managed services like GresIQ. In smbCloud repos, that usually means less back-and-forth and fewer generic answers.
+It works in any codebase, but it's particularly at home in smbCloud repos. It knows the shape of the platform: Rust workspaces, Rails services, deploy flows, auth boundaries, GresIQ. That means less back-and-forth and fewer generic answers when you're working on smbCloud stuff.
 
-siGit has two main modes:
+Two modes:
 
-- ACP mode, where Zed or another ACP-compatible editor starts it over stdio
-- an interactive terminal chat when you run `sigit` yourself
+- **ACP mode** — Zed or another ACP-compatible editor starts it over stdio
+- **Terminal mode** — run `sigit` directly for an interactive chat
 
-Current platform support:
+| Platform | ACP mode | Terminal mode |
+|----------|----------|---------------|
+| macOS | ✓ | ✓ |
+| Linux | ✓ | ✓ |
+| Windows | ✓ | not yet |
 
-- macOS: ACP mode and interactive terminal mode
-- Linux: ACP mode and interactive terminal mode
-- Windows: ACP mode only for now
+## smbCloud context
 
-## What siGit knows about smbCloud
+When siGit is in an smbCloud repo, it uses platform context instead of giving generic cloud-app advice:
 
-When siGit is working in an smbCloud repo, it should use platform context instead of treating everything like a generic cloud app. That includes things like:
+- platform user flows vs. tenant app auth flows are different things
+- `Project` is the umbrella workspace; `FrontendApp`, `AuthApp`, and GresIQ are separate deployable units
+- Next.js SSR deploys aren't the same as the git-push path
+- existing workspace patterns and crate boundaries over new abstractions
 
-- the difference between platform user flows and tenant app auth flows
-- the fact that `Project` is the umbrella workspace, while app-like resources such as `FrontendApp`, `AuthApp`, and GresIQ are separate deployable units
-- the fact that Next.js SSR deploys are not the same as the generic git-push path
-- the fact that smbCloud repos usually prefer existing workspace patterns and crate boundaries over new abstractions
-
-Outside smbCloud, it should still behave like a normal coding agent and not force platform-specific advice into places where it does not belong.
+Outside smbCloud repos it stays general. No platform-specific advice where it doesn't belong.
 
 ## Install
-
-Install siGit Code with Cargo, Homebrew, pip, or npm:
 
 ```sh
 cargo install sigit
@@ -51,9 +49,9 @@ cargo install sigit
 
 ## First run
 
-The first time siGit starts, it downloads a GGUF model, usually around 1 to 2 GB, from Hugging Face. After that, it loads from disk in a few seconds.
+On first launch siGit downloads a GGUF model from Hugging Face, usually 1–2 GB. After that it loads from disk in a few seconds.
 
-On macOS, siGit shares its model cache with the siGit desktop app through an App Group container. If the desktop app already downloaded the model, the CLI reuses it.
+On macOS, the model cache is shared with the siGit desktop app through an App Group container. If the desktop app already has the model, the CLI reuses it.
 
 ## Zed setup
 
@@ -70,7 +68,7 @@ Add to `~/.config/zed/settings.json`:
 }
 ```
 
-Use the full absolute path. `~` does not get expanded here.
+Use the full absolute path. `~` doesn't expand here.
 
 ## VSCode via ACP Client extension
 
@@ -90,9 +88,9 @@ Install [ACP client](https://marketplace.visualstudio.com/items?itemName=formula
 
 ## Terminal mode
 
-If you run `sigit` directly in a terminal, it opens an interactive chat UI. It uses the same model and system prompt as the editor integration, so it is handy for quick questions when you do not want to open Zed first.
+Run `sigit` in a terminal and you get an interactive chat UI. Same model and system prompt as the editor integration, just without opening Zed.
 
-That terminal mode still depends on Unix terminal behavior, so it works on macOS and Linux. On Windows, siGit supports ACP and editor mode only for now.
+Terminal mode needs Unix terminal behavior, so macOS and Linux only. Windows gets ACP mode for now.
 
 ## Platform support
 
@@ -104,7 +102,7 @@ That terminal mode still depends on Unix terminal behavior, so it works on macOS
 
 ## License
 
-Licensed under **Apache 2.0**. See [LICENSE](https://github.com/getsigit/sigit/blob/main/LICENSE).
+[Apache 2.0](https://github.com/getsigit/sigit/blob/main/LICENSE)
 
 ## Copyright
 

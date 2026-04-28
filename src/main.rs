@@ -1,29 +1,21 @@
-//! siGit Code is a local coding agent built on Onde Inference.
+//! siGit Code — local coding agent on Onde Inference.
 //!
-//! When you run it in an interactive terminal, all process output goes to
-//! `$TMPDIR/sigit.log` first. That includes `log::` events, `tracing` output
-//! from mistralrs_core, and even stray `println!` calls from dependencies.
-//! Ratatui gets its own copy of the real terminal handle, so the UI can keep
-//! drawing normally while the noisy stuff goes to the log file.
+//! In TTY mode, all output (log crate, tracing, stray printlns) redirects to
+//! `$TMPDIR/sigit.log`. Ratatui holds a separate fd to the real terminal so
+//! the TUI stays clean.
 //!
-//! siGit has two modes:
-//! - ACP mode over stdio for editors like Zed
-//! - interactive terminal mode when you run it directly in a TTY
+//! Two modes:
+//! - ACP over stdio (editor integration, e.g. Zed)
+//! - interactive terminal (direct TTY)
 //!
-//! Current platform support:
-//! - macOS: ACP mode and interactive terminal mode
-//! - Linux: ACP mode and interactive terminal mode
-//! - Windows: ACP mode only for now
+//! Interactive mode is Unix-only — it needs fd redirection to keep logs out
+//! of the TUI. Windows only gets ACP mode for now.
 //!
-//! The interactive terminal path is still Unix-only because it relies on
-//! Unix file-descriptor redirection to keep logs away from the TUI.
+//! The model loads before the ACP `LocalSet` starts because `mistralrs` calls
+//! `block_in_place`, which panics inside `spawn_local`. Loading on a regular
+//! multi-thread worker sidesteps that.
 //!
-//! The model loads before the ACP `LocalSet` starts. That is important because
-//! `mistralrs` calls `block_in_place` internally, and that blows up inside
-//! `spawn_local` tasks. Loading it on a normal multi-thread worker avoids the
-//! problem.
-//!
-//! On macOS, the HF cache points at the App Group container shared with the
+//! On macOS the HF cache lives in the App Group container shared with the
 //! siGit desktop app. See [`setup`].
 //!
 //! # Zed setup
@@ -194,11 +186,8 @@ specific and practical.
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
 root cause, not the symptom. Correct beats clever.";
 
-/// Slim system prompt for models that do not support tool calling.
-///
-/// These models (e.g. DeepSeek Coder v1) cannot use the agent tools, so
-/// the long tool-oriented instructions in [`SYSTEM_PROMPT`] would waste
-/// context and confuse the model. Keep this short and code-focused.
+/// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
+/// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
 const SIMPLE_SYSTEM_PROMPT: &str = "\
 Your name is siGit — a coding assistant. \
 You are helpful, concise, and write clean, idiomatic code. \
@@ -206,7 +195,6 @@ Answer any question the user asks — programming, general knowledge, or casual 
 When debugging, address the root cause, not the symptom. \
 Be direct and brief.";
 
-/// Pick the right system prompt based on whether the model supports tool calling.
 pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
     if tool_calling {
         SYSTEM_PROMPT
@@ -215,10 +203,9 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
     }
 }
 
-/// Maximum number of tool-calling rounds before forcing a text response.
+/// cap tool-call loops so a confused model can't spin forever
 const MAX_TOOL_ROUNDS: usize = 10;
 
-/// Convert the agent tool definitions into onde's `ToolDefinition` type.
 fn agent_tools_as_onde() -> Vec<ToolDefinition> {
     tools::all_tools()
         .into_iter()
@@ -278,16 +265,11 @@ fn initialize_meta() -> Meta {
     meta
 }
 
-// Agent
-
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     notification_tx: mpsc::Sender<SessionNotification>,
-    /// The project working directory provided by the editor via ACP session
-    /// creation. Tool calls use this as `cwd` so file operations target the
-    /// correct project, not wherever the agent process was spawned.
+    /// cwd from the editor — tool calls run here, not where the process started
     session_cwd: std::sync::Mutex<Option<PathBuf>>,
-    /// The currently loaded model config, used for config_options reporting.
     current_model: std::sync::Mutex<GgufModelConfig>,
 }
 
@@ -344,12 +326,8 @@ impl SiGitAgent {
             ..SamplingConfig::default()
         };
 
-        // load_gguf_model calls block_in_place internally.  Calling it from
-        // inside the ACP LocalSet (spawn_local) panics with "can call blocking
-        // only when running on the multi-threaded runtime".  Fix: run the
-        // unload + load on a dedicated OS thread with its own runtime, then
-        // await the result over a oneshot channel — same pattern used at
-        // startup in run_acp_server.
+        // block_in_place inside spawn_local panics, so run the load on a
+        // dedicated thread with its own runtime (same trick as startup)
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let loader_engine = Arc::clone(&self.engine);
         let loader_config = new_config.clone();
@@ -359,10 +337,8 @@ impl SiGitAgent {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
             let result = rt.block_on(async move {
-                // load_gguf_model unloads any existing model internally before
-                // loading the new one.  Calling unload_model() explicitly first
-                // would create a window where no model is loaded — if a prompt
-                // arrived in that gap it would fail with NoModelLoaded.
+                // load_gguf_model already unloads the old model internally;
+                // calling unload first would leave a gap where prompts fail
                 loader_engine
                     .load_gguf_model(
                         loader_config,
@@ -414,10 +390,9 @@ impl SiGitAgent {
     }
 }
 
-/// The config option ID used for the model selector in the Zed agent panel.
+/// config option ID for the model picker in Zed's agent panel
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
-/// Build the `SessionConfigOption` list for model selection.
 fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
     let items = models::build_model_picker_items();
 
@@ -465,9 +440,7 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
     ]
 }
 
-/// Look up the GgufModelConfig for a given model_id value from the picker items.
-///
-/// Returns `(config, max_tokens, tool_calling)`.
+/// returns `(config, max_tokens, tool_calling)` for a picker model_id, or None
 fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64, bool)> {
     let items = models::build_model_picker_items();
     items
@@ -760,24 +733,20 @@ impl Agent for SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        // Capture the project working directory from the editor.
         if let Ok(mut guard) = self.session_cwd.lock() {
             *guard = Some(args.cwd.clone());
         }
 
-        // Set the process cwd so tool calls using relative paths land in the
-        // correct project directory.
+        // tool calls use relative paths, so we need to match the editor's cwd
         if args.cwd.is_dir()
             && let Err(err) = std::env::set_current_dir(&args.cwd)
         {
             log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
-        // Clear conversation history — siGit doesn't persist sessions, so a
-        // "load" is effectively a fresh start with the same session ID.
+        // no session persistence, so "load" just resets
         self.engine.clear_history().await;
 
-        // Tell the model which project directory it's working in.
         self.engine
             .push_history(onde::inference::ChatMessage::system(format!(
                 "The user's project working directory is {}. \
@@ -811,7 +780,6 @@ impl Agent for SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        // Update cwd if the fork provides a different one.
         if let Ok(mut guard) = self.session_cwd.lock() {
             *guard = Some(args.cwd.clone());
         }
@@ -821,9 +789,7 @@ impl Agent for SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
-        // siGit doesn't persist history, so a fork is effectively a fresh
-        // session — clear the conversation and let the user start over from
-        // their edited message.
+        // no persistence, so fork == fresh session
         self.engine.clear_history().await;
 
         self.engine
@@ -858,7 +824,6 @@ impl Agent for SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        // Capture the project working directory from the editor.
         if let Ok(mut guard) = self.session_cwd.lock() {
             *guard = Some(args.cwd.clone());
         }
@@ -868,7 +833,6 @@ impl Agent for SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
-        // Clear history — the model is already loaded.
         self.engine.clear_history().await;
 
         self.engine
@@ -892,8 +856,7 @@ impl Agent for SiGitAgent {
     async fn prompt(&self, args: PromptRequest) -> agent_client_protocol::Result<PromptResponse> {
         let session_id = args.session_id.clone();
 
-        // Debug: log every content block the editor sends so we can see
-        // exactly what arrives for @ references, file context, etc.
+        // log every block so we can debug @ references and file context
         for (i, block) in args.prompt.iter().enumerate() {
             match block {
                 ContentBlock::Text(t) => {
@@ -949,7 +912,7 @@ impl Agent for SiGitAgent {
                     parts.push(t.text.clone());
                 }
                 ContentBlock::Resource(embedded) => {
-                    // Embedded file content sent by the editor (preferred over ResourceLink).
+                    // editor inlined the file content already
                     match &embedded.resource {
                         agent_client_protocol::EmbeddedResourceResource::TextResourceContents(
                             text_resource,
@@ -970,11 +933,10 @@ impl Agent for SiGitAgent {
                     }
                 }
                 ContentBlock::ResourceLink(link) => {
-                    // The editor sent a reference but not the content — read it if it's a file.
+                    // reference without content; read the file ourselves
                     let label = link.name.clone();
 
                     if let Some(raw_path) = link.uri.strip_prefix("file://") {
-                        // Split off the #L<start>:<end> fragment if present.
                         let (file_path, line_range) = if let Some(hash_pos) = raw_path.rfind('#') {
                             let fragment = &raw_path[hash_pos + 1..];
                             let path = &raw_path[..hash_pos];
@@ -994,7 +956,6 @@ impl Agent for SiGitAgent {
                         match std::fs::read_to_string(file_path) {
                             Ok(contents) => {
                                 let extracted = if let Some((start, end)) = line_range {
-                                    // Extract only the requested line range (1-based, inclusive).
                                     let selected: Vec<&str> = contents
                                         .lines()
                                         .enumerate()
@@ -1046,13 +1007,9 @@ impl Agent for SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
-        // ── Agentic tool-calling loop ────────────────────────────────────
-        //
-        // 1. Send the user message with tool definitions (non-streaming).
-        // 2. If the model responds with tool calls, execute them, feed
-        //    results back, and repeat (up to MAX_TOOL_ROUNDS).
-        // 3. Once the model produces a text response (no tool calls),
-        //    stream it to the editor.
+        // ── tool-calling loop ────────────────────────────────────────────
+        // send message → execute any tool calls → feed results back
+        // repeat up to MAX_TOOL_ROUNDS, then force a text reply
 
         let onde_tools = agent_tools_as_onde();
 
@@ -1085,7 +1042,6 @@ impl Agent for SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Execute the tool (async — read_website uses spawn_blocking internally).
                 let output = tools::execute_tool(&tc.function_name, &tc.arguments).await;
 
                 log::info!("  ← {} chars", output.len());
@@ -1096,11 +1052,10 @@ impl Agent for SiGitAgent {
                 });
             }
 
-            // Decide whether to allow further tool calls.
             let next_tools = if round < MAX_TOOL_ROUNDS {
                 Some(onde_tools.as_slice())
             } else {
-                None // force a text response on the last round
+                None // last round: force text
             };
 
             result = self
@@ -1129,8 +1084,7 @@ impl Agent for SiGitAgent {
                 String::new()
             }
         } else {
-            // Strip Qwen 3 `<think>…</think>` blocks — the editor doesn't
-            // need to see internal reasoning tokens.
+            // strip <think> blocks so reasoning tokens stay hidden
             let (_think, visible) = chat::strip_think_blocks(&reply_text);
             visible
         };
@@ -1173,21 +1127,18 @@ impl Agent for SiGitAgent {
 
         let model_id = args.value.0.as_ref();
 
-        // Check if this model needs to be downloaded first so we can show
-        // a progress indicator in Zed while the download + load is happening.
         let needs_download = models::build_model_picker_items()
             .into_iter()
             .find(|item| item.config.model_id == model_id)
             .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
             .unwrap_or(false);
 
-        // Spawn a progress-poller task that sends periodic download status
-        // messages to Zed via the notification channel.  A shared flag lets
-        // us stop the poller once the load finishes.
+        // shared flag to kill the progress poller when the load finishes
         let stop_flag = Arc::new(AtomicBool::new(false));
 
+        let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
+
         if needs_download {
-            // Send the initial "downloading" banner immediately.
             let model_id_owned = model_id.to_string();
             let expected_bytes = onde::inference::models::SUPPORTED_MODEL_INFO
                 .iter()
@@ -1207,14 +1158,12 @@ impl Agent for SiGitAgent {
                 String::new()
             };
 
-            let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
-
             self.send_tool_call_update(
                 args.session_id.clone(),
                 SessionUpdate::ToolCall(
                     ToolCall::new(
                         tool_call_id.clone(),
-                        format!("Downloading {display_name}{size_hint}"),
+                        format!("⏬ Downloading {display_name}{size_hint}"),
                     )
                     .kind(ToolKind::Execute)
                     .status(ToolCallStatus::InProgress)
@@ -1228,7 +1177,7 @@ impl Agent for SiGitAgent {
             )
             .await;
 
-            // Poller: every 4 seconds report bytes-on-disk / expected.
+            // poll download progress and update the spinner in Zed
             let poller_tx = self.notification_tx.clone();
             let poller_session = args.session_id.clone();
             let poller_model_id = model_id_owned.clone();
@@ -1236,8 +1185,10 @@ impl Agent for SiGitAgent {
             let poller_tool_call_id = tool_call_id.clone();
 
             tokio::task::spawn_local(async move {
+                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                 let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(4));
+                let mut tick: usize = 0;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.tick().await; // consume the immediate first tick
 
                 while !poller_stop.load(Ordering::Relaxed) {
@@ -1252,6 +1203,17 @@ impl Agent for SiGitAgent {
                         .filter(|p| p.exists())
                         .map(|p| dir_size_recursive(p))
                         .unwrap_or(0);
+
+                    let frame = SPINNER[tick % SPINNER.len()];
+                    tick += 1;
+
+                    let title = if expected_bytes > 0 {
+                        let pct =
+                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
+                        format!("{frame} Downloading {display_name}{size_hint} ({pct}%)")
+                    } else {
+                        format!("{frame} Downloading {display_name}{size_hint}")
+                    };
 
                     let msg = if expected_bytes > 0 {
                         let pct =
@@ -1274,6 +1236,7 @@ impl Agent for SiGitAgent {
                         SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                             poller_tool_call_id.clone(),
                             ToolCallUpdateFields::new()
+                                .title(title)
                                 .status(ToolCallStatus::InProgress)
                                 .content(vec![msg.into()]),
                         )),
@@ -1285,10 +1248,7 @@ impl Agent for SiGitAgent {
             });
         }
 
-        // For already-cached models, send a "loading" message and a spinner
-        // so the user sees activity while mistralrs loads the weights (~10-30 s).
-        let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
-
+        // cached models still take 10-30s to load weights; show a spinner
         if !needs_download {
             let cached_display_name = models::build_model_picker_items()
                 .into_iter()
@@ -1310,8 +1270,7 @@ impl Agent for SiGitAgent {
             )
             .await;
 
-            // Spinner poller: send an elapsed-time update every 5 seconds so
-            // the user can tell siGit is still working.
+            // tick every 5s so the user knows we haven't frozen
             let spinner_tx = self.notification_tx.clone();
             let spinner_session = args.session_id.clone();
             let spinner_name = cached_display_name.clone();
@@ -1360,15 +1319,14 @@ impl Agent for SiGitAgent {
 
         let switch_result = self.switch_model_by_id(model_id).await;
 
-        // Stop the progress / spinner poller regardless of success/failure.
         stop_flag.store(true, Ordering::Relaxed);
 
         match switch_result {
             Ok(new_config) => {
                 let completion_title = if needs_download {
-                    format!("{} downloaded and loaded", new_config.display_name)
+                    format!("✓ {} downloaded and loaded", new_config.display_name)
                 } else {
-                    format!("Switched to {}", new_config.display_name)
+                    format!("✓ Switched to {}", new_config.display_name)
                 };
                 let completion_body = if needs_download {
                     format!("✓ {} downloaded and loaded.", new_config.display_name)
@@ -1417,9 +1375,8 @@ impl Agent for SiGitAgent {
 
 // ── Download progress helpers ─────────────────────────────────────────────────
 
-/// Recursively sum the sizes of all files under `path`, following symlinks.
-/// Used by the ACP download-progress poller to report bytes-on-disk before
-/// hf-hub renames the staging files to their final blob names.
+/// total bytes on disk under `path`. needed because hf-hub uses staging
+/// names during download, so we can't just stat the final blobs.
 fn dir_size_recursive(path: &std::path::Path) -> u64 {
     let mut total: u64 = 0;
     let Ok(entries) = std::fs::read_dir(path) else {
@@ -1436,7 +1393,6 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
     total
 }
 
-/// Format a byte count as a human-readable string (B / KB / MB / GB).
 fn format_size_human(bytes: u64) -> String {
     const GB: u64 = 1_073_741_824;
     const MB: u64 = 1_048_576;
@@ -1452,8 +1408,6 @@ fn format_size_human(bytes: u64) -> String {
     }
 }
 
-/// Build a simple ASCII progress bar string of the given width.
-/// e.g. `[████████░░░░░░░░░░░░]` at 40 %
 fn progress_bar(pct: u8, width: usize) -> String {
     let filled = ((pct as usize) * width) / 100;
     let empty = width.saturating_sub(filled);
@@ -1462,28 +1416,17 @@ fn progress_bar(pct: u8, width: usize) -> String {
 
 // ── Output capture ────────────────────────────────────────────────────────────
 
-/// Redirect **both** stdout and stderr to `$TMPDIR/sigit.log` at the
-/// file-descriptor level and return a [`std::fs::File`] handle to the *real*
-/// terminal (the original stdout) so ratatui can still render to it.
-///
-/// This is the nuclear option — it catches absolutely everything that any
-/// library writes to stdout (`println!` in mistralrs `print_metadata`) or
-/// stderr (`tracing::info!`, `log::info!`, raw `eprintln!`).
-///
-/// Returns **two** `File` handles to the real terminal (both created via
-/// `dup(STDOUT)` *before* the redirect):
-///
-/// 1. **`tui`** — given to ratatui's `CrosstermBackend` for rendering.
-/// 2. **`cleanup`** — kept by the caller for writing `LeaveAlternateScreen`
-///    and restoring stdout/stderr after the TUI exits (since ratatui 0.29
-///    does not expose `writer_mut()` on the backend).
+/// redirect stdout+stderr to `$TMPDIR/sigit.log` at the fd level so
+/// mistralrs/tracing noise never hits the terminal. returns two dup'd
+/// fds to the real tty: one for ratatui, one for cleanup (ratatui 0.29
+/// doesn't expose `writer_mut()`).
 #[cfg(unix)]
 fn redirect_output_to_log() -> anyhow::Result<(std::fs::File, std::fs::File)> {
     let log_path = std::env::temp_dir().join("sigit.log");
     let log_file = std::fs::File::create(&log_path)?;
     let log_fd = log_file.as_raw_fd();
 
-    // Save TWO copies of the real terminal fd before we clobber stdout.
+    // two copies: ratatui needs one, cleanup needs another
     let saved_tui = unsafe { libc::dup(libc::STDOUT_FILENO) };
     anyhow::ensure!(
         saved_tui >= 0,
@@ -1497,14 +1440,12 @@ fn redirect_output_to_log() -> anyhow::Result<(std::fs::File, std::fs::File)> {
         std::io::Error::last_os_error()
     );
 
-    // Point stdout and stderr at the log file.
     unsafe {
         libc::dup2(log_fd, libc::STDOUT_FILENO);
         libc::dup2(log_fd, libc::STDERR_FILENO);
     }
 
-    // `log_file` can drop — dup2 created independent references to the
-    // underlying file description, so stdout/stderr keep it alive.
+    // safe to drop log_file; dup2 keeps the fd alive via stdout/stderr
 
     Ok((unsafe { std::fs::File::from_raw_fd(saved_tui) }, unsafe {
         std::fs::File::from_raw_fd(saved_cleanup)
@@ -1513,11 +1454,8 @@ fn redirect_output_to_log() -> anyhow::Result<(std::fs::File, std::fs::File)> {
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-/// Initialise `tracing-subscriber` as the single logging backend.
-///
-/// In TUI mode stdout/stderr have already been redirected to the log file by
-/// [`redirect_output_to_log`], so the subscriber simply writes to stderr
-/// (which *is* the log file).  In ACP mode stderr is the real stderr.
+/// in TUI mode stderr is the log file (redirected earlier);
+/// in ACP mode it's real stderr. either way, write there.
 fn init_logging(is_tty: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_fmt::Subscriber::builder()
@@ -1529,19 +1467,9 @@ fn init_logging(is_tty: bool) {
 
 // ── Interactive TUI mode ──────────────────────────────────────────────────────
 
-/// Start the TUI immediately, load the model concurrently, signal completion
-/// via a oneshot channel so the TUI can animate the banner while waiting.
-///
-/// The terminal is set up *manually* against the saved real-terminal `File`
-/// returned by [`redirect_output_to_log`].  Because stdout/stderr have
-/// already been redirected to the log file at that point, any `println!`,
-/// `eprintln!`, `log::info!`, or `tracing::info!` emitted by mistralrs or
-/// onde goes straight to `$TMPDIR/sigit.log` and never touches the screen.
-///
-/// `tty` is given to ratatui; `cleanup_tty` is a second fd to the same
-/// terminal, used for `LeaveAlternateScreen` and restoring stdout/stderr
-/// (we cannot access the backend's writer because `writer_mut()` is private
-/// in ratatui 0.29).
+/// boot the TUI and load the model on a background thread.
+/// `tty` goes to ratatui; `cleanup_tty` is a separate fd for
+/// LeaveAlternateScreen (ratatui 0.29 hides `writer_mut()`).
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
     let engine = Arc::new(ChatEngine::new());
@@ -1550,7 +1478,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let startup_model_name = startup_selection
         .as_ref()
         .map(|selection| selection.display_name.clone())
-        .unwrap_or_else(|| GgufModelConfig::platform_default().display_name);
+        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().display_name);
 
     let config = startup_selection
         .as_ref()
@@ -1573,14 +1501,13 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 })
                 .map(|item| item.config)
         })
-        .unwrap_or_else(GgufModelConfig::platform_default);
+        .unwrap_or_else(GgufModelConfig::qwen3_4b);
     let sampling = SamplingConfig {
         max_tokens: Some(8192),
         ..SamplingConfig::default()
     };
 
-    // std::sync::mpsc — the loader runs on a dedicated OS thread, completely
-    // decoupled from the tokio runtime so it can't starve the TUI draw loop.
+    // std::sync::mpsc on a real thread so model loading can't starve the TUI
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let loader_engine = Arc::clone(&engine);
@@ -1597,24 +1524,21 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
         let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
     });
 
-    // Set up the terminal manually on the real tty fd.
     crossterm::terminal::enable_raw_mode()?;
     let mut tty = BufWriter::new(tty);
     crossterm::execute!(tty, crossterm::terminal::EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(tty);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    // The TUI runs here on the main tokio runtime.  It polls load_rx via
-    // try_recv() on every tick — non-blocking, zero contention.
+    // polls load_rx with try_recv() each tick, no blocking
     let chat_result = chat::run_with(&mut terminal, engine, load_rx, startup_model_name).await;
 
-    // Restore the terminal before exiting.
-    // Use the separate cleanup fd — the backend's writer is private.
+    // cleanup fd because backend's writer is private
     crossterm::execute!(cleanup_tty, crossterm::terminal::LeaveAlternateScreen)?;
     cleanup_tty.flush()?;
     crossterm::terminal::disable_raw_mode()?;
 
-    // Restore stdout/stderr so any post-TUI error messages are visible.
+    // restore real stdout/stderr for post-TUI error output
     #[cfg(unix)]
     {
         let cleanup_fd = cleanup_tty.as_raw_fd();
@@ -1632,8 +1556,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("ACP mode — starting agent server");
 
-    // Load before the LocalSet. block_in_place panics inside spawn_local,
-    // so the model must load on a regular worker thread.
+    // must load before LocalSet: block_in_place panics inside spawn_local
     log::info!("loading model (this may take a minute on first run)...");
 
     let engine = Arc::new(ChatEngine::new());
@@ -1690,11 +1613,11 @@ async fn run_acp_server() -> anyhow::Result<()> {
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
     let agent = SiGitAgent::new(engine, notification_tx, startup_config);
 
-    // AgentSideConnection wants futures-io, not tokio-io.
+    // AgentSideConnection needs futures-io
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
 
-    // ACP futures are !Send — needs a LocalSet.
+    // ACP futures are !Send
     let local = tokio::task::LocalSet::new();
 
     local
@@ -1708,7 +1631,6 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 },
             );
 
-            // Forward streamed chunks to the editor.
             tokio::task::spawn_local(async move {
                 while let Some(notification) = notification_rx.recv().await {
                     if let Err(err) = conn.session_notification(notification).await {
@@ -1717,7 +1639,6 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 }
             });
 
-            // Runs until the editor disconnects.
             if let Err(err) = io_task.await {
                 log::error!("ACP IO error: {err}");
             }
@@ -1735,8 +1656,7 @@ async fn main() -> anyhow::Result<()> {
     let is_tty = std::io::stdin().is_terminal();
 
     if is_tty {
-        // Redirect stdout/stderr to $TMPDIR/sigit.log *first* — before any
-        // library code can println!/eprintln!/log to the real terminal.
+        // must redirect before any library code touches stdout
         #[cfg(unix)]
         {
             let (tty, cleanup_tty) = redirect_output_to_log()?;

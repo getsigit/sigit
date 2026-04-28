@@ -1,44 +1,33 @@
-//! Full-screen terminal chat UI for siGit Code.
+//! Full-screen terminal chat UI.
 //!
-//! Takes over the alternate screen and multiplexes terminal events with
-//! streaming LLM tokens via `tokio::select!`.
-//!
-//! The UI has two phases:
-//!
-//! 1. **Loading phase** — a centered spinner is shown while the model loads
-//!    in the background.  The oneshot channel from the caller signals
-//!    completion or failure.
-//! 2. **Chat phase** — normal interactive chat once `load_rx` resolves.
+//! Two phases: a loading spinner while the model initializes, then
+//! interactive chat. Uses `tokio::select!` to multiplex terminal events
+//! with streaming LLM tokens.
 
 // ── Think-block stripping ─────────────────────────────────────────────────────
 
-/// Strip `<think>…</think>` blocks from a model response.
+/// Split out `<think>…</think>` blocks from a model response.
 ///
-/// Qwen 3 models emit `<think>…</think>` before the real answer. This
-/// function separates the thinking content from the visible reply so the
-/// UI can render them differently (dimmed / collapsed).
-///
+/// Qwen 3 emits reasoning inside `<think>` tags before the actual answer.
 /// Returns `(thinking_text, visible_reply)`. Either may be empty.
 pub(crate) fn strip_think_blocks(raw: &str) -> (String, String) {
     let mut thinking = String::new();
     let mut remainder = raw;
 
     while let Some(start) = remainder.find("<think>") {
-        // Text before <think> is visible.
         let before = &remainder[..start];
         if let Some(end) = remainder[start..].find("</think>") {
             let block = &remainder[start + 7..start + end];
             thinking.push_str(block.trim());
             remainder = &remainder[start + end + 8..];
-            // Prepend any text before <think> to the leftover.
             if !before.trim().is_empty() {
-                // Unusual — text before <think>. Keep it visible.
+                // rare: text before <think> — keep it visible
                 let mut combined = before.to_string();
                 combined.push_str(remainder);
                 return (thinking, combined.trim().to_string());
             }
         } else {
-            // Unclosed <think> — treat rest as thinking (model ran out of tokens).
+            // unclosed tag — model probably ran out of tokens
             thinking.push_str(remainder[start + 7..].trim());
             remainder = before;
             break;
@@ -50,8 +39,7 @@ pub(crate) fn strip_think_blocks(raw: &str) -> (String, String) {
 
 // ── Unix-only TUI ─────────────────────────────────────────────────────────────
 //
-// Everything below this point is compiled only on Unix (macOS + Linux).
-// Windows supports ACP mode only; the interactive TUI is not available there.
+// macOS + Linux only. Windows uses ACP mode instead.
 
 #[cfg(unix)]
 mod tui {
@@ -82,14 +70,14 @@ mod tui {
         User,
         Assistant,
         System,
-        /// Banner art — each character gets its own color.
+        /// rainbow-colored banner art
         Banner,
     }
 
     struct ChatMessage {
         role: Role,
         text: String,
-        /// Extracted `<think>…</think>` content, if any (Qwen 3 reasoning).
+        /// Qwen 3 reasoning extracted from `<think>` tags, if any.
         think_block: Option<String>,
     }
 
@@ -131,13 +119,10 @@ mod tui {
 
     // ── Inference updates from background task ────────────────────────────────
 
-    /// Messages sent from the spawned inference task back to the event loop.
     enum InferenceUpdate {
-        /// The model is calling a tool — show its name in the chat.
+        /// show tool name in chat while it runs
         ToolUse(String),
-        /// The model produced a final text response.
         Response(String),
-        /// Something went wrong during inference.
         Error(String),
     }
 
@@ -155,39 +140,26 @@ mod tui {
         scroll_offset: u16,
         stream_rx: Option<mpsc::Receiver<StreamChunk>>,
         stream_buf: String,
-        /// Channel for receiving results from the background inference task.
         inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
-        /// Channel for receiving results from a model switch.
         model_load_rx: Option<mpsc::Receiver<ModelLoadUpdate>>,
-        /// True while waiting for inference to finish.
         thinking: bool,
-        /// Counter driving the thinking spinner animation.
         thinking_tick: u8,
         quit: bool,
-        /// Flips every few ticks while streaming to make the cursor blink.
+        /// toggled periodically so the streaming cursor blinks
         blink_on: bool,
         blink_counter: u8,
-        /// True while a model switch is in progress.
         switching_model: bool,
-        /// Tool-calling flag for the model currently being loaded in the background.
-        /// Applied to `app.tool_calling` when `ModelLoadUpdate::Loaded` arrives.
+        /// stashed until ModelLoadUpdate::Loaded applies it to `app.tool_calling`
         pending_tool_calling: Option<bool>,
-        /// Set to true when the user cancels a model switch with Ctrl+C.
-        /// Suppresses the "loader task disconnected" error message that would
-        /// otherwise appear when we drop model_load_rx to abort the switch.
+        /// suppresses the spurious "disconnected" error when we drop model_load_rx on cancel
         model_load_cancelled: bool,
 
         // ── Loading-phase state ───────────────────────────────────────────────
-        /// True while the model is still loading; switches to false on completion.
         is_loading: bool,
-        /// Monotonic counter incremented on every animation tick.  Drives the
-        /// braille spinner shown during loading.
         load_tick: u32,
-        /// Set when model loading fails; keeps the loading view up with the error.
+        /// keeps the loading view visible so the user can read the error
         load_error: Option<String>,
-        /// When loading started — drives the elapsed-time counter.
         load_start: Instant,
-        /// Display name of the model being loaded (shown in the spinner line).
         load_model_name: String,
 
         // ── Model picker state ────────────────────────────────────────────────
@@ -195,16 +167,11 @@ mod tui {
         model_picker_index: usize,
         model_picker_items: Vec<ModelPickerItem>,
         current_model_name: String,
-        /// Whether the currently loaded model supports tool calling.
         tool_calling: bool,
 
         // ── Model-switch download progress ────────────────────────────────────
-        /// The model_id of the model currently being downloaded/switched to.
-        /// `None` when no switch is in progress.
         switching_model_id: Option<String>,
-        /// Bytes on disk / expected bytes for the in-progress download.
-        /// Updated every 100 ms tick while `switching_model` is true and the
-        /// selected model was not yet cached.
+        /// (downloaded, expected) bytes — polled every tick during a model switch
         download_progress: Option<(u64, u64)>,
     }
 
@@ -223,7 +190,6 @@ mod tui {
 55555555555555555555555555555560953258000866660000051140866908666600008966900065555555555555
 88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888";
 
-    /// Spinner frames for the "thinking" animation.
     const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
     impl App {
@@ -267,7 +233,6 @@ mod tui {
             }
         }
 
-        /// True when either streaming tokens or waiting for inference.
         fn is_busy(&self) -> bool {
             self.is_streaming() || self.thinking || self.switching_model
         }
@@ -315,13 +280,11 @@ mod tui {
             THINKING_FRAMES[idx]
         }
 
-        /// Advance the spinner tick counter.
         fn tick(&mut self) {
             self.load_tick = self.load_tick.wrapping_add(1);
         }
 
-        /// Poll the HF cache directory for the model being switched to and update
-        /// `download_progress`.  Called on every 100 ms tick while switching.
+        /// check how much of the model has landed on disk so far
         fn poll_download_progress(&mut self) {
             let Some(ref model_id) = self.switching_model_id else {
                 return;
@@ -340,8 +303,7 @@ mod tui {
             self.download_progress = Some((downloaded, expected));
         }
 
-        /// Transition from loading phase to normal chat.
-        /// Adds the banner art and welcome messages to the message log.
+        /// switch to chat phase and show the welcome banner
         fn finish_loading(&mut self) {
             self.is_loading = false;
             for line in BANNER_ART.lines() {
@@ -359,8 +321,7 @@ mod tui {
                 .push(ChatMessage::system("Type /help for commands."));
         }
 
-        /// Record a loading error.  The loading view stays visible so the user can
-        /// read the message before pressing Ctrl+C.
+        /// store the error but stay in loading view so the user can read it
         fn set_load_error(&mut self, error: String) {
             self.load_error = Some(error);
             // is_loading stays true so render_loading() keeps rendering.
@@ -418,21 +379,19 @@ mod tui {
             self.model_picker_index = (self.model_picker_index + 1) % self.model_picker_items.len();
         }
 
-        /// Total lines the messages area would need (rough estimate for scrolling).
+        /// rough line count for scroll math
         fn total_message_lines(&self, width: u16) -> u16 {
             if width == 0 {
                 return 0;
             }
-            let w = width.saturating_sub(2) as usize; // subtract border columns
+            let w = width.saturating_sub(2) as usize;
             let mut lines: u16 = 0;
             for msg in &self.messages {
                 lines += wrapped_line_count(&msg.text, msg.role, w);
             }
-            // count any in-progress streaming text too
             if !self.stream_buf.is_empty() {
                 lines += wrapped_line_count(&self.stream_buf, Role::Assistant, w);
             }
-            // thinking / switching indicator
             if self.thinking || self.switching_model {
                 lines += 1;
             }
@@ -449,7 +408,6 @@ mod tui {
         }
     }
 
-    /// How many terminal rows a message takes up after line-wrapping.
     fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
         let prefix_len = match role {
             Role::User => 6,      // "you > "
@@ -473,16 +431,14 @@ mod tui {
         count.max(1)
     }
 
-    // ── Model table ──────────────────────────────────────────────────────────
+    // ── Model picker ─────────────────────────────────────────────────────────
     //
-    // ModelSource, ModelPickerItem, and build_model_picker_items live in
-    // crate::models so they are available on all platforms (including Windows),
-    // not just unix where this chat module is compiled.
+    // picker data types live in crate::models so Windows (ACP-only) can use them too
 
     fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let popup = centered_rect(82, 72, area);
 
-        // Erase whatever is behind the popup so the panel is fully readable.
+        // clear the background so text doesn't bleed through
         frame.render_widget(Clear, popup);
 
         let block = Block::default()
@@ -665,7 +621,7 @@ mod tui {
         Help,
         Clear,
         Status,
-        /// `/models` opens the model picker. `/models N` still works as a shortcut.
+        /// picker UI, or jump straight to model N
         Models(Option<usize>),
         Exit,
         Unknown(String),
@@ -695,7 +651,6 @@ mod tui {
         let area = frame.area();
 
         if app.is_loading {
-            // Loading phase: title bar with spinner | loading info | footer hint.
             let zones = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Min(1),
@@ -708,7 +663,6 @@ mod tui {
             return;
         }
 
-        // Normal chat phase: title | messages | input | footer.
         let zones = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -825,7 +779,6 @@ mod tui {
             render_chat_message(&mut lines, msg, inner_width as usize);
         }
 
-        // In-progress streaming token buffer.
         if !app.stream_buf.is_empty() {
             let fake = ChatMessage {
                 role: Role::Assistant,
@@ -833,7 +786,6 @@ mod tui {
                 think_block: None,
             };
             render_chat_message(&mut lines, &fake, inner_width as usize);
-            // blinking cursor at end
             if app.blink_on
                 && let Some(last) = lines.last_mut()
             {
@@ -842,7 +794,6 @@ mod tui {
             }
         }
 
-        // Thinking / switching spinner.
         if app.thinking {
             lines.push(Line::from(Span::styled(
                 format!("  {} thinking…", app.thinking_frame()),
@@ -888,7 +839,6 @@ mod tui {
     fn render_chat_message(lines: &mut Vec<Line<'static>>, msg: &ChatMessage, _width: usize) {
         match msg.role {
             Role::Banner => {
-                // Each character in banner art gets its own rainbow colour.
                 let palette = [
                     Color::Red,
                     Color::Yellow,
@@ -950,7 +900,6 @@ mod tui {
                 }
             }
             Role::Assistant => {
-                // If there is a think block, render it first, dimmed.
                 if let Some(ref think) = msg.think_block {
                     lines.push(Line::from(Span::styled(
                         "  ┌ thinking ".to_string(),
@@ -1005,7 +954,6 @@ mod tui {
             inner,
         );
 
-        // Position the real terminal cursor inside the input box.
         let col = (app.cursor as u16) % inner.width;
         let row = (app.cursor as u16) / inner.width;
         frame.set_cursor_position(Position {
@@ -1213,11 +1161,7 @@ mod tui {
                                 ..SamplingConfig::default()
                             };
 
-                            // Use a dedicated OS thread with its own tokio Runtime
-                            // so that load_gguf_model's internal block_in_place
-                            // cannot steal the main runtime's worker threads and
-                            // freeze the TUI draw loop.  This mirrors the pattern
-                            // used at startup in run_interactive / run_acp_server.
+                            // own thread + runtime so block_in_place doesn't starve the TUI loop
                             let system_prompt = crate::system_prompt_for_model(model.tool_calling);
                             let engine_handle = Arc::clone(&engine);
                             let tool_calling = model.tool_calling;
@@ -1239,13 +1183,10 @@ mod tui {
                                         Err(err) => ModelLoadUpdate::Error(err.to_string()),
                                     }
                                 });
-                                // blocking_send is fine here — the channel has
-                                // capacity 1 and the receiver is always alive while
-                                // switching_model is true.
+                                // capacity-1 channel, receiver alive while switching
                                 let _ = tx.blocking_send(update);
                             });
-                            // tool_calling is applied when ModelLoadUpdate::Loaded
-                            // arrives in the event loop (see model_load_rx handler).
+                            // applied on ModelLoadUpdate::Loaded
                             app.pending_tool_calling = Some(tool_calling);
                         }
                     }
@@ -1263,10 +1204,9 @@ mod tui {
 
     // ── Background inference task ─────────────────────────────────────────────
 
-    /// Maximum number of tool-calling rounds before forcing a text response.
+    /// cap tool rounds so a confused model can't loop forever
     const MAX_TOOL_ROUNDS: usize = 10;
 
-    /// Build onde `ToolDefinition`s from our agent tools.
     fn build_onde_tools() -> Vec<ToolDefinition> {
         crate::tools::all_tools()
             .into_iter()
@@ -1278,11 +1218,8 @@ mod tui {
             .collect()
     }
 
-    /// Runs the agentic tool-calling loop on a background task and sends
-    /// progress updates back through `tx`.
-    ///
-    /// The sender is dropped when the task finishes, which the event loop
-    /// detects as `None` from `rx.recv()`.
+    /// run the tool-calling loop off the main thread, posting updates via `tx`.
+    /// dropping `tx` signals completion to the event loop.
     async fn run_inference_task(
         engine: Arc<ChatEngine>,
         text: String,
@@ -1318,12 +1255,10 @@ mod tui {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Notify the UI about the tool call.
                 let _ = tx
                     .send(InferenceUpdate::ToolUse(tc.function_name.clone()))
                     .await;
 
-                // Execute the tool.
                 let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments).await;
                 log::info!("  ← {} chars", output.len());
 
@@ -1333,11 +1268,11 @@ mod tui {
                 });
             }
 
-            // Allow further tool calls unless we've hit the limit.
+            // on the last round, pass no tools so the model must produce text
             let next_tools = if round < MAX_TOOL_ROUNDS {
                 Some(onde_tools.as_slice())
             } else {
-                None // force a text response on the last round
+                None
             };
 
             match engine.send_tool_results(tool_results, next_tools).await {
@@ -1349,7 +1284,6 @@ mod tui {
             }
         }
 
-        // Send the final text response, or a fallback if the model returned nothing.
         if result.tool_calls.is_empty() {
             if result.text.is_empty() {
                 log::warn!(
@@ -1368,20 +1302,14 @@ mod tui {
         }
 
         log::info!("inference complete — {} tool round(s)", round);
-        // Sender drops here → event loop sees `None`.
+        // tx drops here — event loop gets None from rx.recv()
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
 
-    /// Run the interactive chat UI.  Blocks until the user quits.
-    ///
-    /// Accepts a terminal that has already been initialised by the caller —
-    /// [`ratatui::init`] and [`ratatui::restore`] are the caller's responsibility.
-    ///
-    /// `load_rx` is the receiving end of a [`std::sync::mpsc`] channel.  A
-    /// dedicated OS thread loads the model and sends `Ok(())` or `Err(msg)` when
-    /// done.  The event loop polls `try_recv()` on every tick — non-blocking,
-    /// zero contention with the tokio runtime.
+    /// entry point — blocks until the user quits.
+    /// caller owns terminal init/restore. `load_rx` delivers the model-load result
+    /// from a dedicated OS thread; we poll it non-blocking each tick.
     pub async fn run_with<B: ratatui::backend::Backend>(
         terminal: &mut ratatui::Terminal<B>,
         engine: Arc<ChatEngine>,
@@ -1400,7 +1328,7 @@ mod tui {
         let mut app = App::new(load_model_name);
         let mut event_stream = EventStream::new();
 
-        // 100 ms per tick ≈ 10 fps — enough for a smooth spinner.
+        // 10 fps is plenty for spinners
         let mut ticker = interval(Duration::from_millis(100));
 
         loop {
@@ -1521,7 +1449,7 @@ mod tui {
                                 app.finalize_stream();
                             }
                         }
-                        // Sender dropped without sending done=true.
+                        // sender dropped without done=true
                         None => {
                             app.finalize_stream();
                         }
@@ -1548,8 +1476,7 @@ mod tui {
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
                         None => {
-                            // Sender dropped — task finished (possibly with no
-                            // text response, e.g. all tool calls with empty final).
+                            // task finished, possibly with no text to show
                             app.stop_thinking();
                         }
                     }
@@ -1564,8 +1491,7 @@ mod tui {
                     }
                 } => {
                     app.tick_thinking();
-                    // Refresh download-progress bytes from the HF cache dir so
-                    // the progress bar in render_messages stays current.
+                    // keep the progress display fresh
                     if app.switching_model {
                         app.poll_download_progress();
                     }
@@ -1578,7 +1504,7 @@ mod tui {
                     };
 
                     if let Event::Key(key) = event {
-                        // During loading, only Ctrl+C / Ctrl+D are accepted.
+                        // loading phase — only quit keys work
                         if app.is_loading {
                             if key.kind == KeyEventKind::Press {
                                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1592,7 +1518,7 @@ mod tui {
                             continue;
                         }
 
-                        // While busy (streaming or thinking), only Ctrl+C/D work.
+                        // busy — only cancel keys work
                         if app.is_busy() {
                             if key.kind == KeyEventKind::Press {
                                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1602,15 +1528,12 @@ mod tui {
                                         app.messages.push(ChatMessage::system("(cancelled)"));
                                     }
                                     if app.thinking {
-                                        // Drop the receiver — the background task
-                                        // will see a closed channel and stop.
+                                        // dropping rx kills the background task
                                         app.stop_thinking();
                                         app.messages.push(ChatMessage::system("(cancelled)"));
                                     }
                                     if app.switching_model {
-                                        // Mark as cancelled before dropping the
-                                        // receiver so the Disconnected arm in the
-                                        // model_load_rx handler stays silent.
+                                        // flag before drop so Disconnected handler stays quiet
                                         app.model_load_cancelled = true;
                                         app.switching_model = false;
                                         app.switching_model_id = None;
@@ -1630,7 +1553,7 @@ mod tui {
                                 continue;
                             }
 
-                            // ── Spawn inference on a background task ─────────
+                            // ── spawn inference ──────────────────────────────
                             app.messages.push(ChatMessage::user(&text));
                             app.start_thinking();
 
@@ -1654,8 +1577,7 @@ mod tui {
 
     // ── Download progress helpers (TUI) ──────────────────────────────────────
 
-    /// Recursively sum the on-disk size of all files under `path`, following
-    /// symlinks so hf-hub's blob layout is counted correctly.
+    /// total bytes under `path`, following symlinks (hf-hub uses blobs + symlinks)
     fn dir_size_recursive(path: &std::path::Path) -> u64 {
         let mut total: u64 = 0;
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -1672,7 +1594,6 @@ mod tui {
         total
     }
 
-    /// Format a byte count as a terse human-readable string.
     fn format_size_human(bytes: u64) -> String {
         const GB: u64 = 1_073_741_824;
         const MB: u64 = 1_048_576;
@@ -1689,9 +1610,7 @@ mod tui {
     }
 } // end #[cfg(unix)] mod tui
 
-// Re-export the Unix-only public entry point so callers can write
-// `chat::run_with(...)` on all platforms and get a clean "not available"
-// compile error on Windows rather than a missing-item error.
+// re-export so callers write `chat::run_with(...)` on all platforms
 #[cfg(unix)]
 pub use tui::run_with;
 

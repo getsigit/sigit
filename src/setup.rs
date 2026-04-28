@@ -1,39 +1,25 @@
-//! Shared model cache setup, local model discovery, and lightweight local
-//! preferences.
+//! Model cache setup, local model discovery, and selected-model persistence.
 //!
-//! On macOS, siGit desktop and other Onde apps keep their HuggingFace models
-//! in a shared App Group container at:
+//! On macOS the CLI shares a HuggingFace cache with Onde desktop apps via an
+//! App Group container (`~/Library/Group Containers/group.com.ondeinference.apps/models/`).
+//! On other platforms it falls back to `~/.cache/huggingface/`.
 //!
-//!   `~/Library/Group Containers/group.com.ondeinference.apps/models/`
-//!
-//! This module points `HF_HOME` / `HF_HUB_CACHE` there so the CLI reuses
-//! whatever the desktop app already downloaded (and vice versa). On Linux
-//! and Windows the default `~/.cache/huggingface/` path is used.
-//!
-//! It also exposes helpers for finding locally available models. Discovery
-//! checks the Onde app group first on macOS, then falls back to the normal
-//! Hugging Face cache layout.
-//!
-//! The selected model name is persisted in a small local preferences file so
-//! the interactive UI can restore the last choice on the next launch.
-//!
-//! Call this before anything touches `ChatEngine` or `hf-hub` — they read
-//! the env vars once at init and never check again.
+//! Must run before anything touches `ChatEngine` or `hf-hub` because they
+//! read the env vars once at init.
 
 use std::path::{Path, PathBuf};
 
-/// App Group ID shared across all Onde apps (siGit, Rumi, GT8, …).
+/// shared across siGit, Rumi, GT8, etc.
 #[cfg(target_os = "macos")]
 const APP_GROUP_IDENTIFIER: &str = "group.com.ondeinference.apps";
 
-/// Find the shared container and set `HF_HOME` / `HF_HUB_CACHE` to point
-/// there. Skips any var the user already set.
+/// point `HF_HOME` / `HF_HUB_CACHE` at the shared container. no-ops if
+/// the user already set them.
 pub fn setup_shared_model_cache() {
     if let Some(shared_dir) = resolve_shared_container() {
         let models_home = shared_dir.join("models");
         let model_hub = models_home.join("hub");
 
-        // Make sure the dirs exist.
         if let Err(error) = std::fs::create_dir_all(&model_hub) {
             log::warn!(
                 "Failed to create shared model cache at {}: {error} — falling back to default",
@@ -42,7 +28,6 @@ pub fn setup_shared_model_cache() {
             return;
         }
 
-        // hf-hub derives all its paths from HF_HOME.
         if std::env::var("HF_HOME").is_err() {
             // SAFETY: called once at startup before any threads are spawned.
             unsafe { std::env::set_var("HF_HOME", &models_home) };
@@ -54,8 +39,7 @@ pub fn setup_shared_model_cache() {
             );
         }
 
-        // Some mistral.rs code paths read HF_HUB_CACHE directly instead
-        // of deriving it from HF_HOME, so we set both.
+        // mistral.rs reads HF_HUB_CACHE directly instead of deriving from HF_HOME
         if std::env::var("HF_HUB_CACHE").is_err() {
             // SAFETY: called once at startup before any threads are spawned.
             unsafe { std::env::set_var("HF_HUB_CACHE", &model_hub) };
@@ -66,15 +50,14 @@ pub fn setup_shared_model_cache() {
     }
 }
 
-/// Preference key used to remember the last selected model.
 const SELECTED_MODEL_FILE_NAME: &str = "selected-model.txt";
 
-/// Stable persisted identifier for a selected local model.
+/// persisted identifier for a selected model (model_id + gguf filename).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedModel {
-    /// Hugging Face repo ID, e.g. `bartowski/Qwen_Qwen3-4B-GGUF`.
+    /// e.g. `bartowski/Qwen_Qwen3-4B-GGUF`
     pub model_id: String,
-    /// GGUF filename inside the snapshot.
+
     pub gguf_file: String,
 }
 
@@ -91,31 +74,31 @@ impl SelectedModel {
     }
 }
 
-/// Minimal startup model selection info used before the full UI is running.
+/// what we know about the model before the full UI is up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupModelSelection {
-    /// Human-friendly model name shown in the loading UI.
+    /// shown in the loading screen
     pub display_name: String,
-    /// The saved model identifier if one was found.
+
     pub selected_model: Option<SelectedModel>,
 }
 
-/// A locally discovered GGUF model candidate.
+/// a GGUF model found on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredModel {
-    /// Hugging Face repo ID, e.g. `bartowski/Qwen_Qwen3-4B-GGUF`.
+    /// e.g. `bartowski/Qwen_Qwen3-4B-GGUF`
     pub model_id: String,
-    /// GGUF filename inside the snapshot.
+    /// filename inside the snapshot dir
     pub gguf_file: String,
-    /// Human-friendly label shown in model pickers.
+
     pub display_name: String,
-    /// Absolute path to the snapshot directory that contains the GGUF file.
+
     pub snapshot_path: PathBuf,
-    /// Absolute path to the GGUF file itself.
+
     pub gguf_path: PathBuf,
-    /// True when the model came from the Onde app group cache.
+
     pub from_app_group: bool,
-    /// Whether the snapshot looks complete enough to load.
+
     pub cache_health: ModelCacheHealth,
 }
 
@@ -126,11 +109,7 @@ pub enum ModelCacheHealth {
     NotDownloaded,
 }
 
-/// Return all locally discovered GGUF models.
-///
-/// Search order:
-/// 1. Onde app group cache on macOS
-/// 2. Standard Hugging Face cache
+/// find all GGUF models on disk. checks Onde app group first, then HF cache.
 pub fn discover_local_models() -> Vec<DiscoveredModel> {
     let mut models = Vec::new();
     let mut seen_roots = Vec::new();
@@ -243,18 +222,14 @@ fn collect_models_from_cache_root(
             }
 
             if gguf_files.is_empty() {
-                // No GGUF file found — the snapshot exists on disk (e.g. only
-                // metadata arrived, or the download is still in progress).
-                // Push a sentinel entry with Incomplete health so the model
-                // picker can show it as disabled rather than hiding it entirely.
+                // snapshot dir exists but no .gguf yet (download in progress or
+                // only metadata). mark incomplete so the picker can show it disabled.
                 models.push(DiscoveredModel {
                     display_name: display_name_for_model(&model_id, ""),
                     model_id: model_id.clone(),
                     gguf_file: String::new(),
                     snapshot_path: snapshot_path.clone(),
-                    // Point at the snapshot directory itself; this path is
-                    // never used for loading because Incomplete models are
-                    // filtered out before any GgufModelConfig is built.
+                    // unused for loading; incomplete models are filtered out before config
                     gguf_path: snapshot_path.clone(),
                     from_app_group,
                     cache_health: ModelCacheHealth::Incomplete,
@@ -355,16 +330,8 @@ pub fn load_selected_model_name() -> Option<String> {
         .map(|model| model.display_name)
 }
 
-/// Pick the model name siGit should try to load at startup.
-///
-/// Order:
-/// 1. saved selection, if it still exists locally
-/// 2. first discovered local model (Onde app group first, then HF cache)
-/// 3. no selection
-///
-/// If there is no saved selection but a local model is discovered, persist that
-/// fallback choice so ACP mode and the interactive TUI converge on the same
-/// startup model on the next launch too.
+/// pick a model for startup: saved selection > first local model > none.
+/// if we fall back to a local model, persist it so ACP and TUI agree next time.
 pub fn startup_model_selection() -> Option<StartupModelSelection> {
     let discovered = discover_local_models();
 
@@ -433,10 +400,8 @@ fn selected_model_file_path() -> Option<PathBuf> {
     )
 }
 
-/// Look for the App Group container on disk. macOS creates it the first time
-/// a signed app in the group accesses it, so it only exists if the user has
-/// launched siGit desktop (or another Onde app) at least once. A plain CLI
-/// binary can read/write there without extra entitlements.
+/// macOS only creates this dir when a signed app in the group first runs,
+/// so it won't exist until the user has launched siGit desktop or another Onde app.
 #[cfg(target_os = "macos")]
 fn resolve_shared_container() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;

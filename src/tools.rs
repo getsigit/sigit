@@ -1,31 +1,4 @@
-//! Tool definitions and execution for the siGit Code.
-//!
-//! Each tool has:
-//! - A schema (JSON Schema) that describes its parameters for the LLM
-//! - An execution function that runs the tool and returns a string result
-//!
-//! # Dependencies
-//!
-//! This module requires `serde_json` and `regex` crates in `Cargo.toml`:
-//! ```toml
-//! serde_json = "1"
-//! regex = "1"
-//! ```
-//!
-//! # Write Tools
-//!
-//! - `create_directory` — create a directory and any missing parent directories
-//! - `create_file` — create a new file (fails if it already exists)
-//! - `edit_file` — replace an exact old-text span with new text in an existing file
-//! - `delete_file` — delete a file or empty directory at the given path
-//!
-//! # Web Tools
-//!
-//! - `read_website` — fetch a web page and return readable text content
-//!
-//! # Shell Tools
-//!
-//! - `run_command` — run shell commands, including git porcelain and plumbing commands
+//! Agent tools: schema definitions + execution for siGit Code.
 
 use regex::Regex;
 use serde_json::{Value, json};
@@ -38,25 +11,17 @@ const WEBSITE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const WEBSITE_USER_AGENT: &str =
     "siGit/0.1 (+https://github.com/getsigit/sigit; website-reading tool)";
 
-/// Maximum characters returned from `read_file` before truncation.
 const READ_FILE_CHAR_LIMIT: usize = 10_000;
-
-/// Maximum number of matching lines returned from `search_files`.
 const SEARCH_FILES_MATCH_LIMIT: usize = 50;
 
 // ── Tool schemas ─────────────────────────────────────────────────────────────
 
-/// A tool definition with its JSON Schema and metadata for the LLM.
 pub struct AgentTool {
-    /// Machine-readable tool name (e.g. `"read_file"`).
     pub name: &'static str,
-    /// Human-readable description shown to the LLM.
     pub description: &'static str,
-    /// JSON Schema describing the tool's parameters.
     pub parameters_schema: Value,
 }
 
-/// Return all available agent tools.
 pub fn all_tools() -> Vec<AgentTool> {
     vec![
         AgentTool {
@@ -271,19 +236,13 @@ pub fn all_tools() -> Vec<AgentTool> {
 
 // ── Tool execution ───────────────────────────────────────────────────────────
 
-/// Execute a tool by name with the given JSON arguments string.
-///
-/// Returns the tool output as a human-readable string. Errors are returned as
-/// descriptive strings rather than panicking.
 pub async fn execute_tool(name: &str, arguments: &str) -> String {
     match name {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
         "search_files" => exec_search_files(arguments),
         "read_website" => {
-            // reqwest::blocking panics if called inside a tokio runtime
-            // ("Cannot start a runtime from within a runtime"), so we
-            // off-load it to the blocking thread pool.
+            // reqwest::blocking panics inside a tokio runtime, so run on the blocking pool.
             let args = arguments.to_owned();
             tokio::task::spawn_blocking(move || exec_read_website(&args))
                 .await
@@ -314,7 +273,6 @@ fn absolute_path_string(path: &Path) -> String {
 
 // ── read_file ────────────────────────────────────────────────────────────────
 
-/// Read the contents of a single file, truncating at [`READ_FILE_CHAR_LIMIT`].
 fn exec_read_file(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -380,7 +338,6 @@ fn exec_read_file(arguments: &str) -> String {
 
 // ── list_directory ───────────────────────────────────────────────────────────
 
-/// List directory entries, directories first, sorted alphabetically.
 fn exec_list_directory(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -438,7 +395,6 @@ fn exec_list_directory(arguments: &str) -> String {
     dirs.sort();
     files.sort();
 
-    // Directories first, then files.
     dirs.extend(files);
 
     if dirs.is_empty() {
@@ -450,7 +406,6 @@ fn exec_list_directory(arguments: &str) -> String {
 
 // ── search_files ─────────────────────────────────────────────────────────────
 
-/// Recursively search files for a regex pattern, returning matching lines.
 fn exec_search_files(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -499,13 +454,8 @@ fn exec_search_files(arguments: &str) -> String {
     matches.join("\n")
 }
 
-/// Recursively walk a directory and collect regex matches.
-///
-/// Skips hidden directories (names starting with `.`) and binary files.
-/// Stops collecting once the match list reaches a generous internal cap (2×
-/// the public limit) to avoid unbounded work.
+/// caps collected matches at 2x the public limit to bound work on large trees.
 fn walk_and_search(dir: &Path, re: &Regex, matches: &mut Vec<String>) {
-    // Internal cap to avoid scanning the entire filesystem.
     const WALK_CAP: usize = SEARCH_FILES_MATCH_LIMIT * 2;
 
     let entries = match fs::read_dir(dir) {
@@ -513,7 +463,6 @@ fn walk_and_search(dir: &Path, re: &Regex, matches: &mut Vec<String>) {
         Err(_) => return,
     };
 
-    // Collect and sort for deterministic output.
     let mut sorted: Vec<fs::DirEntry> = entries.filter_map(Result::ok).collect();
     sorted.sort_by_key(|e| e.file_name());
 
@@ -526,7 +475,6 @@ fn walk_and_search(dir: &Path, re: &Regex, matches: &mut Vec<String>) {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip hidden entries.
         if name_str.starts_with('.') {
             continue;
         }
@@ -539,13 +487,10 @@ fn walk_and_search(dir: &Path, re: &Regex, matches: &mut Vec<String>) {
     }
 }
 
-/// Search a single file line-by-line for the regex pattern.
-///
-/// Skips files that cannot be read as UTF-8 (assumed binary).
+/// skips non-UTF-8 files (probably binary).
 fn search_file(path: &Path, re: &Regex, matches: &mut Vec<String>) {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
-        // Skip binary / unreadable files silently.
         Err(_) => return,
     };
 
@@ -677,7 +622,6 @@ fn exec_read_website(arguments: &str) -> String {
 
 // ── create_directory ─────────────────────────────────────────────────────────
 
-/// Create a directory and any missing parent directories.
 fn exec_create_directory(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -706,11 +650,7 @@ fn exec_create_directory(arguments: &str) -> String {
     }
 }
 
-/// Create a new file with the provided content.
-///
-/// Parent directories are created automatically. Fails if the file already
-/// exists to prevent accidental overwrites — the LLM should use `edit_file`
-/// for existing files.
+/// fails if file exists so the LLM is forced to use `edit_file` for modifications.
 fn exec_create_file(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -737,7 +677,6 @@ fn exec_create_file(arguments: &str) -> String {
         );
     }
 
-    // Create parent directories if needed.
     if let Some(parent) = absolute_path.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
@@ -757,12 +696,7 @@ fn exec_create_file(arguments: &str) -> String {
 
 // ── edit_file ────────────────────────────────────────────────────────────────
 
-/// Edit an existing file by replacing an exact occurrence of `old_text` with
-/// `new_text`.
-///
-/// The `old_text` must appear **exactly once** in the file. This prevents
-/// ambiguous edits and forces the LLM to read the file first to get the exact
-/// text span.
+/// `old_text` must match exactly once — ambiguity means the LLM didn't read the file first.
 fn exec_edit_file(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -803,7 +737,6 @@ fn exec_edit_file(arguments: &str) -> String {
         Err(err) => return format!("Error: could not read file: {err}"),
     };
 
-    // Count occurrences to give a clear error message.
     let occurrences = contents.matches(old_text).count();
 
     if occurrences == 0 {
@@ -833,10 +766,7 @@ fn exec_edit_file(arguments: &str) -> String {
 
 // ── delete_file ──────────────────────────────────────────────────────────────
 
-/// Delete a file or empty directory at the given path.
-///
-/// Refuses to remove non-empty directories to guard against accidental
-/// recursive deletes.
+/// only removes files or *empty* directories — no recursive deletes.
 fn exec_delete_file(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -874,18 +804,10 @@ fn exec_delete_file(arguments: &str) -> String {
 
 // ── run_command ──────────────────────────────────────────────────────────────
 
-/// Maximum time a command is allowed to run before being killed.
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Maximum bytes of combined output returned from a command.
 const COMMAND_OUTPUT_LIMIT: usize = 50_000;
 
-/// Run a shell command and return its combined stdout + stderr output.
-///
-/// The command is executed via `sh -c` (Unix) or `cmd /C` (Windows) so shell
-/// features like pipes, redirects, and chaining work out of the box.
-///
-/// Long-running commands are killed after [`COMMAND_TIMEOUT`] seconds.
+/// runs via `sh -c` / `cmd /C`; killed after COMMAND_TIMEOUT.
 fn exec_run_command(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -937,7 +859,6 @@ fn exec_run_command(arguments: &str) -> String {
         Err(err) => return format!("Error: failed to spawn command: {err}"),
     };
 
-    // Wait with a timeout.
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -966,7 +887,6 @@ fn exec_run_command(arguments: &str) -> String {
     combined.push_str(&String::from_utf8_lossy(&output.stdout));
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
 
-    // Truncate if output is huge.
     let truncated = if combined.len() > COMMAND_OUTPUT_LIMIT {
         let truncated_str = &combined[..COMMAND_OUTPUT_LIMIT];
         format!("{truncated_str}\n\n… (output truncated at {COMMAND_OUTPUT_LIMIT} bytes)")
