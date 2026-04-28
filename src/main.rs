@@ -223,20 +223,20 @@ fn initialize_meta() -> Meta {
     let active_model_name = startup_selection
         .as_ref()
         .map(|selection| selection.display_name.clone())
-        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().display_name);
+        .unwrap_or_else(|| GgufModelConfig::qwen25_3b().display_name);
 
     let active_model_id = startup_selection
         .as_ref()
         .and_then(|selection| selection.selected_model.as_ref())
         .map(|selected| selected.model_id.clone())
-        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().model_id);
+        .unwrap_or_else(|| GgufModelConfig::qwen25_3b().model_id);
 
     let active_model_file = startup_selection
         .as_ref()
         .and_then(|selection| selection.selected_model.as_ref())
         .map(|selected| selected.gguf_file.clone())
         .unwrap_or_else(|| {
-            GgufModelConfig::qwen3_4b()
+            GgufModelConfig::qwen25_3b()
                 .files
                 .first()
                 .cloned()
@@ -271,6 +271,16 @@ struct SiGitAgent {
     /// cwd from the editor — tool calls run here, not where the process started
     session_cwd: std::sync::Mutex<Option<PathBuf>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
+    /// flipped once the startup model finishes (success or failure)
+    model_ready: Arc<AtomicBool>,
+    /// set if the startup load failed
+    model_load_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// true when the startup model isn't cached yet
+    startup_needs_download: bool,
+    /// for progress UI
+    startup_model_name: String,
+    /// for download-progress polling
+    startup_model_id: String,
 }
 
 impl SiGitAgent {
@@ -278,13 +288,188 @@ impl SiGitAgent {
         engine: Arc<ChatEngine>,
         notification_tx: mpsc::Sender<SessionNotification>,
         initial_model: GgufModelConfig,
+        model_ready: Arc<AtomicBool>,
+        model_load_error: Arc<std::sync::Mutex<Option<String>>>,
+        startup_needs_download: bool,
     ) -> Self {
+        let startup_model_name = initial_model.display_name.clone();
+        let startup_model_id = initial_model.model_id.clone();
         Self {
             engine,
             notification_tx,
             session_cwd: std::sync::Mutex::new(None),
             current_model: std::sync::Mutex::new(initial_model),
+            model_ready,
+            model_load_error,
+            startup_needs_download,
+            startup_model_name,
+            startup_model_id,
         }
+    }
+
+    /// block until the startup model is ready, showing progress in the session.
+    async fn await_model_ready(&self, session_id: &SessionId) -> agent_client_protocol::Result<()> {
+        if self.model_ready.load(Ordering::Acquire) {
+            // already done — might be a stored error from earlier
+            if let Some(err) = self.model_load_error.lock().unwrap().as_ref() {
+                return Err(agent_client_protocol::Error::new(
+                    -32603,
+                    format!("model load failed: {err}"),
+                ));
+            }
+            return Ok(());
+        }
+
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+        let tool_call_id = format!("startup-load-{}", uuid::Uuid::new_v4());
+        let title = if self.startup_needs_download {
+            format!("Downloading {}", self.startup_model_name)
+        } else {
+            format!("Loading {}", self.startup_model_name)
+        };
+
+        self.send_tool_call_update(
+            session_id.clone(),
+            SessionUpdate::ToolCall(
+                ToolCall::new(tool_call_id.clone(), &title)
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![format!("{}…", title).into()]),
+            ),
+        )
+        .await;
+
+        let expected_bytes = if self.startup_needs_download {
+            onde::inference::models::SUPPORTED_MODEL_INFO
+                .iter()
+                .find(|m| m.id == self.startup_model_id)
+                .map(|m| m.expected_size_bytes)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let load_start = std::time::Instant::now();
+        let mut tick: usize = 0;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            tick += 1;
+
+            if self.model_ready.load(Ordering::Acquire) {
+                break;
+            }
+
+            let frame = SPINNER[tick % SPINNER.len()];
+            let elapsed = load_start.elapsed();
+            let elapsed_str = if elapsed.as_secs() >= 60 {
+                format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+            } else {
+                format!("{}s", elapsed.as_secs())
+            };
+
+            let (update_title, update_content) =
+                if self.startup_needs_download && expected_bytes > 0 {
+                    let cache_path = onde::hf_cache::model_cache_path(&self.startup_model_id);
+                    let downloaded = cache_path
+                        .as_ref()
+                        .filter(|p| p.exists())
+                        .map(|p| dir_size_recursive(p))
+                        .unwrap_or(0);
+                    let pct = ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
+                    let bar = progress_bar(pct, 20);
+                    let size_hint = format!(" (~{})", format_size_human(expected_bytes));
+                    (
+                        format!(
+                            "{frame} Downloading {}{size_hint} ({pct}%)",
+                            self.startup_model_name
+                        ),
+                        format!(
+                            "{} — {bar} {pct}%  ({} / {})",
+                            self.startup_model_name,
+                            format_size_human(downloaded),
+                            format_size_human(expected_bytes),
+                        ),
+                    )
+                } else if self.startup_needs_download {
+                    let cache_path = onde::hf_cache::model_cache_path(&self.startup_model_id);
+                    let downloaded = cache_path
+                        .as_ref()
+                        .filter(|p| p.exists())
+                        .map(|p| dir_size_recursive(p))
+                        .unwrap_or(0);
+                    (
+                        format!("{frame} Downloading {}", self.startup_model_name),
+                        format!(
+                            "{} — {} downloaded… ({elapsed_str})",
+                            self.startup_model_name,
+                            format_size_human(downloaded),
+                        ),
+                    )
+                } else {
+                    (
+                        format!("{frame} Loading {}", self.startup_model_name),
+                        format!(
+                            "{frame} Loading {}… ({elapsed_str})",
+                            self.startup_model_name
+                        ),
+                    )
+                };
+
+            self.send_tool_call_update(
+                session_id.clone(),
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    tool_call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .title(update_title)
+                        .status(ToolCallStatus::InProgress)
+                        .content(vec![update_content.into()]),
+                )),
+            )
+            .await;
+        }
+
+        // done — check if it blew up
+        if let Some(err) = self.model_load_error.lock().unwrap().as_ref() {
+            self.send_tool_call_update(
+                session_id.clone(),
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    tool_call_id,
+                    ToolCallUpdateFields::new()
+                        .title("Model load failed".to_string())
+                        .status(ToolCallStatus::Failed)
+                        .content(vec![format!("error: {err}").into()]),
+                )),
+            )
+            .await;
+
+            return Err(agent_client_protocol::Error::new(
+                -32603,
+                format!("model load failed: {err}"),
+            ));
+        }
+
+        let done_title = if self.startup_needs_download {
+            format!("✓ {} downloaded and loaded", self.startup_model_name)
+        } else {
+            format!("✓ {} loaded", self.startup_model_name)
+        };
+
+        self.send_tool_call_update(
+            session_id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id,
+                ToolCallUpdateFields::new()
+                    .title(done_title)
+                    .status(ToolCallStatus::Completed),
+            )),
+        )
+        .await;
+
+        Ok(())
     }
 
     async fn send_assistant_message(&self, session_id: SessionId, text: impl Into<String>) {
@@ -1007,6 +1192,9 @@ impl Agent for SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
+        // wait for the startup model if it's still loading/downloading
+        self.await_model_ready(&session_id).await?;
+
         // ── tool-calling loop ────────────────────────────────────────────
         // send message → execute any tool calls → feed results back
         // repeat up to MAX_TOOL_ROUNDS, then force a text reply
@@ -1127,13 +1315,35 @@ impl Agent for SiGitAgent {
 
         let model_id = args.value.0.as_ref();
 
+        // can't switch while the startup model is still loading — the old
+        // weights are in GPU memory and the new load gets "does not fit"
+        if !self.model_ready.load(Ordering::Acquire) {
+            log::info!("set_session_config_option: waiting for startup model to finish loading");
+            while !self.model_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        // Zed re-fires the last selection on connect; no-op if it's already loaded
+        {
+            let current = self.current_model.lock().unwrap();
+            if current.model_id == model_id {
+                log::info!(
+                    "set_session_config_option: {} is already the active model, skipping",
+                    current.display_name
+                );
+                let config_options = build_model_config_options(&current);
+                return Ok(SetSessionConfigOptionResponse::new(config_options));
+            }
+        }
+
         let needs_download = models::build_model_picker_items()
             .into_iter()
             .find(|item| item.config.model_id == model_id)
             .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
             .unwrap_or(false);
 
-        // shared flag to kill the progress poller when the load finishes
+        // tells the progress poller to stop
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
@@ -1165,7 +1375,7 @@ impl Agent for SiGitAgent {
                         tool_call_id.clone(),
                         format!("⏬ Downloading {display_name}{size_hint}"),
                     )
-                    .kind(ToolKind::Execute)
+                    .kind(ToolKind::Think)
                     .status(ToolCallStatus::InProgress)
                     .content(vec![
                         format!(
@@ -1263,7 +1473,7 @@ impl Agent for SiGitAgent {
                         tool_call_id.clone(),
                         format!("Loading {cached_display_name}"),
                     )
-                    .kind(ToolKind::Execute)
+                    .kind(ToolKind::Think)
                     .status(ToolCallStatus::InProgress)
                     .content(vec![format!("Loading {cached_display_name}…").into()]),
                 ),
@@ -1478,7 +1688,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let startup_model_name = startup_selection
         .as_ref()
         .map(|selection| selection.display_name.clone())
-        .unwrap_or_else(|| GgufModelConfig::qwen3_4b().display_name);
+        .unwrap_or_else(|| GgufModelConfig::qwen25_3b().display_name);
 
     let config = startup_selection
         .as_ref()
@@ -1501,7 +1711,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 })
                 .map(|item| item.config)
         })
-        .unwrap_or_else(GgufModelConfig::qwen3_4b);
+        .unwrap_or_else(GgufModelConfig::qwen25_3b);
     let sampling = SamplingConfig {
         max_tokens: Some(8192),
         ..SamplingConfig::default()
@@ -1556,9 +1766,6 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("ACP mode — starting agent server");
 
-    // must load before LocalSet: block_in_place panics inside spawn_local
-    log::info!("loading model (this may take a minute on first run)...");
-
     let engine = Arc::new(ChatEngine::new());
 
     let startup_selection = setup::startup_model_selection();
@@ -1583,7 +1790,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 })
                 .map(|item| item.config)
         })
-        .unwrap_or_else(GgufModelConfig::qwen3_4b);
+        .unwrap_or_else(GgufModelConfig::qwen25_3b);
 
     let acp_tool_calling = models::build_model_picker_items()
         .iter()
@@ -1599,19 +1806,65 @@ async fn run_acp_server() -> anyhow::Result<()> {
         ..SamplingConfig::default()
     };
 
-    log::info!("ACP startup model: {}", config.display_name);
+    // do we need to download, or is it cached?
+    let needs_download = models::build_model_picker_items()
+        .iter()
+        .find(|item| item.config.model_id == config.model_id)
+        .map(|item| item.cache_health != setup::ModelCacheHealth::Complete)
+        .unwrap_or(true);
+
+    log::info!(
+        "ACP startup model: {} ({})",
+        config.display_name,
+        if needs_download {
+            "needs download"
+        } else {
+            "cached"
+        }
+    );
 
     let startup_config = config.clone();
-    let acp_system_prompt = system_prompt_for_model(tool_calling).to_string();
-    engine
-        .load_gguf_model(config, Some(acp_system_prompt), Some(sampling))
-        .await
-        .map_err(|error| anyhow::anyhow!("model load failed: {error}"))?;
 
-    log::info!("model loaded and ready");
+    // loader thread flips model_ready when done; agent polls it
+    let model_ready = Arc::new(AtomicBool::new(false));
+    let model_load_error: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // real thread + own runtime: block_in_place panics inside spawn_local
+    let loader_engine = Arc::clone(&engine);
+    let loader_config = config.clone();
+    let loader_ready = Arc::clone(&model_ready);
+    let loader_error = Arc::clone(&model_load_error);
+    let acp_system_prompt = system_prompt_for_model(tool_calling).to_string();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
+        match rt.block_on(loader_engine.load_gguf_model(
+            loader_config,
+            Some(acp_system_prompt),
+            Some(sampling),
+        )) {
+            Ok(_) => {
+                log::info!("startup model loaded and ready");
+                loader_ready.store(true, Ordering::Release);
+            }
+            Err(error) => {
+                log::error!("startup model load failed: {error}");
+                *loader_error.lock().unwrap() = Some(error.to_string());
+                loader_ready.store(true, Ordering::Release);
+            }
+        }
+    });
 
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
-    let agent = SiGitAgent::new(engine, notification_tx, startup_config);
+    let agent = SiGitAgent::new(
+        engine,
+        notification_tx,
+        startup_config,
+        model_ready,
+        model_load_error,
+        needs_download,
+    );
 
     // AgentSideConnection needs futures-io
     let stdin = tokio::io::stdin().compat();
