@@ -1,8 +1,8 @@
 <h1 align="center">siGit Code</h1>
 
 <p align="center">
-  <strong>AI coding agent powered by local LLM via <a href="https://ondeinference.com">Onde Inference</a>.</strong><br>
-  ACP-compatible agent that runs entirely on your machine — no API keys, no cloud.
+  AI coding agent powered by local LLM via <a href="https://ondeinference.com">Onde Inference</a>.<br>
+  Runs on your machine. No API keys, no cloud.
 </p>
 
 <p align="center">
@@ -19,26 +19,24 @@
 
 ## Install
 
-Use `pip` or `uv`:
-
 ```sh
 pip install sigit-code
 uvx --from sigit-code sigit
 ```
 
-Installs the native `sigit` binary for your platform — no compiler, no Node.js, no runtime dependencies.
+Installs a native `sigit` binary for your platform. No compiler, no runtime dependencies.
 
 ## Quick start
 
-### Interactive TUI
+### Terminal
 
 ```sh
 sigit
 ```
 
-A terminal UI opens where you can chat with a local LLM coding agent directly.
+Opens a chat UI where you talk to a local LLM coding agent directly.
 
-### Zed editor (ACP agent)
+### Zed (ACP agent)
 
 siGit works as an [ACP-compatible](https://github.com/nicobailon/agent-client-protocol) agent in [Zed](https://zed.dev). Add this to your Zed settings:
 
@@ -53,9 +51,9 @@ siGit works as an [ACP-compatible](https://github.com/nicobailon/agent-client-pr
 }
 ```
 
-Then select **sigit** as your agent profile in the Zed assistant panel.
+Then pick **sigit** as your agent in the Zed assistant panel.
 
-## Other installation methods
+## Other install methods
 
 | Method | Command |
 |--------|---------|
@@ -74,27 +72,19 @@ cargo build --release
 
 ## Platform support
 
-Pre-built native binaries ship for every major platform:
+| Platform | Architecture |
+|----------|--------------|
+| macOS | arm64, x64 |
+| Linux (glibc) | arm64, x64 |
+| Windows | arm64, x64 |
 
-| Platform      | Architecture |
-|---------------|--------------|
-| macOS         | arm64, x64   |
-| Linux (glibc) | arm64, x64   |
-| Windows       | arm64, x64   |
+## Source and issues
 
-## Source & issues
-
-This package ships a pre-built native binary. Source lives at
-[github.com/getsigit/sigit](https://github.com/getsigit/sigit) —
-file bugs and feature requests there.
+This package ships a pre-built binary. Source code is at [github.com/getsigit/sigit](https://github.com/getsigit/sigit). File bugs there.
 
 ## License
 
-Licensed under **Apache 2.0**.
-
-- [Apache License 2.0](https://github.com/getsigit/sigit/blob/main/LICENSE)
-
----
+[Apache 2.0](https://github.com/getsigit/sigit/blob/main/LICENSE)
 
 ## Copyright
 

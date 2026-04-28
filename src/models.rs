@@ -1,8 +1,5 @@
-//! Platform-independent model picker types and item construction.
-//!
-//! This module is available on all target platforms (Windows, macOS, Linux).
-//! The TUI rendering code in `chat.rs` (unix-only) re-uses these types
-//! rather than defining them inline.
+//! Model picker types and item construction, shared across platforms.
+//! The unix-only TUI in `chat.rs` pulls from here.
 
 use onde::inference::GgufModelConfig;
 
@@ -16,8 +13,7 @@ pub(crate) use crate::setup::ModelCacheHealth;
 pub(crate) enum ModelSource {
     Onde,
     HuggingFace,
-    /// Supported model that is not yet downloaded locally. When selected it
-    /// will be downloaded into the Onde app-group cache automatically.
+    /// not downloaded yet — selecting it triggers a download into the app-group cache.
     Available,
     Fallback,
 }
@@ -37,9 +33,7 @@ pub(crate) struct ModelPickerItem {
 
 // ── Model ID → GgufModelConfig mapping ────────────────────────────────────────
 
-/// Map a HuggingFace model ID to the corresponding [`GgufModelConfig`]
-/// constructor. Returns `None` for model IDs that siGit does not know how
-/// to load.
+/// map a HF model ID to its config constructor, or `None` if we don't support it.
 pub(crate) fn model_id_to_config(model_id: &str) -> Option<GgufModelConfig> {
     Some(match model_id {
         "bartowski/Qwen_Qwen3-4B-GGUF" => GgufModelConfig::qwen3_4b(),
@@ -56,7 +50,6 @@ pub(crate) fn model_id_to_config(model_id: &str) -> Option<GgufModelConfig> {
     })
 }
 
-/// Whether a model ID supports tool calling (Qwen 3 family).
 fn is_tool_calling(model_id: &str) -> bool {
     matches!(
         model_id,
@@ -68,29 +61,15 @@ fn is_tool_calling(model_id: &str) -> bool {
     )
 }
 
-/// Max tokens for a given model (tool-calling models need higher budgets
-/// because the `<think>…</think>` block consumes tokens before the real
-/// response).
+/// tool-calling models get more tokens because `<think>` blocks eat into the budget.
 fn max_tokens_for(model_id: &str) -> u64 {
     if is_tool_calling(model_id) { 4096 } else { 512 }
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-/// Build the full list of model picker items.
-///
-/// Items are sourced from:
-/// 1. **Locally cached** models in the Onde app-group and HuggingFace caches.
-/// 2. **All supported models** from [`onde::inference::models::SUPPORTED_MODEL_INFO`]
-///    that are not yet downloaded locally — shown as `Available` so the user
-///    can select them to trigger a download into the app-group cache.
-///
-/// If no models are discovered *and* no supported models are known, a single
-/// fallback entry for the platform-default model is returned so the picker
-/// is never empty.
-///
-/// Items are sorted: Onde first, then HuggingFace, then Available (not
-/// downloaded), then Fallback, and alphabetically within each group.
+/// collect every model the picker should show: local cache, remote available, fallback.
+/// sorted by source (Onde > HF > Available > Fallback), then alphabetically.
 pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
     let mut items = Vec::new();
 
@@ -102,13 +81,6 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
     }
 
     // ── 2. Supported models not yet downloaded ───────────────────────────
-    //
-    // Walk SUPPORTED_MODEL_INFO and add an entry for every model ID that
-    // does not already appear in the local items list (by model_id).
-    // These entries have `cache_health: NotDownloaded` and
-    // `source: Available`. When the user selects one, `load_gguf_model`
-    // will download the GGUF file from HuggingFace into the app-group
-    // cache automatically.
     for info in onde::inference::models::SUPPORTED_MODEL_INFO {
         let already_present = items.iter().any(|item| item.config.model_id == info.id);
         if already_present {
