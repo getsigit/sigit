@@ -433,7 +433,8 @@ impl SiGitAgent {
         }
 
         // done — check if it blew up
-        if let Some(err) = self.model_load_error.lock().unwrap().as_ref() {
+        let load_error = self.model_load_error.lock().unwrap().clone();
+        if let Some(err) = load_error {
             self.send_tool_call_update(
                 session_id.clone(),
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
