@@ -8,14 +8,14 @@
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
-siGit is a coding agent that runs on your machine. No API keys. No cloud round-trips.
+siGit is a coding agent that runs on your machine. No API keys, no cloud round-trips, no subscription.
 
-It works in any codebase, but it's particularly at home in smbCloud repos. It knows the shape of the platform: Rust workspaces, Rails services, deploy flows, auth boundaries, GresIQ. That means less back-and-forth and fewer generic answers when you're working on smbCloud stuff.
+It works with any codebase. It knows smbCloud repos a bit better — the Rust workspace layout, deploy flows, auth boundaries, GresIQ — so you spend less time explaining the setup.
 
 Two modes:
 
 - **ACP mode** — Zed or another ACP-compatible editor starts it over stdio
-- **Terminal mode** — run `sigit` directly for an interactive chat
+- **Terminal mode** — run `sigit` for an interactive chat UI
 
 | Platform | ACP mode | Terminal mode |
 |----------|----------|---------------|
@@ -25,14 +25,14 @@ Two modes:
 
 ## smbCloud context
 
-When siGit is in an smbCloud repo, it uses platform context instead of giving generic cloud-app advice:
+In an smbCloud repo, siGit knows the terrain:
 
-- platform user flows vs. tenant app auth flows are different things
+- platform user flows and tenant app auth flows are different things
 - `Project` is the umbrella workspace; `FrontendApp`, `AuthApp`, and GresIQ are separate deployable units
 - Next.js SSR deploys aren't the same as the git-push path
 - existing workspace patterns and crate boundaries over new abstractions
 
-Outside smbCloud repos it stays general. No platform-specific advice where it doesn't belong.
+In other repos it stays general and doesn't pretend otherwise.
 
 ## Install
 
@@ -51,7 +51,7 @@ cargo install sigit
 
 On first launch siGit downloads a GGUF model from Hugging Face, usually 1–2 GB. After that it loads from disk in a few seconds.
 
-On macOS, the model cache is shared with the siGit desktop app through an App Group container. If the desktop app already has the model, the CLI reuses it.
+On macOS, the model cache is shared with the siGit desktop app via an App Group container. If the desktop app already pulled the model, the CLI reuses it.
 
 ## Zed setup
 
@@ -88,9 +88,9 @@ Install [ACP client](https://marketplace.visualstudio.com/items?itemName=formula
 
 ## Terminal mode
 
-Run `sigit` in a terminal and you get an interactive chat UI. Same model and system prompt as the editor integration, just without opening Zed.
+Run `sigit` in a terminal and you get an interactive chat UI. Same model and system prompt as the editor integration, just without Zed.
 
-Terminal mode needs Unix terminal behavior, so macOS and Linux only. Windows gets ACP mode for now.
+Terminal mode needs Unix terminal behavior, so macOS and Linux only for now.
 
 ## Platform support
 
