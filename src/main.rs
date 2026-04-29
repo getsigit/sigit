@@ -1676,6 +1676,23 @@ fn init_logging(is_tty: bool) {
         .try_init();
 }
 
+#[cfg(unix)]
+fn redirect_stdout_to_stderr() -> anyhow::Result<()> {
+    let stderr_dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+    anyhow::ensure!(
+        stderr_dup >= 0,
+        "dup(stderr) failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    unsafe {
+        libc::dup2(stderr_dup, libc::STDOUT_FILENO);
+        libc::close(stderr_dup);
+    }
+
+    Ok(())
+}
+
 // ── Interactive TUI mode ──────────────────────────────────────────────────────
 
 /// boot the TUI and load the model on a background thread.
@@ -1767,47 +1784,26 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("ACP mode — starting agent server");
 
-    let engine = Arc::new(ChatEngine::new());
-
     let startup_selection = setup::startup_model_selection();
     let config = startup_selection
         .as_ref()
         .and_then(|selection| {
-            models::build_model_picker_items()
-                .into_iter()
-                .find(|item| {
-                    selection
-                        .selected_model
-                        .as_ref()
-                        .map(|selected| {
-                            item.config.model_id == selected.model_id
-                                && item
-                                    .config
-                                    .files
-                                    .iter()
-                                    .any(|file| file == &selected.gguf_file)
-                        })
-                        .unwrap_or(false)
-                })
-                .map(|item| item.config)
+            selection.selected_model.as_ref().and_then(|selected| {
+                models::build_model_picker_items()
+                    .into_iter()
+                    .find(|item| {
+                        item.config.model_id == selected.model_id
+                            && item
+                                .config
+                                .files
+                                .iter()
+                                .any(|file| file == &selected.gguf_file)
+                    })
+                    .map(|item| item.config)
+            })
         })
         .unwrap_or_else(GgufModelConfig::qwen25_3b);
 
-    let acp_tool_calling = models::build_model_picker_items()
-        .iter()
-        .find(|item| item.config.model_id == config.model_id)
-        .map(|item| (item.tool_calling, item.max_tokens))
-        .unwrap_or((true, 4096));
-
-    let max_tokens = acp_tool_calling.1;
-    let tool_calling = acp_tool_calling.0;
-
-    let sampling = SamplingConfig {
-        max_tokens: Some(max_tokens),
-        ..SamplingConfig::default()
-    };
-
-    // do we need to download, or is it cached?
     let needs_download = models::build_model_picker_items()
         .iter()
         .find(|item| item.config.model_id == config.model_id)
@@ -1815,7 +1811,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .unwrap_or(true);
 
     log::info!(
-        "ACP startup model: {} ({})",
+        "ACP startup model selected: {} ({})",
         config.display_name,
         if needs_download {
             "needs download"
@@ -1824,44 +1820,19 @@ async fn run_acp_server() -> anyhow::Result<()> {
         }
     );
 
-    let startup_config = config.clone();
+    let engine = Arc::new(ChatEngine::new());
 
-    // loader thread flips model_ready when done; agent polls it
-    let model_ready = Arc::new(AtomicBool::new(false));
+    // Delay model loading until after initialize/auth so ACP stdout stays clean
+    // even if model libraries emit startup diagnostics.
+    let model_ready = Arc::new(AtomicBool::new(true));
     let model_load_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
-
-    // real thread + own runtime: block_in_place panics inside spawn_local
-    let loader_engine = Arc::clone(&engine);
-    let loader_config = config.clone();
-    let loader_ready = Arc::clone(&model_ready);
-    let loader_error = Arc::clone(&model_load_error);
-    let acp_system_prompt = system_prompt_for_model(tool_calling).to_string();
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        match rt.block_on(loader_engine.load_gguf_model(
-            loader_config,
-            Some(acp_system_prompt),
-            Some(sampling),
-        )) {
-            Ok(_) => {
-                log::info!("startup model loaded and ready");
-                loader_ready.store(true, Ordering::Release);
-            }
-            Err(error) => {
-                log::error!("startup model load failed: {error}");
-                *loader_error.lock().unwrap() = Some(error.to_string());
-                loader_ready.store(true, Ordering::Release);
-            }
-        }
-    });
 
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
     let agent = SiGitAgent::new(
         engine,
         notification_tx,
-        startup_config,
+        config,
         model_ready,
         model_load_error,
         needs_download,
@@ -1923,7 +1894,10 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
         }
     } else {
-        // ACP mode: no redirect needed, logs go to stderr.
+        // ACP mode: stdout must contain only ACP JSON messages.
+        #[cfg(unix)]
+        redirect_stdout_to_stderr()?;
+
         init_logging(false);
         setup::setup_shared_model_cache();
         log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));
