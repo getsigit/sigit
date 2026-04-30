@@ -1,8 +1,8 @@
 <h1 align="center">siGit Code</h1>
 
 <p align="center">
-  AI coding agent powered by local LLM via <a href="https://ondeinference.com">Onde Inference</a>.<br>
-  Runs on your machine. No API keys, no cloud.
+  A local coding agent powered by <a href="https://ondeinference.com">Onde Inference</a>.<br>
+  Runs on your machine. No API keys. No cloud round-trips.
 </p>
 
 <p align="center">
@@ -13,10 +13,6 @@
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
-<br>
-
----
-
 ## Install
 
 ```sh
@@ -24,21 +20,21 @@ pip install sigit-code
 uvx --from sigit-code sigit
 ```
 
-Installs a native `sigit` binary for your platform. No compiler, no runtime dependencies.
+This installs a native `sigit` binary for your platform. You do not need a compiler or extra runtime setup.
 
 ## Quick start
 
-### Terminal
+### Terminal mode
 
 ```sh
 sigit
 ```
 
-Opens a chat UI where you talk to a local LLM coding agent directly.
+That opens the local chat UI.
 
-### Zed (ACP agent)
+### Zed
 
-siGit works as an [ACP-compatible](https://github.com/nicobailon/agent-client-protocol) agent in [Zed](https://zed.dev). Add this to your Zed settings:
+siGit Code works as an [ACP-compatible](https://github.com/nicobailon/agent-client-protocol) agent in [Zed](https://zed.dev). Add this to your Zed settings:
 
 ```json
 {
@@ -51,7 +47,7 @@ siGit works as an [ACP-compatible](https://github.com/nicobailon/agent-client-pr
 }
 ```
 
-Then pick **sigit** as your agent in the Zed assistant panel.
+Then pick **siGit Code** in the assistant panel.
 
 ## Other install methods
 
@@ -80,7 +76,7 @@ cargo build --release
 
 ## Source and issues
 
-This package ships a pre-built binary. Source code is at [github.com/getsigit/sigit](https://github.com/getsigit/sigit). File bugs there.
+This package ships a prebuilt binary. The source code lives at [github.com/getsigit/sigit](https://github.com/getsigit/sigit). If something breaks, file the issue there.
 
 ## License
 

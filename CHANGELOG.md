@@ -1,69 +1,145 @@
 # Changelog
 
-## 1.0.0 — 2026
+## 1.0.3
 
-We've been running siGit in real smbCloud codebases for a while now. It holds up. Time to call it 1.0.
+This is the cleanup release for the editor-side startup problems.
 
----
+### What changed
 
-### The short version
+- Fixed ACP sessions failing on the first real prompt because the server claimed the model was ready before anything had actually been loaded
+- Changed ACP startup so the default model loads lazily on the first non-slash prompt instead of pretending it is already in memory
+- Kept `initialize` and `session/new` lightweight while still sending proper progress updates once model loading begins
+- Updated the Onde integration to `1.0.0`
+- Removed a few dependencies we were no longer using
 
-siGit is a local coding agent. It runs a quantized LLM on your machine, talks to editors over ACP, and can read files, run commands, search the web, and write code, all without sending anything to a cloud API. You can install it with cargo, pip, npm, or Homebrew. Then you use it like any other tool on your machine.
+## 1.0.2
 
----
+This release was supposed to fix the ACP auth breakage. It did fix the stdout pollution problem, but it turned out not to be the whole story.
 
-### What's actually in here
+### What changed
 
-**The editor integration** is the main thing. Zed and VSCode both pick it up as an ACP agent. Multi-turn sessions, tool calling, session forking, working directory context, all there. This was the original goal, and it feels solid now.
+- Delayed model loading in ACP mode so startup diagnostics would not leak into protocol stdout during the auth handshake
+- Tightened up the ACP startup path for editor integrations
+- Refreshed some README wording while cutting `1.0.2`
 
-**The terminal UI** started as a bonus and ended up being genuinely useful. You get a full-screen ratatui chat, streaming tokens with a blinking cursor, a spinner while the model thinks, and a model picker you can open mid-session. It runs on macOS and Linux. Windows gets the editor integration for now. TUI support there is still on the list.
+## 1.0.1
 
-**Tool calling** is what makes it feel like an agent instead of a chat window. The loop runs up to 10 rounds per message:
+The first patch after `1.0.0` was mostly about making model loading and model switching feel less opaque.
+
+### What changed
+
+- Added ToolCall-based progress UI for startup model loading and downloading
+- Improved model-switch progress reporting in ACP clients
+- Fixed model-load error handling so failed switches did not leave the UI in a weird state
+- Cleaned up a few status messages and docs while the release was going out
+
+## 1.0.0 (2026)
+
+siGit Code has been living in real smbCloud repos for a while now. At some point it stopped feeling like an experiment, so we called it 1.0.
+
+### What this release is
+
+siGit Code is a local coding agent. It runs a quantized model on your machine, talks to editors over ACP, and can read files, run commands, fetch web pages, and write code without sending your project to a hosted API.
+
+You can install it with Cargo, pip, npm, or Homebrew and use it like any other tool on your machine.
+
+### What shipped in 1.0
+
+#### Editor integration
+
+This is the core of the project.
+
+Zed and VS Code can talk to siGit Code over ACP. Multi-turn sessions work. Tool calling works. Session forking works. Working-directory context works. That was the original goal, and it feels solid now.
+
+#### Terminal UI
+
+The terminal UI started as a side quest and turned out to be useful. You get a full-screen ratatui chat, streaming tokens, a spinner while the model is busy, and a model picker you can open in the middle of a session.
+
+It runs on macOS and Linux. Windows gets ACP and editor mode for now. The Windows terminal UI is still unfinished.
+
+#### Tool calling
+
+This is the part that makes siGit Code feel like an agent instead of a chat box. The loop can run up to 10 rounds per message.
+
+Available tools:
 
 - `read_file` / `write_file` / `delete_file`
 - `list_directory` / `search_files`
-- `run_command` — shell commands with optional working directory
-- `read_website` — fetches a URL and strips it to readable text
+- `run_command`, with an optional working directory
+- `read_website`, which fetches a URL and strips it down to readable text
 
-The model decides which tools to call, sees the results, and keeps going until it has something useful to say.
+The model can call a tool, inspect the result, and keep going until it has a real answer.
 
-**Model support** ended up broader than we expected for 1.0. Qwen 3 1.7B, 4B, 8B, and 14B. Qwen 2.5 1.5B and 3B. Qwen 2.5 Coder 1.5B, 3B, and 7B. DeepSeek Coder 6.7B. All GGUF, all pulled from HuggingFace on first run.
+#### Model support
 
-Qwen 3 is the interesting one. It uses extended thinking mode. The model reasons inside `<think>…</think>` blocks before answering. The TUI strips those out and renders them dimmed above the reply, so you can see what it was doing without cluttering the conversation. The 8B is the default on desktop. Mobile defaults to 1.7B because iOS gives apps about 2 to 3 GB, and we found out the hard way that 3B causes OOM on an iPhone 16e.
+The model list ended up wider than we expected for 1.0:
 
-**The model picker** (`/models` in the TUI, or an agent config option in editors) shows what is cached locally, what is available to download, whether a model supports tool calling, and whether its local cache looks healthy. Switching models downloads and loads in the background. The UI stays alive the whole time, with a progress bar.
+- Qwen 3 1.7B, 4B, 8B, and 14B
+- Qwen 2.5 1.5B and 3B
+- Qwen 2.5 Coder 1.5B, 3B, and 7B
+- DeepSeek Coder 6.7B
 
-**smbCloud context** is baked into the system prompt. siGit knows the difference between platform user flows and tenant app auth flows, how `Project` / `FrontendApp` / `AuthApp` / GresIQ fit together, that Next.js SSR deploys are not the generic git-push path, and what workspace patterns smbCloud repos tend to follow. Outside smbCloud, it behaves like a normal coding agent and does not force platform-specific advice where it does not belong.
+They are all GGUF models and they all come from Hugging Face on first run.
 
-**Distribution** ended up being more work than the software itself, honestly. Pre-built binaries for macOS (arm64 + x64), Linux (arm64 + x64), and Windows (arm64 + x64). Four install methods: `cargo install sigit`, `pip install sigit-code`, `npm install -g @smbcloud/sigit`, `brew install sigit`. Getting all of that working across CI, crates.io, PyPI, npm, and Homebrew was basically its own project.
+Qwen 3 is the interesting one. It uses extended thinking mode. The model reasons inside `<think>...</think>` blocks before answering. The TUI strips those blocks out and renders them dimmed above the reply, so you can see what happened without turning the whole conversation into noise.
 
----
+The 8B model is the desktop default. Mobile stays on 1.7B because iOS gives apps roughly 2 to 3 GB of memory, and we learned the hard way that 3B can blow up on an iPhone 16e.
 
-### What doesn't work yet
+#### Model picker
 
-The Windows TUI. ACP and editor mode work fine on Windows. It is just the interactive terminal UI that is still missing. The underlying issue is Unix-specific terminal handling that we have not abstracted yet.
+The model picker shows:
 
----
+- what is already cached locally
+- what can be downloaded
+- which models support tool calling
+- whether the local cache looks healthy
+
+You can open it with `/models` in the TUI or through the editor config option. Switching models happens in the background and the UI stays alive while the download or load is in progress.
+
+#### smbCloud context
+
+siGit Code knows smbCloud repos better than a generic coding assistant does. It understands the difference between platform-user flows and tenant-app auth flows, how `Project`, `FrontendApp`, `AuthApp`, and GresIQ fit together, and why Next.js SSR deploys are not the same thing as the generic git-push path.
+
+Outside smbCloud, it backs off and behaves like a normal coding agent.
+
+#### Distribution
+
+Distribution took an unreasonable amount of time, honestly.
+
+There are prebuilt binaries for macOS, Linux, and Windows on both arm64 and x64 where relevant, plus install paths through Cargo, PyPI, npm, and Homebrew:
+
+- `cargo install sigit`
+- `pip install sigit-code`
+- `npm install -g @smbcloud/sigit`
+- `brew install sigit`
+
+Getting that whole pipeline to behave across CI, crates.io, PyPI, npm, and Homebrew was basically its own project.
+
+### What still does not work
+
+The Windows terminal UI is still missing.
+
+ACP and editor mode work on Windows. The part that is still missing is the interactive full-screen terminal UI. The blocker is Unix-specific terminal handling that has not been abstracted cleanly yet.
 
 ### Changes since 0.1.2
 
-- Qwen 3 14B support
-- Qwen 3 `<think>` block parsing, which strips and renders thinking content separately in the TUI
-- Moved all TUI code into `#[cfg(unix)]`, which fixed a pile of dead-code errors on Windows CI that were blocking releases
-- Live download progress bar during model switch, with cancellation support (Ctrl+C mid-download works)
-- Model download and loading progress shown in the Zed agent config panel
-- Animated spinner during model switching
-- Qwen 2.5 Coder 7B
-- Available-for-download models shown in the picker, not just locally cached ones
-- Model selection persists across restarts
-- Session working directory support
-- Model picker logic moved to a platform-independent module so it compiles on Windows even without the TUI
-- `/models N` shortcut for picking a model by number directly
-- `read_website` tool
-- Better `read_file` handling and empty reply detection
-- Async tool execution
+- Added Qwen 3 14B support
+- Added Qwen 3 `<think>` block parsing and separate rendering in the TUI
+- Moved all TUI code into `#[cfg(unix)]`, which fixed a pile of dead-code errors on Windows CI
+- Added live download progress during model switches, including cancellation with Ctrl+C
+- Added model download and loading progress in the Zed agent config panel
+- Added an animated spinner during model switching
+- Added Qwen 2.5 Coder 7B
+- Added downloadable models to the picker, not just locally cached ones
+- Made model selection persist across restarts
+- Added session working-directory support
+- Moved model picker logic into a platform-independent module so Windows can compile without the TUI
+- Added the `/models N` shortcut for picking a model by number
+- Added the `read_website` tool
+- Improved `read_file` handling and empty-reply detection
+- Added async tool execution
 - Fixed CI cross-compilation for macOS, iOS, Linux, and Windows
-- npm, PyPI, and Homebrew distribution added
+- Added npm, PyPI, and Homebrew distribution
 
 ---
 
