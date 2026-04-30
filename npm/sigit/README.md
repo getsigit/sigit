@@ -1,8 +1,8 @@
 <h1 align="center">siGit Code</h1>
 
 <p align="center">
-  AI coding agent powered by local LLM via <a href="https://ondeinference.com">Onde Inference</a>.<br>
-  Runs entirely on your machine — no API keys, no cloud round-trips.
+  A local coding agent powered by <a href="https://ondeinference.com">Onde Inference</a>.<br>
+  Runs on your machine. No API keys. No cloud round-trips.
 </p>
 
 <p align="center">
@@ -13,26 +13,28 @@
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
----
-
 ## Install
 
 ```sh
 npm install -g @smbcloud/sigit
 ```
 
-The right binary for your platform is pulled in automatically. Works on macOS (Apple Silicon and Intel), Linux (x64 and arm64), and Windows (x64 and arm64).
+npm pulls in the right binary for your platform automatically.
 
-### Other ways to install
+Supported targets:
+
+- macOS, Apple Silicon and Intel
+- Linux, x64 and arm64
+- Windows, x64 and arm64
+
+## Other install methods
 
 | Method | Command |
 |---|---|
-| **Homebrew** | `brew tap getsigit/tap && brew install sigit` |
-| **pip** | `pip install sigit-code` |
-| **uv** | `uvx --from sigit-code sigit` |
-| **Cargo** | `cargo install sigit` |
-
----
+| Homebrew | `brew tap getsigit/tap && brew install sigit` |
+| pip | `pip install sigit-code` |
+| uv | `uvx --from sigit-code sigit` |
+| Cargo | `cargo install sigit` |
 
 ## Usage
 
@@ -40,9 +42,9 @@ The right binary for your platform is pulled in automatically. Works on macOS (A
 sigit
 ```
 
-Opens a TUI coding agent that runs entirely on your device using a local LLM.
+That starts the local terminal UI.
 
-### Zed (ACP agent)
+### Zed
 
 Add this to `~/.config/zed/settings.json`:
 
@@ -57,9 +59,9 @@ Add this to `~/.config/zed/settings.json`:
 }
 ```
 
-Then select **siGit Code** as your agent in the Zed assistant panel.
+Then select **siGit Code** in the Zed assistant panel.
 
-### VSCode via ACP Client extension
+### VS Code with ACP Client
 
 Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client), then add:
 
@@ -75,8 +77,6 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 }
 ```
 
----
-
 ## Platform support
 
 | Platform | Architecture | Package |
@@ -87,8 +87,6 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 | Linux | arm64 | [`@smbcloud/sigit-linux-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-linux-arm64) |
 | Windows | x64 | [`@smbcloud/sigit-windows-x64`](https://www.npmjs.com/package/@smbcloud/sigit-windows-x64) |
 | Windows | arm64 | [`@smbcloud/sigit-windows-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-windows-arm64) |
-
----
 
 ## Links
 
