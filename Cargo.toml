@@ -22,7 +22,7 @@ agent-client-protocol = { version = "0.10.4", features = ["unstable_session_fork
 
 # Onde Inference engine (local LLM)
 # onde = { path = "../onde" }
-onde = { version = "0.1.8", git = "https://github.com/ondeinference/onde", branch = "development" }
+onde = "1.0.0"
 
 # Async runtime
 async-trait = "0.1"
