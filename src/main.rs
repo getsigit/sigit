@@ -273,6 +273,8 @@ struct SiGitAgent {
     current_model: std::sync::Mutex<GgufModelConfig>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
+    /// guards the one-time lazy startup load for ACP mode
+    startup_model_load_started: Arc<AtomicBool>,
     /// set if the startup load failed
     model_load_error: Arc<std::sync::Mutex<Option<String>>>,
     /// true when the startup model isn't cached yet
@@ -289,6 +291,7 @@ impl SiGitAgent {
         notification_tx: mpsc::Sender<SessionNotification>,
         initial_model: GgufModelConfig,
         model_ready: Arc<AtomicBool>,
+        startup_model_load_started: Arc<AtomicBool>,
         model_load_error: Arc<std::sync::Mutex<Option<String>>>,
         startup_needs_download: bool,
     ) -> Self {
@@ -300,11 +303,72 @@ impl SiGitAgent {
             session_cwd: std::sync::Mutex::new(None),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
+            startup_model_load_started,
             model_load_error,
             startup_needs_download,
             startup_model_name,
             startup_model_id,
         }
+    }
+
+    fn start_startup_model_load_if_needed(&self) {
+        if self
+            .startup_model_load_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        self.model_ready.store(false, Ordering::Release);
+        if let Ok(mut guard) = self.model_load_error.lock() {
+            *guard = None;
+        }
+
+        let startup_config = self.current_model.lock().unwrap().clone();
+        let (max_tokens, tool_calling) = models::build_model_picker_items()
+            .into_iter()
+            .find(|item| {
+                item.config.model_id == startup_config.model_id
+                    && item
+                        .config
+                        .files
+                        .first()
+                        .zip(startup_config.files.first())
+                        .map(|(left, right)| left == right)
+                        .unwrap_or(false)
+            })
+            .map(|item| (item.max_tokens, item.tool_calling))
+            .unwrap_or((4096, false));
+
+        let sampling = SamplingConfig {
+            max_tokens: Some(max_tokens),
+            ..SamplingConfig::default()
+        };
+
+        let loader_engine = Arc::clone(&self.engine);
+        let loader_system_prompt = system_prompt_for_model(tool_calling).to_string();
+        let model_ready = Arc::clone(&self.model_ready);
+        let model_load_error = Arc::clone(&self.model_load_error);
+
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|error| error.to_string())
+                .and_then(|rt| {
+                    rt.block_on(loader_engine.load_gguf_model(
+                        startup_config,
+                        Some(loader_system_prompt),
+                        Some(sampling),
+                    ))
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+                });
+
+            if let Ok(mut guard) = model_load_error.lock() {
+                *guard = result.err();
+            }
+            model_ready.store(true, Ordering::Release);
+        });
     }
 
     /// block until the startup model is ready, showing progress in the session.
@@ -543,6 +607,13 @@ impl SiGitAgent {
                 log::error!("model switch failed: {error}");
                 agent_client_protocol::Error::new(-32603, format!("model switch failed: {error}"))
             })?;
+
+        self.startup_model_load_started
+            .store(true, Ordering::Release);
+        self.model_ready.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.model_load_error.lock() {
+            *guard = None;
+        }
 
         if let Some(item) = models::build_model_picker_items()
             .iter()
@@ -1193,7 +1264,9 @@ impl Agent for SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
-        // wait for the startup model if it's still loading/downloading
+        // load the default ACP model lazily so initialize/session/new stay clean
+        // for registry validation and editor startup.
+        self.start_startup_model_load_if_needed();
         self.await_model_ready(&session_id).await?;
 
         // ── tool-calling loop ────────────────────────────────────────────
@@ -1318,7 +1391,9 @@ impl Agent for SiGitAgent {
 
         // can't switch while the startup model is still loading — the old
         // weights are in GPU memory and the new load gets "does not fit"
-        if !self.model_ready.load(Ordering::Acquire) {
+        if self.startup_model_load_started.load(Ordering::Acquire)
+            && !self.model_ready.load(Ordering::Acquire)
+        {
             log::info!("set_session_config_option: waiting for startup model to finish loading");
             while !self.model_ready.load(Ordering::Acquire) {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1767,47 +1842,26 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 async fn run_acp_server() -> anyhow::Result<()> {
     log::info!("ACP mode — starting agent server");
 
-    let engine = Arc::new(ChatEngine::new());
-
     let startup_selection = setup::startup_model_selection();
     let config = startup_selection
         .as_ref()
         .and_then(|selection| {
-            models::build_model_picker_items()
-                .into_iter()
-                .find(|item| {
-                    selection
-                        .selected_model
-                        .as_ref()
-                        .map(|selected| {
-                            item.config.model_id == selected.model_id
-                                && item
-                                    .config
-                                    .files
-                                    .iter()
-                                    .any(|file| file == &selected.gguf_file)
-                        })
-                        .unwrap_or(false)
-                })
-                .map(|item| item.config)
+            selection.selected_model.as_ref().and_then(|selected| {
+                models::build_model_picker_items()
+                    .into_iter()
+                    .find(|item| {
+                        item.config.model_id == selected.model_id
+                            && item
+                                .config
+                                .files
+                                .iter()
+                                .any(|file| file == &selected.gguf_file)
+                    })
+                    .map(|item| item.config)
+            })
         })
         .unwrap_or_else(GgufModelConfig::qwen25_3b);
 
-    let acp_tool_calling = models::build_model_picker_items()
-        .iter()
-        .find(|item| item.config.model_id == config.model_id)
-        .map(|item| (item.tool_calling, item.max_tokens))
-        .unwrap_or((true, 4096));
-
-    let max_tokens = acp_tool_calling.1;
-    let tool_calling = acp_tool_calling.0;
-
-    let sampling = SamplingConfig {
-        max_tokens: Some(max_tokens),
-        ..SamplingConfig::default()
-    };
-
-    // do we need to download, or is it cached?
     let needs_download = models::build_model_picker_items()
         .iter()
         .find(|item| item.config.model_id == config.model_id)
@@ -1815,7 +1869,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .unwrap_or(true);
 
     log::info!(
-        "ACP startup model: {} ({})",
+        "ACP startup model selected: {} ({})",
         config.display_name,
         if needs_download {
             "needs download"
@@ -1824,45 +1878,22 @@ async fn run_acp_server() -> anyhow::Result<()> {
         }
     );
 
-    let startup_config = config.clone();
+    let engine = Arc::new(ChatEngine::new());
 
-    // loader thread flips model_ready when done; agent polls it
-    let model_ready = Arc::new(AtomicBool::new(false));
+    // Delay model loading until the first real prompt so initialize/session/new
+    // stay lightweight and registry auth checks don't trip over model startup.
+    let model_ready = Arc::new(AtomicBool::new(true));
+    let startup_model_load_started = Arc::new(AtomicBool::new(false));
     let model_load_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
-
-    // real thread + own runtime: block_in_place panics inside spawn_local
-    let loader_engine = Arc::clone(&engine);
-    let loader_config = config.clone();
-    let loader_ready = Arc::clone(&model_ready);
-    let loader_error = Arc::clone(&model_load_error);
-    let acp_system_prompt = system_prompt_for_model(tool_calling).to_string();
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        match rt.block_on(loader_engine.load_gguf_model(
-            loader_config,
-            Some(acp_system_prompt),
-            Some(sampling),
-        )) {
-            Ok(_) => {
-                log::info!("startup model loaded and ready");
-                loader_ready.store(true, Ordering::Release);
-            }
-            Err(error) => {
-                log::error!("startup model load failed: {error}");
-                *loader_error.lock().unwrap() = Some(error.to_string());
-                loader_ready.store(true, Ordering::Release);
-            }
-        }
-    });
 
     let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
     let agent = SiGitAgent::new(
         engine,
         notification_tx,
-        startup_config,
+        config,
         model_ready,
+        startup_model_load_started,
         model_load_error,
         needs_download,
     );
@@ -1923,7 +1954,8 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
         }
     } else {
-        // ACP mode: no redirect needed, logs go to stderr.
+        // ACP mode: keep stdout untouched for protocol JSON only.
+        // Logs already go to stderr via `init_logging(false)`.
         init_logging(false);
         setup::setup_shared_model_cache();
         log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));

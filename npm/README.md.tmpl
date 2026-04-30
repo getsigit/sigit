@@ -1,8 +1,8 @@
 <h1 align="center">siGit Code</h1>
 
 <p align="center">
-  AI coding agent powered by local LLM via <a href="https://ondeinference.com">Onde Inference</a>.<br>
-  Runs on your machine. No API keys, no cloud.
+  A local coding agent powered by <a href="https://ondeinference.com">Onde Inference</a>.<br>
+  Runs on your machine. No API keys. No cloud round-trips.
 </p>
 
 <p align="center">
@@ -13,13 +13,11 @@
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
-<br>
-
 ## `${node_pkg}`
 
-This is the npm distribution of siGit Code, a platform-specific binary package for [`@smbcloud/sigit`](https://www.npmjs.com/package/@smbcloud/sigit). You don't need to install it directly.
+This package is one of the platform-specific binaries behind [`@smbcloud/sigit`](https://www.npmjs.com/package/@smbcloud/sigit). You usually do not need to install it directly.
 
-Install the main package and npm pulls in the right binary for your OS and architecture:
+Install the main package and npm will pull in the right binary for your OS and architecture:
 
 ```sh
 npm install -g @smbcloud/sigit
@@ -29,11 +27,11 @@ npm install -g @smbcloud/sigit
 
 | Channel | Command |
 |---------|---------|
-| **npm** | `npm install -g @smbcloud/sigit` |
-| **Homebrew** | `brew tap getsigit/tap && brew install sigit` |
-| **pip** | `pip install sigit-code` |
-| **uv** | `uvx --from sigit-code sigit` |
-| **Cargo** | `cargo install sigit` |
+| npm | `npm install -g @smbcloud/sigit` |
+| Homebrew | `brew tap getsigit/tap && brew install sigit` |
+| pip | `pip install sigit-code` |
+| uv | `uvx --from sigit-code sigit` |
+| Cargo | `cargo install sigit` |
 
 ## Platform support
 
