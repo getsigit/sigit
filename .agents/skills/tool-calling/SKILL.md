@@ -1,3 +1,8 @@
+---
+name: tool-calling
+description: A skill for tool calling in siGit Code, supporting agentic tool execution with Qwen 3 models.
+---
+
 # Skill: Tool Calling in siGit Code
 
 ## Overview
