@@ -1,3 +1,8 @@
+---
+name: ai-assisted-coding
+description: A skill for knowledge about AI-assisted coding, agents, harness, and everything in between.
+---
+
 # Skill: AI-Assisted Coding Agents — Onde Inference Integration
 
 ## Overview

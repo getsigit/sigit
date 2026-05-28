@@ -1,3 +1,8 @@
+---
+name: agent-client-protocol
+description: A JSON-RPC 2.0 protocol over stdio for integrating AI coding agents with editors.
+---
+
 # Skill: Agent Client Protocol (ACP) — Rust Implementation
 
 ## Overview
