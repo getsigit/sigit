@@ -1,4 +1,9 @@
-# Skill: Branding and naming reference
+---
+name: branding
+description: Keep siGit Code branding, naming, and package references consistent. Use when editing docs, release notes, UI copy, package metadata, setup guides, or any prose that mentions the product, CLI, company, or Onde Inference.
+---
+
+# Branding
 
 ## Overview
 

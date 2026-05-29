@@ -1,4 +1,9 @@
-# Skill: Tool Calling in siGit Code
+---
+name: tool-calling
+description: Implement or debug tool calling in siGit Code across the app, Onde Inference, and mistral.rs. Use when working on tool schemas, execution loops, model support, session cwd handling, or tool-call troubleshooting.
+---
+
+# Tool Calling
 
 ## Overview
 

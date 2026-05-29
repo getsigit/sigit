@@ -1,16 +1,16 @@
 [package]
 name = "sigit"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
-description = "siGit Code — ACP-compatible AI coding agent for smbCloud platform."
+description = "siGit Code — ACP-compatible AI coding agent. Sí, git."
 documentation = "https://github.com/getsigit/sigit"
 license = "Apache-2.0"
 repository = "https://github.com/getsigit/sigit"
-homepage = "https://smbcloud.xyz"
+homepage = "https://sigit.si"
 readme = "README.md"
 keywords = ["sigit", "cli", "ai", "coding-agent", "llm"]
 categories = ["command-line-utilities"]
-authors = ["Seto Elkahfi <hej@setoelkahfi.se>"]
+authors = ["Seto Elkahfi <seto@ondeinference.com>"]
 
 [[bin]]
 name = "sigit"
@@ -22,7 +22,7 @@ agent-client-protocol = { version = "0.10.4", features = ["unstable_session_fork
 
 # Onde Inference engine (local LLM)
 # onde = { path = "../onde" }
-onde = "1.0.0"
+onde = "1.1.2"
 
 # Async runtime
 async-trait = "0.1"
