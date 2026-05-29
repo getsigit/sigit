@@ -37,6 +37,31 @@ pub(crate) fn strip_think_blocks(raw: &str) -> (String, String) {
     (thinking, remainder.trim().to_string())
 }
 
+pub(crate) fn parse_rich_text_segments(text: &str) -> Vec<(String, bool)> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    let mut bold = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '*' && chars.peek() == Some(&'*') {
+            chars.next();
+            if !current.is_empty() {
+                segments.push((std::mem::take(&mut current), bold));
+            }
+            bold = !bold;
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push((current, bold));
+    }
+
+    segments
+}
+
 // ── Unix-only TUI ─────────────────────────────────────────────────────────────
 //
 // macOS + Linux only. Windows uses ACP mode instead.
@@ -191,6 +216,21 @@ mod tui {
 88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888";
 
     const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    fn rich_text_spans(text: &str, base_style: Style, bold_style: Style) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+
+        for (segment, is_bold) in super::parse_rich_text_segments(text) {
+            let style = if is_bold { bold_style } else { base_style };
+            spans.push(Span::styled(segment, style));
+        }
+
+        if spans.is_empty() {
+            spans.push(Span::styled(String::new(), base_style));
+        }
+
+        spans
+    }
 
     impl App {
         fn new(load_model_name: String) -> Self {
@@ -923,16 +963,19 @@ mod tui {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 );
+                let body_style = Style::default();
+                let bold_style = Style::default().add_modifier(Modifier::BOLD);
                 let mut first = true;
                 for text_line in msg.text.split('\n') {
                     if first {
-                        lines.push(Line::from(vec![
-                            prefix.clone(),
-                            Span::raw(text_line.to_string()),
-                        ]));
+                        let mut spans = vec![prefix.clone()];
+                        spans.extend(rich_text_spans(text_line, body_style, bold_style));
+                        lines.push(Line::from(spans));
                         first = false;
                     } else {
-                        lines.push(Line::from(Span::raw(format!("         {text_line}"))));
+                        let mut spans = vec![Span::raw("         ".to_string())];
+                        spans.extend(rich_text_spans(text_line, body_style, bold_style));
+                        lines.push(Line::from(spans));
                     }
                 }
             }
@@ -1618,7 +1661,7 @@ pub use tui::run_with;
 
 #[cfg(test)]
 mod tests {
-    use super::strip_think_blocks;
+    use super::{parse_rich_text_segments, strip_think_blocks};
 
     #[test]
     fn strip_think_blocks_separates_thinking_and_visible_reply() {
@@ -1645,5 +1688,36 @@ mod tests {
 
         assert_eq!(thinking, "");
         assert_eq!(visible, "No hidden reasoning here.");
+    }
+
+    #[test]
+    fn parse_rich_text_segments_marks_bold_runs() {
+        let segments = parse_rich_text_segments(
+            "The current weather is **72°F** with **Partly Cloudy** conditions.",
+        );
+
+        assert_eq!(
+            segments,
+            vec![
+                ("The current weather is ".to_string(), false),
+                ("72°F".to_string(), true),
+                (" with ".to_string(), false),
+                ("Partly Cloudy".to_string(), true),
+                (" conditions.".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rich_text_segments_treats_unclosed_marker_as_bold_to_end() {
+        let segments = parse_rich_text_segments("Prefix **bold");
+
+        assert_eq!(
+            segments,
+            vec![
+                ("Prefix ".to_string(), false),
+                ("bold".to_string(), true),
+            ]
+        );
     }
 }
