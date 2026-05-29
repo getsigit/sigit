@@ -1,6 +1,6 @@
 ---
 name: tool-calling
-description: A skill for tool calling in siGit Code, supporting agentic tool execution with Qwen 3 models.
+description: Implement or debug tool calling in siGit Code across the app, Onde Inference, and mistral.rs. Use when working on tool schemas, execution loops, model support, session cwd handling, or tool-call troubleshooting.
 ---
 
 # Skill: Tool Calling in siGit Code

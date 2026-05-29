@@ -1,8 +1,27 @@
 ---
 name: branding
-description: Keep siGit Code naming, casing, and product voice consistent across docs, UI copy, release notes, and package metadata.
-allowed-tools: Read, Write, Edit, Glob, Grep, AskUserQuestion
-user-invocable: true
+description: Keep siGit Code branding, naming, and package references consistent. Use when editing docs, release notes, UI copy, package metadata, setup guides, or any prose that mentions the product, CLI, company, or Onde Inference.
+---
+
+# Branding
+
+## Overview
+
+Use this file when writing docs, release notes, UI copy, package metadata, or setup guides for this repository.
+
+The short version:
+
+- **Product / brand name:** `siGit Code`
+- **CLI command:** `sigit`
+- **Rust crate:** `sigit`
+- **npm package:** `@smbcloud/sigit`
+- **PyPI package:** `sigit-code`
+- **Company name:** `smbCloud`
+- **LLM backend name:** `Onde Inference`
+
+The most common mistake is mixing the product name with the command name.
+
+
 ---
 
 # Branding: siGit Code naming and voice

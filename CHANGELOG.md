@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.4
+
+This release tightens up the terminal experience and finishes a few release-facing cleanup items.
+
+### What changed
+
+- Added bold rich-text rendering in the TUI for assistant replies, so `**text**` now displays with terminal styling instead of raw markdown markers
+- Refreshed the bundled skill metadata to follow the current Agent Skills `SKILL.md` format
+- Synced the crate release metadata for the `1.0.4` cut
+
 ## 1.0.3
 
 This is the cleanup release for the editor-side startup problems.
