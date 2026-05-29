@@ -1714,10 +1714,7 @@ mod tests {
 
         assert_eq!(
             segments,
-            vec![
-                ("Prefix ".to_string(), false),
-                ("bold".to_string(), true),
-            ]
+            vec![("Prefix ".to_string(), false), ("bold".to_string(), true),]
         );
     }
 }

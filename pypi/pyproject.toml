@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 dynamic = ["version"]
 license = { text = "Apache-2.0" }
-authors = [{ name = "Seto Elkahfi", email = "hej@setoelkahfi.se" }]
+authors = [{ name = "Seto Elkahfi", email = "seto@ondeinference.com" }]
 keywords = ["sigit", "cli", "ai", "coding-agent", "llm", "on-device"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -27,7 +27,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://smbcloud.xyz"
+Homepage = "https://sigit.si"
 Documentation = "https://github.com/getsigit/sigit"
 Repository = "https://github.com/getsigit/sigit"
 Issues = "https://github.com/getsigit/sigit/issues"

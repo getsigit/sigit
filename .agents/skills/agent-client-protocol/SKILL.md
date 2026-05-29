@@ -1,4 +1,9 @@
-# Skill: Agent Client Protocol (ACP) — Rust Implementation
+---
+name: agent-client-protocol
+description: Implement or debug Agent Client Protocol (ACP) support in Rust for siGit Code. Use when working on ACP JSON-RPC over stdio, the agent-client-protocol crate, session or prompt handlers, streaming notifications, or editor integration.
+---
+
+# Agent Client Protocol
 
 ## Overview
 
