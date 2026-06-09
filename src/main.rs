@@ -666,7 +666,7 @@ impl SiGitAgent {
                     .title("siGit Code - AI Coding Agent"),
             )
             .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
-                "sigit", "siGit",
+                "sigit", "siGit Code",
             ))])
             .agent_capabilities(
                 AgentCapabilities::default()
