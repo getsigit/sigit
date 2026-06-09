@@ -18,14 +18,13 @@ path = "src/main.rs"
 
 [dependencies]
 # ACP protocol SDK
-agent-client-protocol = { version = "0.10.4", features = ["unstable_session_fork", "unstable_session_additional_directories"] }
+agent-client-protocol = { version = "0.11", features = ["unstable_session_fork", "unstable_session_additional_directories"] }
 
 # Onde Inference engine (local LLM)
 # onde = { path = "../onde" }
 onde = "1.1.2"
 
 # Async runtime
-async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
