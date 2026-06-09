@@ -663,7 +663,7 @@ impl SiGitAgent {
         Ok(InitializeResponse::new(ProtocolVersion::V1)
             .agent_info(
                 Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
-                    .title("siGit — AI Coding Agent"),
+                    .title("siGit Code - AI Coding Agent"),
             )
             .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
                 "sigit", "siGit",
