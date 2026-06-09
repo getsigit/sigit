@@ -25,7 +25,6 @@ agent-client-protocol = { version = "0.11", features = ["unstable_session_fork",
 onde = "1.1.2"
 
 # Async runtime
-async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"

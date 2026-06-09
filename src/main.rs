@@ -11,10 +11,6 @@
 //! Interactive mode is Unix-only — it needs fd redirection to keep logs out
 //! of the TUI. Windows only gets ACP mode for now.
 //!
-//! The model loads before the ACP `LocalSet` starts because `mistralrs` calls
-//! `block_in_place`, which panics inside `spawn_local`. Loading on a regular
-//! multi-thread worker sidesteps that.
-//!
 //! On macOS the HF cache lives in the App Group container shared with the
 //! siGit desktop app. See [`setup`].
 //!
@@ -44,22 +40,21 @@ use std::sync::Arc;
 
 use onde::inference::SamplingConfig;
 
-use agent_client_protocol::{
-    Agent, AgentCapabilities, AgentSideConnection, AuthMethod, AuthMethodAgent,
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, ContentBlock,
-    ContentChunk, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
+use agent_client_protocol::schema::{
+    AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
+    CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource,
+    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
-use futures::future::LocalBoxFuture;
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 
@@ -267,7 +262,6 @@ fn initialize_meta() -> Meta {
 
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
-    notification_tx: mpsc::Sender<SessionNotification>,
     /// cwd from the editor — tool calls run here, not where the process started
     session_cwd: std::sync::Mutex<Option<PathBuf>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
@@ -288,7 +282,6 @@ struct SiGitAgent {
 impl SiGitAgent {
     fn new(
         engine: Arc<ChatEngine>,
-        notification_tx: mpsc::Sender<SessionNotification>,
         initial_model: GgufModelConfig,
         model_ready: Arc<AtomicBool>,
         startup_model_load_started: Arc<AtomicBool>,
@@ -299,7 +292,6 @@ impl SiGitAgent {
         let startup_model_id = initial_model.model_id.clone();
         Self {
             engine,
-            notification_tx,
             session_cwd: std::sync::Mutex::new(None),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
@@ -372,7 +364,11 @@ impl SiGitAgent {
     }
 
     /// block until the startup model is ready, showing progress in the session.
-    async fn await_model_ready(&self, session_id: &SessionId) -> agent_client_protocol::Result<()> {
+    async fn await_model_ready(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+    ) -> agent_client_protocol::Result<()> {
         if self.model_ready.load(Ordering::Acquire) {
             // already done — might be a stored error from earlier
             if let Some(err) = self.model_load_error.lock().unwrap().as_ref() {
@@ -394,6 +390,7 @@ impl SiGitAgent {
         };
 
         self.send_tool_call_update(
+            cx,
             session_id.clone(),
             SessionUpdate::ToolCall(
                 ToolCall::new(tool_call_id.clone(), &title)
@@ -402,7 +399,7 @@ impl SiGitAgent {
                     .content(vec![format!("{}…", title).into()]),
             ),
         )
-        .await;
+        .ok();
 
         let expected_bytes = if self.startup_needs_download {
             onde::inference::models::SUPPORTED_MODEL_INFO
@@ -484,6 +481,7 @@ impl SiGitAgent {
                 };
 
             self.send_tool_call_update(
+                cx,
                 session_id.clone(),
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                     tool_call_id.clone(),
@@ -493,13 +491,14 @@ impl SiGitAgent {
                         .content(vec![update_content.into()]),
                 )),
             )
-            .await;
+            .ok();
         }
 
         // done — check if it blew up
         let load_error = self.model_load_error.lock().unwrap().clone();
         if let Some(err) = load_error {
             self.send_tool_call_update(
+                cx,
                 session_id.clone(),
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                     tool_call_id,
@@ -509,7 +508,7 @@ impl SiGitAgent {
                         .content(vec![format!("error: {err}").into()]),
                 )),
             )
-            .await;
+            .ok();
 
             return Err(agent_client_protocol::Error::new(
                 -32603,
@@ -524,6 +523,7 @@ impl SiGitAgent {
         };
 
         self.send_tool_call_update(
+            cx,
             session_id.clone(),
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 tool_call_id,
@@ -532,26 +532,30 @@ impl SiGitAgent {
                     .status(ToolCallStatus::Completed),
             )),
         )
-        .await;
+        .ok();
 
         Ok(())
     }
 
-    async fn send_assistant_message(&self, session_id: SessionId, text: impl Into<String>) {
-        let notification = SessionNotification::new(
+    fn send_assistant_message(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        text: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(
             session_id,
             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
-        );
-        if self.notification_tx.send(notification).await.is_err() {
-            log::warn!("notification channel closed");
-        }
+        ))
     }
 
-    async fn send_tool_call_update(&self, session_id: SessionId, update: SessionUpdate) {
-        let notification = SessionNotification::new(session_id, update);
-        if self.notification_tx.send(notification).await.is_err() {
-            log::warn!("notification channel closed");
-        }
+    fn send_tool_call_update(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        update: SessionUpdate,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(session_id, update))
     }
 
     async fn switch_model_by_id(
@@ -647,6 +651,733 @@ impl SiGitAgent {
     }
 }
 
+// ── ACP handler implementations ───────────────────────────────────────────────
+
+impl SiGitAgent {
+    async fn handle_initialize(
+        &self,
+        _req: InitializeRequest,
+    ) -> agent_client_protocol::Result<InitializeResponse> {
+        log::info!("initialize");
+
+        Ok(InitializeResponse::new(ProtocolVersion::V1)
+            .agent_info(
+                Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
+                    .title("siGit — AI Coding Agent"),
+            )
+            .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
+                "sigit", "siGit",
+            ))])
+            .agent_capabilities(
+                AgentCapabilities::default()
+                    .load_session(true)
+                    .session_capabilities(
+                        SessionCapabilities::new().fork(SessionForkCapabilities::new()),
+                    ),
+            )
+            .meta(initialize_meta()))
+    }
+
+    async fn handle_authenticate(
+        &self,
+        _req: AuthenticateRequest,
+    ) -> agent_client_protocol::Result<AuthenticateResponse> {
+        log::info!("authenticate");
+        Ok(AuthenticateResponse::default())
+    }
+
+    async fn handle_load_session(
+        &self,
+        args: LoadSessionRequest,
+    ) -> agent_client_protocol::Result<LoadSessionResponse> {
+        log::info!(
+            "load_session: id={}, cwd={}, additional_directories={:?}",
+            args.session_id,
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+
+        // tool calls use relative paths, so we need to match the editor's cwd
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
+
+        // no session persistence, so "load" just resets
+        self.engine.clear_history().await;
+
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(LoadSessionResponse::new().config_options(config_options))
+    }
+
+    async fn handle_fork_session(
+        &self,
+        args: ForkSessionRequest,
+    ) -> agent_client_protocol::Result<ForkSessionResponse> {
+        let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        log::info!(
+            "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
+            args.session_id,
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
+
+        // no persistence, so fork == fresh session
+        self.engine.clear_history().await;
+
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(ForkSessionResponse::new(new_id).config_options(config_options))
+    }
+
+    async fn handle_new_session(
+        &self,
+        args: NewSessionRequest,
+    ) -> agent_client_protocol::Result<NewSessionResponse> {
+        let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        log::info!(
+            "new_session: id={session_id}, cwd={}, additional_directories={:?}",
+            args.cwd.display(),
+            args.additional_directories
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(args.cwd.clone());
+        }
+        if args.cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&args.cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
+        }
+
+        self.engine.clear_history().await;
+
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(format!(
+                "The user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations. This is the root of the project \
+                 the user has open in their editor.",
+                args.cwd.display()
+            )))
+            .await;
+
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+
+        Ok(NewSessionResponse::new(session_id).config_options(config_options))
+    }
+
+    async fn handle_prompt(
+        &self,
+        cx: &ConnectionTo<Client>,
+        args: PromptRequest,
+    ) -> agent_client_protocol::Result<PromptResponse> {
+        let session_id = args.session_id.clone();
+
+        // log every block so we can debug @ references and file context
+        for (i, block) in args.prompt.iter().enumerate() {
+            match block {
+                ContentBlock::Text(t) => {
+                    log::info!(
+                        "prompt({}) block[{}]: Text({} chars) = \"{}\"",
+                        session_id,
+                        i,
+                        t.text.len(),
+                        t.text.chars().take(200).collect::<String>()
+                    );
+                }
+                ContentBlock::Resource(embedded) => {
+                    log::info!(
+                        "prompt({}) block[{}]: EmbeddedResource = {:?}",
+                        session_id,
+                        i,
+                        match &embedded.resource {
+                            EmbeddedResourceResource::TextResourceContents(t) =>
+                                format!("TextResource(uri={}, {} chars)", t.uri, t.text.len()),
+                            EmbeddedResourceResource::BlobResourceContents(b) =>
+                                format!("BlobResource(uri={})", b.uri),
+                            _ => "Unknown".to_string(),
+                        }
+                    );
+                }
+                ContentBlock::ResourceLink(link) => {
+                    log::info!(
+                        "prompt({}) block[{}]: ResourceLink(name={}, uri={}, title={:?}, desc={:?})",
+                        session_id,
+                        i,
+                        link.name,
+                        link.uri,
+                        link.title,
+                        link.description
+                    );
+                }
+                other => {
+                    log::info!(
+                        "prompt({}) block[{}]: Other({:?})",
+                        session_id,
+                        i,
+                        std::mem::discriminant(other)
+                    );
+                }
+            }
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+
+        for block in &args.prompt {
+            match block {
+                ContentBlock::Text(t) => {
+                    parts.push(t.text.clone());
+                }
+                ContentBlock::Resource(embedded) => {
+                    // editor inlined the file content already
+                    match &embedded.resource {
+                        EmbeddedResourceResource::TextResourceContents(text_resource) => {
+                            parts.push(format!(
+                                "\n--- {} ---\n{}\n--- end {} ---",
+                                text_resource.uri, text_resource.text, text_resource.uri
+                            ));
+                        }
+                        EmbeddedResourceResource::BlobResourceContents(blob) => {
+                            parts.push(format!("[binary resource: {}]", blob.uri));
+                        }
+                        _ => {
+                            log::debug!("ignoring unsupported embedded resource variant");
+                        }
+                    }
+                }
+                ContentBlock::ResourceLink(link) => {
+                    // reference without content; read the file ourselves
+                    let label = link.name.clone();
+
+                    if let Some(raw_path) = link.uri.strip_prefix("file://") {
+                        let (file_path, line_range) = if let Some(hash_pos) = raw_path.rfind('#') {
+                            let fragment = &raw_path[hash_pos + 1..];
+                            let path = &raw_path[..hash_pos];
+                            // Parse "L207:219" or "L207-219" → (207, 219)
+                            let range = fragment.strip_prefix('L').and_then(|rest| {
+                                let sep = if rest.contains(':') { ':' } else { '-' };
+                                let mut parts = rest.splitn(2, sep);
+                                let start = parts.next()?.parse::<usize>().ok()?;
+                                let end = parts.next()?.parse::<usize>().ok()?;
+                                Some((start, end))
+                            });
+                            (path, range)
+                        } else {
+                            (raw_path, None)
+                        };
+
+                        match std::fs::read_to_string(file_path) {
+                            Ok(contents) => {
+                                let extracted = if let Some((start, end)) = line_range {
+                                    let selected: Vec<&str> = contents
+                                        .lines()
+                                        .enumerate()
+                                        .filter(|(i, _)| {
+                                            let line_num = i + 1;
+                                            line_num >= start && line_num <= end
+                                        })
+                                        .map(|(_, line)| line)
+                                        .collect();
+                                    format!(
+                                        "\n--- {label} ({file_path} lines {start}-{end}) ---\n{}\n--- end {label} ---",
+                                        selected.join("\n")
+                                    )
+                                } else {
+                                    format!(
+                                        "\n--- {label} ({file_path}) ---\n{contents}\n--- end {label} ---"
+                                    )
+                                };
+                                parts.push(extracted);
+                            }
+                            Err(err) => {
+                                log::warn!("could not read ResourceLink {}: {err}", link.uri);
+                                parts.push(format!("[referenced file: {label} ({file_path})]"));
+                            }
+                        }
+                    } else {
+                        parts.push(format!("[resource link: {label} ({})]", link.uri));
+                    }
+                }
+                _ => {
+                    log::debug!("ignoring unsupported content block type in prompt");
+                }
+            }
+        }
+
+        let user_text = parts.join("\n");
+
+        if user_text.trim().is_empty() {
+            return Ok(PromptResponse::new(StopReason::EndTurn));
+        }
+
+        if let Some(command) = parse_slash(&user_text) {
+            return exec_slash_acp(self, cx, session_id, command).await;
+        }
+
+        log::info!(
+            "prompt({}): \"{}\"",
+            session_id,
+            user_text.chars().take(80).collect::<String>()
+        );
+
+        // load the default ACP model lazily so initialize/session/new stay clean
+        // for registry validation and editor startup.
+        self.start_startup_model_load_if_needed();
+        self.await_model_ready(cx, &session_id).await?;
+
+        // ── tool-calling loop ────────────────────────────────────────────
+        // send message → execute any tool calls → feed results back
+        // repeat up to MAX_TOOL_ROUNDS, then force a text reply
+
+        let onde_tools = agent_tools_as_onde();
+
+        let mut result = self
+            .engine
+            .send_message_with_tools(&user_text, &onde_tools)
+            .await
+            .map_err(|error| {
+                log::error!("send_message_with_tools failed: {error}");
+                agent_client_protocol::Error::new(-32603, format!("inference failed: {error}"))
+            })?;
+
+        let mut round = 0;
+
+        while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+            round += 1;
+            log::info!(
+                "prompt({}) tool round {} — {} call(s)",
+                session_id,
+                round,
+                result.tool_calls.len()
+            );
+
+            let mut tool_results = Vec::new();
+
+            for tc in &result.tool_calls {
+                log::info!(
+                    "  → {}({})",
+                    tc.function_name,
+                    tc.arguments.chars().take(120).collect::<String>()
+                );
+
+                let output = tools::execute_tool(&tc.function_name, &tc.arguments).await;
+
+                log::info!("  ← {} chars", output.len());
+
+                tool_results.push(ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: output,
+                });
+            }
+
+            let next_tools = if round < MAX_TOOL_ROUNDS {
+                Some(onde_tools.as_slice())
+            } else {
+                None // last round: force text
+            };
+
+            result = self
+                .engine
+                .send_tool_results(tool_results, next_tools)
+                .await
+                .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
+        }
+
+        // ── Send the final text response ─────────────────────────────────
+        let reply_text = result.text.trim().to_string();
+
+        let final_text = if reply_text.is_empty() {
+            if round > 0 {
+                log::warn!(
+                    "prompt({}) — model returned empty reply after {} tool round(s)",
+                    session_id,
+                    round
+                );
+                "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
+            } else {
+                log::warn!(
+                    "prompt({}) — model returned empty reply (no tool rounds)",
+                    session_id
+                );
+                String::new()
+            }
+        } else {
+            // strip <think> blocks so reasoning tokens stay hidden
+            let (_think, visible) = chat::strip_think_blocks(&reply_text);
+            visible
+        };
+
+        if !final_text.is_empty() {
+            self.send_assistant_message(cx, session_id.clone(), final_text)
+                .ok();
+        }
+
+        log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
+        Ok(PromptResponse::new(StopReason::EndTurn))
+    }
+
+    async fn handle_cancel(
+        &self,
+        args: CancelNotification,
+    ) -> agent_client_protocol::Result<()> {
+        log::info!("cancel requested for session {}", args.session_id);
+        Ok(())
+    }
+
+    async fn handle_set_session_config_option(
+        &self,
+        cx: &ConnectionTo<Client>,
+        args: SetSessionConfigOptionRequest,
+    ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
+        log::info!(
+            "set_session_config_option: config_id={}, value={:?}",
+            args.config_id,
+            args.value
+        );
+
+        if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!("unknown config option: {}", args.config_id.0),
+            ));
+        }
+
+        let model_id = args.value.0.as_ref();
+
+        // can't switch while the startup model is still loading — the old
+        // weights are in GPU memory and the new load gets "does not fit"
+        if self.startup_model_load_started.load(Ordering::Acquire)
+            && !self.model_ready.load(Ordering::Acquire)
+        {
+            log::info!("set_session_config_option: waiting for startup model to finish loading");
+            while !self.model_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        // Zed re-fires the last selection on connect; no-op if it's already loaded
+        {
+            let current = self.current_model.lock().unwrap();
+            if current.model_id == model_id {
+                log::info!(
+                    "set_session_config_option: {} is already the active model, skipping",
+                    current.display_name
+                );
+                let config_options = build_model_config_options(&current);
+                return Ok(SetSessionConfigOptionResponse::new(config_options));
+            }
+        }
+
+        let needs_download = models::build_model_picker_items()
+            .into_iter()
+            .find(|item| item.config.model_id == model_id)
+            .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
+            .unwrap_or(false);
+
+        // tells the progress poller to stop
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
+
+        if needs_download {
+            let model_id_owned = model_id.to_string();
+            let expected_bytes = onde::inference::models::SUPPORTED_MODEL_INFO
+                .iter()
+                .find(|m| m.id == model_id_owned)
+                .map(|m| m.expected_size_bytes)
+                .unwrap_or(0);
+
+            let display_name = models::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.config.model_id == model_id_owned)
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| model_id_owned.clone());
+
+            let size_hint = if expected_bytes > 0 {
+                format!(" (~{})", format_size_human(expected_bytes))
+            } else {
+                String::new()
+            };
+
+            self.send_tool_call_update(
+                cx,
+                args.session_id.clone(),
+                SessionUpdate::ToolCall(
+                    ToolCall::new(
+                        tool_call_id.clone(),
+                        format!("⏬ Downloading {display_name}{size_hint}"),
+                    )
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![
+                        format!(
+                            "Preparing download for {display_name}. This may take a few minutes."
+                        )
+                        .into(),
+                    ]),
+                ),
+            )
+            .ok();
+
+            // poll download progress and update the spinner in Zed
+            let cx_for_poller = cx.clone();
+            let poller_session = args.session_id.clone();
+            let poller_model_id = model_id_owned.clone();
+            let poller_stop = Arc::clone(&stop_flag);
+            let poller_tool_call_id = tool_call_id.clone();
+
+            cx.spawn(async move {
+                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
+                let mut tick: usize = 0;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                interval.tick().await; // consume the immediate first tick
+
+                while !poller_stop.load(Ordering::Relaxed) {
+                    interval.tick().await;
+
+                    if poller_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let downloaded = cache_path
+                        .as_ref()
+                        .filter(|p| p.exists())
+                        .map(|p| dir_size_recursive(p))
+                        .unwrap_or(0);
+
+                    let frame = SPINNER[tick % SPINNER.len()];
+                    tick += 1;
+
+                    let title = if expected_bytes > 0 {
+                        let pct =
+                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
+                        format!("{frame} Downloading {display_name}{size_hint} ({pct}%)")
+                    } else {
+                        format!("{frame} Downloading {display_name}{size_hint}")
+                    };
+
+                    let msg = if expected_bytes > 0 {
+                        let pct =
+                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
+                        let bar = progress_bar(pct, 20);
+                        format!(
+                            "{display_name} — {bar} {pct}%  ({} / {})",
+                            format_size_human(downloaded),
+                            format_size_human(expected_bytes),
+                        )
+                    } else {
+                        format!(
+                            "{display_name} — {} downloaded…",
+                            format_size_human(downloaded)
+                        )
+                    };
+
+                    let notification = SessionNotification::new(
+                        poller_session.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            poller_tool_call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .title(title)
+                                .status(ToolCallStatus::InProgress)
+                                .content(vec![msg.into()]),
+                        )),
+                    );
+                    if cx_for_poller.send_notification(notification).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+            .ok();
+        }
+
+        // cached models still take 10-30s to load weights; show a spinner
+        if !needs_download {
+            let cached_display_name = models::build_model_picker_items()
+                .into_iter()
+                .find(|item| item.config.model_id == model_id)
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| model_id.to_string());
+
+            self.send_tool_call_update(
+                cx,
+                args.session_id.clone(),
+                SessionUpdate::ToolCall(
+                    ToolCall::new(
+                        tool_call_id.clone(),
+                        format!("Loading {cached_display_name}"),
+                    )
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![format!("Loading {cached_display_name}…").into()]),
+                ),
+            )
+            .ok();
+
+            // tick every 5s so the user knows we haven't frozen
+            let cx_for_spinner = cx.clone();
+            let spinner_session = args.session_id.clone();
+            let spinner_name = cached_display_name.clone();
+            let spinner_stop = Arc::clone(&stop_flag);
+            let spinner_tool_call_id = tool_call_id.clone();
+            let load_start = std::time::Instant::now();
+
+            cx.spawn(async move {
+                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let mut tick: usize = 0;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.tick().await; // consume the immediate first tick
+
+                while !spinner_stop.load(Ordering::Relaxed) {
+                    interval.tick().await;
+
+                    if spinner_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let elapsed = load_start.elapsed();
+                    let elapsed_str = if elapsed.as_secs() >= 60 {
+                        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+                    } else {
+                        format!("{}s", elapsed.as_secs())
+                    };
+                    let frame = SPINNER[tick % SPINNER.len()];
+                    tick += 1;
+
+                    let msg = format!("{frame} Loading {spinner_name}… ({elapsed_str})");
+                    let notification = SessionNotification::new(
+                        spinner_session.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            spinner_tool_call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::InProgress)
+                                .content(vec![msg.into()]),
+                        )),
+                    );
+                    if cx_for_spinner.send_notification(notification).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+            .ok();
+        }
+
+        let switch_result = self.switch_model_by_id(model_id).await;
+
+        stop_flag.store(true, Ordering::Relaxed);
+
+        match switch_result {
+            Ok(new_config) => {
+                let completion_title = if needs_download {
+                    format!("✓ {} downloaded and loaded", new_config.display_name)
+                } else {
+                    format!("✓ Switched to {}", new_config.display_name)
+                };
+                let completion_body = if needs_download {
+                    format!("✓ {} downloaded and loaded.", new_config.display_name)
+                } else {
+                    format!("✓ Switched to {}.", new_config.display_name)
+                };
+
+                self.send_tool_call_update(
+                    cx,
+                    args.session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        tool_call_id,
+                        ToolCallUpdateFields::new()
+                            .title(completion_title)
+                            .status(ToolCallStatus::Completed)
+                            .content(vec![completion_body.into()]),
+                    )),
+                )
+                .ok();
+
+                let config_options = {
+                    let guard = self.current_model.lock().unwrap();
+                    build_model_config_options(&guard)
+                };
+
+                log::info!("model switch complete");
+                Ok(SetSessionConfigOptionResponse::new(config_options))
+            }
+            Err(err) => {
+                self.send_tool_call_update(
+                    cx,
+                    args.session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        tool_call_id,
+                        ToolCallUpdateFields::new()
+                            .title("Model switch failed".to_string())
+                            .status(ToolCallStatus::Failed)
+                            .content(vec![format!("error loading model: {}", err.message).into()]),
+                    )),
+                )
+                .ok();
+
+                Err(err)
+            }
+        }
+    }
+}
+
+// ── Config option helpers ─────────────────────────────────────────────────────
+
 /// config option ID for the model picker in Zed's agent panel
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
@@ -708,6 +1439,8 @@ fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64, bool)> 
         })
         .map(|item| (item.config, item.max_tokens, item.tool_calling))
 }
+
+// ── Slash commands ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 enum SlashCommand {
@@ -801,6 +1534,7 @@ fn format_models_list(current_model: &GgufModelConfig) -> String {
 
 async fn exec_slash_acp(
     agent: &SiGitAgent,
+    cx: &ConnectionTo<Client>,
     session_id: SessionId,
     command: SlashCommand,
 ) -> agent_client_protocol::Result<PromptResponse> {
@@ -808,6 +1542,7 @@ async fn exec_slash_acp(
         SlashCommand::Help => {
             agent
                 .send_assistant_message(
+                    cx,
                     session_id,
                     "/help      - show this message\n\
                      /models    - list available models\n\
@@ -816,16 +1551,17 @@ async fn exec_slash_acp(
                      /status    - show engine status\n\
                      /exit      - end this turn",
                 )
-                .await;
+                .ok();
         }
         SlashCommand::Clear => {
             let cleared = agent.engine.clear_history().await;
             agent
                 .send_assistant_message(
+                    cx,
                     session_id,
                     format!("Cleared {cleared} turn(s). History is empty."),
                 )
-                .await;
+                .ok();
         }
         SlashCommand::Status => {
             let info = agent.engine.info().await;
@@ -833,19 +1569,20 @@ async fn exec_slash_acp(
             let memory = info.approx_memory.as_deref().unwrap_or("unknown");
             agent
                 .send_assistant_message(
+                    cx,
                     session_id,
                     format!(
                         "status: {:?}  model: {}  memory: {}  history: {} turns",
                         info.status, model, memory, info.history_length,
                     ),
                 )
-                .await;
+                .ok();
         }
         SlashCommand::Models(None) => {
             let current_model = agent.current_model.lock().unwrap().clone();
             agent
-                .send_assistant_message(session_id, format_models_list(&current_model))
-                .await;
+                .send_assistant_message(cx, session_id, format_models_list(&current_model))
+                .ok();
         }
         SlashCommand::Models(Some(number)) => {
             let items = models::build_model_picker_items();
@@ -854,72 +1591,79 @@ async fn exec_slash_acp(
                 None => {
                     agent
                         .send_assistant_message(
+                            cx,
                             session_id,
                             format!("error: no model #{number} - type /models to see the list."),
                         )
-                        .await;
+                        .ok();
                 }
                 Some(model) => {
                     if model.cache_health == setup::ModelCacheHealth::Incomplete {
                         agent
                             .send_assistant_message(
+                                cx,
                                 session_id,
                                 format!(
                                     "error: {} has an incomplete local cache and cannot be selected yet.",
                                     model.display_name
                                 ),
                             )
-                            .await;
+                            .ok();
                     } else if model.cache_health == setup::ModelCacheHealth::NotDownloaded {
                         agent
                             .send_assistant_message(
+                                cx,
                                 session_id.clone(),
                                 format!(
                                     "Downloading and loading {} ({})… this may take a few minutes.",
                                     model.display_name, model.description
                                 ),
                             )
-                            .await;
+                            .ok();
 
                         match agent.switch_model_by_id(&model.config.model_id).await {
                             Ok(new_config) => {
                                 agent.engine.clear_history().await;
                                 agent
                                     .send_assistant_message(
+                                        cx,
                                         session_id,
                                         format!(
                                             "✓ Downloaded and switched to {}",
                                             new_config.display_name
                                         ),
                                     )
-                                    .await;
+                                    .ok();
                             }
                             Err(err) => {
                                 agent
                                     .send_assistant_message(
+                                        cx,
                                         session_id,
                                         format!("error downloading model: {}", err.message),
                                     )
-                                    .await;
+                                    .ok();
                             }
                         }
                     } else {
                         agent
                             .send_assistant_message(
+                                cx,
                                 session_id.clone(),
                                 format!("Loading {}...", model.display_name),
                             )
-                            .await;
+                            .ok();
 
                         let switched = agent.switch_model_by_id(&model.config.model_id).await?;
                         agent.engine.clear_history().await;
 
                         agent
                             .send_assistant_message(
+                                cx,
                                 session_id,
                                 format!("Switched to {}.", switched.display_name),
                             )
-                            .await;
+                            .ok();
                     }
                 }
             }
@@ -927,735 +1671,31 @@ async fn exec_slash_acp(
         SlashCommand::Exit => {
             agent
                 .send_assistant_message(
+                    cx,
                     session_id,
                     "Use the panel controls to close or switch threads.",
                 )
-                .await;
+                .ok();
         }
         SlashCommand::Unknown(command) => {
             agent
-                .send_assistant_message(session_id, format!("unknown command: {command}"))
-                .await;
+                .send_assistant_message(cx, session_id, format!("unknown command: {command}"))
+                .ok();
         }
     }
 
     Ok(PromptResponse::new(StopReason::EndTurn))
 }
 
-#[async_trait::async_trait(?Send)]
-impl Agent for SiGitAgent {
-    async fn initialize(
-        &self,
-        _args: InitializeRequest,
-    ) -> agent_client_protocol::Result<InitializeResponse> {
-        log::info!("initialize");
-
-        Ok(InitializeResponse::new(ProtocolVersion::V1)
-            .agent_info(
-                Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
-                    .title("siGit — AI Coding Agent"),
-            )
-            .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
-                "sigit", "siGit",
-            ))])
-            .agent_capabilities(
-                AgentCapabilities::default()
-                    .load_session(true)
-                    .session_capabilities(
-                        SessionCapabilities::new().fork(SessionForkCapabilities::new()),
-                    ),
-            )
-            .meta(initialize_meta()))
-    }
-
-    async fn authenticate(
-        &self,
-        _args: AuthenticateRequest,
-    ) -> agent_client_protocol::Result<AuthenticateResponse> {
-        log::info!("authenticate");
-        Ok(AuthenticateResponse::default())
-    }
-
-    async fn load_session(
-        &self,
-        args: LoadSessionRequest,
-    ) -> agent_client_protocol::Result<LoadSessionResponse> {
-        log::info!(
-            "load_session: id={}, cwd={}, additional_directories={:?}",
-            args.session_id,
-            args.cwd.display(),
-            args.additional_directories
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-        );
-
-        if let Ok(mut guard) = self.session_cwd.lock() {
-            *guard = Some(args.cwd.clone());
-        }
-
-        // tool calls use relative paths, so we need to match the editor's cwd
-        if args.cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(&args.cwd)
-        {
-            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-        }
-
-        // no session persistence, so "load" just resets
-        self.engine.clear_history().await;
-
-        self.engine
-            .push_history(onde::inference::ChatMessage::system(format!(
-                "The user's project working directory is {}. \
-                 Always use absolute paths under this directory for all file \
-                 and directory operations. This is the root of the project \
-                 the user has open in their editor.",
-                args.cwd.display()
-            )))
-            .await;
-
-        let config_options = {
-            let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
-        };
-
-        Ok(LoadSessionResponse::new().config_options(config_options))
-    }
-
-    async fn fork_session(
-        &self,
-        args: ForkSessionRequest,
-    ) -> agent_client_protocol::Result<ForkSessionResponse> {
-        let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        log::info!(
-            "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
-            args.session_id,
-            args.cwd.display(),
-            args.additional_directories
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-        );
-
-        if let Ok(mut guard) = self.session_cwd.lock() {
-            *guard = Some(args.cwd.clone());
-        }
-        if args.cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(&args.cwd)
-        {
-            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-        }
-
-        // no persistence, so fork == fresh session
-        self.engine.clear_history().await;
-
-        self.engine
-            .push_history(onde::inference::ChatMessage::system(format!(
-                "The user's project working directory is {}. \
-                 Always use absolute paths under this directory for all file \
-                 and directory operations. This is the root of the project \
-                 the user has open in their editor.",
-                args.cwd.display()
-            )))
-            .await;
-
-        let config_options = {
-            let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
-        };
-
-        Ok(ForkSessionResponse::new(new_id).config_options(config_options))
-    }
-
-    async fn new_session(
-        &self,
-        args: NewSessionRequest,
-    ) -> agent_client_protocol::Result<NewSessionResponse> {
-        let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        log::info!(
-            "new_session: id={session_id}, cwd={}, additional_directories={:?}",
-            args.cwd.display(),
-            args.additional_directories
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-        );
-
-        if let Ok(mut guard) = self.session_cwd.lock() {
-            *guard = Some(args.cwd.clone());
-        }
-        if args.cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(&args.cwd)
-        {
-            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-        }
-
-        self.engine.clear_history().await;
-
-        self.engine
-            .push_history(onde::inference::ChatMessage::system(format!(
-                "The user's project working directory is {}. \
-                 Always use absolute paths under this directory for all file \
-                 and directory operations. This is the root of the project \
-                 the user has open in their editor.",
-                args.cwd.display()
-            )))
-            .await;
-
-        let config_options = {
-            let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
-        };
-
-        Ok(NewSessionResponse::new(session_id).config_options(config_options))
-    }
-
-    async fn prompt(&self, args: PromptRequest) -> agent_client_protocol::Result<PromptResponse> {
-        let session_id = args.session_id.clone();
-
-        // log every block so we can debug @ references and file context
-        for (i, block) in args.prompt.iter().enumerate() {
-            match block {
-                ContentBlock::Text(t) => {
-                    log::info!(
-                        "prompt({}) block[{}]: Text({} chars) = \"{}\"",
-                        session_id,
-                        i,
-                        t.text.len(),
-                        t.text.chars().take(200).collect::<String>()
-                    );
-                }
-                ContentBlock::Resource(embedded) => {
-                    log::info!(
-                        "prompt({}) block[{}]: EmbeddedResource = {:?}",
-                        session_id,
-                        i,
-                        match &embedded.resource {
-                            agent_client_protocol::EmbeddedResourceResource::TextResourceContents(t) =>
-                                format!("TextResource(uri={}, {} chars)", t.uri, t.text.len()),
-                            agent_client_protocol::EmbeddedResourceResource::BlobResourceContents(b) =>
-                                format!("BlobResource(uri={})", b.uri),
-                            _ => "Unknown".to_string(),
-                        }
-                    );
-                }
-                ContentBlock::ResourceLink(link) => {
-                    log::info!(
-                        "prompt({}) block[{}]: ResourceLink(name={}, uri={}, title={:?}, desc={:?})",
-                        session_id,
-                        i,
-                        link.name,
-                        link.uri,
-                        link.title,
-                        link.description
-                    );
-                }
-                other => {
-                    log::info!(
-                        "prompt({}) block[{}]: Other({:?})",
-                        session_id,
-                        i,
-                        std::mem::discriminant(other)
-                    );
-                }
-            }
-        }
-
-        let mut parts: Vec<String> = Vec::new();
-
-        for block in &args.prompt {
-            match block {
-                ContentBlock::Text(t) => {
-                    parts.push(t.text.clone());
-                }
-                ContentBlock::Resource(embedded) => {
-                    // editor inlined the file content already
-                    match &embedded.resource {
-                        agent_client_protocol::EmbeddedResourceResource::TextResourceContents(
-                            text_resource,
-                        ) => {
-                            parts.push(format!(
-                                "\n--- {} ---\n{}\n--- end {} ---",
-                                text_resource.uri, text_resource.text, text_resource.uri
-                            ));
-                        }
-                        agent_client_protocol::EmbeddedResourceResource::BlobResourceContents(
-                            blob,
-                        ) => {
-                            parts.push(format!("[binary resource: {}]", blob.uri));
-                        }
-                        _ => {
-                            log::debug!("ignoring unsupported embedded resource variant");
-                        }
-                    }
-                }
-                ContentBlock::ResourceLink(link) => {
-                    // reference without content; read the file ourselves
-                    let label = link.name.clone();
-
-                    if let Some(raw_path) = link.uri.strip_prefix("file://") {
-                        let (file_path, line_range) = if let Some(hash_pos) = raw_path.rfind('#') {
-                            let fragment = &raw_path[hash_pos + 1..];
-                            let path = &raw_path[..hash_pos];
-                            // Parse "L207:219" or "L207-219" → (207, 219)
-                            let range = fragment.strip_prefix('L').and_then(|rest| {
-                                let sep = if rest.contains(':') { ':' } else { '-' };
-                                let mut parts = rest.splitn(2, sep);
-                                let start = parts.next()?.parse::<usize>().ok()?;
-                                let end = parts.next()?.parse::<usize>().ok()?;
-                                Some((start, end))
-                            });
-                            (path, range)
-                        } else {
-                            (raw_path, None)
-                        };
-
-                        match std::fs::read_to_string(file_path) {
-                            Ok(contents) => {
-                                let extracted = if let Some((start, end)) = line_range {
-                                    let selected: Vec<&str> = contents
-                                        .lines()
-                                        .enumerate()
-                                        .filter(|(i, _)| {
-                                            let line_num = i + 1;
-                                            line_num >= start && line_num <= end
-                                        })
-                                        .map(|(_, line)| line)
-                                        .collect();
-                                    format!(
-                                        "\n--- {label} ({file_path} lines {start}-{end}) ---\n{}\n--- end {label} ---",
-                                        selected.join("\n")
-                                    )
-                                } else {
-                                    format!(
-                                        "\n--- {label} ({file_path}) ---\n{contents}\n--- end {label} ---"
-                                    )
-                                };
-                                parts.push(extracted);
-                            }
-                            Err(err) => {
-                                log::warn!("could not read ResourceLink {}: {err}", link.uri);
-                                parts.push(format!("[referenced file: {label} ({file_path})]"));
-                            }
-                        }
-                    } else {
-                        parts.push(format!("[resource link: {label} ({})]", link.uri));
-                    }
-                }
-                _ => {
-                    log::debug!("ignoring unsupported content block type in prompt");
-                }
-            }
-        }
-
-        let user_text = parts.join("\n");
-
-        if user_text.trim().is_empty() {
-            return Ok(PromptResponse::new(StopReason::EndTurn));
-        }
-
-        if let Some(command) = parse_slash(&user_text) {
-            return exec_slash_acp(self, session_id, command).await;
-        }
-
-        log::info!(
-            "prompt({}): \"{}\"",
-            session_id,
-            user_text.chars().take(80).collect::<String>()
-        );
-
-        // load the default ACP model lazily so initialize/session/new stay clean
-        // for registry validation and editor startup.
-        self.start_startup_model_load_if_needed();
-        self.await_model_ready(&session_id).await?;
-
-        // ── tool-calling loop ────────────────────────────────────────────
-        // send message → execute any tool calls → feed results back
-        // repeat up to MAX_TOOL_ROUNDS, then force a text reply
-
-        let onde_tools = agent_tools_as_onde();
-
-        let mut result = self
-            .engine
-            .send_message_with_tools(&user_text, &onde_tools)
-            .await
-            .map_err(|error| {
-                log::error!("send_message_with_tools failed: {error}");
-                agent_client_protocol::Error::new(-32603, format!("inference failed: {error}"))
-            })?;
-
-        let mut round = 0;
-
-        while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
-            round += 1;
-            log::info!(
-                "prompt({}) tool round {} — {} call(s)",
-                session_id,
-                round,
-                result.tool_calls.len()
-            );
-
-            let mut tool_results = Vec::new();
-
-            for tc in &result.tool_calls {
-                log::info!(
-                    "  → {}({})",
-                    tc.function_name,
-                    tc.arguments.chars().take(120).collect::<String>()
-                );
-
-                let output = tools::execute_tool(&tc.function_name, &tc.arguments).await;
-
-                log::info!("  ← {} chars", output.len());
-
-                tool_results.push(ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: output,
-                });
-            }
-
-            let next_tools = if round < MAX_TOOL_ROUNDS {
-                Some(onde_tools.as_slice())
-            } else {
-                None // last round: force text
-            };
-
-            result = self
-                .engine
-                .send_tool_results(tool_results, next_tools)
-                .await
-                .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
-        }
-
-        // ── Send the final text response ─────────────────────────────────
-        let reply_text = result.text.trim().to_string();
-
-        let final_text = if reply_text.is_empty() {
-            if round > 0 {
-                log::warn!(
-                    "prompt({}) — model returned empty reply after {} tool round(s)",
-                    session_id,
-                    round
-                );
-                "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
-            } else {
-                log::warn!(
-                    "prompt({}) — model returned empty reply (no tool rounds)",
-                    session_id
-                );
-                String::new()
-            }
-        } else {
-            // strip <think> blocks so reasoning tokens stay hidden
-            let (_think, visible) = chat::strip_think_blocks(&reply_text);
-            visible
-        };
-
-        if !final_text.is_empty() {
-            let notification = SessionNotification::new(
-                session_id.clone(),
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(final_text))),
-            );
-            if self.notification_tx.send(notification).await.is_err() {
-                log::warn!("notification channel closed");
-            }
-        }
-
-        log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
-        Ok(PromptResponse::new(StopReason::EndTurn))
-    }
-
-    async fn cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
-        log::info!("cancel requested for session {}", args.session_id);
-        Ok(())
-    }
-
-    async fn set_session_config_option(
-        &self,
-        args: SetSessionConfigOptionRequest,
-    ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
-        log::info!(
-            "set_session_config_option: config_id={}, value={:?}",
-            args.config_id,
-            args.value
-        );
-
-        if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
-            return Err(agent_client_protocol::Error::new(
-                -32602,
-                format!("unknown config option: {}", args.config_id.0),
-            ));
-        }
-
-        let model_id = args.value.0.as_ref();
-
-        // can't switch while the startup model is still loading — the old
-        // weights are in GPU memory and the new load gets "does not fit"
-        if self.startup_model_load_started.load(Ordering::Acquire)
-            && !self.model_ready.load(Ordering::Acquire)
-        {
-            log::info!("set_session_config_option: waiting for startup model to finish loading");
-            while !self.model_ready.load(Ordering::Acquire) {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-
-        // Zed re-fires the last selection on connect; no-op if it's already loaded
-        {
-            let current = self.current_model.lock().unwrap();
-            if current.model_id == model_id {
-                log::info!(
-                    "set_session_config_option: {} is already the active model, skipping",
-                    current.display_name
-                );
-                let config_options = build_model_config_options(&current);
-                return Ok(SetSessionConfigOptionResponse::new(config_options));
-            }
-        }
-
-        let needs_download = models::build_model_picker_items()
-            .into_iter()
-            .find(|item| item.config.model_id == model_id)
-            .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
-            .unwrap_or(false);
-
-        // tells the progress poller to stop
-        let stop_flag = Arc::new(AtomicBool::new(false));
-
-        let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
-
-        if needs_download {
-            let model_id_owned = model_id.to_string();
-            let expected_bytes = onde::inference::models::SUPPORTED_MODEL_INFO
-                .iter()
-                .find(|m| m.id == model_id_owned)
-                .map(|m| m.expected_size_bytes)
-                .unwrap_or(0);
-
-            let display_name = models::build_model_picker_items()
-                .into_iter()
-                .find(|item| item.config.model_id == model_id_owned)
-                .map(|item| item.display_name.clone())
-                .unwrap_or_else(|| model_id_owned.clone());
-
-            let size_hint = if expected_bytes > 0 {
-                format!(" (~{})", format_size_human(expected_bytes))
-            } else {
-                String::new()
-            };
-
-            self.send_tool_call_update(
-                args.session_id.clone(),
-                SessionUpdate::ToolCall(
-                    ToolCall::new(
-                        tool_call_id.clone(),
-                        format!("⏬ Downloading {display_name}{size_hint}"),
-                    )
-                    .kind(ToolKind::Think)
-                    .status(ToolCallStatus::InProgress)
-                    .content(vec![
-                        format!(
-                            "Preparing download for {display_name}. This may take a few minutes."
-                        )
-                        .into(),
-                    ]),
-                ),
-            )
-            .await;
-
-            // poll download progress and update the spinner in Zed
-            let poller_tx = self.notification_tx.clone();
-            let poller_session = args.session_id.clone();
-            let poller_model_id = model_id_owned.clone();
-            let poller_stop = Arc::clone(&stop_flag);
-            let poller_tool_call_id = tool_call_id.clone();
-
-            tokio::task::spawn_local(async move {
-                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-                let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
-                let mut tick: usize = 0;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-                interval.tick().await; // consume the immediate first tick
-
-                while !poller_stop.load(Ordering::Relaxed) {
-                    interval.tick().await;
-
-                    if poller_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let downloaded = cache_path
-                        .as_ref()
-                        .filter(|p| p.exists())
-                        .map(|p| dir_size_recursive(p))
-                        .unwrap_or(0);
-
-                    let frame = SPINNER[tick % SPINNER.len()];
-                    tick += 1;
-
-                    let title = if expected_bytes > 0 {
-                        let pct =
-                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
-                        format!("{frame} Downloading {display_name}{size_hint} ({pct}%)")
-                    } else {
-                        format!("{frame} Downloading {display_name}{size_hint}")
-                    };
-
-                    let msg = if expected_bytes > 0 {
-                        let pct =
-                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
-                        let bar = progress_bar(pct, 20);
-                        format!(
-                            "{display_name} — {bar} {pct}%  ({} / {})",
-                            format_size_human(downloaded),
-                            format_size_human(expected_bytes),
-                        )
-                    } else {
-                        format!(
-                            "{display_name} — {} downloaded…",
-                            format_size_human(downloaded)
-                        )
-                    };
-
-                    let notification = SessionNotification::new(
-                        poller_session.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            poller_tool_call_id.clone(),
-                            ToolCallUpdateFields::new()
-                                .title(title)
-                                .status(ToolCallStatus::InProgress)
-                                .content(vec![msg.into()]),
-                        )),
-                    );
-                    if poller_tx.send(notification).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        // cached models still take 10-30s to load weights; show a spinner
-        if !needs_download {
-            let cached_display_name = models::build_model_picker_items()
-                .into_iter()
-                .find(|item| item.config.model_id == model_id)
-                .map(|item| item.display_name.clone())
-                .unwrap_or_else(|| model_id.to_string());
-
-            self.send_tool_call_update(
-                args.session_id.clone(),
-                SessionUpdate::ToolCall(
-                    ToolCall::new(
-                        tool_call_id.clone(),
-                        format!("Loading {cached_display_name}"),
-                    )
-                    .kind(ToolKind::Think)
-                    .status(ToolCallStatus::InProgress)
-                    .content(vec![format!("Loading {cached_display_name}…").into()]),
-                ),
-            )
-            .await;
-
-            // tick every 5s so the user knows we haven't frozen
-            let spinner_tx = self.notification_tx.clone();
-            let spinner_session = args.session_id.clone();
-            let spinner_name = cached_display_name.clone();
-            let spinner_stop = Arc::clone(&stop_flag);
-            let spinner_tool_call_id = tool_call_id.clone();
-            let load_start = std::time::Instant::now();
-
-            tokio::task::spawn_local(async move {
-                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-                let mut tick: usize = 0;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                interval.tick().await; // consume the immediate first tick
-
-                while !spinner_stop.load(Ordering::Relaxed) {
-                    interval.tick().await;
-
-                    if spinner_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let elapsed = load_start.elapsed();
-                    let elapsed_str = if elapsed.as_secs() >= 60 {
-                        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
-                    } else {
-                        format!("{}s", elapsed.as_secs())
-                    };
-                    let frame = SPINNER[tick % SPINNER.len()];
-                    tick += 1;
-
-                    let msg = format!("{frame} Loading {spinner_name}… ({elapsed_str})");
-                    let notification = SessionNotification::new(
-                        spinner_session.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            spinner_tool_call_id.clone(),
-                            ToolCallUpdateFields::new()
-                                .status(ToolCallStatus::InProgress)
-                                .content(vec![msg.into()]),
-                        )),
-                    );
-                    if spinner_tx.send(notification).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        let switch_result = self.switch_model_by_id(model_id).await;
-
-        stop_flag.store(true, Ordering::Relaxed);
-
-        match switch_result {
-            Ok(new_config) => {
-                let completion_title = if needs_download {
-                    format!("✓ {} downloaded and loaded", new_config.display_name)
-                } else {
-                    format!("✓ Switched to {}", new_config.display_name)
-                };
-                let completion_body = if needs_download {
-                    format!("✓ {} downloaded and loaded.", new_config.display_name)
-                } else {
-                    format!("✓ Switched to {}.", new_config.display_name)
-                };
-
-                self.send_tool_call_update(
-                    args.session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                        tool_call_id,
-                        ToolCallUpdateFields::new()
-                            .title(completion_title)
-                            .status(ToolCallStatus::Completed)
-                            .content(vec![completion_body.into()]),
-                    )),
-                )
-                .await;
-
-                let config_options = {
-                    let guard = self.current_model.lock().unwrap();
-                    build_model_config_options(&guard)
-                };
-
-                log::info!("model switch complete");
-                Ok(SetSessionConfigOptionResponse::new(config_options))
-            }
-            Err(err) => {
-                self.send_tool_call_update(
-                    args.session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                        tool_call_id,
-                        ToolCallUpdateFields::new()
-                            .title("Model switch failed".to_string())
-                            .status(ToolCallStatus::Failed)
-                            .content(vec![format!("error loading model: {}", err.message).into()]),
-                    )),
-                )
-                .await;
-
-                Err(err)
-            }
-        }
+// ── Request dispatch helper ───────────────────────────────────────────────────
+
+fn handle_response<T: agent_client_protocol::JsonRpcResponse>(
+    responder: Responder<T>,
+    result: agent_client_protocol::Result<T>,
+) -> agent_client_protocol::Result<()> {
+    match result {
+        Ok(resp) => responder.respond(resp),
+        Err(err) => responder.respond_with_error(err),
     }
 }
 
@@ -1887,48 +1927,99 @@ async fn run_acp_server() -> anyhow::Result<()> {
     let model_load_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    let (notification_tx, mut notification_rx) = mpsc::channel::<SessionNotification>(256);
-    let agent = SiGitAgent::new(
+    let state = Arc::new(SiGitAgent::new(
         engine,
-        notification_tx,
         config,
         model_ready,
         startup_model_load_started,
         model_load_error,
         needs_download,
-    );
+    ));
 
-    // AgentSideConnection needs futures-io
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
+    let transport = ByteStreams::new(stdout, stdin);
 
-    // ACP futures are !Send
-    let local = tokio::task::LocalSet::new();
-
-    local
-        .run_until(async move {
-            let (conn, io_task) = AgentSideConnection::new(
-                agent,
-                stdout,
-                stdin,
-                |fut: LocalBoxFuture<'static, ()>| {
-                    tokio::task::spawn_local(fut);
-                },
-            );
-
-            tokio::task::spawn_local(async move {
-                while let Some(notification) = notification_rx.recv().await {
-                    if let Err(err) = conn.session_notification(notification).await {
-                        log::warn!("session_notification failed: {err}");
-                    }
+    Agent
+        .builder()
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: InitializeRequest, responder, _cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_initialize(req).await)
                 }
-            });
-
-            if let Err(err) = io_task.await {
-                log::error!("ACP IO error: {err}");
-            }
-        })
-        .await;
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: AuthenticateRequest, responder, _cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_authenticate(req).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: LoadSessionRequest, responder, _cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_load_session(req).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: ForkSessionRequest, responder, _cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_fork_session(req).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: NewSessionRequest, responder, _cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_new_session(req).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_prompt(&cx, req).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: SetSessionConfigOptionRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_response(
+                        responder,
+                        state.handle_set_session_config_option(&cx, req).await,
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let state = Arc::clone(&state);
+                async move |notif: CancelNotification, _cx: ConnectionTo<Client>| {
+                    state.handle_cancel(notif).await
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("ACP connection error: {e}"))?;
 
     log::info!("siGit shutting down");
     Ok(())

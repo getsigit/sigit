@@ -5071,7 +5071,6 @@ version = "1.0.4"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
- "async-trait",
  "crossterm 0.29.0",
  "futures",
  "libc",
