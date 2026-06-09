@@ -40,18 +40,18 @@ use std::sync::Arc;
 
 use onde::inference::SamplingConfig;
 
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use agent_client_protocol::schema::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource,
-    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, ProtocolVersion, SessionCapabilities, SessionConfigOption,
+    CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
+    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, ProtocolVersion, SessionCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
     SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1070,10 +1070,7 @@ impl SiGitAgent {
         Ok(PromptResponse::new(StopReason::EndTurn))
     }
 
-    async fn handle_cancel(
-        &self,
-        args: CancelNotification,
-    ) -> agent_client_protocol::Result<()> {
+    async fn handle_cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
         log::info!("cancel requested for session {}", args.session_id);
         Ok(())
     }
@@ -1999,7 +1996,9 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: SetSessionConfigOptionRequest, responder, cx: ConnectionTo<Client>| {
+                async move |req: SetSessionConfigOptionRequest,
+                            responder,
+                            cx: ConnectionTo<Client>| {
                     handle_response(
                         responder,
                         state.handle_set_session_config_option(&cx, req).await,
