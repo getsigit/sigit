@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+Bumps the ACP SDK to v0.13 and pulls in updated dependencies.
+
+### What changed
+
+- Updated `agent-client-protocol` from v0.11 to v0.13
+- Updated `onde` to 1.1.2
+- Refreshed branding and skill metadata
+
 ## 1.0.4
 
 This release tightens up the terminal experience and finishes a few release-facing cleanup items.

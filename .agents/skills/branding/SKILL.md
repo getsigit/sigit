@@ -21,9 +21,32 @@ The short version:
 
 The most common mistake is mixing the product name with the command name.
 
+
 ---
 
-## Primary rule
+# Branding: siGit Code naming and voice
+
+Use this skill when you are writing docs, release notes, UI copy, package descriptions, setup guides, or anything else user-facing in this repo.
+
+The main job is simple: keep the names straight.
+
+## The name map
+
+These names are case-sensitive.
+
+- **Product / brand:** `siGit Code`
+- **CLI command:** `sigit`
+- **Rust crate:** `sigit`
+- **Repository slug:** `getsigit/sigit`
+- **npm package:** `@smbcloud/sigit`
+- **PyPI package:** `sigit-code`
+- **Company:** `smbCloud`
+- **LLM backend in prose:** `Onde Inference`
+- **Rust crate for the backend:** `onde`
+- **Protocol acronym:** `ACP`
+- **Long form when needed:** `Agent Client Protocol (ACP)`
+
+## First rule
 
 When you mean the product, write **`siGit Code`** exactly like that.
 
@@ -41,13 +64,18 @@ Wrong:
 - `sigit Code`
 - `SIGIT`
 
-Do not shorten the product name to just `siGit` in documentation or marketing copy unless there is a very specific reason and the surrounding text makes it unmistakable.
+Do not shorten the product name to just `siGit` in docs or marketing copy unless there is a very specific reason and the sentence still reads clearly.
 
----
+## Second rule
 
-## Use lowercase names for commands and packages
+When you mean something users type, install, import, or clone, use the literal lowercase name.
 
-Use lowercase `sigit` when you mean the executable, crate, repo slug, or package name.
+That means:
+
+- `sigit` for the command, crate, and repo slug
+- `@smbcloud/sigit` for npm
+- `sigit-code` for PyPI
+- `onde` for the Rust crate
 
 Examples:
 
@@ -57,42 +85,36 @@ Examples:
 - Install with `pip install sigit-code`.
 - The repository is `getsigit/sigit`.
 
-This distinction matters:
+A good gut-check:
 
-- **Brand / product:** `siGit Code`
-- **Command / package / repo:** `sigit`
+> If this is the thing a user types or installs, keep the literal package or command name.
+> If this is the thing you are describing, use the branded product name.
 
----
+## Preferred wording
 
-## Recommended wording patterns
-
-### Product description
+Keep the prose plain and direct.
 
 Prefer:
 
 - `siGit Code is a local coding agent.`
 - `siGit Code runs on your machine.`
 - `siGit Code works with any codebase.`
+- `Install siGit Code with Cargo:`
+- `To start siGit Code, run `sigit`.`
 
 Avoid:
 
 - `siGit is a local coding agent.`
 - `sigit is a coding assistant.`
 - `The siGit product...`
+- inflated marketing language that makes the copy sound generic
 
-### Install instructions
+If a sentence feels awkward because of the brand name, rewrite the sentence. Do not change the name.
 
-Prefer:
+## Editor setup rules
 
-- `Install siGit Code with Cargo:`
-- `Install siGit Code from npm:`
-- To start siGit Code, run `sigit`.
-
-That keeps the brand name in prose and the command name in code.
-
-### Editor setup
-
-In UI-facing examples, keep the displayed agent name as `siGit Code`.
+In UI-facing examples, the visible label should stay `siGit Code`.
+The executable should stay `sigit`.
 
 Example:
 
@@ -107,19 +129,13 @@ Example:
 }
 ```
 
-The visible name is `siGit Code`. The executable path is `sigit`.
+The same rule applies in VS Code ACP examples, screenshots, panel labels, and release notes.
 
----
-
-## Other names that should stay consistent
+## Other names that must stay exact
 
 ### smbCloud
 
-Always write `smbCloud` with a lowercase `smb` and uppercase `C`.
-
-Correct:
-
-- `smbCloud`
+Always write `smbCloud` with lowercase `smb` and uppercase `C`.
 
 Wrong:
 
@@ -129,36 +145,45 @@ Wrong:
 
 ### Onde Inference
 
-Use `Onde Inference` when referring to the product or project.
-
-Use `onde` when referring to the Rust crate.
+Use `Onde Inference` when you mean the product or project.
+Use `onde` when you mean the Rust crate.
 
 Examples:
 
 - `siGit Code uses Onde Inference as its local LLM backend.`
-- The Rust dependency is `onde`.
+- `The Rust dependency is `onde`.`
 
 ### ACP
 
-Use `ACP` for the protocol acronym.
+Use `ACP` for the acronym.
+Use `Agent Client Protocol (ACP)` on first mention when the long form helps.
 
-Preferred long form:
+## Humanizing without breaking branding
 
-- `Agent Client Protocol (ACP)` on first mention when useful
+If you are also cleaning up AI-ish writing, preserve every case-sensitive name exactly as written.
 
----
+That includes:
 
-## Copy checklist
+- `siGit Code`
+- `smbCloud`
+- `Onde Inference`
+- `ACP`
+- `sigit`
+- `@smbcloud/sigit`
+- `sigit-code`
+- `onde`
 
-Before you finish any docs or release-note edit, check these quickly:
+Do not "smooth out" a brand name. Do not re-case package names to make a sentence look nicer. Rewrite around them.
 
-1. Did you use `siGit Code` for the product name?
-2. Did you keep `sigit` lowercase for commands and package names?
-3. Did you keep `smbCloud` cased correctly?
-4. Did you keep `Onde Inference` cased correctly in prose?
+## Quick checklist
+
+Before you finish any doc or release-note edit, check these:
+
+1. Did you use `siGit Code` when referring to the product?
+2. Did you keep `sigit` lowercase for commands, crates, and repo references?
+3. Did you keep `@smbcloud/sigit` and `sigit-code` exact?
+4. Did you keep `smbCloud` and `Onde Inference` cased correctly?
 5. In setup examples, does the visible editor label say `siGit Code` while the command stays `sigit`?
-
----
 
 ## Fast replacements
 
@@ -170,9 +195,9 @@ Common fixes:
 - `On macOS, siGit` -> `On macOS, siGit Code`
 - `Sigit` -> usually `siGit Code` or `sigit`, depending on context
 
-When in doubt, ask:
+When in doubt, ask one question:
 
-> Am I talking about the branded product, or the literal command/package name?
+> Am I talking about the product, or the literal thing a user types?
 
 If it is the product, use `siGit Code`.
-If it is something users type or install, use `sigit`.
+If it is the command or package, use the exact lowercase name.

@@ -3,7 +3,7 @@ name: ai-assisted-coding
 description: Build or maintain AI-assisted coding features in Rust using Onde Inference. Use when working on ChatEngine integration, model loading, streaming inference, history management, sampling config, or local coding-agent architecture.
 ---
 
-# AI-Assisted Coding
+# Skill: AI-Assisted Coding Agents — Onde Inference Integration
 
 ## Overview
 
