@@ -10,6 +10,13 @@
 //!
 //! The trait exposes neither `onde` nor OpenAI types, so the loop does not depend
 //! on a specific backend.
+//!
+//! The whole backend seam is wired up only through the interactive client, which
+//! is `#[cfg(unix)]` (see `run_interactive` in `main.rs` and `mod tui` in
+//! `chat.rs`). On non-Unix targets the binary runs ACP-only and drives `onde`
+//! directly, so every item here is legitimately unused there. Suppress the
+//! dead-code lint on those targets only — Unix builds still get full coverage.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::sync::Arc;
 

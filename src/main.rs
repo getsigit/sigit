@@ -58,6 +58,9 @@ use agent_client_protocol::schema::{
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
 
+// These back the interactive client (`run_interactive`), which is `#[cfg(unix)]`;
+// the import is unused on non-Unix targets that run ACP-only.
+#[cfg_attr(not(unix), allow(unused_imports))]
 use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
