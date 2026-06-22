@@ -75,8 +75,9 @@ mod tui {
     use anyhow::Result;
     use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use futures::StreamExt;
-    use onde::inference::{ChatEngine, SamplingConfig, StreamChunk, ToolDefinition, ToolResult};
+    use onde::inference::{ChatEngine, SamplingConfig, StreamChunk};
 
+    use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
     use crate::models::{ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items};
     use ratatui::{
         Frame,
@@ -198,6 +199,11 @@ mod tui {
         switching_model_id: Option<String>,
         /// (downloaded, expected) bytes — polled every tick during a model switch
         download_progress: Option<(u64, u64)>,
+
+        // ── Active inference backend ──────────────────────────────────────────
+        /// The backend serving inference. Swapped in place when the user picks a
+        /// different model or cloud tier via `/models`.
+        backend: Arc<dyn InferenceBackend>,
     }
 
     const BANNER_ART: &str = "\
@@ -233,13 +239,22 @@ mod tui {
     }
 
     impl App {
-        fn new(load_model_name: String) -> Self {
+        fn new(load_model_name: String, backend: Arc<dyn InferenceBackend>) -> Self {
+            let is_remote = backend.is_remote();
             let items = build_model_picker_items();
             let tool_calling = items
                 .iter()
                 .find(|m| m.display_name == load_model_name)
                 .map(|m| m.tool_calling)
                 .unwrap_or(true);
+            // For a remote provider the passed-in name is authoritative; the
+            // persisted local selection must not override it (or the title would
+            // show an on-device model while requests go to the cloud).
+            let current_model_name = if is_remote {
+                load_model_name.clone()
+            } else {
+                crate::setup::load_selected_model_name().unwrap_or_else(|| load_model_name.clone())
+            };
             Self {
                 messages: Vec::new(),
                 input: String::new(),
@@ -267,9 +282,9 @@ mod tui {
                 show_model_picker: false,
                 model_picker_index: 0,
                 model_picker_items: items,
-                current_model_name: crate::setup::load_selected_model_name()
-                    .unwrap_or_else(|| load_model_name.clone()),
+                current_model_name,
                 tool_calling,
+                backend,
             }
         }
 
@@ -532,6 +547,14 @@ mod tui {
                             .bg(Color::Black)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    ModelSource::Cloud => (
+                        "☁",
+                        "siGit Code Cloud",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .bg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 };
 
                 lines.push(
@@ -567,6 +590,7 @@ mod tui {
                 ModelSource::HuggingFace => "○",
                 ModelSource::Available => "↓",
                 ModelSource::Fallback => "◎",
+                ModelSource::Cloud => "☁",
             };
             let source = format!("  [{} {}]", brand_mark, item.source_label);
 
@@ -584,6 +608,7 @@ mod tui {
                     ModelSource::HuggingFace => Style::default().fg(Color::Cyan).bg(Color::Black),
                     ModelSource::Available => Style::default().fg(Color::Blue).bg(Color::Black),
                     ModelSource::Fallback => Style::default().fg(Color::Yellow).bg(Color::Black),
+                    ModelSource::Cloud => Style::default().fg(Color::Magenta).bg(Color::Black),
                 }
             };
 
@@ -663,6 +688,10 @@ mod tui {
         Status,
         /// picker UI, or jump straight to model N
         Models(Option<usize>),
+        /// `/login <email> <password>` — the raw argument, parsed when executed.
+        Login(Option<String>),
+        Logout,
+        Whoami,
         Exit,
         Unknown(String),
     }
@@ -680,6 +709,9 @@ mod tui {
             "/clear" => SlashCommand::Clear,
             "/status" => SlashCommand::Status,
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
+            "/login" => SlashCommand::Login(arg.map(str::to_string)),
+            "/logout" => SlashCommand::Logout,
+            "/whoami" => SlashCommand::Whoami,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -1125,12 +1157,15 @@ mod tui {
         match cmd {
             SlashCommand::Help => {
                 app.messages.push(ChatMessage::system(
-                    "/help      — show this message\n\
-                     /models    — open the model picker\n\
-                     /models N  — switch to model N\n\
-                     /clear     — wipe conversation history\n\
-                     /status    — show engine status\n\
-                     /exit      — quit chat",
+                    "/help          — show this message\n\
+                     /models        — open the model picker\n\
+                     /models N      — switch to model N\n\
+                     /login E P     — sign in to siGit Code Cloud\n\
+                     /logout        — sign out\n\
+                     /whoami        — show the signed-in account\n\
+                     /clear         — wipe conversation history\n\
+                     /status        — show engine status\n\
+                     /exit          — quit chat",
                 ));
             }
             SlashCommand::Clear => {
@@ -1163,6 +1198,36 @@ mod tui {
                             )));
                         }
                         Some(model) => {
+                            // ── siGit Code Cloud tier: no local load; sign-in gated ──
+                            if let Some(tier) = model.cloud_tier.clone() {
+                                app.close_model_picker();
+                                match crate::provider::cloud_tier_provider(&tier) {
+                                    Some(provider) => {
+                                        let system_prompt =
+                                            crate::system_prompt_for_model(true).to_string();
+                                        app.backend = Arc::new(OpenAiBackend::new(
+                                            provider.base_url,
+                                            provider.api_key,
+                                            provider.model,
+                                            Some(system_prompt),
+                                        ));
+                                        app.current_model_name = provider.display_name.clone();
+                                        app.tool_calling = true;
+                                        app.messages.push(ChatMessage::system(format!(
+                                            "Switched to {}.",
+                                            provider.display_name
+                                        )));
+                                    }
+                                    None => {
+                                        app.messages.push(ChatMessage::system(
+                                            "siGit Code Cloud needs an account. Use \
+                                             `/login <email> <password>`, or create one at sigit.si.",
+                                        ));
+                                    }
+                                }
+                                return;
+                            }
+
                             if model.cache_health == ModelCacheHealth::Incomplete {
                                 app.close_model_picker();
                                 app.messages.push(ChatMessage::system(format!(
@@ -1171,6 +1236,10 @@ mod tui {
                                 )));
                                 return;
                             }
+
+                            // Route inference on-device; the loader thread below
+                            // fills the engine the LocalBackend reads from.
+                            app.backend = Arc::new(LocalBackend::new(Arc::clone(&engine)));
 
                             let loading_msg = if model.cache_health
                                 == ModelCacheHealth::NotDownloaded
@@ -1235,6 +1304,28 @@ mod tui {
                     }
                 }
             },
+            SlashCommand::Login(arg) => {
+                let message = match arg.as_deref().and_then(crate::account::parse_login_args) {
+                    Some((email, password)) => {
+                        match crate::account::authenticate(&email, &password).await {
+                            Ok(email) => format!(
+                                "Signed in as {email}. siGit Code Cloud applies to your next session."
+                            ),
+                            Err(error) => format!("Login failed: {error}"),
+                        }
+                    }
+                    None => "usage: /login <email> <password>".to_string(),
+                };
+                app.messages.push(ChatMessage::system(message));
+            }
+            SlashCommand::Logout => {
+                let message = crate::account::end_session().await;
+                app.messages.push(ChatMessage::system(message));
+            }
+            SlashCommand::Whoami => {
+                let message = crate::account::status_line().await;
+                app.messages.push(ChatMessage::system(message));
+            }
             SlashCommand::Exit => {
                 app.quit = true;
             }
@@ -1250,10 +1341,10 @@ mod tui {
     /// cap tool rounds so a confused model can't loop forever
     const MAX_TOOL_ROUNDS: usize = 10;
 
-    fn build_onde_tools() -> Vec<ToolDefinition> {
+    fn build_tool_specs() -> Vec<ToolSpec> {
         crate::tools::all_tools()
             .into_iter()
-            .map(|t| ToolDefinition {
+            .map(|t| ToolSpec {
                 name: t.name.to_string(),
                 description: t.description.to_string(),
                 parameters_schema: t.parameters_schema.to_string(),
@@ -1264,21 +1355,21 @@ mod tui {
     /// run the tool-calling loop off the main thread, posting updates via `tx`.
     /// dropping `tx` signals completion to the event loop.
     async fn run_inference_task(
-        engine: Arc<ChatEngine>,
+        backend: Arc<dyn InferenceBackend>,
         text: String,
         tx: mpsc::Sender<InferenceUpdate>,
         tools_enabled: bool,
     ) {
-        let onde_tools = if tools_enabled {
-            build_onde_tools()
+        let tools = if tools_enabled {
+            build_tool_specs()
         } else {
             vec![]
         };
 
-        let mut result = match engine.send_message_with_tools(&text, &onde_tools).await {
+        let mut result = match backend.send_message_with_tools(&text, &tools).await {
             Ok(r) => r,
             Err(err) => {
-                let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+                let _ = tx.send(InferenceUpdate::Error(err)).await;
                 return;
             }
         };
@@ -1294,15 +1385,13 @@ mod tui {
             for tc in &result.tool_calls {
                 log::info!(
                     "  → {}({})",
-                    tc.function_name,
+                    tc.name,
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                let _ = tx
-                    .send(InferenceUpdate::ToolUse(tc.function_name.clone()))
-                    .await;
+                let _ = tx.send(InferenceUpdate::ToolUse(tc.name.clone())).await;
 
-                let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments).await;
+                let output = crate::tools::execute_tool(&tc.name, &tc.arguments).await;
                 log::info!("  ← {} chars", output.len());
 
                 tool_results.push(ToolResult {
@@ -1313,15 +1402,15 @@ mod tui {
 
             // on the last round, pass no tools so the model must produce text
             let next_tools = if round < MAX_TOOL_ROUNDS {
-                Some(onde_tools.as_slice())
+                Some(tools.as_slice())
             } else {
                 None
             };
 
-            match engine.send_tool_results(tool_results, next_tools).await {
+            match backend.send_tool_results(tool_results, next_tools).await {
                 Ok(r) => result = r,
                 Err(err) => {
-                    let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+                    let _ = tx.send(InferenceUpdate::Error(err)).await;
                     return;
                 }
             }
@@ -1356,19 +1445,21 @@ mod tui {
     pub async fn run_with<B: ratatui::backend::Backend>(
         terminal: &mut ratatui::Terminal<B>,
         engine: Arc<ChatEngine>,
+        backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
     ) -> Result<()> {
-        event_loop(terminal, engine, load_rx, load_model_name).await
+        event_loop(terminal, engine, backend, load_rx, load_model_name).await
     }
 
     async fn event_loop<B: ratatui::backend::Backend>(
         terminal: &mut ratatui::Terminal<B>,
         engine: Arc<ChatEngine>,
+        backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
     ) -> Result<()> {
-        let mut app = App::new(load_model_name);
+        let mut app = App::new(load_model_name, backend);
         let mut event_stream = EventStream::new();
 
         // 10 fps is plenty for spinners
@@ -1603,11 +1694,11 @@ mod tui {
                             let (tx, rx) = mpsc::channel::<InferenceUpdate>(64);
                             app.inference_rx = Some(rx);
 
-                            let engine_handle = Arc::clone(&engine);
+                            let backend_handle = Arc::clone(&app.backend);
                             let user_text = text.clone();
                             let tools_enabled = app.tool_calling;
                             tokio::spawn(async move {
-                                run_inference_task(engine_handle, user_text, tx, tools_enabled).await;
+                                run_inference_task(backend_handle, user_text, tx, tools_enabled).await;
                             });
                         }
                     }

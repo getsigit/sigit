@@ -28,8 +28,12 @@
 //! }
 //! ```
 
+mod account;
+mod backend;
 mod chat;
+mod credentials;
 mod models;
+mod provider;
 mod setup;
 mod tools;
 
@@ -53,6 +57,11 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
+
+// These back the interactive client (`run_interactive`), which is `#[cfg(unix)]`;
+// the import is unused on non-Unix targets that run ACP-only.
+#[cfg_attr(not(unix), allow(unused_imports))]
+use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -318,7 +327,7 @@ impl SiGitAgent {
         }
 
         let startup_config = self.current_model.lock().unwrap().clone();
-        let (max_tokens, tool_calling) = models::build_model_picker_items()
+        let (max_tokens, tool_calling) = models::local_picker_items()
             .into_iter()
             .find(|item| {
                 item.config.model_id == startup_config.model_id
@@ -619,7 +628,7 @@ impl SiGitAgent {
             *guard = None;
         }
 
-        if let Some(item) = models::build_model_picker_items()
+        if let Some(item) = models::local_picker_items()
             .iter()
             .find(|item| item.config.model_id == new_config.model_id)
             && let Err(err) = setup::save_selected_model(&setup::SelectedModel {
@@ -1120,7 +1129,7 @@ impl SiGitAgent {
             }
         }
 
-        let needs_download = models::build_model_picker_items()
+        let needs_download = models::local_picker_items()
             .into_iter()
             .find(|item| item.config.model_id == model_id)
             .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
@@ -1139,7 +1148,7 @@ impl SiGitAgent {
                 .map(|m| m.expected_size_bytes)
                 .unwrap_or(0);
 
-            let display_name = models::build_model_picker_items()
+            let display_name = models::local_picker_items()
                 .into_iter()
                 .find(|item| item.config.model_id == model_id_owned)
                 .map(|item| item.display_name.clone())
@@ -1246,7 +1255,7 @@ impl SiGitAgent {
 
         // cached models still take 10-30s to load weights; show a spinner
         if !needs_download {
-            let cached_display_name = models::build_model_picker_items()
+            let cached_display_name = models::local_picker_items()
                 .into_iter()
                 .find(|item| item.config.model_id == model_id)
                 .map(|item| item.display_name.clone())
@@ -1380,7 +1389,7 @@ impl SiGitAgent {
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
 fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
-    let items = models::build_model_picker_items();
+    let items = models::local_picker_items();
 
     let options: Vec<SessionConfigSelectOption> = items
         .iter()
@@ -1428,7 +1437,7 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
 
 /// returns `(config, max_tokens, tool_calling)` for a picker model_id, or None
 fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64, bool)> {
-    let items = models::build_model_picker_items();
+    let items = models::local_picker_items();
     items
         .into_iter()
         .find(|item| {
@@ -1446,6 +1455,10 @@ enum SlashCommand {
     Clear,
     Status,
     Models(Option<usize>),
+    /// `/login <email> <password>` — the raw argument, parsed when executed.
+    Login(Option<String>),
+    Logout,
+    Whoami,
     Exit,
     Unknown(String),
 }
@@ -1463,13 +1476,16 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/clear" => SlashCommand::Clear,
         "/status" => SlashCommand::Status,
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
+        "/login" => SlashCommand::Login(argument.map(str::to_string)),
+        "/logout" => SlashCommand::Logout,
+        "/whoami" => SlashCommand::Whoami,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
 }
 
 fn format_models_list(current_model: &GgufModelConfig) -> String {
-    let items = models::build_model_picker_items();
+    let items = models::local_picker_items();
     if items.is_empty() {
         return "No local models found. siGit will use the platform default model.".to_string();
     }
@@ -1542,12 +1558,15 @@ async fn exec_slash_acp(
                 .send_assistant_message(
                     cx,
                     session_id,
-                    "/help      - show this message\n\
-                     /models    - list available models\n\
-                     /models N  - switch to model N\n\
-                     /clear     - wipe conversation history\n\
-                     /status    - show engine status\n\
-                     /exit      - end this turn",
+                    "/help          - show this message\n\
+                     /models        - list available models\n\
+                     /models N      - switch to model N\n\
+                     /login E P     - sign in to siGit Code Cloud\n\
+                     /logout        - sign out\n\
+                     /whoami        - show the signed-in account\n\
+                     /clear         - wipe conversation history\n\
+                     /status        - show engine status\n\
+                     /exit          - end this turn",
                 )
                 .ok();
         }
@@ -1583,7 +1602,7 @@ async fn exec_slash_acp(
                 .ok();
         }
         SlashCommand::Models(Some(number)) => {
-            let items = models::build_model_picker_items();
+            let items = models::local_picker_items();
             let index = number.saturating_sub(1);
             match items.get(index).cloned() {
                 None => {
@@ -1665,6 +1684,26 @@ async fn exec_slash_acp(
                     }
                 }
             }
+        }
+        SlashCommand::Login(argument) => {
+            let message = match argument.as_deref().and_then(account::parse_login_args) {
+                Some((email, password)) => match account::authenticate(&email, &password).await {
+                    Ok(email) => format!(
+                        "Signed in as {email}. siGit Code Cloud applies to your next session."
+                    ),
+                    Err(error) => format!("Login failed: {error}"),
+                },
+                None => "usage: /login <email> <password>".to_string(),
+            };
+            agent.send_assistant_message(cx, session_id, message).ok();
+        }
+        SlashCommand::Logout => {
+            let message = account::end_session().await;
+            agent.send_assistant_message(cx, session_id, message).ok();
+        }
+        SlashCommand::Whoami => {
+            let message = account::status_line().await;
+            agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Exit => {
             agent
@@ -1807,7 +1846,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let config = startup_selection
         .as_ref()
         .and_then(|selection| {
-            models::build_model_picker_items()
+            models::local_picker_items()
                 .into_iter()
                 .find(|item| {
                     selection
@@ -1834,28 +1873,68 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     // std::sync::mpsc on a real thread so model loading can't starve the TUI
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    let loader_engine = Arc::clone(&engine);
-    let tool_calling = models::build_model_picker_items()
+    let tool_calling = models::local_picker_items()
         .iter()
         .find(|item| item.config.model_id == config.model_id)
         .map(|item| item.tool_calling)
         .unwrap_or(false);
-    let system_prompt = system_prompt_for_model(tool_calling).to_string();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        let result =
-            rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), Some(sampling)));
-        let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
-    });
+
+    // Pick the inference backend: a configured provider if present, else on-device.
+    let (inference_backend, startup_model_name): (Arc<dyn InferenceBackend>, String) =
+        match provider::active_provider() {
+            Some(provider) => {
+                log::info!(
+                    "inference: using {} (model {}) at {}",
+                    provider.display_name,
+                    provider.model,
+                    provider.base_url
+                );
+                // No local model to load; the endpoint is ready immediately.
+                let _ = load_tx.send(Ok(()));
+                let label = provider.display_name.clone();
+                let backend = Arc::new(OpenAiBackend::new(
+                    provider.base_url,
+                    provider.api_key,
+                    provider.model,
+                    Some(SYSTEM_PROMPT.to_string()),
+                )) as Arc<dyn InferenceBackend>;
+                (backend, label)
+            }
+            None => {
+                // On-device: load the local GGUF model on a real thread.
+                let loader_engine = Arc::clone(&engine);
+                let system_prompt = system_prompt_for_model(tool_calling).to_string();
+                std::thread::spawn(move || {
+                    let rt =
+                        tokio::runtime::Runtime::new().expect("failed to create loader runtime");
+                    let result = rt.block_on(loader_engine.load_gguf_model(
+                        config,
+                        Some(system_prompt),
+                        Some(sampling),
+                    ));
+                    let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+                });
+                let backend =
+                    Arc::new(LocalBackend::new(Arc::clone(&engine))) as Arc<dyn InferenceBackend>;
+                (backend, startup_model_name)
+            }
+        };
 
     crossterm::terminal::enable_raw_mode()?;
     let mut tty = BufWriter::new(tty);
     crossterm::execute!(tty, crossterm::terminal::EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(tty);
-    let mut terminal = ratatui::Terminal::new(backend)?;
+    let term_backend = ratatui::backend::CrosstermBackend::new(tty);
+    let mut terminal = ratatui::Terminal::new(term_backend)?;
 
     // polls load_rx with try_recv() each tick, no blocking
-    let chat_result = chat::run_with(&mut terminal, engine, load_rx, startup_model_name).await;
+    let chat_result = chat::run_with(
+        &mut terminal,
+        engine,
+        inference_backend,
+        load_rx,
+        startup_model_name,
+    )
+    .await;
 
     // cleanup fd because backend's writer is private
     crossterm::execute!(cleanup_tty, crossterm::terminal::LeaveAlternateScreen)?;
@@ -1885,7 +1964,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|selection| {
             selection.selected_model.as_ref().and_then(|selected| {
-                models::build_model_picker_items()
+                models::local_picker_items()
                     .into_iter()
                     .find(|item| {
                         item.config.model_id == selected.model_id
@@ -1900,7 +1979,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
         })
         .unwrap_or_else(GgufModelConfig::qwen25_3b);
 
-    let needs_download = models::build_model_picker_items()
+    let needs_download = models::local_picker_items()
         .iter()
         .find(|item| item.config.model_id == config.model_id)
         .map(|item| item.cache_health != setup::ModelCacheHealth::Complete)
