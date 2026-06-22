@@ -75,8 +75,9 @@ mod tui {
     use anyhow::Result;
     use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use futures::StreamExt;
-    use onde::inference::{ChatEngine, SamplingConfig, StreamChunk, ToolDefinition, ToolResult};
+    use onde::inference::{ChatEngine, SamplingConfig, StreamChunk};
 
+    use crate::backend::{InferenceBackend, ToolResult, ToolSpec};
     use crate::models::{ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items};
     use ratatui::{
         Frame,
@@ -233,13 +234,22 @@ mod tui {
     }
 
     impl App {
-        fn new(load_model_name: String) -> Self {
+        fn new(load_model_name: String, is_remote: bool) -> Self {
             let items = build_model_picker_items();
             let tool_calling = items
                 .iter()
                 .find(|m| m.display_name == load_model_name)
                 .map(|m| m.tool_calling)
                 .unwrap_or(true);
+            // For a remote provider the passed-in name is authoritative; the
+            // persisted local selection must not override it (or the title would
+            // show an on-device model while requests go to the cloud).
+            let current_model_name = if is_remote {
+                load_model_name.clone()
+            } else {
+                crate::setup::load_selected_model_name()
+                    .unwrap_or_else(|| load_model_name.clone())
+            };
             Self {
                 messages: Vec::new(),
                 input: String::new(),
@@ -267,8 +277,7 @@ mod tui {
                 show_model_picker: false,
                 model_picker_index: 0,
                 model_picker_items: items,
-                current_model_name: crate::setup::load_selected_model_name()
-                    .unwrap_or_else(|| load_model_name.clone()),
+                current_model_name,
                 tool_calling,
             }
         }
@@ -1250,10 +1259,10 @@ mod tui {
     /// cap tool rounds so a confused model can't loop forever
     const MAX_TOOL_ROUNDS: usize = 10;
 
-    fn build_onde_tools() -> Vec<ToolDefinition> {
+    fn build_tool_specs() -> Vec<ToolSpec> {
         crate::tools::all_tools()
             .into_iter()
-            .map(|t| ToolDefinition {
+            .map(|t| ToolSpec {
                 name: t.name.to_string(),
                 description: t.description.to_string(),
                 parameters_schema: t.parameters_schema.to_string(),
@@ -1264,21 +1273,21 @@ mod tui {
     /// run the tool-calling loop off the main thread, posting updates via `tx`.
     /// dropping `tx` signals completion to the event loop.
     async fn run_inference_task(
-        engine: Arc<ChatEngine>,
+        backend: Arc<dyn InferenceBackend>,
         text: String,
         tx: mpsc::Sender<InferenceUpdate>,
         tools_enabled: bool,
     ) {
-        let onde_tools = if tools_enabled {
-            build_onde_tools()
+        let tools = if tools_enabled {
+            build_tool_specs()
         } else {
             vec![]
         };
 
-        let mut result = match engine.send_message_with_tools(&text, &onde_tools).await {
+        let mut result = match backend.send_message_with_tools(&text, &tools).await {
             Ok(r) => r,
             Err(err) => {
-                let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+                let _ = tx.send(InferenceUpdate::Error(err)).await;
                 return;
             }
         };
@@ -1294,15 +1303,13 @@ mod tui {
             for tc in &result.tool_calls {
                 log::info!(
                     "  → {}({})",
-                    tc.function_name,
+                    tc.name,
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                let _ = tx
-                    .send(InferenceUpdate::ToolUse(tc.function_name.clone()))
-                    .await;
+                let _ = tx.send(InferenceUpdate::ToolUse(tc.name.clone())).await;
 
-                let output = crate::tools::execute_tool(&tc.function_name, &tc.arguments).await;
+                let output = crate::tools::execute_tool(&tc.name, &tc.arguments).await;
                 log::info!("  ← {} chars", output.len());
 
                 tool_results.push(ToolResult {
@@ -1313,15 +1320,15 @@ mod tui {
 
             // on the last round, pass no tools so the model must produce text
             let next_tools = if round < MAX_TOOL_ROUNDS {
-                Some(onde_tools.as_slice())
+                Some(tools.as_slice())
             } else {
                 None
             };
 
-            match engine.send_tool_results(tool_results, next_tools).await {
+            match backend.send_tool_results(tool_results, next_tools).await {
                 Ok(r) => result = r,
                 Err(err) => {
-                    let _ = tx.send(InferenceUpdate::Error(err.to_string())).await;
+                    let _ = tx.send(InferenceUpdate::Error(err)).await;
                     return;
                 }
             }
@@ -1356,19 +1363,21 @@ mod tui {
     pub async fn run_with<B: ratatui::backend::Backend>(
         terminal: &mut ratatui::Terminal<B>,
         engine: Arc<ChatEngine>,
+        backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
     ) -> Result<()> {
-        event_loop(terminal, engine, load_rx, load_model_name).await
+        event_loop(terminal, engine, backend, load_rx, load_model_name).await
     }
 
     async fn event_loop<B: ratatui::backend::Backend>(
         terminal: &mut ratatui::Terminal<B>,
         engine: Arc<ChatEngine>,
+        backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
     ) -> Result<()> {
-        let mut app = App::new(load_model_name);
+        let mut app = App::new(load_model_name, backend.is_remote());
         let mut event_stream = EventStream::new();
 
         // 10 fps is plenty for spinners
@@ -1603,11 +1612,11 @@ mod tui {
                             let (tx, rx) = mpsc::channel::<InferenceUpdate>(64);
                             app.inference_rx = Some(rx);
 
-                            let engine_handle = Arc::clone(&engine);
+                            let backend_handle = Arc::clone(&backend);
                             let user_text = text.clone();
                             let tools_enabled = app.tool_calling;
                             tokio::spawn(async move {
-                                run_inference_task(engine_handle, user_text, tx, tools_enabled).await;
+                                run_inference_task(backend_handle, user_text, tx, tools_enabled).await;
                             });
                         }
                     }

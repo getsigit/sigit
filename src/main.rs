@@ -28,8 +28,12 @@
 //! }
 //! ```
 
+mod account;
+mod backend;
 mod chat;
+mod credentials;
 mod models;
+mod provider;
 mod setup;
 mod tools;
 
@@ -53,6 +57,8 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
+
+use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -1834,28 +1840,62 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     // std::sync::mpsc on a real thread so model loading can't starve the TUI
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    let loader_engine = Arc::clone(&engine);
     let tool_calling = models::build_model_picker_items()
         .iter()
         .find(|item| item.config.model_id == config.model_id)
         .map(|item| item.tool_calling)
         .unwrap_or(false);
-    let system_prompt = system_prompt_for_model(tool_calling).to_string();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-        let result =
-            rt.block_on(loader_engine.load_gguf_model(config, Some(system_prompt), Some(sampling)));
-        let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
-    });
+
+    // Pick the inference backend: a configured provider if present, else on-device.
+    let (inference_backend, startup_model_name): (Arc<dyn InferenceBackend>, String) =
+        match provider::active_provider() {
+            Some(provider) => {
+                log::info!(
+                    "inference: using {} (model {}) at {}",
+                    provider.display_name,
+                    provider.model,
+                    provider.base_url
+                );
+                // No local model to load; the endpoint is ready immediately.
+                let _ = load_tx.send(Ok(()));
+                let label = provider.display_name.clone();
+                let backend = Arc::new(OpenAiBackend::new(
+                    provider.base_url,
+                    provider.api_key,
+                    provider.model,
+                    Some(SYSTEM_PROMPT.to_string()),
+                )) as Arc<dyn InferenceBackend>;
+                (backend, label)
+            }
+            None => {
+                // On-device: load the local GGUF model on a real thread.
+                let loader_engine = Arc::clone(&engine);
+                let system_prompt = system_prompt_for_model(tool_calling).to_string();
+                std::thread::spawn(move || {
+                    let rt =
+                        tokio::runtime::Runtime::new().expect("failed to create loader runtime");
+                    let result = rt.block_on(loader_engine.load_gguf_model(
+                        config,
+                        Some(system_prompt),
+                        Some(sampling),
+                    ));
+                    let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+                });
+                let backend =
+                    Arc::new(LocalBackend::new(Arc::clone(&engine))) as Arc<dyn InferenceBackend>;
+                (backend, startup_model_name)
+            }
+        };
 
     crossterm::terminal::enable_raw_mode()?;
     let mut tty = BufWriter::new(tty);
     crossterm::execute!(tty, crossterm::terminal::EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(tty);
-    let mut terminal = ratatui::Terminal::new(backend)?;
+    let term_backend = ratatui::backend::CrosstermBackend::new(tty);
+    let mut terminal = ratatui::Terminal::new(term_backend)?;
 
     // polls load_rx with try_recv() each tick, no blocking
-    let chat_result = chat::run_with(&mut terminal, engine, load_rx, startup_model_name).await;
+    let chat_result =
+        chat::run_with(&mut terminal, engine, inference_backend, load_rx, startup_model_name).await;
 
     // cleanup fd because backend's writer is private
     crossterm::execute!(cleanup_tty, crossterm::terminal::LeaveAlternateScreen)?;
@@ -2029,6 +2069,21 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Account subcommands run before the TUI/ACP split. They are plain CLI verbs.
+    if let Some(command) = std::env::args().nth(1) {
+        match command.as_str() {
+            "login" | "logout" | "whoami" => {
+                init_logging(false);
+                return match command.as_str() {
+                    "login" => account::login().await,
+                    "logout" => account::logout().await,
+                    _ => account::whoami().await,
+                };
+            }
+            _ => {}
+        }
+    }
+
     let is_tty = std::io::stdin().is_terminal();
 
     if is_tty {
