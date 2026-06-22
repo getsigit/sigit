@@ -19,9 +19,11 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-/// Default siGit Code Cloud inference endpoint. Override with `SIGIT_CLOUD_URL`
-/// (dev: `http://localhost:8090/v1`).
-const DEFAULT_CLOUD_URL: &str = "https://cloud.ondeinference.com/v1";
+/// Default siGit Code Cloud inference endpoint. This is the siGit platform API
+/// (sigit.si), which authenticates the user and forwards to the inference
+/// backend; the client never talks to the backend directly. Override with
+/// `SIGIT_CLOUD_URL` (dev: `http://localhost:8088/api/v1`).
+const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 
 /// The cloud quality tiers, in display order. Always offered in `/models`;
 /// selecting one requires a signed-in account.
