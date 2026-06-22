@@ -112,7 +112,8 @@ pub async fn end_session() -> String {
 /// One-line description of the current session, verifying the token if reachable.
 pub async fn status_line() -> String {
     let Some(creds) = credentials::load() else {
-        return "Not signed in. Use `/login <email> <password>` to use siGit Code Cloud.".to_string();
+        return "Not signed in. Use `/login <email> <password>` to use siGit Code Cloud."
+            .to_string();
     };
 
     let url = format!("{}/api/v1/me", api_base().trim_end_matches('/'));

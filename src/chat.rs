@@ -253,8 +253,7 @@ mod tui {
             let current_model_name = if is_remote {
                 load_model_name.clone()
             } else {
-                crate::setup::load_selected_model_name()
-                    .unwrap_or_else(|| load_model_name.clone())
+                crate::setup::load_selected_model_name().unwrap_or_else(|| load_model_name.clone())
             };
             Self {
                 messages: Vec::new(),

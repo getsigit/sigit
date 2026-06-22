@@ -1924,8 +1924,14 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let mut terminal = ratatui::Terminal::new(term_backend)?;
 
     // polls load_rx with try_recv() each tick, no blocking
-    let chat_result =
-        chat::run_with(&mut terminal, engine, inference_backend, load_rx, startup_model_name).await;
+    let chat_result = chat::run_with(
+        &mut terminal,
+        engine,
+        inference_backend,
+        load_rx,
+        startup_model_name,
+    )
+    .await;
 
     // cleanup fd because backend's writer is private
     crossterm::execute!(cleanup_tty, crossterm::terminal::LeaveAlternateScreen)?;

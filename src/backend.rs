@@ -398,7 +398,10 @@ mod tests {
         let json = OpenAiBackend::tools_json(&tools);
         assert_eq!(json[0]["type"], "function");
         assert_eq!(json[0]["function"]["name"], "read_file");
-        assert_eq!(json[0]["function"]["parameters"]["properties"]["path"]["type"], "string");
+        assert_eq!(
+            json[0]["function"]["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
     }
 
     #[test]
