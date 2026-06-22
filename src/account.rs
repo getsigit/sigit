@@ -1,7 +1,10 @@
-//! Account commands: `login`, `logout`, `whoami`.
+//! Account access for siGit Code Cloud, surfaced as the `/login`, `/logout`,
+//! and `/whoami` slash commands in both the TUI and ACP sessions.
 //!
-//! These authenticate against the siGit account API and store a session token
-//! locally. The token is the credential used for siGit Code Cloud requests.
+//! These functions authenticate against the siGit account API and store a
+//! session token locally. The token is the credential used for siGit Code Cloud
+//! requests. They perform no console I/O, so each slash surface can render the
+//! returned message however it likes.
 //!
 //! Base URL: `$SIGIT_API_URL`, else `https://sigit.si`.
 
@@ -16,25 +19,12 @@ fn api_base() -> String {
     std::env::var("SIGIT_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string())
 }
 
-// ── sigit.si /api/v1 response shapes ─────────────────────────────────────────────
-
-/// Sign-in response. A successful sign-in carries an `access_token`; an
-/// unverified account reports a `status`; failures arrive as an `error`.
-#[derive(Debug, Deserialize)]
-struct SignInResponse {
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    error: Option<ApiError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiError {
-    #[serde(default)]
-    message: Option<String>,
-}
+// Sign-in returns an `AccountStatus`, one of:
+//   "NotFound"                            (a bare JSON string)
+//   {"Ready":{"access_token":"…"}}
+//   {"Incomplete":{"status":<u32>}}
+// Failures return {"error_code":<i32>,"message":"…"}. Parsed from a
+// `serde_json::Value` rather than a struct because of the bare-string variant.
 
 #[derive(Debug, Deserialize)]
 struct MeResponse {
@@ -42,60 +32,70 @@ struct MeResponse {
     email: Option<String>,
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────────────
-
-/// `sigit login`: prompt for credentials, authenticate, and store the token.
-pub async fn login() -> anyhow::Result<()> {
-    let base = api_base();
-    println!("Sign in to siGit Code Cloud ({base})");
-
-    let email = prompt("Email: ")?;
-    let password = rpassword::prompt_password("Password: ")?;
-    if email.trim().is_empty() || password.is_empty() {
-        anyhow::bail!("email and password are required");
+/// Authenticate with email and password, storing the session token on success.
+/// Returns the signed-in email, or a human-readable error message.
+pub async fn authenticate(email: &str, password: &str) -> Result<String, String> {
+    let email = email.trim();
+    if email.is_empty() || password.is_empty() {
+        return Err("email and password are required".to_string());
     }
 
-    let url = format!("{}/api/v1/users/sign_in", base.trim_end_matches('/'));
+    let url = format!("{}/api/v1/auth/sign_in", api_base().trim_end_matches('/'));
     let response = reqwest::Client::new()
         .post(&url)
-        .json(&serde_json::json!({ "email": email.trim(), "password": password }))
+        .json(&serde_json::json!({ "email": email, "password": password }))
         .send()
         .await
-        .map_err(|error| anyhow::anyhow!("could not reach siGit Code Cloud: {error}"))?;
+        .map_err(|error| format!("could not reach siGit Code Cloud: {error}"))?;
 
     let status = response.status();
-    let parsed: SignInResponse = response
+    let body: serde_json::Value = response
         .json()
         .await
-        .map_err(|error| anyhow::anyhow!("unexpected response from siGit Code Cloud: {error}"))?;
+        .map_err(|error| format!("unexpected response from siGit Code Cloud: {error}"))?;
 
-    if let Some(token) = parsed.access_token.filter(|token| !token.trim().is_empty()) {
-        credentials::store(&Credentials {
-            access_token: token,
-            email: Some(email.trim().to_string()),
-        })
-        .map_err(|error| anyhow::anyhow!("could not save session: {error}"))?;
-        println!("✓ Signed in as {}. siGit Code Cloud is ready.", email.trim());
-        return Ok(());
+    if status.is_success() {
+        // AccountStatus::Ready
+        if let Some(token) = body
+            .get("Ready")
+            .and_then(|ready| ready.get("access_token"))
+            .and_then(|token| token.as_str())
+            .filter(|token| !token.trim().is_empty())
+        {
+            credentials::store(&Credentials {
+                access_token: token.to_string(),
+                email: Some(email.to_string()),
+            })?;
+            return Ok(email.to_string());
+        }
+        // AccountStatus::Incomplete
+        if body.get("Incomplete").is_some() {
+            return Err(
+                "your account is not verified yet. Check your email to confirm it, then sign in again."
+                    .to_string(),
+            );
+        }
+        // AccountStatus::NotFound (a bare JSON string)
+        if body.as_str() == Some("NotFound") {
+            return Err(format!("no siGit account found for {email}."));
+        }
+        return Err("unexpected sign-in response from siGit Code Cloud".to_string());
     }
 
-    // No token: surface the most specific message available.
-    if let Some(message) = parsed.error.and_then(|error| error.message) {
-        anyhow::bail!("sign-in failed: {message}");
-    }
-    if let Some(account_status) = parsed.status {
-        anyhow::bail!(
-            "sign-in incomplete (status: {account_status}). Check your email to verify your account."
-        );
-    }
-    anyhow::bail!("sign-in failed (HTTP {})", status.as_u16());
+    // ErrorResponse { error_code, message }
+    let message = body
+        .get("message")
+        .and_then(|message| message.as_str())
+        .unwrap_or("sign-in failed");
+    Err(format!("sign-in failed: {message}"))
 }
 
-/// `sigit logout`: clear the local session, notifying the server best-effort.
-pub async fn logout() -> anyhow::Result<()> {
+/// Clear the local session, notifying the server best-effort. Returns a message
+/// suitable for display.
+pub async fn end_session() -> String {
     if let Some(token) = credentials::load_token() {
-        let url = format!("{}/api/v1/users/sign_out", api_base().trim_end_matches('/'));
-        // Best-effort: a failed server call must not block local logout.
+        let url = format!("{}/api/v1/auth/sign_out", api_base().trim_end_matches('/'));
+        // A failed server call must not block local sign-out.
         let _ = reqwest::Client::new()
             .delete(&url)
             .bearer_auth(&token)
@@ -103,18 +103,16 @@ pub async fn logout() -> anyhow::Result<()> {
             .await;
     }
     if credentials::clear() {
-        println!("✓ Signed out of siGit Code Cloud.");
+        "Signed out of siGit Code Cloud.".to_string()
     } else {
-        println!("Not signed in.");
+        "Not signed in.".to_string()
     }
-    Ok(())
 }
 
-/// `sigit whoami`: show the signed-in account, verifying the token if reachable.
-pub async fn whoami() -> anyhow::Result<()> {
+/// One-line description of the current session, verifying the token if reachable.
+pub async fn status_line() -> String {
     let Some(creds) = credentials::load() else {
-        println!("Not signed in. Run `sigit login` to use siGit Code Cloud.");
-        return Ok(());
+        return "Not signed in. Use `/login <email> <password>` to use siGit Code Cloud.".to_string();
     };
 
     let url = format!("{}/api/v1/me", api_base().trim_end_matches('/'));
@@ -132,29 +130,28 @@ pub async fn whoami() -> anyhow::Result<()> {
                 .and_then(|me| me.email)
                 .or(creds.email)
                 .unwrap_or_else(|| "(unknown)".to_string());
-            println!("Signed in to siGit Code Cloud as {email}.");
+            format!("Signed in to siGit Code Cloud as {email}.")
         }
-        Ok(response) => {
-            println!(
-                "Session may be expired (HTTP {}). Run `sigit login` again.",
-                response.status().as_u16()
-            );
-        }
+        Ok(response) => format!(
+            "Session may be expired (HTTP {}). Use `/login` again.",
+            response.status().as_u16()
+        ),
         Err(_) => {
-            // Offline: fall back to the cached email.
             let email = creds.email.unwrap_or_else(|| "(unknown)".to_string());
-            println!("Signed in as {email} (could not reach siGit Code Cloud to verify).");
+            format!("Signed in as {email} (could not reach siGit Code Cloud to verify).")
         }
     }
-    Ok(())
 }
 
-/// Print a prompt and read one trimmed line from stdin.
-fn prompt(label: &str) -> anyhow::Result<String> {
-    use std::io::Write;
-    print!("{label}");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+/// Split a `/login` argument into `(email, password)`. The password is the rest
+/// of the line after the first whitespace, so it may contain spaces.
+pub fn parse_login_args(arg: &str) -> Option<(String, String)> {
+    let mut parts = arg.trim().splitn(2, char::is_whitespace);
+    let email = parts.next().unwrap_or("").trim();
+    let password = parts.next().unwrap_or("").trim();
+    if email.is_empty() || password.is_empty() {
+        None
+    } else {
+        Some((email.to_string(), password.to_string()))
+    }
 }

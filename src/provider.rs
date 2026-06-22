@@ -16,9 +16,33 @@ use serde::Deserialize;
 /// (dev: `http://localhost:8090/v1`).
 const DEFAULT_CLOUD_URL: &str = "https://cloud.ondeinference.com/v1";
 
-/// Default quality tier when the user hasn't chosen one. Override with `SIGIT_TIER`
-/// (`fast` | `balanced` | `large`).
-const DEFAULT_TIER: &str = "balanced";
+/// The cloud quality tiers, in display order. Always offered in `/models`;
+/// selecting one requires a signed-in account.
+pub const CLOUD_TIERS: &[&str] = &["fast", "balanced", "large"];
+
+/// Base URL of the siGit Code Cloud inference endpoint. Override with
+/// `SIGIT_CLOUD_URL` (dev: `http://localhost:8090/v1`).
+pub fn cloud_base_url() -> String {
+    std::env::var("SIGIT_CLOUD_URL").unwrap_or_else(|_| DEFAULT_CLOUD_URL.to_string())
+}
+
+/// Display label for a tier, e.g. `siGit Code Cloud · Balanced`.
+pub fn cloud_tier_label(tier: &str) -> String {
+    format!("siGit Code Cloud · {}", tier_title(tier))
+}
+
+/// Build a siGit Code Cloud provider for `tier`, if the user is signed in.
+/// Returns `None` when there is no stored session, so the caller can prompt for
+/// login rather than silently failing.
+pub fn cloud_tier_provider(tier: &str) -> Option<ProviderConfig> {
+    let token = crate::credentials::load_token()?;
+    Some(ProviderConfig {
+        display_name: cloud_tier_label(tier),
+        base_url: cloud_base_url(),
+        api_key: token,
+        model: tier_to_model(tier),
+    })
+}
 
 /// Map a neutral tier name to the model id sent on the wire. Unknown values pass
 /// through unchanged so an explicit model id still works.
@@ -58,35 +82,23 @@ fn tier_title(tier: &str) -> String {
 /// Default model id used when an environment-configured provider omits one.
 const DEFAULT_ENV_MODEL: &str = "onde-large";
 
-/// Resolve the active provider, or `None` to run on-device.
+/// Resolve the startup provider, or `None` to run on-device.
+///
+/// This is only the explicit override (env or `providers.toml`), for power users
+/// and BYO endpoints. Being signed in does **not** auto-select the cloud: model
+/// choice is separate from identity, and the user picks a model or tier in
+/// `/models`. With no override, siGit Code is local-first.
 pub fn active_provider() -> Option<ProviderConfig> {
-    // 1. Explicit override (env or providers.toml).
     if let Some(config) = from_env() {
         return Some(config);
     }
     match from_config_file() {
-        Ok(Some(config)) => return Some(config),
-        Ok(None) => {}
-        Err(error) => log::warn!("provider: ignoring providers.toml: {error}"),
+        Ok(config) => config,
+        Err(error) => {
+            log::warn!("provider: ignoring providers.toml: {error}");
+            None
+        }
     }
-    // 2. siGit Code Cloud, used when logged in.
-    from_login()
-    // 3. Otherwise None, meaning on-device.
-}
-
-/// The siGit Code Cloud provider, used once the user has logged in. The session
-/// token is the credential.
-fn from_login() -> Option<ProviderConfig> {
-    let token = crate::credentials::load_token()?;
-    let base_url =
-        std::env::var("SIGIT_CLOUD_URL").unwrap_or_else(|_| DEFAULT_CLOUD_URL.to_string());
-    let tier = std::env::var("SIGIT_TIER").unwrap_or_else(|_| DEFAULT_TIER.to_string());
-    Some(ProviderConfig {
-        display_name: format!("siGit Code Cloud · {}", tier_title(&tier)),
-        base_url,
-        api_key: token,
-        model: tier_to_model(&tier),
-    })
 }
 
 /// Provider from environment variables, if both URL and key are present.

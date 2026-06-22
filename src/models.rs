@@ -16,6 +16,8 @@ pub(crate) enum ModelSource {
     /// not downloaded yet — selecting it triggers a download into the app-group cache.
     Available,
     Fallback,
+    /// a siGit Code Cloud tier (runs over the network, not on-device).
+    Cloud,
 }
 
 #[derive(Clone)]
@@ -29,6 +31,8 @@ pub(crate) struct ModelPickerItem {
 
     pub(crate) source: ModelSource,
     pub(crate) cache_health: ModelCacheHealth,
+    /// `Some(tier)` for a siGit Code Cloud entry; `None` for an on-device model.
+    pub(crate) cloud_tier: Option<String>,
 }
 
 // ── Model ID → GgufModelConfig mapping ────────────────────────────────────────
@@ -105,10 +109,11 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
 
             source: ModelSource::Available,
             cache_health: ModelCacheHealth::NotDownloaded,
+            cloud_tier: None,
         });
     }
 
-    // ── 3. Fallback ──────────────────────────────────────────────────────
+    // ── 3. Fallback (on-device default when nothing else is present) ─────
     if items.is_empty() {
         let config = GgufModelConfig::platform_default();
         let tool_calling = is_tool_calling(&config.model_id);
@@ -124,6 +129,33 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
 
             source: ModelSource::Fallback,
             cache_health: ModelCacheHealth::Complete,
+            cloud_tier: None,
+        });
+    }
+
+    // ── 4. siGit Code Cloud tiers (always offered; sign-in gated at select) ─
+    for tier in crate::provider::CLOUD_TIERS {
+        let label = crate::provider::cloud_tier_label(tier);
+        // Synthetic config: a `sigit-cloud:<tier>` id never collides with a real
+        // HuggingFace id (no `/`), so on-device matching code stays inert.
+        let config = GgufModelConfig {
+            model_id: format!("sigit-cloud:{tier}"),
+            files: Vec::new(),
+            tok_model_id: None,
+            display_name: label.clone(),
+            approx_memory: "Cloud".to_string(),
+            chat_template: None,
+        };
+        items.push(ModelPickerItem {
+            display_name: label,
+            description: "siGit Code Cloud".to_string(),
+            tool_calling: true,
+            max_tokens: 4096,
+            config,
+            source_label: "siGit Code Cloud".to_string(),
+            source: ModelSource::Cloud,
+            cache_health: ModelCacheHealth::Complete,
+            cloud_tier: Some((*tier).to_string()),
         });
     }
 
@@ -134,6 +166,16 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
     });
 
     items
+}
+
+/// Picker items restricted to on-device models (no cloud tiers). Used by the
+/// model-loading and ACP session-config paths, which only handle local GGUF
+/// models. The cloud tiers are an interactive TUI-picker feature.
+pub(crate) fn local_picker_items() -> Vec<ModelPickerItem> {
+    build_model_picker_items()
+        .into_iter()
+        .filter(|item| item.cloud_tier.is_none())
+        .collect()
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -164,5 +206,6 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
             ModelSource::HuggingFace
         },
         cache_health: model.cache_health,
+        cloud_tier: None,
     })
 }

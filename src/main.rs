@@ -324,7 +324,7 @@ impl SiGitAgent {
         }
 
         let startup_config = self.current_model.lock().unwrap().clone();
-        let (max_tokens, tool_calling) = models::build_model_picker_items()
+        let (max_tokens, tool_calling) = models::local_picker_items()
             .into_iter()
             .find(|item| {
                 item.config.model_id == startup_config.model_id
@@ -625,7 +625,7 @@ impl SiGitAgent {
             *guard = None;
         }
 
-        if let Some(item) = models::build_model_picker_items()
+        if let Some(item) = models::local_picker_items()
             .iter()
             .find(|item| item.config.model_id == new_config.model_id)
             && let Err(err) = setup::save_selected_model(&setup::SelectedModel {
@@ -1126,7 +1126,7 @@ impl SiGitAgent {
             }
         }
 
-        let needs_download = models::build_model_picker_items()
+        let needs_download = models::local_picker_items()
             .into_iter()
             .find(|item| item.config.model_id == model_id)
             .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
@@ -1145,7 +1145,7 @@ impl SiGitAgent {
                 .map(|m| m.expected_size_bytes)
                 .unwrap_or(0);
 
-            let display_name = models::build_model_picker_items()
+            let display_name = models::local_picker_items()
                 .into_iter()
                 .find(|item| item.config.model_id == model_id_owned)
                 .map(|item| item.display_name.clone())
@@ -1252,7 +1252,7 @@ impl SiGitAgent {
 
         // cached models still take 10-30s to load weights; show a spinner
         if !needs_download {
-            let cached_display_name = models::build_model_picker_items()
+            let cached_display_name = models::local_picker_items()
                 .into_iter()
                 .find(|item| item.config.model_id == model_id)
                 .map(|item| item.display_name.clone())
@@ -1386,7 +1386,7 @@ impl SiGitAgent {
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
 fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
-    let items = models::build_model_picker_items();
+    let items = models::local_picker_items();
 
     let options: Vec<SessionConfigSelectOption> = items
         .iter()
@@ -1434,7 +1434,7 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
 
 /// returns `(config, max_tokens, tool_calling)` for a picker model_id, or None
 fn resolve_model_config(model_id: &str) -> Option<(GgufModelConfig, u64, bool)> {
-    let items = models::build_model_picker_items();
+    let items = models::local_picker_items();
     items
         .into_iter()
         .find(|item| {
@@ -1452,6 +1452,10 @@ enum SlashCommand {
     Clear,
     Status,
     Models(Option<usize>),
+    /// `/login <email> <password>` — the raw argument, parsed when executed.
+    Login(Option<String>),
+    Logout,
+    Whoami,
     Exit,
     Unknown(String),
 }
@@ -1469,13 +1473,16 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/clear" => SlashCommand::Clear,
         "/status" => SlashCommand::Status,
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
+        "/login" => SlashCommand::Login(argument.map(str::to_string)),
+        "/logout" => SlashCommand::Logout,
+        "/whoami" => SlashCommand::Whoami,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
 }
 
 fn format_models_list(current_model: &GgufModelConfig) -> String {
-    let items = models::build_model_picker_items();
+    let items = models::local_picker_items();
     if items.is_empty() {
         return "No local models found. siGit will use the platform default model.".to_string();
     }
@@ -1548,12 +1555,15 @@ async fn exec_slash_acp(
                 .send_assistant_message(
                     cx,
                     session_id,
-                    "/help      - show this message\n\
-                     /models    - list available models\n\
-                     /models N  - switch to model N\n\
-                     /clear     - wipe conversation history\n\
-                     /status    - show engine status\n\
-                     /exit      - end this turn",
+                    "/help          - show this message\n\
+                     /models        - list available models\n\
+                     /models N      - switch to model N\n\
+                     /login E P     - sign in to siGit Code Cloud\n\
+                     /logout        - sign out\n\
+                     /whoami        - show the signed-in account\n\
+                     /clear         - wipe conversation history\n\
+                     /status        - show engine status\n\
+                     /exit          - end this turn",
                 )
                 .ok();
         }
@@ -1589,7 +1599,7 @@ async fn exec_slash_acp(
                 .ok();
         }
         SlashCommand::Models(Some(number)) => {
-            let items = models::build_model_picker_items();
+            let items = models::local_picker_items();
             let index = number.saturating_sub(1);
             match items.get(index).cloned() {
                 None => {
@@ -1671,6 +1681,26 @@ async fn exec_slash_acp(
                     }
                 }
             }
+        }
+        SlashCommand::Login(argument) => {
+            let message = match argument.as_deref().and_then(account::parse_login_args) {
+                Some((email, password)) => match account::authenticate(&email, &password).await {
+                    Ok(email) => format!(
+                        "Signed in as {email}. siGit Code Cloud applies to your next session."
+                    ),
+                    Err(error) => format!("Login failed: {error}"),
+                },
+                None => "usage: /login <email> <password>".to_string(),
+            };
+            agent.send_assistant_message(cx, session_id, message).ok();
+        }
+        SlashCommand::Logout => {
+            let message = account::end_session().await;
+            agent.send_assistant_message(cx, session_id, message).ok();
+        }
+        SlashCommand::Whoami => {
+            let message = account::status_line().await;
+            agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Exit => {
             agent
@@ -1813,7 +1843,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     let config = startup_selection
         .as_ref()
         .and_then(|selection| {
-            models::build_model_picker_items()
+            models::local_picker_items()
                 .into_iter()
                 .find(|item| {
                     selection
@@ -1840,7 +1870,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     // std::sync::mpsc on a real thread so model loading can't starve the TUI
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    let tool_calling = models::build_model_picker_items()
+    let tool_calling = models::local_picker_items()
         .iter()
         .find(|item| item.config.model_id == config.model_id)
         .map(|item| item.tool_calling)
@@ -1925,7 +1955,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|selection| {
             selection.selected_model.as_ref().and_then(|selected| {
-                models::build_model_picker_items()
+                models::local_picker_items()
                     .into_iter()
                     .find(|item| {
                         item.config.model_id == selected.model_id
@@ -1940,7 +1970,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
         })
         .unwrap_or_else(GgufModelConfig::qwen25_3b);
 
-    let needs_download = models::build_model_picker_items()
+    let needs_download = models::local_picker_items()
         .iter()
         .find(|item| item.config.model_id == config.model_id)
         .map(|item| item.cache_health != setup::ModelCacheHealth::Complete)
@@ -2069,21 +2099,6 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Account subcommands run before the TUI/ACP split. They are plain CLI verbs.
-    if let Some(command) = std::env::args().nth(1) {
-        match command.as_str() {
-            "login" | "logout" | "whoami" => {
-                init_logging(false);
-                return match command.as_str() {
-                    "login" => account::login().await,
-                    "logout" => account::logout().await,
-                    _ => account::whoami().await,
-                };
-            }
-            _ => {}
-        }
-    }
-
     let is_tty = std::io::stdin().is_terminal();
 
     if is_tty {

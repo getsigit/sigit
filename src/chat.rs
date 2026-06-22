@@ -77,7 +77,7 @@ mod tui {
     use futures::StreamExt;
     use onde::inference::{ChatEngine, SamplingConfig, StreamChunk};
 
-    use crate::backend::{InferenceBackend, ToolResult, ToolSpec};
+    use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
     use crate::models::{ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items};
     use ratatui::{
         Frame,
@@ -199,6 +199,11 @@ mod tui {
         switching_model_id: Option<String>,
         /// (downloaded, expected) bytes — polled every tick during a model switch
         download_progress: Option<(u64, u64)>,
+
+        // ── Active inference backend ──────────────────────────────────────────
+        /// The backend serving inference. Swapped in place when the user picks a
+        /// different model or cloud tier via `/models`.
+        backend: Arc<dyn InferenceBackend>,
     }
 
     const BANNER_ART: &str = "\
@@ -234,7 +239,8 @@ mod tui {
     }
 
     impl App {
-        fn new(load_model_name: String, is_remote: bool) -> Self {
+        fn new(load_model_name: String, backend: Arc<dyn InferenceBackend>) -> Self {
+            let is_remote = backend.is_remote();
             let items = build_model_picker_items();
             let tool_calling = items
                 .iter()
@@ -279,6 +285,7 @@ mod tui {
                 model_picker_items: items,
                 current_model_name,
                 tool_calling,
+                backend,
             }
         }
 
@@ -541,6 +548,14 @@ mod tui {
                             .bg(Color::Black)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    ModelSource::Cloud => (
+                        "☁",
+                        "siGit Code Cloud",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .bg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 };
 
                 lines.push(
@@ -576,6 +591,7 @@ mod tui {
                 ModelSource::HuggingFace => "○",
                 ModelSource::Available => "↓",
                 ModelSource::Fallback => "◎",
+                ModelSource::Cloud => "☁",
             };
             let source = format!("  [{} {}]", brand_mark, item.source_label);
 
@@ -593,6 +609,7 @@ mod tui {
                     ModelSource::HuggingFace => Style::default().fg(Color::Cyan).bg(Color::Black),
                     ModelSource::Available => Style::default().fg(Color::Blue).bg(Color::Black),
                     ModelSource::Fallback => Style::default().fg(Color::Yellow).bg(Color::Black),
+                    ModelSource::Cloud => Style::default().fg(Color::Magenta).bg(Color::Black),
                 }
             };
 
@@ -672,6 +689,10 @@ mod tui {
         Status,
         /// picker UI, or jump straight to model N
         Models(Option<usize>),
+        /// `/login <email> <password>` — the raw argument, parsed when executed.
+        Login(Option<String>),
+        Logout,
+        Whoami,
         Exit,
         Unknown(String),
     }
@@ -689,6 +710,9 @@ mod tui {
             "/clear" => SlashCommand::Clear,
             "/status" => SlashCommand::Status,
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
+            "/login" => SlashCommand::Login(arg.map(str::to_string)),
+            "/logout" => SlashCommand::Logout,
+            "/whoami" => SlashCommand::Whoami,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -1134,12 +1158,15 @@ mod tui {
         match cmd {
             SlashCommand::Help => {
                 app.messages.push(ChatMessage::system(
-                    "/help      — show this message\n\
-                     /models    — open the model picker\n\
-                     /models N  — switch to model N\n\
-                     /clear     — wipe conversation history\n\
-                     /status    — show engine status\n\
-                     /exit      — quit chat",
+                    "/help          — show this message\n\
+                     /models        — open the model picker\n\
+                     /models N      — switch to model N\n\
+                     /login E P     — sign in to siGit Code Cloud\n\
+                     /logout        — sign out\n\
+                     /whoami        — show the signed-in account\n\
+                     /clear         — wipe conversation history\n\
+                     /status        — show engine status\n\
+                     /exit          — quit chat",
                 ));
             }
             SlashCommand::Clear => {
@@ -1172,6 +1199,36 @@ mod tui {
                             )));
                         }
                         Some(model) => {
+                            // ── siGit Code Cloud tier: no local load; sign-in gated ──
+                            if let Some(tier) = model.cloud_tier.clone() {
+                                app.close_model_picker();
+                                match crate::provider::cloud_tier_provider(&tier) {
+                                    Some(provider) => {
+                                        let system_prompt =
+                                            crate::system_prompt_for_model(true).to_string();
+                                        app.backend = Arc::new(OpenAiBackend::new(
+                                            provider.base_url,
+                                            provider.api_key,
+                                            provider.model,
+                                            Some(system_prompt),
+                                        ));
+                                        app.current_model_name = provider.display_name.clone();
+                                        app.tool_calling = true;
+                                        app.messages.push(ChatMessage::system(format!(
+                                            "Switched to {}.",
+                                            provider.display_name
+                                        )));
+                                    }
+                                    None => {
+                                        app.messages.push(ChatMessage::system(
+                                            "siGit Code Cloud needs an account. Use \
+                                             `/login <email> <password>`, or create one at sigit.si.",
+                                        ));
+                                    }
+                                }
+                                return;
+                            }
+
                             if model.cache_health == ModelCacheHealth::Incomplete {
                                 app.close_model_picker();
                                 app.messages.push(ChatMessage::system(format!(
@@ -1180,6 +1237,10 @@ mod tui {
                                 )));
                                 return;
                             }
+
+                            // Route inference on-device; the loader thread below
+                            // fills the engine the LocalBackend reads from.
+                            app.backend = Arc::new(LocalBackend::new(Arc::clone(&engine)));
 
                             let loading_msg = if model.cache_health
                                 == ModelCacheHealth::NotDownloaded
@@ -1244,6 +1305,28 @@ mod tui {
                     }
                 }
             },
+            SlashCommand::Login(arg) => {
+                let message = match arg.as_deref().and_then(crate::account::parse_login_args) {
+                    Some((email, password)) => {
+                        match crate::account::authenticate(&email, &password).await {
+                            Ok(email) => format!(
+                                "Signed in as {email}. siGit Code Cloud applies to your next session."
+                            ),
+                            Err(error) => format!("Login failed: {error}"),
+                        }
+                    }
+                    None => "usage: /login <email> <password>".to_string(),
+                };
+                app.messages.push(ChatMessage::system(message));
+            }
+            SlashCommand::Logout => {
+                let message = crate::account::end_session().await;
+                app.messages.push(ChatMessage::system(message));
+            }
+            SlashCommand::Whoami => {
+                let message = crate::account::status_line().await;
+                app.messages.push(ChatMessage::system(message));
+            }
             SlashCommand::Exit => {
                 app.quit = true;
             }
@@ -1377,7 +1460,7 @@ mod tui {
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
     ) -> Result<()> {
-        let mut app = App::new(load_model_name, backend.is_remote());
+        let mut app = App::new(load_model_name, backend);
         let mut event_stream = EventStream::new();
 
         // 10 fps is plenty for spinners
@@ -1612,7 +1695,7 @@ mod tui {
                             let (tx, rx) = mpsc::channel::<InferenceUpdate>(64);
                             app.inference_rx = Some(rx);
 
-                            let backend_handle = Arc::clone(&backend);
+                            let backend_handle = Arc::clone(&app.backend);
                             let user_text = text.clone();
                             let tools_enabled = app.tool_calling;
                             tokio::spawn(async move {
