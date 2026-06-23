@@ -19,9 +19,11 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-/// Default siGit Code Cloud inference endpoint. Override with `SIGIT_CLOUD_URL`
-/// (dev: `http://localhost:8090/v1`).
-const DEFAULT_CLOUD_URL: &str = "https://cloud.ondeinference.com/v1";
+/// Default siGit Code Cloud inference endpoint. This is the siGit platform API
+/// (sigit.si), which authenticates the user and forwards to the inference
+/// backend; the client never talks to the backend directly. Override with
+/// `SIGIT_CLOUD_URL` (dev: `http://localhost:8088/api/v1`).
+const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 
 /// The cloud quality tiers, in display order. Always offered in `/models`;
 /// selecting one requires a signed-in account.
@@ -69,7 +71,7 @@ fn tier_to_model(tier: &str) -> String {
 pub struct ProviderConfig {
     /// Human-facing name shown in the UI (e.g. `siGit Code Cloud · Balanced`).
     pub display_name: String,
-    /// API root, e.g. `https://cloud.ondeinference.com/v1`.
+    /// API root, e.g. `https://api.openai.com/v1`.
     pub base_url: String,
     pub api_key: String,
     /// Model id sent to the endpoint, e.g. `onde-balanced` or `gpt-4o-mini`.
@@ -203,13 +205,13 @@ mod tests {
     #[test]
     fn parses_active_profile_from_toml() {
         let toml = r#"
-            active = "onde-cloud"
+            active = "primary"
 
             [[provider]]
-            name = "onde-cloud"
-            base_url = "https://cloud.ondeinference.com/v1"
+            name = "primary"
+            base_url = "https://api.example.com/v1"
             api_key = "sk-test"
-            model = "onde-large"
+            model = "model-a"
 
             [[provider]]
             name = "openai"
@@ -224,8 +226,8 @@ mod tests {
             .into_iter()
             .find(|entry| entry.name == active)
             .unwrap();
-        assert_eq!(entry.base_url, "https://cloud.ondeinference.com/v1");
-        assert_eq!(entry.model, "onde-large");
+        assert_eq!(entry.base_url, "https://api.example.com/v1");
+        assert_eq!(entry.model, "model-a");
     }
 
     #[test]
