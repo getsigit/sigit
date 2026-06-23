@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+Adds siGit Code Cloud — a hosted inference tier alongside on-device models.
+
+### What changed
+
+- Added siGit Code Cloud with cloud-tier routing, pointed at `sigit.si`
+- Added account management slash commands and surfaced cloud tiers in `/models`
+- Carried forward from 1.1.0: ACP SDK v0.13, refreshed dependencies and branding
+
 ## 1.1.0
 
 Bumps the ACP SDK to v0.13 and pulls in updated dependencies.
