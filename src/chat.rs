@@ -872,25 +872,46 @@ mod tui {
                 Style::default().fg(Color::DarkGray),
             )));
         } else if app.switching_model {
-            let frame_str = app.switching_frame();
-            let progress_str = if let Some((downloaded, expected)) = app.download_progress {
-                if expected > 0 {
-                    let pct = (downloaded as f64 / expected as f64 * 100.0).min(100.0) as u8;
-                    let dl_str = format_size_human(downloaded);
-                    let ex_str = format_size_human(expected);
-                    format!(" — {dl_str} / {ex_str} ({pct}%)")
-                } else if downloaded > 0 {
-                    format!(" — {} downloaded", format_size_human(downloaded))
+            // Once the weights have fully landed on disk, swap the spinner for a
+            // checkmark so it's clear the download finished and we're now loading
+            // the model into memory (which can still take a while).
+            let download_complete = matches!(
+                app.download_progress,
+                Some((downloaded, expected)) if expected > 0 && downloaded >= expected
+            );
+
+            if download_complete {
+                let size_str = app
+                    .download_progress
+                    .map(|(_, expected)| format!(" ({})", format_size_human(expected)))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("  ✓ ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        format!("model downloaded{size_str} — loading into memory…"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            } else {
+                let progress_str = if let Some((downloaded, expected)) = app.download_progress {
+                    if expected > 0 {
+                        let pct = (downloaded as f64 / expected as f64 * 100.0).min(100.0) as u8;
+                        let dl_str = format_size_human(downloaded.min(expected));
+                        let ex_str = format_size_human(expected);
+                        format!(" — {dl_str} / {ex_str} ({pct}%)")
+                    } else if downloaded > 0 {
+                        format!(" — {} downloaded", format_size_human(downloaded))
+                    } else {
+                        String::new()
+                    }
                 } else {
                     String::new()
-                }
-            } else {
-                String::new()
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  {frame_str} switching model{progress_str}…"),
-                Style::default().fg(Color::DarkGray),
-            )));
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {} switching model{progress_str}…", app.switching_frame()),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
 
         let total_lines = lines.len() as u16;
