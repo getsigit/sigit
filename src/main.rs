@@ -46,7 +46,8 @@ use onde::inference::SamplingConfig;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, UnstructuredCommandInput,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ConfigOptionUpdate,
+    UnstructuredCommandInput,
     CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PromptRequest,
@@ -596,6 +597,7 @@ impl SiGitAgent {
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
             AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
             AvailableCommand::new("whoami", "Show the signed-in account"),
+            AvailableCommand::new("reload", "Re-sync sign-in and model state"),
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
@@ -1214,6 +1216,70 @@ impl SiGitAgent {
         *self.backend.lock().await = local_backend;
     }
 
+    /// Re-attempt the lazy startup model load if the previous attempt failed.
+    /// Clears the one-shot guard so the next load runs; a healthy load is left
+    /// untouched so `/reload` doesn't needlessly reload a working model.
+    fn retry_startup_model_load_if_failed(&self) {
+        let had_error = self
+            .model_load_error
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        if had_error {
+            self.startup_model_load_started
+                .store(false, Ordering::Release);
+            self.start_startup_model_load_if_needed();
+        }
+    }
+
+    /// Re-sync session state in place — no new session needed. Re-applies the
+    /// active backend from current credentials (so a fresh `/login` token is
+    /// picked up), retries a failed model load, and pushes refreshed commands +
+    /// picker so the editor's UI reflects the current state.
+    async fn handle_reload(&self, cx: &ConnectionTo<Client>, session_id: SessionId) {
+        let signed_in = account::status_line().await;
+
+        let on_cloud_tier = {
+            let guard = self.current_model.lock().unwrap();
+            guard
+                .model_id
+                .strip_prefix("sigit-cloud:")
+                .map(str::to_string)
+        };
+
+        let backend_note = match on_cloud_tier {
+            Some(tier) => match self.switch_to_cloud_tier(&tier).await {
+                Some(name) => format!("Active: {name}."),
+                None => {
+                    self.reset_to_local_backend().await;
+                    "Signed out — back to on-device. Pick a model with /models.".to_string()
+                }
+            },
+            None => {
+                self.reset_to_local_backend().await;
+                self.retry_startup_model_load_if_failed();
+                let guard = self.current_model.lock().unwrap();
+                format!("Active: {}.", guard.display_name)
+            }
+        };
+
+        // Push refreshed picker + commands so the editor reflects current state.
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+        self.send_tool_call_update(
+            cx,
+            session_id.clone(),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+        )
+        .ok();
+        self.advertise_commands(cx, session_id.clone());
+
+        self.send_assistant_message(cx, session_id, format!("Reloaded. {signed_in} {backend_note}"))
+            .ok();
+    }
+
     async fn handle_set_session_config_option(
         &self,
         cx: &ConnectionTo<Client>,
@@ -1609,6 +1675,8 @@ enum SlashCommand {
     Login(Option<String>),
     Logout,
     Whoami,
+    /// Re-sync session state (auth, backend, picker) without a new session.
+    Reload,
     Exit,
     Unknown(String),
 }
@@ -1629,6 +1697,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
         "/logout" => SlashCommand::Logout,
         "/whoami" => SlashCommand::Whoami,
+        "/reload" => SlashCommand::Reload,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -1722,6 +1791,7 @@ async fn exec_slash_acp(
                      /login E P     - sign in to siGit Code Cloud\n\
                      /logout        - sign out\n\
                      /whoami        - show the signed-in account\n\
+                     /reload        - re-sync sign-in and model state\n\
                      /clear         - wipe conversation history\n\
                      /status        - show engine status\n\
                      /exit          - end this turn",
@@ -1858,7 +1928,7 @@ async fn exec_slash_acp(
             let message = match argument.as_deref().and_then(account::parse_login_args) {
                 Some((email, password)) => match account::authenticate(&email, &password).await {
                     Ok(email) => format!(
-                        "Signed in as {email}. siGit Code Cloud applies to your next session."
+                        "Signed in as {email}. Pick a siGit Code Cloud tier in /models to use it."
                     ),
                     Err(error) => format!("Login failed: {error}"),
                 },
@@ -1867,12 +1937,23 @@ async fn exec_slash_acp(
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Logout => {
+            // If we're on a cloud tier, drop back to local — the token is gone.
+            let on_cloud = {
+                let guard = agent.current_model.lock().unwrap();
+                guard.model_id.starts_with("sigit-cloud:")
+            };
             let message = account::end_session().await;
+            if on_cloud {
+                agent.reset_to_local_backend().await;
+            }
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Whoami => {
             let message = account::status_line().await;
             agent.send_assistant_message(cx, session_id, message).ok();
+        }
+        SlashCommand::Reload => {
+            agent.handle_reload(cx, session_id).await;
         }
         SlashCommand::Exit => {
             agent
