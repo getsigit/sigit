@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 # ACP protocol SDK
-agent-client-protocol = { version = "0.13", features = ["unstable_session_fork", "unstable_session_additional_directories"] }
+agent-client-protocol = { version = "0.13", features = ["unstable_session_fork", "unstable_session_additional_directories", "unstable_auth_methods"] }
 
 # Onde Inference engine (local LLM)
 # onde = { path = "../onde" }
@@ -45,3 +45,4 @@ async-trait = "0.1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
+rpassword = "7"

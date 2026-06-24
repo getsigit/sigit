@@ -46,6 +46,8 @@ use onde::inference::SamplingConfig;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ConfigOptionUpdate,
+    UnstructuredCommandInput,
     CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PromptRequest,
@@ -56,12 +58,11 @@ use agent_client_protocol::schema::{
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
-use onde::inference::{ChatEngine, GgufModelConfig, ToolDefinition, ToolResult};
+use onde::inference::{ChatEngine, GgufModelConfig};
 
-// These back the interactive client (`run_interactive`), which is `#[cfg(unix)]`;
-// the import is unused on non-Unix targets that run ACP-only.
-#[cfg_attr(not(unix), allow(unused_imports))]
-use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend};
+use crate::backend::{
+    InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult, ToolSpec,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -210,10 +211,15 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
 /// cap tool-call loops so a confused model can't spin forever
 const MAX_TOOL_ROUNDS: usize = 10;
 
-fn agent_tools_as_onde() -> Vec<ToolDefinition> {
+/// Shown when a siGit Code Cloud tier is selected without a signed-in account.
+const CLOUD_LOGIN_PROMPT: &str = "siGit Code Cloud needs an account. Sign in with \
+    `/login <email> <password>` (or the Authenticate button), then pick the tier again. \
+    Create an account at https://sigit.si.";
+
+fn agent_tools_as_specs() -> Vec<ToolSpec> {
     tools::all_tools()
         .into_iter()
-        .map(|t| ToolDefinition {
+        .map(|t| ToolSpec {
             name: t.name.to_string(),
             description: t.description.to_string(),
             parameters_schema: t.parameters_schema.to_string(),
@@ -271,6 +277,9 @@ fn initialize_meta() -> Meta {
 
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
+    /// The active inference backend. `LocalBackend` by default; swapped to an
+    /// `OpenAiBackend` when the user selects a siGit Code Cloud tier in the panel.
+    backend: tokio::sync::Mutex<Arc<dyn InferenceBackend>>,
     /// cwd from the editor — tool calls run here, not where the process started
     session_cwd: std::sync::Mutex<Option<PathBuf>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
@@ -299,8 +308,11 @@ impl SiGitAgent {
     ) -> Self {
         let startup_model_name = initial_model.display_name.clone();
         let startup_model_id = initial_model.model_id.clone();
+        let backend: Arc<dyn InferenceBackend> =
+            Arc::new(LocalBackend::new(Arc::clone(&engine)));
         Self {
             engine,
+            backend: tokio::sync::Mutex::new(backend),
             session_cwd: std::sync::Mutex::new(None),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
@@ -567,6 +579,36 @@ impl SiGitAgent {
         cx.send_notification(SessionNotification::new(session_id, update))
     }
 
+    /// Advertise siGit's slash commands to the client. Editors like Zed parse
+    /// `/`-prefixed input and only forward commands they've been told about, so
+    /// without this `/login`, `/models`, etc. are rejected client-side.
+    fn advertise_commands(&self, cx: &ConnectionTo<Client>, session_id: SessionId) {
+        let with_hint = |name: &str, desc: &str, hint: &str| {
+            AvailableCommand::new(name, desc).input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new(hint),
+            ))
+        };
+        let commands = vec![
+            AvailableCommand::new("help", "Show available commands"),
+            AvailableCommand::new("models", "List available models")
+                .input(AvailableCommandInput::Unstructured(
+                    UnstructuredCommandInput::new("model number to switch to (optional)"),
+                )),
+            with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
+            AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
+            AvailableCommand::new("whoami", "Show the signed-in account"),
+            AvailableCommand::new("reload", "Re-sync sign-in and model state"),
+            AvailableCommand::new("clear", "Wipe the conversation history"),
+            AvailableCommand::new("status", "Show engine status"),
+        ];
+        self.send_tool_call_update(
+            cx,
+            session_id,
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(commands)),
+        )
+        .ok();
+    }
+
     async fn switch_model_by_id(
         &self,
         model_id: &str,
@@ -669,15 +711,23 @@ impl SiGitAgent {
     ) -> agent_client_protocol::Result<InitializeResponse> {
         log::info!("initialize");
 
+        // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
+        // like Zed advertise terminal-auth capability but don't actually spawn the
+        // login terminal for *custom* ACP agents, so the button is a silent no-op.
+        // With an Agent method, clicking calls `authenticate`, which returns either
+        // confirmation (already signed in via `/login`) or a message telling the
+        // user to run `/login <email> <password>` — so the button does something.
+        let auth_methods = vec![AuthMethod::Agent(
+            AuthMethodAgent::new("sigit", "Sign in to siGit Code")
+                .description("Sign in with `/login <email> <password>` in the message box."),
+        )];
+
         Ok(InitializeResponse::new(ProtocolVersion::V1)
             .agent_info(
                 Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
                     .title("siGit Code - AI Coding Agent"),
             )
-            .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
-                "sigit",
-                "siGit Code",
-            ))])
+            .auth_methods(auth_methods)
             .agent_capabilities(
                 AgentCapabilities::default()
                     .load_session(true)
@@ -690,14 +740,32 @@ impl SiGitAgent {
 
     async fn handle_authenticate(
         &self,
-        _req: AuthenticateRequest,
+        req: AuthenticateRequest,
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
-        log::info!("authenticate");
-        Ok(AuthenticateResponse::default())
+        log::info!("authenticate: method={}", req.method_id.0);
+
+        // Confirm the stored token works. The button can't collect a password,
+        // so an unsigned-in user is pointed at the `/login` slash command; a user
+        // already signed in via `/login` gets the gate cleared.
+        match account::verify_session().await {
+            Ok(email) => {
+                log::info!("authenticate: verified session for {email}");
+                Ok(AuthenticateResponse::default())
+            }
+            Err(reason) => Err(agent_client_protocol::Error::new(
+                -32000,
+                format!(
+                    "Not signed in to siGit Code Cloud ({reason}). \
+                     Sign in with `/login <email> <password>` in the message box, \
+                     or create an account at https://sigit.si."
+                ),
+            )),
+        }
     }
 
     async fn handle_load_session(
         &self,
+        cx: &ConnectionTo<Client>,
         args: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
         log::info!(
@@ -739,11 +807,14 @@ impl SiGitAgent {
             build_model_config_options(&guard)
         };
 
+        self.advertise_commands(cx, args.session_id.clone());
+
         Ok(LoadSessionResponse::new().config_options(config_options))
     }
 
     async fn handle_fork_session(
         &self,
+        cx: &ConnectionTo<Client>,
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
@@ -784,11 +855,14 @@ impl SiGitAgent {
             build_model_config_options(&guard)
         };
 
+        self.advertise_commands(cx, new_id.clone());
+
         Ok(ForkSessionResponse::new(new_id).config_options(config_options))
     }
 
     async fn handle_new_session(
         &self,
+        cx: &ConnectionTo<Client>,
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
@@ -826,6 +900,8 @@ impl SiGitAgent {
             let guard = self.current_model.lock().unwrap();
             build_model_config_options(&guard)
         };
+
+        self.advertise_commands(cx, session_id.clone());
 
         Ok(NewSessionResponse::new(session_id).config_options(config_options))
     }
@@ -984,20 +1060,25 @@ impl SiGitAgent {
             user_text.chars().take(80).collect::<String>()
         );
 
-        // load the default ACP model lazily so initialize/session/new stay clean
-        // for registry validation and editor startup.
-        self.start_startup_model_load_if_needed();
-        self.await_model_ready(cx, &session_id).await?;
+        // The active backend drives the turn. Snapshot it once so a mid-turn
+        // model switch doesn't split the conversation across backends.
+        let backend = self.backend.lock().await.clone();
+
+        // Only on-device inference needs a local model in memory. Cloud tiers run
+        // over the network, so skip the lazy load and the readiness wait for them.
+        if !backend.is_remote() {
+            self.start_startup_model_load_if_needed();
+            self.await_model_ready(cx, &session_id).await?;
+        }
 
         // ── tool-calling loop ────────────────────────────────────────────
         // send message → execute any tool calls → feed results back
         // repeat up to MAX_TOOL_ROUNDS, then force a text reply
 
-        let onde_tools = agent_tools_as_onde();
+        let tools = agent_tools_as_specs();
 
-        let mut result = self
-            .engine
-            .send_message_with_tools(&user_text, &onde_tools)
+        let mut result = backend
+            .send_message_with_tools(&user_text, &tools)
             .await
             .map_err(|error| {
                 log::error!("send_message_with_tools failed: {error}");
@@ -1020,28 +1101,27 @@ impl SiGitAgent {
             for tc in &result.tool_calls {
                 log::info!(
                     "  → {}({})",
-                    tc.function_name,
+                    tc.name,
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                let output = tools::execute_tool(&tc.function_name, &tc.arguments).await;
+                let output = tools::execute_tool(&tc.name, &tc.arguments).await;
 
                 log::info!("  ← {} chars", output.len());
 
-                tool_results.push(ToolResult {
+                tool_results.push(BackendToolResult {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
             }
 
             let next_tools = if round < MAX_TOOL_ROUNDS {
-                Some(onde_tools.as_slice())
+                Some(tools.as_slice())
             } else {
                 None // last round: force text
             };
 
-            result = self
-                .engine
+            result = backend
                 .send_tool_results(tool_results, next_tools)
                 .await
                 .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
@@ -1083,6 +1163,121 @@ impl SiGitAgent {
     async fn handle_cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
         log::info!("cancel requested for session {}", args.session_id);
         Ok(())
+    }
+
+    /// Swap the active backend to a siGit Code Cloud tier and reflect it as the
+    /// current model so the picker shows it selected. Returns the tier's display
+    /// name on success, or `None` when no account is signed in (caller prompts
+    /// for login). Shared by the panel picker and the `/models` slash command.
+    async fn switch_to_cloud_tier(&self, tier: &str) -> Option<String> {
+        let cfg = crate::provider::cloud_tier_provider(tier)?;
+        let mut system_prompt = system_prompt_for_model(true).to_string();
+        // Mirror the cwd guidance the local engine gets at session load, so the
+        // cloud model also uses absolute paths under the editor's project root.
+        if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
+            system_prompt.push_str(&format!(
+                "\n\nThe user's project working directory is {}. \
+                 Always use absolute paths under this directory for all file \
+                 and directory operations.",
+                cwd.display()
+            ));
+        }
+        let cloud_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
+            cfg.base_url,
+            cfg.api_key,
+            cfg.model,
+            Some(system_prompt),
+        ));
+        *self.backend.lock().await = cloud_backend;
+
+        let cloud_config = GgufModelConfig {
+            model_id: format!("sigit-cloud:{tier}"),
+            files: Vec::new(),
+            tok_model_id: None,
+            display_name: cfg.display_name.clone(),
+            approx_memory: "Cloud".to_string(),
+            chat_template: None,
+        };
+        {
+            let mut guard = self.current_model.lock().unwrap();
+            *guard = cloud_config;
+        }
+
+        log::info!("switched to cloud tier {tier}");
+        Some(cfg.display_name)
+    }
+
+    /// Route inference back on-device. Used after leaving a cloud tier for a
+    /// local model. The `LocalBackend` reads the live `engine`, so this just
+    /// repoints the active backend.
+    async fn reset_to_local_backend(&self) {
+        let local_backend: Arc<dyn InferenceBackend> =
+            Arc::new(LocalBackend::new(Arc::clone(&self.engine)));
+        *self.backend.lock().await = local_backend;
+    }
+
+    /// Re-attempt the lazy startup model load if the previous attempt failed.
+    /// Clears the one-shot guard so the next load runs; a healthy load is left
+    /// untouched so `/reload` doesn't needlessly reload a working model.
+    fn retry_startup_model_load_if_failed(&self) {
+        let had_error = self
+            .model_load_error
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        if had_error {
+            self.startup_model_load_started
+                .store(false, Ordering::Release);
+            self.start_startup_model_load_if_needed();
+        }
+    }
+
+    /// Re-sync session state in place — no new session needed. Re-applies the
+    /// active backend from current credentials (so a fresh `/login` token is
+    /// picked up), retries a failed model load, and pushes refreshed commands +
+    /// picker so the editor's UI reflects the current state.
+    async fn handle_reload(&self, cx: &ConnectionTo<Client>, session_id: SessionId) {
+        let signed_in = account::status_line().await;
+
+        let on_cloud_tier = {
+            let guard = self.current_model.lock().unwrap();
+            guard
+                .model_id
+                .strip_prefix("sigit-cloud:")
+                .map(str::to_string)
+        };
+
+        let backend_note = match on_cloud_tier {
+            Some(tier) => match self.switch_to_cloud_tier(&tier).await {
+                Some(name) => format!("Active: {name}."),
+                None => {
+                    self.reset_to_local_backend().await;
+                    "Signed out — back to on-device. Pick a model with /models.".to_string()
+                }
+            },
+            None => {
+                self.reset_to_local_backend().await;
+                self.retry_startup_model_load_if_failed();
+                let guard = self.current_model.lock().unwrap();
+                format!("Active: {}.", guard.display_name)
+            }
+        };
+
+        // Push refreshed picker + commands so the editor reflects current state.
+        let config_options = {
+            let guard = self.current_model.lock().unwrap();
+            build_model_config_options(&guard)
+        };
+        self.send_tool_call_update(
+            cx,
+            session_id.clone(),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+        )
+        .ok();
+        self.advertise_commands(cx, session_id.clone());
+
+        self.send_assistant_message(cx, session_id, format!("Reloaded. {signed_in} {backend_note}"))
+            .ok();
     }
 
     async fn handle_set_session_config_option(
@@ -1127,6 +1322,20 @@ impl SiGitAgent {
                 let config_options = build_model_config_options(&current);
                 return Ok(SetSessionConfigOptionResponse::new(config_options));
             }
+        }
+
+        // ── siGit Code Cloud tier: no local load; sign-in gated ─────────────
+        if let Some(tier) = model_id.strip_prefix("sigit-cloud:") {
+            let message = match self.switch_to_cloud_tier(tier).await {
+                Some(display_name) => format!("Switched to {display_name}."),
+                None => CLOUD_LOGIN_PROMPT.to_string(),
+            };
+            self.send_assistant_message(cx, args.session_id.clone(), message)
+                .ok();
+
+            let current = self.current_model.lock().unwrap().clone();
+            let config_options = build_model_config_options(&current);
+            return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
         let needs_download = models::local_picker_items()
@@ -1331,6 +1540,9 @@ impl SiGitAgent {
 
         match switch_result {
             Ok(new_config) => {
+                // Route inference back on-device (in case we were on a cloud tier).
+                self.reset_to_local_backend().await;
+
                 let completion_title = if needs_download {
                     format!("✓ {} downloaded and loaded", new_config.display_name)
                 } else {
@@ -1389,7 +1601,9 @@ impl SiGitAgent {
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
 fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
-    let items = models::local_picker_items();
+    // The full list, including the siGit Code Cloud tiers, so the panel picker
+    // mirrors the TUI `/models`. Cloud entries are sign-in gated at selection.
+    let items = models::build_model_picker_items();
 
     let options: Vec<SessionConfigSelectOption> = items
         .iter()
@@ -1404,7 +1618,9 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
                 desc_parts.push("↓ download on select".to_string());
             }
             let description = desc_parts.join(" - ");
-            let source_badge = if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
+            let source_badge = if item.cloud_tier.is_some() {
+                " [☁ siGit Code Cloud]"
+            } else if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
                 " [↓ Onde]"
             } else {
                 match item.source_label.as_str() {
@@ -1431,7 +1647,7 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
     vec![
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
             .category(SessionConfigOptionCategory::Model)
-            .description("Select the local LLM model for inference"),
+            .description("Select an on-device model or a siGit Code Cloud tier"),
     ]
 }
 
@@ -1459,6 +1675,8 @@ enum SlashCommand {
     Login(Option<String>),
     Logout,
     Whoami,
+    /// Re-sync session state (auth, backend, picker) without a new session.
+    Reload,
     Exit,
     Unknown(String),
 }
@@ -1479,13 +1697,14 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
         "/logout" => SlashCommand::Logout,
         "/whoami" => SlashCommand::Whoami,
+        "/reload" => SlashCommand::Reload,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
 }
 
 fn format_models_list(current_model: &GgufModelConfig) -> String {
-    let items = models::local_picker_items();
+    let items = models::build_model_picker_items();
     if items.is_empty() {
         return "No local models found. siGit will use the platform default model.".to_string();
     }
@@ -1497,6 +1716,7 @@ fn format_models_list(current_model: &GgufModelConfig) -> String {
         let source_key = match item.source_label.as_str() {
             "Onde" => "Onde",
             "HuggingFace" => "HuggingFace",
+            "siGit Code Cloud" => "Cloud",
             _ => "Fallback",
         };
 
@@ -1507,9 +1727,15 @@ fn format_models_list(current_model: &GgufModelConfig) -> String {
             let section = match source_key {
                 "Onde" => "Onde Inference",
                 "HuggingFace" => "Hugging Face cache",
+                "Cloud" => "siGit Code Cloud",
                 _ => "Fallback",
             };
             lines.push(section.to_string());
+            // Blank line so the following "N." items render as an ordered list.
+            // CommonMark only lets an ordered list interrupt a paragraph when it
+            // starts at 1, so without this the cloud section (items 9+) would be
+            // absorbed into the header paragraph.
+            lines.push(String::new());
             last_source = Some(source_key);
         }
 
@@ -1532,6 +1758,7 @@ fn format_models_list(current_model: &GgufModelConfig) -> String {
         let source = match source_key {
             "Onde" => "  [Onde]",
             "HuggingFace" => "  [HuggingFace]",
+            "Cloud" => "  [☁ Cloud]",
             _ => "  [default]",
         };
 
@@ -1564,6 +1791,7 @@ async fn exec_slash_acp(
                      /login E P     - sign in to siGit Code Cloud\n\
                      /logout        - sign out\n\
                      /whoami        - show the signed-in account\n\
+                     /reload        - re-sync sign-in and model state\n\
                      /clear         - wipe conversation history\n\
                      /status        - show engine status\n\
                      /exit          - end this turn",
@@ -1602,7 +1830,7 @@ async fn exec_slash_acp(
                 .ok();
         }
         SlashCommand::Models(Some(number)) => {
-            let items = models::local_picker_items();
+            let items = models::build_model_picker_items();
             let index = number.saturating_sub(1);
             match items.get(index).cloned() {
                 None => {
@@ -1613,6 +1841,15 @@ async fn exec_slash_acp(
                             format!("error: no model #{number} - type /models to see the list."),
                         )
                         .ok();
+                }
+                Some(model) if model.cloud_tier.is_some() => {
+                    // siGit Code Cloud tier: swap backend, sign-in gated.
+                    let tier = model.cloud_tier.clone().unwrap_or_default();
+                    let message = match agent.switch_to_cloud_tier(&tier).await {
+                        Some(display_name) => format!("Switched to {display_name}."),
+                        None => CLOUD_LOGIN_PROMPT.to_string(),
+                    };
+                    agent.send_assistant_message(cx, session_id, message).ok();
                 }
                 Some(model) => {
                     if model.cache_health == setup::ModelCacheHealth::Incomplete {
@@ -1640,6 +1877,7 @@ async fn exec_slash_acp(
 
                         match agent.switch_model_by_id(&model.config.model_id).await {
                             Ok(new_config) => {
+                                agent.reset_to_local_backend().await;
                                 agent.engine.clear_history().await;
                                 agent
                                     .send_assistant_message(
@@ -1672,6 +1910,7 @@ async fn exec_slash_acp(
                             .ok();
 
                         let switched = agent.switch_model_by_id(&model.config.model_id).await?;
+                        agent.reset_to_local_backend().await;
                         agent.engine.clear_history().await;
 
                         agent
@@ -1689,7 +1928,7 @@ async fn exec_slash_acp(
             let message = match argument.as_deref().and_then(account::parse_login_args) {
                 Some((email, password)) => match account::authenticate(&email, &password).await {
                     Ok(email) => format!(
-                        "Signed in as {email}. siGit Code Cloud applies to your next session."
+                        "Signed in as {email}. Pick a siGit Code Cloud tier in /models to use it."
                     ),
                     Err(error) => format!("Login failed: {error}"),
                 },
@@ -1698,12 +1937,23 @@ async fn exec_slash_acp(
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Logout => {
+            // If we're on a cloud tier, drop back to local — the token is gone.
+            let on_cloud = {
+                let guard = agent.current_model.lock().unwrap();
+                guard.model_id.starts_with("sigit-cloud:")
+            };
             let message = account::end_session().await;
+            if on_cloud {
+                agent.reset_to_local_backend().await;
+            }
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Whoami => {
             let message = account::status_line().await;
             agent.send_assistant_message(cx, session_id, message).ok();
+        }
+        SlashCommand::Reload => {
+            agent.handle_reload(cx, session_id).await;
         }
         SlashCommand::Exit => {
             agent
@@ -2040,8 +2290,8 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: LoadSessionRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_load_session(req).await)
+                async move |req: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_load_session(&cx, req).await)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2049,8 +2299,8 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: ForkSessionRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_fork_session(req).await)
+                async move |req: ForkSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_fork_session(&cx, req).await)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2058,8 +2308,8 @@ async fn run_acp_server() -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: NewSessionRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_new_session(req).await)
+                async move |req: NewSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_new_session(&cx, req).await)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2108,6 +2358,38 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Account subcommands. The editor launches `sigit login` in an embedded
+    // terminal for ACP terminal-based authentication; the same verbs are handy
+    // directly from a shell. These must be handled before the TTY/ACP split.
+    if let Some(verb) = std::env::args().nth(1) {
+        match verb.as_str() {
+            "login" => {
+                init_logging(true);
+                match account::interactive_login().await {
+                    Ok(email) => {
+                        println!("Signed in to siGit Code Cloud as {email}.");
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        eprintln!("Login failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "logout" => {
+                init_logging(true);
+                println!("{}", account::end_session().await);
+                return Ok(());
+            }
+            "whoami" => {
+                init_logging(true);
+                println!("{}", account::status_line().await);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     let is_tty = std::io::stdin().is_terminal();
 
     if is_tty {

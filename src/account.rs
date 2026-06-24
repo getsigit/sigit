@@ -90,6 +90,60 @@ pub async fn authenticate(email: &str, password: &str) -> Result<String, String>
     Err(format!("sign-in failed: {message}"))
 }
 
+/// Verify that a usable session exists, confirming the stored token against the
+/// account API. Returns the signed-in email on success, or a human-readable
+/// reason it is not usable. Used by the ACP `authenticate` handler to answer the
+/// editor's auth gate.
+pub async fn verify_session() -> Result<String, String> {
+    let Some(creds) = credentials::load() else {
+        return Err("not signed in".to_string());
+    };
+
+    let url = format!("{}/api/v1/me", api_base().trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(&creds.access_token)
+        .send()
+        .await
+        .map_err(|error| format!("could not reach siGit Code Cloud: {error}"))?;
+
+    if response.status().is_success() {
+        let email = response
+            .json::<MeResponse>()
+            .await
+            .ok()
+            .and_then(|me| me.email)
+            .or(creds.email)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        Ok(email)
+    } else {
+        Err(format!(
+            "session expired (HTTP {})",
+            response.status().as_u16()
+        ))
+    }
+}
+
+/// Run an interactive sign-in against the terminal, prompting for email and a
+/// hidden password. Used by `sigit login`, which the editor launches in an
+/// embedded terminal for ACP terminal-based authentication. Returns the signed-in
+/// email or a human-readable error.
+pub async fn interactive_login() -> Result<String, String> {
+    use std::io::{Write, stdin, stdout};
+
+    print!("siGit Code email: ");
+    stdout().flush().ok();
+    let mut email = String::new();
+    stdin()
+        .read_line(&mut email)
+        .map_err(|error| format!("could not read email: {error}"))?;
+
+    let password = rpassword::prompt_password("siGit Code password: ")
+        .map_err(|error| format!("could not read password: {error}"))?;
+
+    authenticate(email.trim(), &password).await
+}
+
 /// Clear the local session, notifying the server best-effort. Returns a message
 /// suitable for display.
 pub async fn end_session() -> String {
