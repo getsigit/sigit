@@ -9,33 +9,61 @@ description: Implement or debug tool calling in siGit Code across the app, Onde 
 
 siGit Code supports **agentic tool calling** — the LLM invokes tools (read/write files, run commands, read websites) to operate on the user's codebase. This works in both **interactive TUI mode** and **ACP server mode** (Zed editor).
 
-Tool calling spans three layers:
+Tool calling spans these layers:
 
 ```
 siGit (agent loop + tool execution)
-  → onde (ChatEngine with tool-aware API)
-    → mistral.rs (model inference + tool call parsing)
+  → InferenceBackend (src/backend.rs — LocalBackend or OpenAiBackend/cloud)
+    → onde ChatEngine (tool-aware API)   ── for LocalBackend
+      → mistral.rs (model inference + tool call parsing)
+    └ OpenAI-compatible HTTP endpoint    ── for OpenAiBackend (siGit Code Cloud)
 ```
+
+The agent loop talks to an `InferenceBackend` trait object, not the engine
+directly. `LocalBackend` wraps the on-device `ChatEngine`; `OpenAiBackend` calls
+a remote OpenAI-compatible endpoint (the siGit Code Cloud tiers). Both implement
+`send_message_with_tools` / `send_tool_results`, so the loop is identical.
 
 ---
 
 ## Model Requirement
 
-**Only Qwen 3 supports tool calling.** Qwen 2.5 does NOT — mistral.rs only has a parser for Qwen 3's `<tool_call>...</tool_call>` XML format.
+Tool calling needs a model mistral.rs has a tool-call parser for. The supported
+set is the **Qwen 3 family** (`<tool_call>...</tool_call>` XML) plus **Qwen 2.5
+Coder 7B**. Plain Qwen 2.5 and the smaller Qwen 2.5 Coder variants do NOT support
+tool calling. The authoritative list is `is_tool_calling()` in `src/models.rs`.
 
-| Model | Constructor | Size | Tool calling | Default |
-|-------|-----------|------|:---:|:---:|
-| Qwen 3 8B (Q4_K_M) | `GgufModelConfig::qwen3_8b()` | ~5 GB | ✅ | ✅ **default** |
-| Qwen 3 4B (Q4_K_M) | `GgufModelConfig::qwen3_4b()` | ~2.7 GB | ✅ | |
-| Qwen 3 1.7B (Q4_K_M) | `GgufModelConfig::qwen3_1_7b()` | ~1.3 GB | ✅ | |
-| Qwen 2.5 Coder 3B | `GgufModelConfig::qwen25_coder_3b()` | ~1.93 GB | ❌ | |
-| Qwen 2.5 Coder 1.5B | `GgufModelConfig::qwen25_coder_1_5b()` | ~941 MB | ❌ | |
+| Model | Constructor | Size | Tool calling |
+|-------|-----------|------|:---:|
+| Qwen 3 14B (Q4_K_M) | `GgufModelConfig::qwen3_14b()` | ~9 GB | ✅ |
+| Qwen 3 8B (Q4_K_M) | `GgufModelConfig::qwen3_8b()` | ~5 GB | ✅ |
+| Qwen 3 4B (Q4_K_M) | `GgufModelConfig::qwen3_4b()` | ~2.7 GB | ✅ |
+| Qwen 3 1.7B (Q4_K_M) | `GgufModelConfig::qwen3_1_7b()` | ~1.3 GB | ✅ |
+| Qwen 2.5 Coder 7B | `GgufModelConfig::qwen25_coder_7b()` | ~5 GB | ✅ |
+| Qwen 2.5 Coder 3B | `GgufModelConfig::qwen25_coder_3b()` | ~1.93 GB | ❌ |
+| Qwen 2.5 Coder 1.5B | `GgufModelConfig::qwen25_coder_1_5b()` | ~941 MB | ❌ |
+| Qwen 2.5 3B / 1.5B | `qwen25_3b()` / `qwen25_1_5b()` | ~1.93 GB / ~941 MB | ❌ |
 
-siGit uses **Qwen 3 8B** by default with `max_tokens: 8192` (set in `main.rs` for both TUI and ACP modes).
+### Default model
 
-### Why 8B over 4B
+There is **no hardcoded default model.** Startup uses the saved selection
+(`setup::startup_model_selection`), then the first complete locally-cached model,
+falling back to `GgufModelConfig::platform_default()` (Qwen 2.5 3B on macOS) when
+nothing is cached. The TUI/ACP code in `main.rs` uses `qwen25_3b()` as that final
+fallback. Users pick a tool-calling model via the `/models` picker.
 
-4B can't do `edit_file` reliably. It reads a file, then fails to reproduce the exact `old_text` it just saw. This spirals into 7+ retry rounds that burn through `max_tokens` on `<think>` blocks and return nothing. 8B is the smallest model that actually lands edits.
+### max_tokens
+
+`max_tokens_for()` in `src/models.rs` gives tool-calling models **4096** tokens
+and non-tool models **512** (tool models need headroom because `<think>` blocks
+eat the budget). The TUI startup load in `run_interactive` overrides this to
+**8192**. Don't assume a single value.
+
+### Why prefer 8B+ over 4B for editing
+
+4B struggles with `edit_file`: it reads a file, then fails to reproduce the exact
+`old_text` it just saw, spiralling into retry rounds that burn `max_tokens` on
+`<think>` blocks and return nothing. 8B (or larger) lands edits far more reliably.
 
 ### bartowski GGUF naming convention
 
@@ -76,7 +104,9 @@ Defined in `sigit/src/tools.rs` via `all_tools()`:
 
 ### Tool gating by model
 
-In TUI mode, `run_inference_task()` takes a `tools_enabled: bool` parameter. When the model's `ModelOption.tool_calling` is `false` (Qwen 2.5), an empty tool list is passed so the model doesn't receive tool schemas it can't use.
+In TUI mode, `run_inference_task()` takes a `tools_enabled: bool` parameter. When the picker item's `tool_calling` (from `models::is_tool_calling`) is `false`, an empty tool list is passed so the model doesn't receive tool schemas it can't use.
+
+In ACP mode, `handle_prompt` currently always passes the full tool set (`agent_tools_as_specs()`) regardless of the active model — there is no per-model gate on the ACP path.
 
 ---
 
@@ -108,6 +138,24 @@ In TUI mode, `run_inference_task()` takes a `tools_enabled: bool` parameter. Whe
 |--------|---------|
 | `send_message_with_tools(msg, &[ToolDefinition])` | Returns `ToolAwareResult` with possible tool calls |
 | `send_tool_results(Vec<ToolResult>, Option<&[ToolDefinition]>)` | Feed results back; `None` forces text response |
+
+#### Layer 2.5: the `InferenceBackend` abstraction (`src/backend.rs`)
+
+siGit doesn't call the engine directly from the agent loop — it goes through the
+`InferenceBackend` trait so on-device and cloud inference share one code path:
+
+| Item | Purpose |
+|------|---------|
+| `trait InferenceBackend` | `send_message_with_tools` / `send_tool_results` / `is_remote` |
+| `LocalBackend` | wraps `Arc<ChatEngine>` — on-device inference |
+| `OpenAiBackend` | OpenAI-compatible HTTP client — siGit Code Cloud tiers |
+| `ToolSpec` | backend-level tool definition (`name`, `description`, `parameters_schema`) |
+| `ToolCall` / `ToolResult` / `TurnResult` | backend-level request/result types |
+
+`handle_prompt` snapshots `self.backend.lock().await.clone()` once per turn so a
+mid-turn model/tier switch can't split the conversation across backends. When
+`backend.is_remote()` it skips the local model load + readiness wait. Cloud tiers
+(`fast`, `balanced`, `large`) come from `src/provider.rs` and are sign-in gated.
 
 #### Internal details
 
@@ -148,10 +196,11 @@ siGit parses this into path `/path/to/index.html` + lines 207–219.
 
 ## The Agentic Loop
 
-Both ACP mode (`SiGitAgent::prompt()`) and TUI mode (`run_inference_task()`) implement:
+Both ACP mode (`SiGitAgent::handle_prompt()`) and TUI mode (`run_inference_task()`)
+implement the same loop, driven through the active `InferenceBackend`:
 
 ```
-1. engine.send_message_with_tools(user_text, &tools) → ToolAwareResult
+1. backend.send_message_with_tools(user_text, &tools) → TurnResult
 2. while result.tool_calls is non-empty AND round < MAX_TOOL_ROUNDS (10):
    a. For each tool_call:
       - Log: → tool_name(arguments)
@@ -161,22 +210,29 @@ Both ACP mode (`SiGitAgent::prompt()`) and TUI mode (`run_inference_task()`) imp
    b. Decide next_tools:
       - round < MAX_TOOL_ROUNDS → Some(&tools)  (allow more calls)
       - else → None  (force text response)
-   c. engine.send_tool_results(results, next_tools) → ToolAwareResult
-3. Send final result.text to user
+   c. backend.send_tool_results(results, next_tools) → TurnResult
+3. Strip <think> blocks (chat::strip_think_blocks), send final text to user
    - Empty reply after tool rounds → log warning (ACP) or show error (TUI)
 ```
+
+In ACP mode the final text is sent as one `AgentMessageChunk`; the tool-calling
+loop is not streamed token-by-token.
 
 ---
 
 ## System Prompt
 
-The `SYSTEM_PROMPT` in `main.rs` (~122 lines) includes critical instructions:
+`main.rs` defines **two** prompts, picked by `system_prompt_for_model(tool_calling)`:
 
-- **Never tell the user to run commands** — use `run_command` tool instead
-- **Can access websites** — use `read_website` tool (overrides RLHF refusal training)
-- **Prefer absolute paths** in all tool arguments
-- **Git operations** — always use `run_command` with absolute cwd
-- **smbCloud domain knowledge** — auth boundaries, deploy flows, project structure
+- **`SYSTEM_PROMPT`** (~120 lines) — the full agentic prompt for tool-calling models:
+  - **Never tell the user to run commands** — use `run_command` tool instead
+  - **Can access websites** — use `read_website` tool (overrides RLHF refusal training)
+  - **Prefer absolute paths** in all tool arguments
+  - **Git operations** — always use `run_command` with absolute cwd
+  - **Always re-read a file before `edit_file`** — don't trust stale content
+  - **smbCloud domain knowledge** — auth boundaries, deploy flows, project structure
+- **`SIMPLE_SYSTEM_PROMPT`** — a short prompt for non-tool models; the full one
+  wastes context and confuses them.
 
 The session `cwd` is injected as a separate system message at session creation time (not part of the static prompt).
 
@@ -209,8 +265,8 @@ No changes needed in onde or mistral.rs — tool definitions are passed dynamica
 
 1. **`onde/src/inference/models.rs`** — add `pub const` for repo ID and GGUF filename, add to `SUPPORTED_MODELS` array and `SUPPORTED_MODEL_INFO`
 2. **`onde/src/inference/engine.rs`** — add `pub fn model_name() -> Self` constructor to `impl GgufModelConfig`
-3. **`sigit/src/chat.rs`** — add `ModelOption` entry to `SIGIT_MODELS` with `tool_calling: true/false`
-4. **`sigit/src/main.rs`** — update `run_interactive()` and `run_acp_server()` if changing the default
+3. **`sigit/src/models.rs`** — add a match arm to `model_id_to_config()` mapping the repo ID to the new constructor; if it supports tool calling, add the repo ID to `is_tool_calling()` (which also drives `max_tokens_for()`). The picker (`build_model_picker_items`) then surfaces it automatically.
+4. **`sigit/src/main.rs`** — only if you're changing the fallback default (`qwen25_3b()`)
 
 ---
 
@@ -266,19 +322,16 @@ could not read ResourceLink file:///path/to/index.html#L207:219: No such file or
 
 ## Cargo Dependency Note
 
-For local development, `sigit/Cargo.toml` must use the path dependency:
+`onde` is published on crates.io; `sigit/Cargo.toml` pins it:
 
 ```toml
-onde = { path = "../onde" }
+onde = "1.1.2"
 ```
 
-For CI/release, switch to the git dependency (after pushing Onde changes):
-
-```toml
-onde = { git = "https://github.com/ondeinference/onde", branch = "development" }
-```
-
-The `qwen3_8b()` constructor only exists in the local Onde SDK until it's pushed to the `development` branch.
+The Qwen 3 / Coder-7B constructors (`qwen3_8b()`, etc.) ship in that release. For
+local SDK development against an `onde` checkout, swap to a path dep
+(`onde = { path = "../onde" }`) — but the committed form must stay the crates.io
+version so CI/release builds resolve.
 
 ---
 
@@ -287,9 +340,12 @@ The `qwen3_8b()` constructor only exists in the local Onde SDK until it's pushed
 | File | What it does |
 |------|-------------|
 | `sigit/src/tools.rs` | 9 tool schemas (`all_tools()`), `execute_tool()` dispatch, all `exec_*` implementations |
-| `sigit/src/main.rs` | `SYSTEM_PROMPT`, `SiGitAgent` struct with `session_cwd`, ACP session handlers (cwd + push_history), `prompt()` with content block parsing, model selection (`qwen3_8b`), `MAX_TOOL_ROUNDS` |
-| `sigit/src/chat.rs` | `SIGIT_MODELS` array (4 models), `run_inference_task()` with `tools_enabled` gate, TUI tool loop |
-| `sigit/src/setup.rs` | HF cache setup pointing to shared App Group container |
+| `sigit/src/main.rs` | `SYSTEM_PROMPT`, `SiGitAgent` struct with `session_cwd` + `backend`, ACP handlers (cwd + push_history), `handle_prompt()` content-block parsing + tool loop, `MAX_TOOL_ROUNDS`, ACP builder wiring |
+| `sigit/src/backend.rs` | `InferenceBackend` trait, `LocalBackend`, `OpenAiBackend`, `ToolSpec`/`ToolCall`/`ToolResult`/`TurnResult` |
+| `sigit/src/models.rs` | `ModelPickerItem`, `model_id_to_config()`, `is_tool_calling()`, `max_tokens_for()`, `build_model_picker_items()` / `local_picker_items()` |
+| `sigit/src/provider.rs` | `CLOUD_TIERS`, `cloud_tier_provider()`, cloud endpoint config |
+| `sigit/src/chat.rs` | TUI app, model picker UI (uses `build_model_picker_items`), `run_inference_task()` with `tools_enabled` gate, TUI tool loop |
+| `sigit/src/setup.rs` | HF cache setup (shared App Group container), `startup_model_selection()` |
 | `onde/src/inference/types.rs` | `ToolDefinition`, `ToolCallRequest`, `ToolResult`, `ToolAwareResult` |
 | `onde/src/inference/engine.rs` | `send_message_with_tools()`, `send_tool_results()`, `attach_tools()`, `parse_tool_calls()`, `replay_history_with_tools()`, `GgufModelConfig::qwen3_8b()` |
 | `onde/src/inference/models.rs` | Model constants and `SUPPORTED_MODELS` array |
