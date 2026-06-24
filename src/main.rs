@@ -1603,6 +1603,17 @@ impl SiGitAgent {
 /// config option ID for the model picker in Zed's agent panel
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
+/// Replace non-ASCII chars so a downstream byte-index truncation can't split a
+/// multi-byte char. Zed slices the model-picker label at a fixed byte offset
+/// (`agent_ui/src/config_options.rs`) and panics — crashing the whole editor —
+/// when the cut lands mid-glyph (e.g. inside `☁` or `·`). Mapping to `-` keeps
+/// separators readable; ASCII bytes are always char boundaries.
+fn ascii_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii() { c } else { '-' })
+        .collect()
+}
+
 fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
     // The full list, including the siGit Code Cloud tiers, so the panel picker
     // mirrors the TUI `/models`. Cloud entries are sign-in gated at selection.
@@ -1618,21 +1629,33 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
             }
             desc_parts.push(item.description.clone());
             if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
-                desc_parts.push("↓ download on select".to_string());
+                desc_parts.push("download on select".to_string());
             }
-            let description = desc_parts.join(" - ");
+            // ASCII-only for the same reason as the name (see `ascii_safe`).
+            let description = ascii_safe(&desc_parts.join(" - "));
+            // Keep badges ASCII: Zed truncates the picker label at a fixed byte
+            // offset and panics if the cut splits a multi-byte char. See
+            // `ascii_safe` below.
             let source_badge = if item.cloud_tier.is_some() {
-                " [☁ siGit Code Cloud]"
+                " [siGit Code Cloud]"
             } else if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
-                " [↓ Onde]"
+                " [Onde]"
             } else {
                 match item.source_label.as_str() {
-                    "Onde" => " [◉ Onde]",
-                    "HuggingFace" => " [○ HuggingFace]",
+                    "Onde" => " [Onde]",
+                    "HuggingFace" => " [HuggingFace]",
                     _ => "",
                 }
             };
-            let name = format!("{}{}", item.display_name, source_badge);
+            // For cloud tiers use just the tier title (e.g. "Balanced") so the
+            // label reads "Balanced [siGit Code Cloud]" instead of repeating the
+            // brand. The display name can carry non-ASCII (the cloud tier label
+            // is "siGit Code Cloud · Balanced"), so sanitize the whole label.
+            let base_name = match &item.cloud_tier {
+                Some(tier) => crate::provider::tier_title(tier),
+                None => item.display_name.clone(),
+            };
+            let name = ascii_safe(&format!("{base_name}{source_badge}"));
             SessionConfigSelectOption::new(
                 SessionConfigValueId::new(item.config.model_id.as_str()),
                 name,
@@ -2415,5 +2438,37 @@ async fn main() -> anyhow::Result<()> {
         setup::setup_shared_model_cache();
         log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));
         run_acp_server().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_safe_replaces_multibyte_chars() {
+        // The exact label that crashed Zed: the cloud tier name plus the old
+        // "[☁ siGit Code Cloud]" badge. After sanitizing it must be pure ASCII so
+        // Zed's fixed byte-offset truncation can never split a glyph.
+        let crashing = "siGit Code Cloud · Balanced [☁ siGit Code Cloud]";
+        let safe = ascii_safe(crashing);
+        assert!(safe.is_ascii(), "sanitized label must be ASCII: {safe:?}");
+        assert_eq!(safe, "siGit Code Cloud - Balanced [- siGit Code Cloud]");
+    }
+
+    #[test]
+    fn ascii_safe_leaves_ascii_untouched() {
+        let plain = "Qwen 2.5 3B [Onde]";
+        assert_eq!(ascii_safe(plain), plain);
+    }
+
+    #[test]
+    fn ascii_safe_output_has_only_char_boundaries() {
+        // Every byte index in an ASCII string is a valid char boundary, so any
+        // downstream truncation is panic-free regardless of where it cuts.
+        let safe = ascii_safe("Onde · ◉ ↓ ☁ ○ test");
+        for i in 0..=safe.len() {
+            assert!(safe.is_char_boundary(i));
+        }
     }
 }
