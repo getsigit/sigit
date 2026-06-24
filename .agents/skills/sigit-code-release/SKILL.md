@@ -29,7 +29,8 @@ Use this skill when preparing a release for this repository.
 - Add or update the top changelog entry in `CHANGELOG.md` for the release being cut.
 - Do not treat `npm/sigit/package.json` `0.0.0-dev` as a bug by default. The npm release workflow rewrites it at publish time using `npm/scripts/render-main-package.cjs` and the release tag.
 - Do not add a hardcoded version to `pypi/pyproject.toml` for normal releases. PyPI uses `maturin` with `dynamic = ["version"]` and derives the published package version from `Cargo.toml`.
-- Release workflows are tag-driven. `release-github.yml`, `release-npm.yml`, and `release-pypi.yml` all derive `RELEASE_VERSION` from a `v*.*.*` tag or a manually supplied tag input.
+- Release workflows are tag-driven. `release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, and `release-homebrew.yml` all derive `RELEASE_VERSION` from a `v*.*.*` tag or a manually supplied tag input.
+- The crate is published to crates.io (`release-crates.yml`) and the Homebrew tap is updated (`release-homebrew.yml`) as part of the tag-driven flow. Per the siGit release flow, Homebrew is auto-triggered — do not dispatch it manually.
 
 ## Typical files to inspect
 
@@ -41,7 +42,7 @@ Use this skill when preparing a release for this repository.
 - `npm/scripts/render-main-package.cjs`
 - `npm/`
 - `pypi/`
-- `.github/workflows/`
+- `.github/workflows/` (`release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, `release-homebrew.yml`)
 
 ## Release checklist
 

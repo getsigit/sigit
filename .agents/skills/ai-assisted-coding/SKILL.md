@@ -11,7 +11,7 @@ Building a local AI coding agent in Rust using Onde Inference as the LLM backend
 Onde wraps mistral.rs with a clean API for model loading, history management, and
 streaming inference across macOS (Metal), iOS, Android, Linux, and Windows.
 
-Crate:  `onde = { path = "../onde" }` or from crates.io when published
+Crate:  `onde = "1.1.2"` (published on crates.io; siGit pins it in `Cargo.toml`)
 Repo:   https://github.com/ondeinference/onde
 Docs:   https://ondeinference.com
 
@@ -165,15 +165,26 @@ GgufModelConfig::qwen25_1_5b()         // force 1.5B
 GgufModelConfig::qwen25_3b()           // force 3B
 GgufModelConfig::qwen25_coder_1_5b()   // coder variant 1.5B
 GgufModelConfig::qwen25_coder_3b()     // coder variant 3B
+GgufModelConfig::qwen25_coder_7b()     // coder variant 7B (tool calling)
+GgufModelConfig::qwen3_1_7b()          // Qwen 3 1.7B (tool calling)
+GgufModelConfig::qwen3_4b()            // Qwen 3 4B (tool calling)
+GgufModelConfig::qwen3_8b()            // Qwen 3 8B (tool calling)
+GgufModelConfig::qwen3_14b()           // Qwen 3 14B (tool calling)
 ```
+
+Only the Qwen 3 family and Qwen 2.5 Coder 7B support tool calling — see the
+`tool-calling` skill. The on-device default is the saved selection, falling back
+to `platform_default()` (Qwen 2.5 3B on macOS).
 
 ---
 
 ## Adding onde as a Rust library dependency
 
 ```toml
-# In your crate's Cargo.toml — onde is a path dep since it's not on crates.io yet
-onde = { path = "../onde" }
+# In your crate's Cargo.toml — onde is published on crates.io
+onde = "1.1.2"
+# For local SDK development against a checkout, swap to a path dep:
+# onde = { path = "../onde" }
 ```
 
 **Important:** `onde` declares `crate-type = ["lib", "cdylib", "staticlib"]`.
@@ -262,20 +273,19 @@ Key principles:
 ### Streaming tokens to ACP (connecting onde → ACP)
 
 ```rust
-// In Agent::prompt():
+// In the prompt handler — cx: &ConnectionTo<Client> is passed in by the builder
+// (agent-client-protocol 0.13). No mpsc forwarder; send through cx directly.
 let mut rx = self.engine.stream_message(user_text).await
     .map_err(|e| Error::new(-32603, e.to_string()))?;
 
 while let Some(chunk) = rx.recv().await {
     if !chunk.delta.is_empty() {
-        self.notification_tx.send(
-            SessionNotification::new(
-                session_id.clone(),
-                SessionUpdate::AgentMessageChunk(
-                    ContentChunk::new(ContentBlock::from(chunk.delta)),
-                ),
-            )
-        ).await.ok();  // .ok() — ignore if forwarder is gone
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::from(chunk.delta)),
+            ),
+        )).ok();  // .ok() — ignore if the client is gone
     }
     if chunk.done { break; }
 }
@@ -285,7 +295,13 @@ Ok(PromptResponse::new(StopReason::EndTurn))
 
 The `PromptResponse` is returned AFTER the stream finishes. The client receives
 streaming tokens via `session/update` notifications while blocking on the
-`session/prompt` response.
+`session/prompt` response. See the `agent-client-protocol` skill for the `cx`
+(`ConnectionTo<Client>`) model that replaced the old mpsc-channel forwarder.
+
+> **Note:** siGit's actual `handle_prompt` does *not* stream token-by-token — it
+> runs a tool-calling loop through an `InferenceBackend` and sends the final text
+> in one `AgentMessageChunk`. The streaming pattern above still applies if you
+> want incremental output. See the `tool-calling` skill for the backend loop.
 
 ---
 
@@ -305,13 +321,18 @@ let user_text: String = args.prompt.iter()
     .join("\n");
 ```
 
-For future resource context (e.g. open files provided by Zed):
+For resource context (e.g. open files provided by Zed) — note the variant is
+`TextResourceContents`, not `Text`:
 ```rust
 ContentBlock::Resource(r) => match &r.resource {
-    EmbeddedResourceResource::Text(t) => Some(t.text.as_str()),
+    EmbeddedResourceResource::TextResourceContents(t) => Some(t.text.as_str()),
+    EmbeddedResourceResource::BlobResourceContents(_) => None,
     _ => None,
 },
 ```
+siGit also handles `ContentBlock::ResourceLink` (a `file://` reference it reads
+from disk, including `#L<start>:<end>` line-range fragments). See the
+`tool-calling` skill.
 
 ---
 
@@ -321,8 +342,11 @@ ContentBlock::Resource(r) => match &r.resource {
 - Safe to wrap in `Arc<ChatEngine>` and share across tasks.
 - `stream_message()` spawns a `tokio::spawn` background task internally — the
   mistralrs model must be `Send`, which it is on all supported platforms.
-- Calling `stream_message()` from a `!Send` future (e.g. inside a `LocalSet`) is
-  fine — the future itself doesn't hold a `!Send` value across `.await`.
+- **`block_in_place` trap:** `load_gguf_model` calls `tokio::task::block_in_place`
+  internally, which panics unless it's on a multi-threaded runtime worker. Run
+  model loads on a dedicated `std::thread` with its own `tokio::runtime::Runtime`
+  and signal back via `AtomicBool`/`oneshot`. siGit does exactly this in both ACP
+  and TUI modes — see the `agent-client-protocol` and `tool-calling` skills.
 
 ---
 
