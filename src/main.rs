@@ -46,16 +46,15 @@ use onde::inference::SamplingConfig;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ConfigOptionUpdate,
-    UnstructuredCommandInput,
-    CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, ProtocolVersion, SessionCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
     SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -308,8 +307,7 @@ impl SiGitAgent {
     ) -> Self {
         let startup_model_name = initial_model.display_name.clone();
         let startup_model_id = initial_model.model_id.clone();
-        let backend: Arc<dyn InferenceBackend> =
-            Arc::new(LocalBackend::new(Arc::clone(&engine)));
+        let backend: Arc<dyn InferenceBackend> = Arc::new(LocalBackend::new(Arc::clone(&engine)));
         Self {
             engine,
             backend: tokio::sync::Mutex::new(backend),
@@ -590,10 +588,11 @@ impl SiGitAgent {
         };
         let commands = vec![
             AvailableCommand::new("help", "Show available commands"),
-            AvailableCommand::new("models", "List available models")
-                .input(AvailableCommandInput::Unstructured(
-                    UnstructuredCommandInput::new("model number to switch to (optional)"),
+            AvailableCommand::new("models", "List available models").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "model number to switch to (optional)",
                 )),
+            ),
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
             AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
             AvailableCommand::new("whoami", "Show the signed-in account"),
@@ -1276,8 +1275,12 @@ impl SiGitAgent {
         .ok();
         self.advertise_commands(cx, session_id.clone());
 
-        self.send_assistant_message(cx, session_id, format!("Reloaded. {signed_in} {backend_note}"))
-            .ok();
+        self.send_assistant_message(
+            cx,
+            session_id,
+            format!("Reloaded. {signed_in} {backend_note}"),
+        )
+        .ok();
     }
 
     async fn handle_set_session_config_option(
