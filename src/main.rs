@@ -1333,7 +1333,10 @@ impl SiGitAgent {
                 Some(display_name) => format!("Switched to {display_name}."),
                 None => CLOUD_LOGIN_PROMPT.to_string(),
             };
-            self.send_assistant_message(cx, args.session_id.clone(), message)
+            // Start on a fresh line: ACP clients concatenate consecutive
+            // agent-message chunks into one block, so without this the switch
+            // confirmation runs onto the end of the previous assistant message.
+            self.send_assistant_message(cx, args.session_id.clone(), format!("\n\n{message}"))
                 .ok();
 
             let current = self.current_model.lock().unwrap().clone();
