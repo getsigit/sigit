@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* **Qwen3-14B on-device inference** (#5): selecting Qwen3-14B and prompting it failed with
+  `Inference failed: inference error: Invalid sampling probability at index 0: NaN. The model
+  likely produced NaN/Inf logits.` This is a half-precision (F16) overflow in the `onde`
+  inference engine on GPUs without bfloat16 support (notably Intel Macs); the 14B model's
+  attention scores exceed F16's range and become `NaN`. Fixed in the engine by preferring F32
+  over the F16 fallback (see `onde/patches/`), surfaced here once the `onde` dependency is
+  bumped. siGit also now shows an actionable hint instead of the raw engine error.
+
 ## 1.2.1
 
 Stabilizes the Zed/ACP integration and finishes the cloud-tier wiring on top of 1.2.0.
