@@ -163,7 +163,6 @@ mod tui {
         messages: Vec<ChatMessage>,
         input: String,
         cursor: usize,
-        scroll_offset: u16,
         stream_rx: Option<mpsc::Receiver<StreamChunk>>,
         stream_buf: String,
         inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
@@ -259,7 +258,6 @@ mod tui {
                 messages: Vec::new(),
                 input: String::new(),
                 cursor: 0,
-                scroll_offset: 0,
                 stream_rx: None,
                 stream_buf: String::new(),
                 inference_rx: None,
@@ -433,57 +431,6 @@ mod tui {
             }
             self.model_picker_index = (self.model_picker_index + 1) % self.model_picker_items.len();
         }
-
-        /// rough line count for scroll math
-        fn total_message_lines(&self, width: u16) -> u16 {
-            if width == 0 {
-                return 0;
-            }
-            let w = width.saturating_sub(2) as usize;
-            let mut lines: u16 = 0;
-            for msg in &self.messages {
-                lines += wrapped_line_count(&msg.text, msg.role, w);
-            }
-            if !self.stream_buf.is_empty() {
-                lines += wrapped_line_count(&self.stream_buf, Role::Assistant, w);
-            }
-            if self.thinking || self.switching_model {
-                lines += 1;
-            }
-            lines
-        }
-
-        fn auto_scroll(&mut self, visible_height: u16, width: u16) {
-            let total = self.total_message_lines(width);
-            if total > visible_height {
-                self.scroll_offset = total - visible_height;
-            } else {
-                self.scroll_offset = 0;
-            }
-        }
-    }
-
-    fn wrapped_line_count(text: &str, role: Role, width: usize) -> u16 {
-        let prefix_len = match role {
-            Role::User => 6,      // "you > "
-            Role::Assistant => 8, // "siGit > "
-            Role::System | Role::Banner => 0,
-        };
-        let effective = if width > prefix_len {
-            width - prefix_len
-        } else {
-            1
-        };
-
-        let mut count: u16 = 0;
-        for line in text.split('\n') {
-            if line.is_empty() {
-                count += 1;
-            } else {
-                count += ((line.len() as f64) / (effective as f64)).ceil() as u16;
-            }
-        }
-        count.max(1)
     }
 
     // ── Model picker ─────────────────────────────────────────────────────────
@@ -832,11 +779,9 @@ mod tui {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn render_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    fn render_messages(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let inner_width = area.width.saturating_sub(2);
         let inner_height = area.height.saturating_sub(2);
-
-        app.auto_scroll(inner_height, area.width);
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -914,19 +859,17 @@ mod tui {
             }
         }
 
-        let total_lines = lines.len() as u16;
-        let scroll = if total_lines > inner_height {
-            app.scroll_offset.min(total_lines - inner_height)
-        } else {
-            0
-        };
+        // Always pin to the bottom so the latest message stays visible. There is
+        // no scrollback, so we just need the exact number of wrapped rows the
+        // paragraph occupies at this width — `line_count` runs the same
+        // WordWrapper as rendering, so it never diverges from what's drawn (an
+        // estimate would, e.g. by forgetting the `<think>` box lines, and scroll
+        // too little — the bug this fixes).
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let total_lines = paragraph.line_count(inner_width) as u16;
+        let scroll = total_lines.saturating_sub(inner_height);
 
-        frame.render_widget(
-            Paragraph::new(lines)
-                .scroll((scroll, 0))
-                .wrap(Wrap { trim: false }),
-            inner,
-        );
+        frame.render_widget(paragraph.scroll((scroll, 0)), inner);
     }
 
     fn render_chat_message(lines: &mut Vec<Line<'static>>, msg: &ChatMessage, _width: usize) {
@@ -1192,7 +1135,6 @@ mod tui {
             SlashCommand::Clear => {
                 let cleared = engine.clear_history().await;
                 app.messages.clear();
-                app.scroll_offset = 0;
                 app.messages.push(ChatMessage::system(format!(
                     "Cleared {cleared} turn(s). History is empty.",
                 )));

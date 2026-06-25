@@ -30,7 +30,10 @@ tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 
 # TUI (interactive chat mode)
-ratatui = "0.29"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which we use to
+# pin the message view to the bottom using the exact wrapped-row count (the same
+# WordWrapper that rendering uses) rather than a hand-rolled estimate.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Utilities
