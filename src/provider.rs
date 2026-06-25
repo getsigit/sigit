@@ -79,7 +79,7 @@ pub struct ProviderConfig {
 }
 
 /// Title-case a tier name for display (`balanced` → `Balanced`).
-fn tier_title(tier: &str) -> String {
+pub fn tier_title(tier: &str) -> String {
     let tier = tier.trim();
     let mut chars = tier.chars();
     match chars.next() {
