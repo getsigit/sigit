@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1
+
+Stabilizes the Zed/ACP integration and finishes the cloud-tier wiring on top of 1.2.0.
+
+### What changed
+
+- Fixed a Zed crash by keeping model-picker labels ASCII in the ACP model selector
+- Wired ACP auth, cloud tiers, and slash commands into the Zed panel, including a `/reload` command to re-sync session state in place
+- Fixed the TUI so the loaded-model checkmark appears once a download completes
+- Synced bundled agent skills with the current code and added `CLAUDE.md`
+
 ## 1.2.0
 
 Adds siGit Code Cloud — a hosted inference tier alongside on-device models.
