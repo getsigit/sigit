@@ -10,6 +10,8 @@
 
 siGit Code is a local coding agent. It runs on your machine, not someone else's. No API keys, no cloud round-trips, no subscription.
 
+Its home is [code.sigit.si](https://code.sigit.si). You can run it yourself, as below, or use the hosted version (siGit Code Cloud) there if you would rather not run a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
+
 It works in any codebase. In smbCloud repos it is more useful out of the box because it already understands the Rust workspace layout, deploy flows, auth boundaries, and GresIQ.
 
 You can use it in two ways:
@@ -22,17 +24,6 @@ You can use it in two ways:
 | macOS | ✓ | ✓ |
 | Linux | ✓ | ✓ |
 | Windows | ✓ | not yet |
-
-## smbCloud context
-
-In an smbCloud repo, siGit Code already knows a few important things:
-
-- platform-user flows and tenant-app auth flows are different systems
-- `Project` is the umbrella workspace, while `FrontendApp`, `AuthApp`, and GresIQ are separate deployable units
-- Next.js SSR deploys are not the same thing as the generic git-push path
-- existing crate boundaries and workspace patterns are usually the right place to start
-
-In other repos it stays general and does not pretend everything is about smbCloud.
 
 ## Install
 
@@ -70,7 +61,27 @@ Add this to `~/.config/zed/settings.json`:
 
 Use the full absolute path. `~` does not expand here.
 
-## VS Code with ACP Client
+## VS Code
+
+### With siGit Code Extension
+
+Install from the [Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=getsigit.sigit-code).
+
+```jsonc
+{
+  "sigit.agents": {
+    "sigit": {
+      "name": "siGit (on-device)",
+      "command": "sigit",
+      "args": [],
+      "env": {}
+    },
+  },
+  "sigit.agent.default": "sigit"
+}
+```
+
+### With ACP Client
 
 Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client), then add:
 
@@ -106,4 +117,4 @@ Terminal mode currently needs Unix terminal behavior, so it works on macOS and L
 
 ## Copyright
 
-© 2026 [smbCloud](https://smbcloud.xyz/) (Splitfire AB).
+© 2026 [smbCloud Platform](https://smbcloud.xyz/) (Splitfire AB).
