@@ -75,7 +75,7 @@ mod tui {
     use anyhow::Result;
     use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use futures::StreamExt;
-    use onde::inference::{ChatEngine, SamplingConfig, StreamChunk};
+    use onde::inference::{ChatEngine, SamplingConfig};
 
     use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
     use crate::models::{ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items};
@@ -148,6 +148,11 @@ mod tui {
     enum InferenceUpdate {
         /// show tool name in chat while it runs
         ToolUse(String),
+        /// a streamed token fragment of the assistant's reply
+        Delta(String),
+        /// the streamed reply is complete; commit the accumulated buffer
+        StreamEnd,
+        /// a complete (non-streamed) assistant reply
         Response(String),
         Error(String),
     }
@@ -164,7 +169,8 @@ mod tui {
         input: String,
         cursor: usize,
         scroll_offset: u16,
-        stream_rx: Option<mpsc::Receiver<StreamChunk>>,
+        /// true while assistant tokens are streaming into `stream_buf`
+        streaming: bool,
         stream_buf: String,
         inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
         model_load_rx: Option<mpsc::Receiver<ModelLoadUpdate>>,
@@ -260,7 +266,7 @@ mod tui {
                 input: String::new(),
                 cursor: 0,
                 scroll_offset: 0,
-                stream_rx: None,
+                streaming: false,
                 stream_buf: String::new(),
                 inference_rx: None,
                 model_load_rx: None,
@@ -298,11 +304,11 @@ mod tui {
         }
 
         fn is_streaming(&self) -> bool {
-            self.stream_rx.is_some()
+            self.streaming
         }
 
         fn finalize_stream(&mut self) {
-            self.stream_rx = None;
+            self.streaming = false;
             if !self.stream_buf.is_empty() {
                 let text = std::mem::take(&mut self.stream_buf);
                 self.messages.push(ChatMessage::assistant(text));
@@ -311,9 +317,21 @@ mod tui {
         }
 
         fn push_stream_delta(&mut self, delta: &str) {
+            self.streaming = true;
             self.stream_buf.push_str(delta);
+            // Hide reasoning the way the rest of the app does: keep the "thinking"
+            // spinner until visible (non-<think>) text appears, then show the
+            // live reply. Don't call stop_thinking() — that drops the channel.
+            let (_think, visible) = super::strip_think_blocks(&self.stream_buf);
+            self.thinking = visible.trim().is_empty();
             self.blink_counter = self.blink_counter.wrapping_add(1);
             self.blink_on = self.blink_counter % 4 < 2;
+        }
+
+        /// The portion of the streaming buffer to show live, with reasoning hidden.
+        fn visible_stream(&self) -> String {
+            let (_think, visible) = super::strip_think_blocks(&self.stream_buf);
+            visible
         }
 
         fn start_thinking(&mut self) {
@@ -444,8 +462,9 @@ mod tui {
             for msg in &self.messages {
                 lines += wrapped_line_count(&msg.text, msg.role, w);
             }
-            if !self.stream_buf.is_empty() {
-                lines += wrapped_line_count(&self.stream_buf, Role::Assistant, w);
+            let visible = self.visible_stream();
+            if !visible.is_empty() {
+                lines += wrapped_line_count(&visible, Role::Assistant, w);
             }
             if self.thinking || self.switching_model {
                 lines += 1;
@@ -851,10 +870,11 @@ mod tui {
             render_chat_message(&mut lines, msg, inner_width as usize);
         }
 
-        if !app.stream_buf.is_empty() {
+        let streamed_visible = app.visible_stream();
+        if !streamed_visible.is_empty() {
             let fake = ChatMessage {
                 role: Role::Assistant,
-                text: app.stream_buf.clone(),
+                text: streamed_visible,
                 think_block: None,
             };
             render_chat_message(&mut lines, &fake, inner_width as usize);
@@ -1387,7 +1407,36 @@ mod tui {
             vec![]
         };
 
-        let mut result = match backend.send_message_with_tools(&text, &tools).await {
+        // Bridge the backend's token sink (plain strings) onto the UI update
+        // channel as `Delta` messages. The forwarder lives for the whole turn.
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+        let forward_tx = tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(piece) = delta_rx.recv().await {
+                if forward_tx
+                    .send(InferenceUpdate::Delta(piece))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // The first round offers tools, so on-device inference can't stream it
+        // (it must buffer to detect tool calls). With tools disabled there are
+        // none to offer, so it streams directly.
+        let first_sink = if tools.is_empty() {
+            Some(&delta_tx)
+        } else {
+            None
+        };
+        let mut streamed = first_sink.is_some();
+
+        let mut result = match backend
+            .send_message_with_tools(&text, &tools, first_sink)
+            .await
+        {
             Ok(r) => r,
             Err(err) => {
                 let _ = tx.send(InferenceUpdate::Error(err)).await;
@@ -1398,6 +1447,8 @@ mod tui {
         let mut round = 0;
 
         while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+            // any tool call means the first round didn't produce a final answer
+            streamed = false;
             round += 1;
             log::info!("tool round {} — {} call(s)", round, result.tool_calls.len());
 
@@ -1421,14 +1472,24 @@ mod tui {
                 });
             }
 
-            // on the last round, pass no tools so the model must produce text
+            // on the last round, pass no tools so the model must produce text —
+            // that's also the round we can stream on-device.
             let next_tools = if round < MAX_TOOL_ROUNDS {
                 Some(tools.as_slice())
             } else {
                 None
             };
+            let sink = if next_tools.is_none() {
+                streamed = true;
+                Some(&delta_tx)
+            } else {
+                None
+            };
 
-            match backend.send_tool_results(tool_results, next_tools).await {
+            match backend
+                .send_tool_results(tool_results, next_tools, sink)
+                .await
+            {
                 Ok(r) => result = r,
                 Err(err) => {
                     let _ = tx.send(InferenceUpdate::Error(err)).await;
@@ -1436,6 +1497,11 @@ mod tui {
                 }
             }
         }
+
+        // Drop the sink so the forwarder finishes draining any buffered tokens
+        // before we commit the reply.
+        drop(delta_tx);
+        let _ = forwarder.await;
 
         if result.tool_calls.is_empty() {
             if result.text.is_empty() {
@@ -1449,6 +1515,9 @@ mod tui {
                             .to_string(),
                     ))
                     .await;
+            } else if streamed {
+                // tokens already went out as deltas; just commit the buffer
+                let _ = tx.send(InferenceUpdate::StreamEnd).await;
             } else {
                 let _ = tx.send(InferenceUpdate::Response(result.text)).await;
             }
@@ -1588,29 +1657,6 @@ mod tui {
                     app.tick();
                 }
 
-                // ── Streaming LLM tokens ──────────────────────────────────────
-                chunk = async {
-                    match app.stream_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => pending().await,
-                    }
-                } => {
-                    match chunk {
-                        Some(chunk) => {
-                            if !chunk.delta.is_empty() {
-                                app.push_stream_delta(&chunk.delta);
-                            }
-                            if chunk.done {
-                                app.finalize_stream();
-                            }
-                        }
-                        // sender dropped without done=true
-                        None => {
-                            app.finalize_stream();
-                        }
-                    }
-                }
-
                 // ── inference updates from background task ───────────────────
                 update = async {
                     match app.inference_rx.as_mut() {
@@ -1622,16 +1668,24 @@ mod tui {
                         Some(InferenceUpdate::ToolUse(name)) => {
                             app.messages.push(ChatMessage::system(format!("🔧 {name}")));
                         }
+                        Some(InferenceUpdate::Delta(delta)) => {
+                            app.push_stream_delta(&delta);
+                        }
+                        Some(InferenceUpdate::StreamEnd) => {
+                            app.finalize_stream();
+                        }
                         Some(InferenceUpdate::Response(text)) => {
                             app.stop_thinking();
                             app.messages.push(ChatMessage::assistant(text));
                         }
                         Some(InferenceUpdate::Error(msg)) => {
+                            app.finalize_stream();
                             app.stop_thinking();
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
                         None => {
                             // task finished, possibly with no text to show
+                            app.finalize_stream();
                             app.stop_thinking();
                         }
                     }

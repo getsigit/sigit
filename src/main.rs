@@ -61,6 +61,7 @@ use onde::inference::{ChatEngine, GgufModelConfig};
 
 use crate::backend::{
     InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult, ToolSpec,
+    TurnResult,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -566,6 +567,72 @@ impl SiGitAgent {
             session_id,
             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
         ))
+    }
+
+    /// Run one inference turn (`fut`) while concurrently forwarding any streamed
+    /// tokens to the editor. The sink receiver is drained as the future runs, so
+    /// chunks reach the client live rather than all at once when it resolves.
+    ///
+    /// `assembled`/`sent`/`streamed_any` persist across the turns of a single
+    /// prompt so reasoning is stripped consistently and we never re-send text.
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_turn<F>(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        fut: F,
+        sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        assembled: &mut String,
+        sent: &mut String,
+        streamed_any: &mut bool,
+    ) -> Result<TurnResult, backend::BackendError>
+    where
+        F: std::future::Future<Output = Result<TurnResult, backend::BackendError>>,
+    {
+        tokio::pin!(fut);
+        let result = loop {
+            tokio::select! {
+                done = &mut fut => break done,
+                Some(piece) = sink_rx.recv() => {
+                    self.emit_visible_chunk(cx, session_id, &piece, assembled, sent, streamed_any);
+                }
+            }
+        };
+        // Flush tokens that landed between the last poll and the future resolving.
+        while let Ok(piece) = sink_rx.try_recv() {
+            self.emit_visible_chunk(cx, session_id, &piece, assembled, sent, streamed_any);
+        }
+        result
+    }
+
+    /// Append a streamed fragment, strip `<think>` reasoning from the running
+    /// text, and send only the newly revealed visible suffix as a chunk. Tracking
+    /// the assembled text (not just deltas) keeps think-block stripping correct
+    /// even when a tag spans chunk boundaries.
+    fn emit_visible_chunk(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        piece: &str,
+        assembled: &mut String,
+        sent: &mut String,
+        streamed_any: &mut bool,
+    ) {
+        assembled.push_str(piece);
+        let (_think, visible) = chat::strip_think_blocks(assembled);
+        match visible.strip_prefix(sent.as_str()) {
+            Some(extra) if !extra.is_empty() => {
+                let extra = extra.to_string();
+                *sent = visible;
+                *streamed_any = true;
+                self.send_assistant_message(cx, session_id.clone(), extra)
+                    .ok();
+            }
+            // No new visible text, or the visible prefix changed retroactively
+            // (rare, e.g. a late-closing think tag): just resync without
+            // resending what's already on the wire.
+            _ => *sent = visible,
+        }
     }
 
     fn send_tool_call_update(
@@ -1076,8 +1143,26 @@ impl SiGitAgent {
 
         let tools = agent_tools_as_specs();
 
-        let mut result = backend
-            .send_message_with_tools(&user_text, &tools)
+        // Token sink: backends stream assistant text through this while a turn
+        // runs. We forward the visible portion to the editor as agent-message
+        // chunks live (see `drain_turn` / `emit_visible_chunk`). The sink stays
+        // alive for the whole prompt so `recv()` only ends when a turn future
+        // resolves, never because every sender was dropped.
+        let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut assembled = String::new();
+        let mut sent = String::new();
+        let mut streamed_any = false;
+
+        let mut result = self
+            .drain_turn(
+                cx,
+                &session_id,
+                backend.send_message_with_tools(&user_text, &tools, Some(&sink)),
+                &mut sink_rx,
+                &mut assembled,
+                &mut sent,
+                &mut streamed_any,
+            )
             .await
             .map_err(|error| {
                 log::error!("send_message_with_tools failed: {error}");
@@ -1120,39 +1205,51 @@ impl SiGitAgent {
                 None // last round: force text
             };
 
-            result = backend
-                .send_tool_results(tool_results, next_tools)
+            result = self
+                .drain_turn(
+                    cx,
+                    &session_id,
+                    backend.send_tool_results(tool_results, next_tools, Some(&sink)),
+                    &mut sink_rx,
+                    &mut assembled,
+                    &mut sent,
+                    &mut streamed_any,
+                )
                 .await
                 .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
         }
 
-        // ── Send the final text response ─────────────────────────────────
-        let reply_text = result.text.trim().to_string();
-
-        let final_text = if reply_text.is_empty() {
-            if round > 0 {
-                log::warn!(
-                    "prompt({}) — model returned empty reply after {} tool round(s)",
-                    session_id,
-                    round
-                );
-                "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
+        // ── Final text response ───────────────────────────────────────────
+        // If anything streamed, the visible reply is already on the wire; only
+        // send a trailing block for the non-streamed path (e.g. on-device direct
+        // answers, which onde can't stream while tools are on offer).
+        if !streamed_any {
+            let reply_text = result.text.trim().to_string();
+            let final_text = if reply_text.is_empty() {
+                if round > 0 {
+                    log::warn!(
+                        "prompt({}) — model returned empty reply after {} tool round(s)",
+                        session_id,
+                        round
+                    );
+                    "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
+                } else {
+                    log::warn!(
+                        "prompt({}) — model returned empty reply (no tool rounds)",
+                        session_id
+                    );
+                    String::new()
+                }
             } else {
-                log::warn!(
-                    "prompt({}) — model returned empty reply (no tool rounds)",
-                    session_id
-                );
-                String::new()
-            }
-        } else {
-            // strip <think> blocks so reasoning tokens stay hidden
-            let (_think, visible) = chat::strip_think_blocks(&reply_text);
-            visible
-        };
+                // strip <think> blocks so reasoning tokens stay hidden
+                let (_think, visible) = chat::strip_think_blocks(&reply_text);
+                visible
+            };
 
-        if !final_text.is_empty() {
-            self.send_assistant_message(cx, session_id.clone(), final_text)
-                .ok();
+            if !final_text.is_empty() {
+                self.send_assistant_message(cx, session_id.clone(), final_text)
+                    .ok();
+            }
         }
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
