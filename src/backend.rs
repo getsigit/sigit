@@ -62,24 +62,40 @@ pub struct TurnResult {
 /// Backend errors are plain strings. Callers map them to ACP errors.
 pub type BackendError = String;
 
+/// A sink for streaming assistant text deltas to the UI as they are produced.
+///
+/// When a caller passes `Some(sink)`, a streaming-capable backend forwards each
+/// text fragment through it as the model emits it; the returned [`TurnResult`]
+/// still carries the fully assembled text (and any tool calls). When the sink is
+/// `None`, the backend runs in non-streaming mode. Unbounded so the inference
+/// task never blocks on a slow consumer.
+pub type TokenSink = tokio::sync::mpsc::UnboundedSender<String>;
+
 // ── The trait ───────────────────────────────────────────────────────────────────
 
 /// A swappable inference backend driving siGit Code's agent loop.
 #[async_trait]
 pub trait InferenceBackend: Send + Sync {
     /// Start an assistant turn from a new user message, offering `tools`.
+    ///
+    /// If `sink` is `Some`, text is streamed through it as it is generated. A
+    /// backend may decline to stream a given round (for example, on-device
+    /// inference cannot stream while it is still deciding whether to call a
+    /// tool); in that case the text is delivered only via the returned result.
     async fn send_message_with_tools(
         &self,
         text: &str,
         tools: &[ToolSpec],
+        sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError>;
 
     /// Continue the turn by returning tool results. `tools` may be `None` on the
-    /// final round to force a text answer.
+    /// final round to force a text answer. `sink` streams that text when set.
     async fn send_tool_results(
         &self,
         results: Vec<ToolResult>,
         tools: Option<&[ToolSpec]>,
+        sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError>;
 
     /// Whether inference runs over the network (a configured provider) rather
@@ -118,7 +134,22 @@ impl InferenceBackend for LocalBackend {
         &self,
         text: &str,
         tools: &[ToolSpec],
+        sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        // onde's tool-aware path is non-streaming: it has to buffer the whole
+        // reply to detect tool calls. We can only stream when no tools are on
+        // offer (a plain answer), which is exactly the tools-disabled case.
+        if let Some(sink) = sink
+            && tools.is_empty()
+        {
+            let rx = self
+                .engine
+                .stream_message(text)
+                .await
+                .map_err(|error| error.to_string())?;
+            return drain_onde_stream(rx, sink).await;
+        }
+
         let onde_tools = to_onde_tools(tools);
         let result = self
             .engine
@@ -132,6 +163,7 @@ impl InferenceBackend for LocalBackend {
         &self,
         results: Vec<ToolResult>,
         tools: Option<&[ToolSpec]>,
+        sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
         let onde_results: Vec<onde::inference::ToolResult> = results
             .into_iter()
@@ -140,6 +172,20 @@ impl InferenceBackend for LocalBackend {
                 content: result.content,
             })
             .collect();
+
+        // The final round passes `tools = None` to force a text answer; that's
+        // the only round onde can stream, since no further tool calls are parsed.
+        if let Some(sink) = sink
+            && tools.is_none()
+        {
+            let rx = self
+                .engine
+                .stream_tool_results(onde_results, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            return drain_onde_stream(rx, sink).await;
+        }
+
         let onde_tools = tools.map(to_onde_tools);
         let result = self
             .engine
@@ -152,6 +198,38 @@ impl InferenceBackend for LocalBackend {
     fn is_remote(&self) -> bool {
         false
     }
+}
+
+/// Drain an onde streaming receiver, forwarding each token to `sink` and
+/// assembling the full text. onde reports stream failures as a final chunk whose
+/// `finish_reason` is `"error: …"`; surface those as a backend error.
+async fn drain_onde_stream(
+    mut rx: tokio::sync::mpsc::Receiver<onde::inference::StreamChunk>,
+    sink: &TokenSink,
+) -> Result<TurnResult, BackendError> {
+    let mut text = String::new();
+    while let Some(chunk) = rx.recv().await {
+        if !chunk.delta.is_empty() {
+            text.push_str(&chunk.delta);
+            // The receiver is the UI; if it's gone the turn is being cancelled,
+            // so stop assembling rather than spinning the model to completion.
+            if sink.send(chunk.delta).is_err() {
+                break;
+            }
+        }
+        if chunk.done {
+            if let Some(reason) = chunk.finish_reason
+                && let Some(message) = reason.strip_prefix("error: ")
+            {
+                return Err(message.to_string());
+            }
+            break;
+        }
+    }
+    Ok(TurnResult {
+        text,
+        tool_calls: Vec::new(),
+    })
 }
 
 /// Convert an `onde` tool-aware result into the neutral [`TurnResult`].
@@ -230,14 +308,20 @@ impl OpenAiBackend {
     }
 
     /// POST the current history (plus `tools`) and apply the assistant reply to
-    /// history, returning the neutral turn result.
-    async fn complete(&self, tools: Option<&[ToolSpec]>) -> Result<TurnResult, BackendError> {
+    /// history, returning the neutral turn result. Streams via SSE when `sink`
+    /// is set; otherwise reads a single JSON response.
+    async fn complete(
+        &self,
+        tools: Option<&[ToolSpec]>,
+        sink: Option<&TokenSink>,
+    ) -> Result<TurnResult, BackendError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let streaming = sink.is_some();
 
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": *self.history.lock().await,
-            "stream": false,
+            "stream": streaming,
         });
         if let Some(tools) = tools
             && !tools.is_empty()
@@ -260,6 +344,15 @@ impl OpenAiBackend {
             return Err(format!("endpoint returned {status}: {detail}"));
         }
 
+        if let Some(sink) = sink {
+            self.consume_stream(response, sink).await
+        } else {
+            self.consume_json(response).await
+        }
+    }
+
+    /// Parse a single non-streaming chat-completion response.
+    async fn consume_json(&self, response: reqwest::Response) -> Result<TurnResult, BackendError> {
         let parsed: ChatCompletion = response
             .json()
             .await
@@ -289,6 +382,150 @@ impl OpenAiBackend {
 
         Ok(TurnResult { text, tool_calls })
     }
+
+    /// Consume an OpenAI Server-Sent Events stream, forwarding content deltas to
+    /// `sink` and reassembling any tool calls (which arrive fragmented across
+    /// chunks, keyed by `index`).
+    async fn consume_stream(
+        &self,
+        response: reqwest::Response,
+        sink: &TokenSink,
+    ) -> Result<TurnResult, BackendError> {
+        use futures::StreamExt;
+
+        let mut stream = response.bytes_stream();
+        // Newlines are ASCII, so splitting raw bytes on `\n` never bisects a
+        // multibyte UTF-8 sequence; we only lossily decode whole lines.
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut text = String::new();
+        let mut tool_accum: Vec<StreamingToolCall> = Vec::new();
+        let mut done = false;
+
+        while let Some(item) = stream.next().await {
+            let bytes = item.map_err(|error| format!("stream read error: {error}"))?;
+            buffer.extend_from_slice(&bytes);
+
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                if data.is_empty() {
+                    continue;
+                }
+
+                let chunk: StreamCompletion = match serde_json::from_str(data) {
+                    Ok(chunk) => chunk,
+                    // Skip keep-alive comments and anything we can't parse rather
+                    // than aborting a turn over one malformed frame.
+                    Err(_) => continue,
+                };
+
+                let Some(choice) = chunk.choices.into_iter().next() else {
+                    continue;
+                };
+                if let Some(content) = choice.delta.content
+                    && !content.is_empty()
+                {
+                    text.push_str(&content);
+                    if sink.send(content).is_err() {
+                        // Consumer dropped (turn cancelled) — stop reading.
+                        done = true;
+                        break;
+                    }
+                }
+                for delta in choice.delta.tool_calls.into_iter().flatten() {
+                    let index = delta.index.unwrap_or(0) as usize;
+                    if tool_accum.len() <= index {
+                        tool_accum.resize_with(index + 1, StreamingToolCall::default);
+                    }
+                    let slot = &mut tool_accum[index];
+                    if let Some(id) = delta.id {
+                        slot.id = id;
+                    }
+                    if let Some(function) = delta.function {
+                        if let Some(name) = function.name {
+                            slot.name = name;
+                        }
+                        if let Some(arguments) = function.arguments {
+                            slot.arguments.push_str(&arguments);
+                        }
+                    }
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        let tool_calls: Vec<ToolCall> = tool_accum
+            .iter()
+            .filter(|call| !call.name.is_empty())
+            .enumerate()
+            .map(|(index, call)| ToolCall {
+                id: if call.id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    call.id.clone()
+                },
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .collect();
+
+        // Record the assistant turn so later tool results have context.
+        self.history
+            .lock()
+            .await
+            .push(streamed_assistant_history(&text, &tool_calls));
+
+        Ok(TurnResult { text, tool_calls })
+    }
+}
+
+/// One tool call being reassembled from streamed deltas.
+#[derive(Default)]
+struct StreamingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Rebuild the assistant message for replay in history after a streamed turn,
+/// preserving any tool calls so the follow-up request is well-formed. Mirrors
+/// [`ResponseMessage::into_history_value`] for the non-streaming path.
+fn streamed_assistant_history(text: &str, tool_calls: &[ToolCall]) -> serde_json::Value {
+    let mut message = serde_json::json!({ "role": "assistant" });
+    message["content"] = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text.to_string())
+    };
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::json!(
+            tool_calls
+                .iter()
+                .map(|call| serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    }
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    message
 }
 
 #[async_trait]
@@ -297,18 +534,20 @@ impl InferenceBackend for OpenAiBackend {
         &self,
         text: &str,
         tools: &[ToolSpec],
+        sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
         self.history
             .lock()
             .await
             .push(serde_json::json!({ "role": "user", "content": text }));
-        self.complete(Some(tools)).await
+        self.complete(Some(tools), sink).await
     }
 
     async fn send_tool_results(
         &self,
         results: Vec<ToolResult>,
         tools: Option<&[ToolSpec]>,
+        sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
         {
             let mut history = self.history.lock().await;
@@ -320,7 +559,7 @@ impl InferenceBackend for OpenAiBackend {
                 }));
             }
         }
-        self.complete(tools).await
+        self.complete(tools, sink).await
     }
 
     fn is_remote(&self) -> bool {
@@ -390,6 +629,46 @@ struct ResponseFunction {
     arguments: String,
 }
 
+// ── OpenAI streaming (SSE) chunk shapes ─────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct StreamCompletion {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCallDelta {
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +699,32 @@ mod tests {
         }];
         let json = OpenAiBackend::tools_json(&tools);
         assert_eq!(json[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn streamed_assistant_history_omits_empty_tool_calls() {
+        let value = streamed_assistant_history("hello", &[]);
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["content"], "hello");
+        assert!(value.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn streamed_assistant_history_preserves_tool_calls() {
+        let calls = vec![ToolCall {
+            id: "call_0".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"a.rs"}"#.to_string(),
+        }];
+        let value = streamed_assistant_history("", &calls);
+        assert!(value["content"].is_null());
+        assert_eq!(value["tool_calls"][0]["id"], "call_0");
+        assert_eq!(value["tool_calls"][0]["type"], "function");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            value["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"a.rs"}"#
+        );
     }
 
     #[test]
