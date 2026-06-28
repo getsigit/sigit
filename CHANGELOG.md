@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.2
+
+Streams assistant tokens as they arrive, on-device and over the cloud.
+
+### What changed
+
+- Streamed assistant tokens live in the TUI and ACP sessions, both on-device and through siGit Code Cloud
+- On-device inference streams only when a turn offers no tools, since `onde` can't stream and detect tool calls in the same pass; tool-capable turns still resolve in one shot
+- Fixed the TUI so the latest message stays visible in long chats
+- Put the cloud model-switch confirmation on its own line in ACP
+
 ## 1.2.1
 
 Stabilizes the Zed/ACP integration and finishes the cloud-tier wiring on top of 1.2.0.
