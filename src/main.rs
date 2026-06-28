@@ -660,6 +660,7 @@ impl SiGitAgent {
                     "model number to switch to (optional)",
                 )),
             ),
+            AvailableCommand::new("load", "Load the selected on-device model"),
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
             AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
             AvailableCommand::new("whoami", "Show the signed-in account"),
@@ -1131,10 +1132,21 @@ impl SiGitAgent {
         let backend = self.backend.lock().await.clone();
 
         // Only on-device inference needs a local model in memory. Cloud tiers run
-        // over the network, so skip the lazy load and the readiness wait for them.
-        if !backend.is_remote() {
-            self.start_startup_model_load_if_needed();
-            self.await_model_ready(cx, &session_id).await?;
+        // over the network, so they never need a local model. We never load the
+        // on-device model implicitly: the user loads it explicitly with `/load`
+        // (or by picking one in `/models`). If a prompt arrives before that, guide
+        // them rather than blocking on a multi-minute download/load.
+        if !backend.is_remote()
+            && self.engine.info().await.status == onde::inference::EngineStatus::Unloaded
+        {
+            self.send_assistant_message(
+                cx,
+                session_id,
+                "No on-device model is loaded. Run `/load` to load the selected model, \
+                 or `/models` to choose one.",
+            )
+            .ok();
+            return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
         // ── tool-calling loop ────────────────────────────────────────────
@@ -1411,12 +1423,16 @@ impl SiGitAgent {
             }
         }
 
-        // Zed re-fires the last selection on connect; no-op if it's already loaded
+        // Zed re-fires the last selection when a thread opens. That re-fire must
+        // not load anything: on-device models are loaded only on an explicit
+        // request (`/load`, or actively picking a *different* model below), so a
+        // re-fire of the already-current selection is a no-op. Otherwise opening a
+        // new thread would silently load the local model — exactly what we avoid.
         {
             let current = self.current_model.lock().unwrap();
             if current.model_id == model_id {
                 log::info!(
-                    "set_session_config_option: {} is already the active model, skipping",
+                    "set_session_config_option: {} is already the active selection, skipping",
                     current.display_name
                 );
                 let config_options = build_model_config_options(&current);
@@ -1797,6 +1813,8 @@ enum SlashCommand {
     Clear,
     Status,
     Models(Option<usize>),
+    /// Explicitly load the selected (or default) on-device model.
+    Load,
     /// `/login <email> <password>` — the raw argument, parsed when executed.
     Login(Option<String>),
     Logout,
@@ -1820,6 +1838,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/clear" => SlashCommand::Clear,
         "/status" => SlashCommand::Status,
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
+        "/load" => SlashCommand::Load,
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
         "/logout" => SlashCommand::Logout,
         "/whoami" => SlashCommand::Whoami,
@@ -1914,6 +1933,7 @@ async fn exec_slash_acp(
                     "/help          - show this message\n\
                      /models        - list available models\n\
                      /models N      - switch to model N\n\
+                     /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
                      /logout        - sign out\n\
                      /whoami        - show the signed-in account\n\
@@ -2049,6 +2069,25 @@ async fn exec_slash_acp(
                     }
                 }
             }
+        }
+        SlashCommand::Load => {
+            // Explicitly load the on-device model. This is the only path that
+            // brings a local model into memory; prompts never do it implicitly.
+            // If a cloud tier is active, fall back to a local default so we don't
+            // try to load the (file-less) cloud config as GGUF.
+            let on_cloud = {
+                let guard = agent.current_model.lock().unwrap();
+                guard.model_id.starts_with("sigit-cloud:")
+            };
+            if on_cloud {
+                let default_config = default_local_model_config();
+                *agent.current_model.lock().unwrap() = default_config;
+                agent.reset_to_local_backend().await;
+            }
+            // `await_model_ready` drives the download/load progress UI and reports
+            // success or failure to the editor.
+            agent.start_startup_model_load_if_needed();
+            agent.await_model_ready(cx, &session_id).await?;
         }
         SlashCommand::Login(argument) => {
             let message = match argument.as_deref().and_then(account::parse_login_args) {
@@ -2219,41 +2258,10 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
         .map(|selection| selection.display_name.clone())
         .unwrap_or_else(|| GgufModelConfig::qwen25_3b().display_name);
 
-    let config = startup_selection
-        .as_ref()
-        .and_then(|selection| {
-            models::local_picker_items()
-                .into_iter()
-                .find(|item| {
-                    selection
-                        .selected_model
-                        .as_ref()
-                        .map(|selected| {
-                            item.config.model_id == selected.model_id
-                                && item
-                                    .config
-                                    .files
-                                    .iter()
-                                    .any(|file| file == &selected.gguf_file)
-                        })
-                        .unwrap_or(false)
-                })
-                .map(|item| item.config)
-        })
-        .unwrap_or_else(GgufModelConfig::qwen25_3b);
-    let sampling = SamplingConfig {
-        max_tokens: Some(8192),
-        ..SamplingConfig::default()
-    };
-
-    // std::sync::mpsc on a real thread so model loading can't starve the TUI
+    // Signals the loading phase to finish. On-device models are no longer loaded
+    // at startup, so this resolves immediately for both backends; it stays a
+    // channel so the loading-phase plumbing in `chat::run_with` is unchanged.
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-    let tool_calling = models::local_picker_items()
-        .iter()
-        .find(|item| item.config.model_id == config.model_id)
-        .map(|item| item.tool_calling)
-        .unwrap_or(false);
 
     // Pick the inference backend: a configured provider if present, else on-device.
     let (inference_backend, startup_model_name): (Arc<dyn InferenceBackend>, String) =
@@ -2277,19 +2285,10 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 (backend, label)
             }
             None => {
-                // On-device: load the local GGUF model on a real thread.
-                let loader_engine = Arc::clone(&engine);
-                let system_prompt = system_prompt_for_model(tool_calling).to_string();
-                std::thread::spawn(move || {
-                    let rt =
-                        tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-                    let result = rt.block_on(loader_engine.load_gguf_model(
-                        config,
-                        Some(system_prompt),
-                        Some(sampling),
-                    ));
-                    let _ = load_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
-                });
+                // On-device: do NOT load the local GGUF model implicitly. The user
+                // loads it explicitly with /load (or /models) from the chat, so the
+                // UI comes up immediately without a multi-minute download/load.
+                let _ = load_tx.send(Ok(()));
                 let backend =
                     Arc::new(LocalBackend::new(Arc::clone(&engine))) as Arc<dyn InferenceBackend>;
                 (backend, startup_model_name)
@@ -2332,11 +2331,11 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
 
 // ── ACP server mode ───────────────────────────────────────────────────────────
 
-async fn run_acp_server() -> anyhow::Result<()> {
-    log::info!("ACP mode — starting agent server");
-
-    let startup_selection = setup::startup_model_selection();
-    let config = startup_selection
+/// The on-device model `/load` should bring up by default: the persisted
+/// selection if it still resolves to a known local model, otherwise the built-in
+/// default (`qwen25_3b`).
+fn default_local_model_config() -> GgufModelConfig {
+    setup::startup_model_selection()
         .as_ref()
         .and_then(|selection| {
             selection.selected_model.as_ref().and_then(|selected| {
@@ -2353,7 +2352,13 @@ async fn run_acp_server() -> anyhow::Result<()> {
                     .map(|item| item.config)
             })
         })
-        .unwrap_or_else(GgufModelConfig::qwen25_3b);
+        .unwrap_or_else(GgufModelConfig::qwen25_3b)
+}
+
+async fn run_acp_server() -> anyhow::Result<()> {
+    log::info!("ACP mode — starting agent server");
+
+    let config = default_local_model_config();
 
     let needs_download = models::local_picker_items()
         .iter()
@@ -2373,8 +2378,9 @@ async fn run_acp_server() -> anyhow::Result<()> {
 
     let engine = Arc::new(ChatEngine::new());
 
-    // Delay model loading until the first real prompt so initialize/session/new
-    // stay lightweight and registry auth checks don't trip over model startup.
+    // The on-device model is never loaded implicitly; the user loads it with
+    // `/load` (or by picking one in `/models`). So initialize/session/new stay
+    // lightweight and `model_ready` starts true (nothing is loading).
     let model_ready = Arc::new(AtomicBool::new(true));
     let startup_model_load_started = Arc::new(AtomicBool::new(false));
     let model_load_error: Arc<std::sync::Mutex<Option<String>>> =
