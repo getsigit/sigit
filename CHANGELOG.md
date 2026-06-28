@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### What changed
+
+- On-device models are no longer loaded implicitly. The chat UI and ACP sessions come up immediately, and the local model is brought into memory only when you run the new `/load` command (or pick one in `/models`). Prompts sent before a model is loaded now return a hint instead of blocking on a multi-minute download.
+
 ## 1.2.2
 
 Streams assistant tokens as they arrive, on-device and over the cloud.
