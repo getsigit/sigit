@@ -46,17 +46,20 @@ use std::sync::Arc;
 
 use onde::inference::SamplingConfig;
 
-use agent_client_protocol::schema::{
+// `ProtocolVersion` is a version-agnostic type at the schema root; the rest of the
+// schema types moved under `schema::v1` in agent-client-protocol 1.0.
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    PromptResponse, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
