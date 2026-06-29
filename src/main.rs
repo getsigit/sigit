@@ -73,7 +73,8 @@ use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-const SYSTEM_PROMPT: &str = "\
+const SYSTEM_PROMPT: &str = concat!(
+    "\
 Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
 Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
 
@@ -128,6 +129,10 @@ Git operations — always use run_command:
 - never run git clone without an explicit absolute destination path
 - if a clone or init fails, check the error, fix the cause (wrong path, missing \
   directory, permissions), and retry
+- when you create a commit, always end the commit message with a blank line and \
+  then this trailer on its own line: Co-Authored-By: siGit Code ",
+    env!("CARGO_PKG_VERSION"),
+    " <sigit@sigit.si>
 
 Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
@@ -191,7 +196,8 @@ force smbCloud-specific advice into the answer. When it is about smbCloud, be \
 specific and practical.
 
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever.";
+root cause, not the symptom. Correct beats clever."
+);
 
 /// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
 /// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
