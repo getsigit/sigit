@@ -253,6 +253,7 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
         "edit_file" => exec_edit_file(arguments),
         "delete_file" => exec_delete_file(arguments),
         "run_command" => exec_run_command(arguments),
+        "skill" => crate::skills::activate_skill(arguments),
         _ => format!("Unknown tool: {name}"),
     }
 }

@@ -32,9 +32,11 @@ mod account;
 mod backend;
 mod chat;
 mod credentials;
+mod instructions;
 mod models;
 mod provider;
 mod setup;
+mod skills;
 mod tools;
 
 use std::io::IsTerminal;
@@ -216,15 +218,48 @@ const CLOUD_LOGIN_PROMPT: &str = "siGit Code Cloud needs an account. Sign in wit
     `/login <email> <password>` (or the Authenticate button), then pick the tier again. \
     Create an account at https://sigit.si.";
 
+/// The per-session context system message: cwd guidance plus any project
+/// instruction files (`AGENTS.md` / `CLAUDE.md`) found for that directory. Used
+/// by every session entry point so on-device and cloud backends get the same
+/// always-on project context.
+fn session_context_message(cwd: &std::path::Path) -> String {
+    let mut message = format!(
+        "The user's project working directory is {}. \
+         Always use absolute paths under this directory for all file \
+         and directory operations. This is the root of the project \
+         the user has open in their editor.",
+        cwd.display()
+    );
+    if let Some(project_instructions) = instructions::load_project_instructions(cwd) {
+        message.push_str("\n\n");
+        message.push_str(&project_instructions);
+    }
+    message
+}
+
 fn agent_tools_as_specs() -> Vec<ToolSpec> {
-    tools::all_tools()
+    let mut specs: Vec<ToolSpec> = tools::all_tools()
         .into_iter()
         .map(|t| ToolSpec {
             name: t.name.to_string(),
             description: t.description.to_string(),
             parameters_schema: t.parameters_schema.to_string(),
         })
-        .collect()
+        .collect();
+
+    // Advertise the `skill` tool only when skills are present, so models without
+    // any skills installed don't see a dangling capability (Agent Skills format,
+    // https://agentskills.io). Discovery metadata lives in the tool description.
+    let discovered = skills::discover_skills();
+    if !discovered.is_empty() {
+        specs.push(ToolSpec {
+            name: skills::SKILL_TOOL_NAME.to_string(),
+            description: skills::skill_tool_description(&discovered),
+            parameters_schema: skills::skill_tool_schema().to_string(),
+        });
+    }
+
+    specs
 }
 
 fn initialize_meta() -> Meta {
@@ -660,6 +695,7 @@ impl SiGitAgent {
                     "model number to switch to (optional)",
                 )),
             ),
+            AvailableCommand::new("skills", "List available Agent Skills"),
             AvailableCommand::new("load", "Load the selected on-device model"),
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
             AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
@@ -755,13 +791,9 @@ impl SiGitAgent {
 
         if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
             self.engine
-                .push_history(onde::inference::ChatMessage::system(format!(
-                    "The user's project working directory is {}. \
-                     Always use absolute paths under this directory for all file \
-                     and directory operations. This is the root of the project \
-                     the user has open in their editor.",
-                    cwd.display()
-                )))
+                .push_history(onde::inference::ChatMessage::system(
+                    session_context_message(&cwd),
+                ))
                 .await;
         }
 
@@ -860,13 +892,9 @@ impl SiGitAgent {
         self.engine.clear_history().await;
 
         self.engine
-            .push_history(onde::inference::ChatMessage::system(format!(
-                "The user's project working directory is {}. \
-                 Always use absolute paths under this directory for all file \
-                 and directory operations. This is the root of the project \
-                 the user has open in their editor.",
-                args.cwd.display()
-            )))
+            .push_history(onde::inference::ChatMessage::system(
+                session_context_message(&args.cwd),
+            ))
             .await;
 
         let config_options = {
@@ -908,13 +936,9 @@ impl SiGitAgent {
         self.engine.clear_history().await;
 
         self.engine
-            .push_history(onde::inference::ChatMessage::system(format!(
-                "The user's project working directory is {}. \
-                 Always use absolute paths under this directory for all file \
-                 and directory operations. This is the root of the project \
-                 the user has open in their editor.",
-                args.cwd.display()
-            )))
+            .push_history(onde::inference::ChatMessage::system(
+                session_context_message(&args.cwd),
+            ))
             .await;
 
         let config_options = {
@@ -954,13 +978,9 @@ impl SiGitAgent {
         self.engine.clear_history().await;
 
         self.engine
-            .push_history(onde::inference::ChatMessage::system(format!(
-                "The user's project working directory is {}. \
-                 Always use absolute paths under this directory for all file \
-                 and directory operations. This is the root of the project \
-                 the user has open in their editor.",
-                args.cwd.display()
-            )))
+            .push_history(onde::inference::ChatMessage::system(
+                session_context_message(&args.cwd),
+            ))
             .await;
 
         let config_options = {
@@ -1280,15 +1300,11 @@ impl SiGitAgent {
     async fn switch_to_cloud_tier(&self, tier: &str) -> Option<String> {
         let cfg = crate::provider::cloud_tier_provider(tier)?;
         let mut system_prompt = system_prompt_for_model(true).to_string();
-        // Mirror the cwd guidance the local engine gets at session load, so the
-        // cloud model also uses absolute paths under the editor's project root.
+        // Mirror the cwd guidance and project instruction files the local engine
+        // gets at session load, so the cloud model shares the same project context.
         if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
-            system_prompt.push_str(&format!(
-                "\n\nThe user's project working directory is {}. \
-                 Always use absolute paths under this directory for all file \
-                 and directory operations.",
-                cwd.display()
-            ));
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&session_context_message(&cwd));
         }
         let cloud_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
             cfg.base_url,
@@ -1813,6 +1829,8 @@ enum SlashCommand {
     Clear,
     Status,
     Models(Option<usize>),
+    /// List discovered Agent Skills.
+    Skills,
     /// Explicitly load the selected (or default) on-device model.
     Load,
     /// `/login <email> <password>` — the raw argument, parsed when executed.
@@ -1838,6 +1856,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/clear" => SlashCommand::Clear,
         "/status" => SlashCommand::Status,
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
+        "/skills" => SlashCommand::Skills,
         "/load" => SlashCommand::Load,
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
         "/logout" => SlashCommand::Logout,
@@ -1933,6 +1952,7 @@ async fn exec_slash_acp(
                     "/help          - show this message\n\
                      /models        - list available models\n\
                      /models N      - switch to model N\n\
+                     /skills        - list available Agent Skills\n\
                      /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
                      /logout        - sign out\n\
@@ -1973,6 +1993,11 @@ async fn exec_slash_acp(
             let current_model = agent.current_model.lock().unwrap().clone();
             agent
                 .send_assistant_message(cx, session_id, format_models_list(&current_model))
+                .ok();
+        }
+        SlashCommand::Skills => {
+            agent
+                .send_assistant_message(cx, session_id, skills::format_skills_list())
                 .ok();
         }
         SlashCommand::Models(Some(number)) => {
@@ -2263,6 +2288,17 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     // channel so the loading-phase plumbing in `chat::run_with` is unchanged.
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
+    // Project instruction files (AGENTS.md / CLAUDE.md) for the launch directory,
+    // injected into the system prompt so the TUI shares the same always-on
+    // project context the ACP sessions get.
+    let project_instructions = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| instructions::load_project_instructions(&cwd));
+    let with_instructions = |base: String| match &project_instructions {
+        Some(extra) => format!("{base}\n\n{extra}"),
+        None => base,
+    };
+
     // Pick the inference backend: a configured provider if present, else on-device.
     let (inference_backend, startup_model_name): (Arc<dyn InferenceBackend>, String) =
         match provider::active_provider() {
@@ -2280,7 +2316,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                     provider.base_url,
                     provider.api_key,
                     provider.model,
-                    Some(SYSTEM_PROMPT.to_string()),
+                    Some(with_instructions(SYSTEM_PROMPT.to_string())),
                 )) as Arc<dyn InferenceBackend>;
                 (backend, label)
             }
@@ -2288,6 +2324,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 // On-device: do NOT load the local GGUF model implicitly. The user
                 // loads it explicitly with /load (or /models) from the chat, so the
                 // UI comes up immediately without a multi-minute download/load.
+                // Project instructions are injected at load time in `chat.rs`.
                 let _ = load_tx.send(Ok(()));
                 let backend =
                     Arc::new(LocalBackend::new(Arc::clone(&engine))) as Arc<dyn InferenceBackend>;
