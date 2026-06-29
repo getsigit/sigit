@@ -386,10 +386,19 @@ mod tui {
             self.messages.push(ChatMessage::system(
                 "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
             ));
-            self.messages.push(ChatMessage::system(format!(
-                "Current model: {}",
-                self.current_model_name
-            )));
+            if self.backend.is_remote() {
+                self.messages.push(ChatMessage::system(format!(
+                    "Current model: {}",
+                    self.current_model_name
+                )));
+            } else {
+                // On-device models are never loaded implicitly; prompt the user to
+                // load one explicitly before their first message.
+                self.messages.push(ChatMessage::system(format!(
+                    "No on-device model loaded. Run /load to load {}, or /models to choose one.",
+                    self.current_model_name
+                )));
+            }
             self.messages
                 .push(ChatMessage::system("Type /help for commands."));
         }
@@ -727,6 +736,10 @@ mod tui {
         Models(Option<usize>),
         /// toggle on-device inference mode. `Some(true/false)` sets it, `None` flips it.
         Local(Option<bool>),
+        /// List discovered Agent Skills.
+        Skills,
+        /// explicitly load the selected (or default) on-device model
+        Load,
         /// `/login <email> <password>` — the raw argument, parsed when executed.
         Login(Option<String>),
         Logout,
@@ -749,6 +762,8 @@ mod tui {
             "/status" => SlashCommand::Status,
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
             "/local" => SlashCommand::Local(parse_on_off(arg)),
+            "/skills" => SlashCommand::Skills,
+            "/load" => SlashCommand::Load,
             "/login" => SlashCommand::Login(arg.map(str::to_string)),
             "/logout" => SlashCommand::Logout,
             "/whoami" => SlashCommand::Whoami,
@@ -1214,6 +1229,120 @@ mod tui {
         }
     }
 
+    // ── Explicit on-device model loading ──────────────────────────────────────
+
+    /// The local model `/load` should bring up: the persisted selection if it
+    /// still resolves to a known model, otherwise the first on-device (non-cloud)
+    /// entry in the picker.
+    fn default_local_model_item(app: &App) -> Option<ModelPickerItem> {
+        if let Some(selected) = crate::setup::load_selected_model()
+            && let Some(item) = app.model_picker_items.iter().find(|item| {
+                item.config.model_id == selected.model_id
+                    && item
+                        .config
+                        .files
+                        .iter()
+                        .any(|file| file == &selected.gguf_file)
+            })
+        {
+            return Some(item.clone());
+        }
+        app.model_picker_items
+            .iter()
+            .find(|item| item.cloud_tier.is_none())
+            .cloned()
+    }
+
+    /// Load `model` on-device on a dedicated loader thread, routing inference to a
+    /// fresh `LocalBackend` and driving the switch-progress UI. The caller is
+    /// responsible for any cloud-tier handling; this path is on-device only.
+    fn start_local_model_load<B: ratatui::backend::Backend>(
+        app: &mut App,
+        model: ModelPickerItem,
+        engine: Arc<ChatEngine>,
+        terminal: &mut ratatui::Terminal<B>,
+    ) {
+        if model.cache_health == ModelCacheHealth::Incomplete {
+            app.messages.push(ChatMessage::system(format!(
+                "error: {} has an incomplete local cache and cannot be selected yet.",
+                model.display_name
+            )));
+            return;
+        }
+
+        // Loading an on-device model puts us in local inference mode.
+        let _ = crate::settings::set_local_inference(true);
+
+        // Route inference on-device; the loader thread below fills the engine the
+        // LocalBackend reads from.
+        app.backend = Arc::new(LocalBackend::new(Arc::clone(&engine)));
+
+        let loading_msg = if model.cache_health == ModelCacheHealth::NotDownloaded {
+            format!(
+                "Downloading and loading {} ({})… this may take a few minutes.",
+                model.display_name, model.description
+            )
+        } else {
+            format!("Loading {}…", model.display_name)
+        };
+
+        app.messages.push(ChatMessage::system(loading_msg));
+        terminal.draw(|frame| render(frame, app)).ok();
+
+        let (tx, rx) = mpsc::channel(1);
+        app.model_load_rx = Some(rx);
+        app.switching_model = true;
+        app.switching_model_id = Some(model.config.model_id.clone());
+        // Only show download progress for models not yet cached.
+        app.download_progress = if model.cache_health == ModelCacheHealth::NotDownloaded {
+            Some((0, 0))
+        } else {
+            None
+        };
+
+        let sampling = SamplingConfig {
+            max_tokens: Some(model.max_tokens),
+            ..SamplingConfig::default()
+        };
+
+        // own thread + runtime so block_in_place doesn't starve the TUI loop.
+        // Fold in project instruction files (AGENTS.md / CLAUDE.md) for the launch
+        // directory so the on-device model gets the same always-on context the
+        // cloud and ACP paths get.
+        let system_prompt = {
+            let base = crate::system_prompt_for_model(model.tool_calling).to_string();
+            match std::env::current_dir()
+                .ok()
+                .and_then(|cwd| crate::instructions::load_project_instructions(&cwd))
+            {
+                Some(extra) => format!("{base}\n\n{extra}"),
+                None => base,
+            }
+        };
+        let engine_handle = Arc::clone(&engine);
+        let tool_calling = model.tool_calling;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create model-loader runtime");
+            let update = rt.block_on(async move {
+                match engine_handle
+                    .load_gguf_model(
+                        model.config.clone(),
+                        Some(system_prompt.to_string()),
+                        Some(sampling),
+                    )
+                    .await
+                {
+                    Ok(_) => ModelLoadUpdate::Loaded(model.display_name.clone()),
+                    Err(err) => ModelLoadUpdate::Error(err.to_string()),
+                }
+            });
+            // capacity-1 channel, receiver alive while switching
+            let _ = tx.blocking_send(update);
+        });
+        // applied on ModelLoadUpdate::Loaded
+        app.pending_tool_calling = Some(tool_calling);
+    }
+
     // ── Slash command execution ───────────────────────────────────────────────
 
     async fn exec_slash<B: ratatui::backend::Backend>(
@@ -1229,6 +1358,8 @@ mod tui {
                      /models        — open the model picker\n\
                      /models N      — switch to model N\n\
                      /local [on|off]— toggle on-device inference mode\n\
+                     /skills        — list available Agent Skills\n\
+                     /load          — load the selected on-device model\n\
                      /login E P     — sign in to siGit Code Cloud\n\
                      /logout        — sign out\n\
                      /whoami        — show the signed-in account\n\
@@ -1252,6 +1383,10 @@ mod tui {
                     "status: {:?}  model: {}  memory: {}  history: {} turns",
                     info.status, model, mem, info.history_length,
                 )));
+            }
+            SlashCommand::Skills => {
+                app.messages
+                    .push(ChatMessage::system(crate::skills::format_skills_list()));
             }
             SlashCommand::Models(selection) => match selection {
                 None => {
@@ -1298,80 +1433,8 @@ mod tui {
                                 return;
                             }
 
-                            if model.cache_health == ModelCacheHealth::Incomplete {
-                                app.close_model_picker();
-                                app.messages.push(ChatMessage::system(format!(
-                                    "error: {} has an incomplete local cache and cannot be selected yet.",
-                                    model.display_name
-                                )));
-                                return;
-                            }
-
-                            // Route inference on-device; the loader thread below
-                            // fills the engine the LocalBackend reads from. Selecting
-                            // an on-device model puts us in local mode.
-                            let _ = crate::settings::set_local_inference(true);
-                            app.backend = Arc::new(LocalBackend::new(Arc::clone(&engine)));
-
-                            let loading_msg = if model.cache_health
-                                == ModelCacheHealth::NotDownloaded
-                            {
-                                format!(
-                                    "Downloading and loading {} ({})… this may take a few minutes.",
-                                    model.display_name, model.description
-                                )
-                            } else {
-                                format!("Loading {}…", model.display_name)
-                            };
-
                             app.close_model_picker();
-                            app.messages.push(ChatMessage::system(loading_msg));
-                            terminal.draw(|frame| render(frame, app)).ok();
-
-                            let (tx, rx) = mpsc::channel(1);
-                            app.model_load_rx = Some(rx);
-                            app.switching_model = true;
-                            app.switching_model_id = Some(model.config.model_id.clone());
-                            // Only show download progress for models not yet cached.
-                            app.download_progress =
-                                if model.cache_health == ModelCacheHealth::NotDownloaded {
-                                    Some((0, 0))
-                                } else {
-                                    None
-                                };
-
-                            let sampling = SamplingConfig {
-                                max_tokens: Some(model.max_tokens),
-                                ..SamplingConfig::default()
-                            };
-
-                            // own thread + runtime so block_in_place doesn't starve the TUI loop
-                            let system_prompt = crate::system_prompt_for_model(model.tool_calling);
-                            let engine_handle = Arc::clone(&engine);
-                            let tool_calling = model.tool_calling;
-                            std::thread::spawn(move || {
-                                let rt = tokio::runtime::Runtime::new()
-                                    .expect("failed to create model-loader runtime");
-                                let update = rt.block_on(async move {
-                                    match engine_handle
-                                        .load_gguf_model(
-                                            model.config.clone(),
-                                            Some(system_prompt.to_string()),
-                                            Some(sampling),
-                                        )
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            ModelLoadUpdate::Loaded(model.display_name.clone())
-                                        }
-                                        Err(err) => ModelLoadUpdate::Error(err.to_string()),
-                                    }
-                                });
-                                // capacity-1 channel, receiver alive while switching
-                                let _ = tx.blocking_send(update);
-                            });
-                            // applied on ModelLoadUpdate::Loaded
-                            app.pending_tool_calling = Some(tool_calling);
+                            start_local_model_load(app, model, Arc::clone(&engine), terminal);
                         }
                     }
                 }
@@ -1401,6 +1464,16 @@ mod tui {
                     }
                 }
             }
+            SlashCommand::Load => match default_local_model_item(app) {
+                None => {
+                    app.messages.push(ChatMessage::system(
+                        "No local model available to load. Use /models to see the list.",
+                    ));
+                }
+                Some(model) => {
+                    start_local_model_load(app, model, Arc::clone(&engine), terminal);
+                }
+            },
             SlashCommand::Login(arg) => {
                 let message = match arg.as_deref().and_then(crate::account::parse_login_args) {
                     Some((email, password)) => {
@@ -1439,14 +1512,28 @@ mod tui {
     const MAX_TOOL_ROUNDS: usize = 10;
 
     fn build_tool_specs() -> Vec<ToolSpec> {
-        crate::tools::all_tools()
+        let mut specs: Vec<ToolSpec> = crate::tools::all_tools()
             .into_iter()
             .map(|t| ToolSpec {
                 name: t.name.to_string(),
                 description: t.description.to_string(),
                 parameters_schema: t.parameters_schema.to_string(),
             })
-            .collect()
+            .collect();
+
+        // Advertise the Agent Skills `skill` tool only when skills exist on disk
+        // (https://agentskills.io). The tool description carries the discovery
+        // list (name + description) for progressive disclosure.
+        let discovered = crate::skills::discover_skills();
+        if !discovered.is_empty() {
+            specs.push(ToolSpec {
+                name: crate::skills::SKILL_TOOL_NAME.to_string(),
+                description: crate::skills::skill_tool_description(&discovered),
+                parameters_schema: crate::skills::skill_tool_schema().to_string(),
+            });
+        }
+
+        specs
     }
 
     /// run the tool-calling loop off the main thread, posting updates via `tx`.
@@ -1815,6 +1902,21 @@ mod tui {
                         if let Some(text) = handle_key(&mut app, key) {
                             if let Some(cmd) = parse_slash(&text) {
                                 exec_slash(&mut app, cmd, Arc::clone(&engine), terminal).await;
+                                continue;
+                            }
+
+                            // On-device inference needs a model in memory, and we
+                            // never load one implicitly: the user loads it with
+                            // /load (or /models). Refuse rather than erroring out
+                            // deep in the backend.
+                            if !app.backend.is_remote()
+                                && engine.info().await.status == onde::inference::EngineStatus::Unloaded
+                            {
+                                app.messages.push(ChatMessage::user(&text));
+                                app.messages.push(ChatMessage::system(
+                                    "No on-device model is loaded. Run /load to load the selected \
+                                     model, or /models to choose one.",
+                                ));
                                 continue;
                             }
 

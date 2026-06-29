@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Adds support for the open [Agent Skills](https://agentskills.io) format and for
+project instruction files (`AGENTS.md` and the like).
+
+### What changed
+
+- Discovers Agent Skills (folders with a `SKILL.md`) from `.sigit/skills/` and `.claude/skills/` in the project, `~/.config/sigit/skills/`, and `~/.claude/skills/`
+- Follows the spec's progressive disclosure: each skill's name and description are advertised up front via a new `skill` tool, and the full instructions load only when the agent activates one
+- Added a `/skills` slash command (TUI and ACP) that lists the discovered skills
+- Reads project instruction files at session start: `AGENTS.md` (the cross-tool standard) and `CLAUDE.md`, walking from the working directory up to the repository root, plus a global file under `~/.config/sigit/`, and injects them into the session's system context so their guidance is always in force
+- Nested instruction files are ordered outermost-first so the closest, most specific file takes precedence; the scan never reads above the repository root
+- On-device models are no longer loaded implicitly. The chat UI and ACP sessions come up immediately, and the local model is brought into memory only when you run the `/load` command (or pick one in `/models`). Prompts sent before a model is loaded now return a hint instead of blocking on a multi-minute download.
+
 ## 1.2.2
 
 Streams assistant tokens as they arrive, on-device and over the cloud.

@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 # ACP protocol SDK
-agent-client-protocol = { version = "0.13", features = ["unstable_session_fork", "unstable_session_additional_directories", "unstable_auth_methods"] }
+agent-client-protocol = { version = "1.0", features = ["unstable_session_fork", "unstable_auth_methods"] }
 
 # Onde Inference engine (local LLM)
 # onde = { path = "../onde" }
