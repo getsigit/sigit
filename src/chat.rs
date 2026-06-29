@@ -662,6 +662,8 @@ mod tui {
         Status,
         /// picker UI, or jump straight to model N
         Models(Option<usize>),
+        /// List discovered Agent Skills.
+        Skills,
         /// explicitly load the selected (or default) on-device model
         Load,
         /// `/login <email> <password>` — the raw argument, parsed when executed.
@@ -685,6 +687,7 @@ mod tui {
             "/clear" => SlashCommand::Clear,
             "/status" => SlashCommand::Status,
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
+            "/skills" => SlashCommand::Skills,
             "/load" => SlashCommand::Load,
             "/login" => SlashCommand::Login(arg.map(str::to_string)),
             "/logout" => SlashCommand::Logout,
@@ -1214,8 +1217,20 @@ mod tui {
             ..SamplingConfig::default()
         };
 
-        // own thread + runtime so block_in_place doesn't starve the TUI loop
-        let system_prompt = crate::system_prompt_for_model(model.tool_calling);
+        // own thread + runtime so block_in_place doesn't starve the TUI loop.
+        // Fold in project instruction files (AGENTS.md / CLAUDE.md) for the launch
+        // directory so the on-device model gets the same always-on context the
+        // cloud and ACP paths get.
+        let system_prompt = {
+            let base = crate::system_prompt_for_model(model.tool_calling).to_string();
+            match std::env::current_dir()
+                .ok()
+                .and_then(|cwd| crate::instructions::load_project_instructions(&cwd))
+            {
+                Some(extra) => format!("{base}\n\n{extra}"),
+                None => base,
+            }
+        };
         let engine_handle = Arc::clone(&engine);
         let tool_calling = model.tool_calling;
         std::thread::spawn(move || {
@@ -1254,6 +1269,7 @@ mod tui {
                     "/help          — show this message\n\
                      /models        — open the model picker\n\
                      /models N      — switch to model N\n\
+                     /skills        — list available Agent Skills\n\
                      /load          — load the selected on-device model\n\
                      /login E P     — sign in to siGit Code Cloud\n\
                      /logout        — sign out\n\
@@ -1278,6 +1294,10 @@ mod tui {
                     "status: {:?}  model: {}  memory: {}  history: {} turns",
                     info.status, model, mem, info.history_length,
                 )));
+            }
+            SlashCommand::Skills => {
+                app.messages
+                    .push(ChatMessage::system(crate::skills::format_skills_list()));
             }
             SlashCommand::Models(selection) => match selection {
                 None => {
@@ -1376,14 +1396,28 @@ mod tui {
     const MAX_TOOL_ROUNDS: usize = 10;
 
     fn build_tool_specs() -> Vec<ToolSpec> {
-        crate::tools::all_tools()
+        let mut specs: Vec<ToolSpec> = crate::tools::all_tools()
             .into_iter()
             .map(|t| ToolSpec {
                 name: t.name.to_string(),
                 description: t.description.to_string(),
                 parameters_schema: t.parameters_schema.to_string(),
             })
-            .collect()
+            .collect();
+
+        // Advertise the Agent Skills `skill` tool only when skills exist on disk
+        // (https://agentskills.io). The tool description carries the discovery
+        // list (name + description) for progressive disclosure.
+        let discovered = crate::skills::discover_skills();
+        if !discovered.is_empty() {
+            specs.push(ToolSpec {
+                name: crate::skills::SKILL_TOOL_NAME.to_string(),
+                description: crate::skills::skill_tool_description(&discovered),
+                parameters_schema: crate::skills::skill_tool_schema().to_string(),
+            });
+        }
+
+        specs
     }
 
     /// run the tool-calling loop off the main thread, posting updates via `tx`.
