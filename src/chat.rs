@@ -78,7 +78,9 @@ mod tui {
     use onde::inference::{ChatEngine, SamplingConfig};
 
     use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
-    use crate::models::{ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items};
+    use crate::models::{
+        InferenceKind, ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items,
+    };
     use ratatui::{
         Frame,
         layout::{Constraint, Layout, Position},
@@ -479,10 +481,68 @@ mod tui {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
+        let active_kind = crate::models::active_inference_kind();
         let mut lines = Vec::new();
+
+        // State banner: which mode is active, and how to flip it.
+        let (state_word, state_style) = match active_kind {
+            InferenceKind::Local => (
+                "ON  (on-device)",
+                Style::default().fg(Color::Green).bg(Color::Black),
+            ),
+            InferenceKind::Cloud => (
+                "OFF (siGit Code Cloud)",
+                Style::default().fg(Color::Magenta).bg(Color::Black),
+            ),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Local inference: ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(state_word, state_style.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "    toggle with /local on|off",
+                Style::default().fg(Color::DarkGray).bg(Color::Black),
+            ),
+        ]));
+        lines.push(Line::from("").style(Style::default().bg(Color::Black)));
+
         let mut last_section: Option<ModelSource> = None;
+        let mut last_kind: Option<InferenceKind> = None;
 
         for (index, item) in app.model_picker_items.iter().enumerate() {
+            let item_kind = item.source.kind();
+            let item_active = item_kind == active_kind;
+
+            // Top-level group header (Local / Cloud) whenever the nature changes.
+            if last_kind != Some(item_kind) {
+                if last_kind.is_some() {
+                    lines.push(Line::from("").style(Style::default().bg(Color::Black)));
+                }
+                let group_label = match item_kind {
+                    InferenceKind::Local => "LOCAL — on-device inference",
+                    InferenceKind::Cloud => "CLOUD — siGit Code Cloud",
+                };
+                let group_style = if item_active {
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(Color::DarkGray).bg(Color::Black)
+                };
+                lines.push(
+                    Line::from(vec![Span::styled(group_label, group_style)])
+                        .style(Style::default().bg(Color::Black)),
+                );
+                last_kind = Some(item_kind);
+                last_section = None;
+            }
+
             if last_section != Some(item.source) {
                 if last_section.is_some() {
                     lines.push(Line::from("").style(Style::default().bg(Color::Black)));
@@ -531,9 +591,16 @@ mod tui {
                     ),
                 };
 
+                // Dim the section header when it belongs to the inactive group.
+                let section_style = if item_active {
+                    section_style
+                } else {
+                    Style::default().fg(Color::DarkGray).bg(Color::Black)
+                };
+
                 lines.push(
                     Line::from(vec![
-                        Span::styled(format!("{section_mark} "), section_style),
+                        Span::styled(format!("  {section_mark} "), section_style),
                         Span::styled(section_name, section_style),
                     ])
                     .style(Style::default().bg(Color::Black)),
@@ -570,12 +637,17 @@ mod tui {
 
             let base_style = if selected {
                 Style::default().fg(Color::Black).bg(Color::Green)
-            } else {
+            } else if item_active {
                 Style::default().fg(Color::White).bg(Color::Black)
+            } else {
+                // Inactive group: still visible (we surface the offering) but dimmed.
+                Style::default().fg(Color::DarkGray).bg(Color::Black)
             };
 
             let source_style = if selected {
                 Style::default().fg(Color::Black).bg(Color::Green)
+            } else if !item_active {
+                Style::default().fg(Color::DarkGray).bg(Color::Black)
             } else {
                 match item.source {
                     ModelSource::Onde => Style::default().fg(Color::Green).bg(Color::Black),
@@ -662,6 +734,8 @@ mod tui {
         Status,
         /// picker UI, or jump straight to model N
         Models(Option<usize>),
+        /// toggle on-device inference mode. `Some(true/false)` sets it, `None` flips it.
+        Local(Option<bool>),
         /// List discovered Agent Skills.
         Skills,
         /// explicitly load the selected (or default) on-device model
@@ -687,6 +761,7 @@ mod tui {
             "/clear" => SlashCommand::Clear,
             "/status" => SlashCommand::Status,
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
+            "/local" => SlashCommand::Local(parse_on_off(arg)),
             "/skills" => SlashCommand::Skills,
             "/load" => SlashCommand::Load,
             "/login" => SlashCommand::Login(arg.map(str::to_string)),
@@ -695,6 +770,16 @@ mod tui {
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
             other => SlashCommand::Unknown(other.to_string()),
         })
+    }
+
+    /// `on`/`off` (and synonyms) → `Some(bool)`; missing or unrecognized → `None`
+    /// (meaning "toggle the current value").
+    fn parse_on_off(arg: Option<&str>) -> Option<bool> {
+        match arg.map(|s| s.trim().to_ascii_lowercase())?.as_str() {
+            "on" | "true" | "1" | "yes" => Some(true),
+            "off" | "false" | "0" | "no" => Some(false),
+            _ => None,
+        }
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
@@ -1185,6 +1270,9 @@ mod tui {
             return;
         }
 
+        // Loading an on-device model puts us in local inference mode.
+        let _ = crate::settings::set_local_inference(true);
+
         // Route inference on-device; the loader thread below fills the engine the
         // LocalBackend reads from.
         app.backend = Arc::new(LocalBackend::new(Arc::clone(&engine)));
@@ -1269,6 +1357,7 @@ mod tui {
                     "/help          — show this message\n\
                      /models        — open the model picker\n\
                      /models N      — switch to model N\n\
+                     /local [on|off]— toggle on-device inference mode\n\
                      /skills        — list available Agent Skills\n\
                      /load          — load the selected on-device model\n\
                      /login E P     — sign in to siGit Code Cloud\n\
@@ -1327,6 +1416,8 @@ mod tui {
                                         ));
                                         app.current_model_name = provider.display_name.clone();
                                         app.tool_calling = true;
+                                        // Selecting a cloud tier puts us in cloud mode.
+                                        let _ = crate::settings::set_local_inference(false);
                                         app.messages.push(ChatMessage::system(format!(
                                             "Switched to {}.",
                                             provider.display_name
@@ -1348,6 +1439,31 @@ mod tui {
                     }
                 }
             },
+            SlashCommand::Local(value) => {
+                let enabled = value.unwrap_or(!crate::settings::local_inference_enabled());
+                match crate::settings::set_local_inference(enabled) {
+                    Ok(()) => {
+                        let state = if enabled { "on" } else { "off" };
+                        let hint = if enabled {
+                            "On-device models are highlighted. Type /models to pick one."
+                        } else {
+                            "siGit Code Cloud tiers are highlighted. Type /models to pick one."
+                        };
+                        app.messages.push(ChatMessage::system(format!(
+                            "Local inference is {state}. {hint}"
+                        )));
+                        // Refresh the picker so emphasis/order reflects the new mode.
+                        if app.show_model_picker {
+                            app.open_model_picker(&engine);
+                        }
+                    }
+                    Err(error) => {
+                        app.messages.push(ChatMessage::system(format!(
+                            "error: could not save local inference setting: {error}"
+                        )));
+                    }
+                }
+            }
             SlashCommand::Load => match default_local_model_item(app) {
                 None => {
                     app.messages.push(ChatMessage::system(

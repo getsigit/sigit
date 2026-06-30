@@ -20,6 +20,33 @@ pub(crate) enum ModelSource {
     Cloud,
 }
 
+/// The broad nature of where inference runs. The picker groups by this and the
+/// `local_inference` setting decides which group is the active (highlighted) one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferenceKind {
+    Local,
+    Cloud,
+}
+
+impl ModelSource {
+    /// On-device sources are `Local`; the cloud tiers are `Cloud`.
+    pub(crate) fn kind(self) -> InferenceKind {
+        match self {
+            ModelSource::Cloud => InferenceKind::Cloud,
+            _ => InferenceKind::Local,
+        }
+    }
+}
+
+/// The active inference mode, from the persisted `local_inference` setting.
+pub(crate) fn active_inference_kind() -> InferenceKind {
+    if crate::settings::local_inference_enabled() {
+        InferenceKind::Local
+    } else {
+        InferenceKind::Cloud
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ModelPickerItem {
     pub(crate) display_name: String,
@@ -159,9 +186,15 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
         });
     }
 
+    // Group by inference nature, active mode first (so the highlighted group
+    // leads the picker), then by source, then alphabetically.
+    let active = active_inference_kind();
+    let group_rank =
+        |item: &ModelPickerItem| -> u8 { if item.source.kind() == active { 0 } else { 1 } };
     items.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
+        group_rank(left)
+            .cmp(&group_rank(right))
+            .then_with(|| left.source.cmp(&right.source))
             .then_with(|| left.display_name.cmp(&right.display_name))
     });
 

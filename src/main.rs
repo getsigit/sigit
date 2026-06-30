@@ -35,9 +35,16 @@ mod credentials;
 mod instructions;
 mod models;
 mod provider;
+mod settings;
 mod setup;
 mod skills;
 mod tools;
+
+/// Serializes tests that mutate process-global env vars (`SIGIT_CONFIG_DIR`
+/// etc.). `cargo test` runs tests in parallel within a binary, so without this
+/// the credentials and settings round-trip tests clobber each other's env.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use std::io::IsTerminal;
 #[cfg(unix)]
@@ -704,6 +711,11 @@ impl SiGitAgent {
                     "model number to switch to (optional)",
                 )),
             ),
+            with_hint(
+                "local",
+                "Toggle on-device inference mode",
+                "on|off (optional)",
+            ),
             AvailableCommand::new("skills", "List available Agent Skills"),
             AvailableCommand::new("load", "Load the selected on-device model"),
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
@@ -906,6 +918,9 @@ impl SiGitAgent {
             ))
             .await;
 
+        // Honor the persisted Local Inference toggle (off + signed in → cloud).
+        self.apply_startup_inference_mode().await;
+
         let config_options = {
             let guard = self.current_model.lock().unwrap();
             build_model_config_options(&guard)
@@ -950,6 +965,9 @@ impl SiGitAgent {
             ))
             .await;
 
+        // Honor the persisted Local Inference toggle (off + signed in → cloud).
+        self.apply_startup_inference_mode().await;
+
         let config_options = {
             let guard = self.current_model.lock().unwrap();
             build_model_config_options(&guard)
@@ -991,6 +1009,9 @@ impl SiGitAgent {
                 session_context_message(&args.cwd),
             ))
             .await;
+
+        // Honor the persisted Local Inference toggle (off + signed in → cloud).
+        self.apply_startup_inference_mode().await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1336,8 +1357,30 @@ impl SiGitAgent {
             *guard = cloud_config;
         }
 
+        // Explicitly choosing a cloud tier puts us in cloud mode.
+        let _ = settings::set_local_inference(false);
+
         log::info!("switched to cloud tier {tier}");
         Some(cfg.display_name)
+    }
+
+    /// Apply the persisted Local Inference mode at session start. When local
+    /// inference is off and an account is signed in, route to a cloud tier so the
+    /// on-device model is never loaded; otherwise leave the on-device backend in
+    /// place. Call after the session cwd is set so the cloud system prompt picks
+    /// it up. Does not flip the stored setting on the not-signed-in fallback.
+    async fn apply_startup_inference_mode(&self) {
+        if settings::local_inference_enabled() {
+            return;
+        }
+        if self.switch_to_cloud_tier("balanced").await.is_some() {
+            log::info!("startup: local inference off; routing inference to siGit Code Cloud");
+        } else {
+            log::warn!(
+                "local inference is off but no account is signed in; staying on-device. \
+                 Run /login or set Local Inference on."
+            );
+        }
     }
 
     /// Route inference back on-device. Used after leaving a cloud tier for a
@@ -1427,6 +1470,37 @@ impl SiGitAgent {
             args.config_id,
             args.value
         );
+
+        // ── Local Inference toggle ──────────────────────────────────────────
+        if args.config_id.0.as_ref() == LOCAL_INFERENCE_CONFIG_ID {
+            let enabled = match args.value.0.as_ref() {
+                LOCAL_INFERENCE_ON => true,
+                LOCAL_INFERENCE_OFF => false,
+                other => {
+                    return Err(agent_client_protocol::Error::new(
+                        -32602,
+                        format!("unknown Local Inference value: {other}"),
+                    ));
+                }
+            };
+            if let Err(error) = settings::set_local_inference(enabled) {
+                return Err(agent_client_protocol::Error::new(
+                    -32603,
+                    format!("could not save Local Inference setting: {error}"),
+                ));
+            }
+            let message = if enabled {
+                "Local inference is on. On-device models are highlighted; pick one from Model."
+            } else {
+                "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
+            };
+            self.send_assistant_message(cx, args.session_id.clone(), format!("\n\n{message}"))
+                .ok();
+            // Rebuild so the Model picker reflects the new emphasis/order.
+            let current = self.current_model.lock().unwrap().clone();
+            let config_options = build_model_config_options(&current);
+            return Ok(SetSessionConfigOptionResponse::new(config_options));
+        }
 
         if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
             return Err(agent_client_protocol::Error::new(
@@ -1686,6 +1760,8 @@ impl SiGitAgent {
             Ok(new_config) => {
                 // Route inference back on-device (in case we were on a cloud tier).
                 self.reset_to_local_backend().await;
+                // Selecting an on-device model puts us in local mode.
+                let _ = settings::set_local_inference(true);
 
                 let completion_title = if needs_download {
                     format!("✓ {} downloaded and loaded", new_config.display_name)
@@ -1744,6 +1820,15 @@ impl SiGitAgent {
 /// config option ID for the model picker in Zed's agent panel
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
+/// config option ID for the Local Inference on/off toggle. Surfaced as a
+/// two-option `select` so ACP clients without slash-command support (e.g. Xcode)
+/// can still flip the mode from the agent panel.
+const LOCAL_INFERENCE_CONFIG_ID: &str = "sigit-local-inference";
+
+/// `select` value ids for the Local Inference toggle.
+const LOCAL_INFERENCE_ON: &str = "local-inference-on";
+const LOCAL_INFERENCE_OFF: &str = "local-inference-off";
+
 /// Replace non-ASCII chars so a downstream byte-index truncation can't split a
 /// multi-byte char. Zed slices the model-picker label at a fixed byte offset
 /// (`agent_ui/src/config_options.rs`) and panics — crashing the whole editor —
@@ -1759,12 +1844,18 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
     // The full list, including the siGit Code Cloud tiers, so the panel picker
     // mirrors the TUI `/models`. Cloud entries are sign-in gated at selection.
     let items = models::build_model_picker_items();
+    let active_kind = models::active_inference_kind();
 
     let options: Vec<SessionConfigSelectOption> = items
         .iter()
         .filter(|item| item.cache_health != setup::ModelCacheHealth::Incomplete)
         .map(|item| {
             let mut desc_parts = Vec::new();
+            // Mark options in the inactive mode so the active group reads as the
+            // recommended set (the list is already ordered active-group-first).
+            if item.source.kind() != active_kind {
+                desc_parts.push("inactive mode".to_string());
+            }
             if item.tool_calling {
                 desc_parts.push("tool calling".to_string());
             }
@@ -1805,8 +1896,36 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
         })
         .collect();
 
+    // Local Inference on/off toggle, modeled as a two-option select so panel-only
+    // ACP clients (no slash commands) can flip the mode.
+    let local_on = settings::local_inference_enabled();
+    let local_current = SessionConfigValueId::new(if local_on {
+        LOCAL_INFERENCE_ON
+    } else {
+        LOCAL_INFERENCE_OFF
+    });
+    let local_options = vec![
+        SessionConfigSelectOption::new(
+            SessionConfigValueId::new(LOCAL_INFERENCE_ON),
+            "On (on-device)".to_string(),
+        )
+        .description("Run inference on-device; on-device models are highlighted".to_string()),
+        SessionConfigSelectOption::new(
+            SessionConfigValueId::new(LOCAL_INFERENCE_OFF),
+            "Off (siGit Code Cloud)".to_string(),
+        )
+        .description("Use siGit Code Cloud; cloud tiers are highlighted".to_string()),
+    ];
+    let local_option = SessionConfigOption::select(
+        LOCAL_INFERENCE_CONFIG_ID,
+        "Local Inference",
+        local_current,
+        local_options,
+    )
+    .description("Toggle on-device inference; changes which models are highlighted");
+
     if options.is_empty() {
-        return vec![];
+        return vec![local_option];
     }
 
     let current_value = SessionConfigValueId::new(current_model.model_id.as_str());
@@ -1815,6 +1934,7 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
             .category(SessionConfigOptionCategory::Model)
             .description("Select an on-device model or a siGit Code Cloud tier"),
+        local_option,
     ]
 }
 
@@ -1838,6 +1958,8 @@ enum SlashCommand {
     Clear,
     Status,
     Models(Option<usize>),
+    /// toggle on-device inference mode. `Some(true/false)` sets it, `None` flips it.
+    Local(Option<bool>),
     /// List discovered Agent Skills.
     Skills,
     /// Explicitly load the selected (or default) on-device model.
@@ -1865,6 +1987,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/clear" => SlashCommand::Clear,
         "/status" => SlashCommand::Status,
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
+        "/local" => SlashCommand::Local(parse_on_off(argument)),
         "/skills" => SlashCommand::Skills,
         "/load" => SlashCommand::Load,
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
@@ -1874,6 +1997,16 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
+}
+
+/// `on`/`off` (and synonyms) → `Some(bool)`; missing or unrecognized → `None`
+/// (meaning "toggle the current value").
+fn parse_on_off(arg: Option<&str>) -> Option<bool> {
+    match arg.map(|s| s.trim().to_ascii_lowercase())?.as_str() {
+        "on" | "true" | "1" | "yes" => Some(true),
+        "off" | "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn format_models_list(current_model: &GgufModelConfig) -> String {
@@ -1961,6 +2094,7 @@ async fn exec_slash_acp(
                     "/help          - show this message\n\
                      /models        - list available models\n\
                      /models N      - switch to model N\n\
+                     /local [on|off]- toggle on-device inference mode\n\
                      /skills        - list available Agent Skills\n\
                      /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
@@ -2058,6 +2192,7 @@ async fn exec_slash_acp(
                         match agent.switch_model_by_id(&model.config.model_id).await {
                             Ok(new_config) => {
                                 agent.reset_to_local_backend().await;
+                                let _ = settings::set_local_inference(true);
                                 agent.engine.clear_history().await;
                                 agent
                                     .send_assistant_message(
@@ -2091,6 +2226,7 @@ async fn exec_slash_acp(
 
                         let switched = agent.switch_model_by_id(&model.config.model_id).await?;
                         agent.reset_to_local_backend().await;
+                        let _ = settings::set_local_inference(true);
                         agent.engine.clear_history().await;
 
                         agent
@@ -2103,6 +2239,33 @@ async fn exec_slash_acp(
                     }
                 }
             }
+        }
+        SlashCommand::Local(value) => {
+            let enabled = value.unwrap_or(!settings::local_inference_enabled());
+            let message = match settings::set_local_inference(enabled) {
+                Ok(()) if enabled => "Local inference is on. On-device models are highlighted; \
+                     pick one with /models."
+                    .to_string(),
+                Ok(()) => "Local inference is off. siGit Code Cloud tiers are highlighted; \
+                     pick one with /models."
+                    .to_string(),
+                Err(error) => format!("error: could not save local inference setting: {error}"),
+            };
+            agent
+                .send_assistant_message(cx, session_id.clone(), message)
+                .ok();
+            // Refresh the panel so the Model picker reflects the new emphasis.
+            let config_options = {
+                let current = agent.current_model.lock().unwrap();
+                build_model_config_options(&current)
+            };
+            agent
+                .send_tool_call_update(
+                    cx,
+                    session_id,
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+                )
+                .ok();
         }
         SlashCommand::Load => {
             // Explicitly load the on-device model. This is the only path that
@@ -2118,6 +2281,8 @@ async fn exec_slash_acp(
                 *agent.current_model.lock().unwrap() = default_config;
                 agent.reset_to_local_backend().await;
             }
+            // Loading an on-device model puts us in local inference mode.
+            let _ = settings::set_local_inference(true);
             // `await_model_ready` drives the download/load progress UI and reports
             // success or failure to the editor.
             agent.start_startup_model_load_if_needed();
@@ -2330,14 +2495,47 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 (backend, label)
             }
             None => {
-                // On-device: do NOT load the local GGUF model implicitly. The user
-                // loads it explicitly with /load (or /models) from the chat, so the
-                // UI comes up immediately without a multi-minute download/load.
-                // Project instructions are injected at load time in `chat.rs`.
-                let _ = load_tx.send(Ok(()));
-                let backend =
-                    Arc::new(LocalBackend::new(Arc::clone(&engine))) as Arc<dyn InferenceBackend>;
-                (backend, startup_model_name)
+                // Honor the Local Inference toggle: when off and signed in, start
+                // on a cloud tier. Otherwise bring up on-device WITHOUT loading a
+                // model — the user loads it explicitly with /load (or /models), so
+                // the UI comes up immediately. Project instructions are injected at
+                // load time in `chat.rs`.
+                let cloud_when_off = if settings::local_inference_enabled() {
+                    None
+                } else {
+                    provider::cloud_tier_provider("balanced")
+                };
+
+                match cloud_when_off {
+                    Some(provider) => {
+                        log::info!(
+                            "inference: local inference off; using {} (model {})",
+                            provider.display_name,
+                            provider.model
+                        );
+                        let _ = load_tx.send(Ok(()));
+                        let label = provider.display_name.clone();
+                        let backend = Arc::new(OpenAiBackend::new(
+                            provider.base_url,
+                            provider.api_key,
+                            provider.model,
+                            Some(with_instructions(SYSTEM_PROMPT.to_string())),
+                        )) as Arc<dyn InferenceBackend>;
+                        (backend, label)
+                    }
+                    None => {
+                        if !settings::local_inference_enabled() {
+                            log::warn!(
+                                "local inference is off but no account is signed in; \
+                                 bringing up on-device. Run /login or /local on."
+                            );
+                        }
+                        let _ = load_tx.send(Ok(()));
+                        let backend = Arc::new(LocalBackend::new(Arc::clone(&engine)))
+                            as Arc<dyn InferenceBackend>;
+                        (backend, startup_model_name)
+                    }
+                }
             }
         };
 
