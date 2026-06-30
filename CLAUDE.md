@@ -17,6 +17,13 @@ is a TTY:
 Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit login`,
 `sigit logout`, `sigit whoami` (see `src/main.rs` `main()`).
 
+## Working in this repo
+
+**IMPORTANT — branch naming:** Name every working branch after the *changes it contains*, not
+after a task, ticket, or session id. Use a short, descriptive, kebab-case slug so the branch is
+self-explanatory from its name alone (e.g. `claude/agent-tools-multiedit-glob-todos-remember`,
+not `claude/code-feature-parity-q003hm`).
+
 ## Build / test / lint
 
 ```sh
