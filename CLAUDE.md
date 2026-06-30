@@ -64,6 +64,21 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
   `list_directory`, `search_files`, `read_website`, `create_file`, `edit_file`, `delete_file`,
   `run_command`. Add a tool in both the spec list and the execute `match`.
+- **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
+  folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
+  instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,
+  and `~/.claude/skills/`. Progressive disclosure: the discovery list (name + description) is
+  baked into the dynamically-built `skill` tool's description, and activating a skill (the model
+  calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
+  `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
+  and only when at least one skill exists.
+- **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
+  Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
+  walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
+  plus a global file under `$SIGIT_CONFIG_DIR`. Files are ordered outermost-first so the deepest
+  (most specific) wins. The combined block is injected via `session_context_message` in `main.rs`
+  — pushed as a system message at every ACP session entry point (new/load/fork + model switch)
+  and appended to the system prompt on the cloud and TUI-startup paths.
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
 - **`src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
@@ -74,9 +89,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
-Slash commands (`/help`, `/models`, `/login`, `/logout`, `/whoami`, `/reload`, `/clear`,
-`/status`) are advertised via `advertise_commands` in `main.rs` and handled in both the TUI and
-ACP sessions.
+Slash commands (`/help`, `/models`, `/skills`, `/login`, `/logout`, `/whoami`, `/reload`,
+`/clear`, `/status`) are advertised via `advertise_commands` in `main.rs` and handled in both the
+TUI and ACP sessions.
 
 ## Model cache (macOS)
 

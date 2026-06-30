@@ -81,6 +81,9 @@ mod tests {
 
     #[test]
     fn round_trips_credentials_via_temp_dir() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("sigit_creds_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: single-threaded test; restores below.
