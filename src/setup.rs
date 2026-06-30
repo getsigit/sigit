@@ -13,6 +13,17 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 const APP_GROUP_IDENTIFIER: &str = "group.com.ondeinference.apps";
 
+/// Opt out of the shared App Group cache. Set truthy to keep siGit out of the
+/// Onde App Group container entirely. On macOS Sequoia a process that touches
+/// another app's Group Container triggers a "would like to access data from
+/// other apps" privacy prompt; when siGit runs as an editor's ACP subprocess
+/// (e.g. Zed) that prompt is attributed to the editor and recurs on every
+/// launch because the unsigned CLI binary can't hold a stable TCC grant.
+/// Setting this routes model discovery and caching to the default
+/// `~/.cache/huggingface` location instead, so the prompt never appears.
+#[cfg(target_os = "macos")]
+const DISABLE_APP_GROUP_ENV: &str = "SIGIT_DISABLE_APP_GROUP";
+
 /// point `HF_HOME` / `HF_HUB_CACHE` at the shared container. no-ops if
 /// the user already set them.
 pub fn setup_shared_model_cache() {
@@ -404,6 +415,24 @@ fn selected_model_file_path() -> Option<PathBuf> {
 /// so it won't exist until the user has launched siGit desktop or another Onde app.
 #[cfg(target_os = "macos")]
 fn resolve_shared_container() -> Option<PathBuf> {
+    // Honor the opt-out before touching the container at all — the access
+    // itself is what triggers the macOS cross-app data privacy prompt.
+    if std::env::var(DISABLE_APP_GROUP_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+    {
+        log::info!(
+            "{DISABLE_APP_GROUP_ENV} set — skipping Onde App Group container, using default HF cache"
+        );
+        return None;
+    }
+
     let home = std::env::var("HOME").ok()?;
     let container = PathBuf::from(home)
         .join("Library")

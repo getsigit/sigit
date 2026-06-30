@@ -35,6 +35,7 @@ mod credentials;
 mod instructions;
 mod models;
 mod provider;
+mod sessions;
 mod settings;
 mod setup;
 mod skills;
@@ -72,8 +73,8 @@ use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder}
 use onde::inference::{ChatEngine, GgufModelConfig};
 
 use crate::backend::{
-    InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult, ToolSpec,
-    TurnResult,
+    HistoryMessage, HistoryRole, InferenceBackend, LocalBackend, OpenAiBackend,
+    ToolResult as BackendToolResult, ToolSpec, TurnResult,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -883,6 +884,51 @@ impl SiGitAgent {
         }
     }
 
+    /// Replay a persisted transcript into a freshly-loaded session: restore the
+    /// model's context on whatever backend is now active, then re-emit each turn
+    /// to the editor so a reopened thread shows its history instead of a blank
+    /// panel. Call after the session cwd and backend are settled.
+    async fn replay_stored_session(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        stored: &sessions::StoredSession,
+    ) {
+        if stored.messages.is_empty() {
+            return;
+        }
+
+        // Give the model its prior context back on the active backend.
+        let history: Vec<HistoryMessage> = stored
+            .messages
+            .iter()
+            .map(|message| HistoryMessage {
+                role: match message.role {
+                    sessions::Role::User => HistoryRole::User,
+                    sessions::Role::Assistant => HistoryRole::Assistant,
+                },
+                content: message.text.clone(),
+            })
+            .collect();
+        self.backend.lock().await.restore_history(&history).await;
+
+        // Replay the visible transcript so the editor re-renders the thread.
+        for message in &stored.messages {
+            let chunk = ContentChunk::new(ContentBlock::from(message.text.clone()));
+            let update = match message.role {
+                sessions::Role::User => SessionUpdate::UserMessageChunk(chunk),
+                sessions::Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
+            };
+            self.send_tool_call_update(cx, session_id.clone(), update)
+                .ok();
+        }
+
+        log::info!(
+            "replayed {} stored message(s) for session {session_id}",
+            stored.messages.len()
+        );
+    }
+
     async fn handle_load_session(
         &self,
         cx: &ConnectionTo<Client>,
@@ -909,7 +955,7 @@ impl SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
-        // no session persistence, so "load" just resets
+        // Start from a clean engine, then rebuild the per-session context.
         self.engine.clear_history().await;
 
         self.engine
@@ -919,7 +965,14 @@ impl SiGitAgent {
             .await;
 
         // Honor the persisted Local Inference toggle (off + signed in → cloud).
+        // Do this before replaying so the saved turns land on the active backend.
         self.apply_startup_inference_mode().await;
+
+        // Replay the persisted transcript so a reopened thread resumes instead
+        // of starting blank.
+        let stored = sessions::load(args.session_id.0.as_ref());
+        self.replay_stored_session(cx, &args.session_id, &stored)
+            .await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -956,7 +1009,7 @@ impl SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
-        // no persistence, so fork == fresh session
+        // Start from a clean engine, then rebuild the per-session context.
         self.engine.clear_history().await;
 
         self.engine
@@ -967,6 +1020,12 @@ impl SiGitAgent {
 
         // Honor the persisted Local Inference toggle (off + signed in → cloud).
         self.apply_startup_inference_mode().await;
+
+        // Carry the parent thread's transcript into the fork so it opens with
+        // the same history rather than blank, then replay it like a load.
+        sessions::fork(args.session_id.0.as_ref(), new_id.0.as_ref());
+        let stored = sessions::load(new_id.0.as_ref());
+        self.replay_stored_session(cx, &new_id, &stored).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1282,10 +1341,14 @@ impl SiGitAgent {
         }
 
         // ── Final text response ───────────────────────────────────────────
-        // If anything streamed, the visible reply is already on the wire; only
-        // send a trailing block for the non-streamed path (e.g. on-device direct
-        // answers, which onde can't stream while tools are on offer).
-        if !streamed_any {
+        // If anything streamed, the visible reply is already on the wire and
+        // `sent` holds exactly what reached the editor. Otherwise send the
+        // buffered final text now (e.g. on-device direct answers, which onde
+        // can't stream while tools are on offer). Either way, keep the visible
+        // reply so we can persist the turn below.
+        let assistant_reply = if streamed_any {
+            sent.clone()
+        } else {
             let reply_text = result.text.trim().to_string();
             let final_text = if reply_text.is_empty() {
                 if round > 0 {
@@ -1309,10 +1372,21 @@ impl SiGitAgent {
             };
 
             if !final_text.is_empty() {
-                self.send_assistant_message(cx, session_id.clone(), final_text)
+                self.send_assistant_message(cx, session_id.clone(), final_text.clone())
                     .ok();
             }
-        }
+            final_text
+        };
+
+        // Persist the completed turn so reopening this thread in the editor
+        // resumes it instead of starting from a blank panel.
+        let cwd = self.session_cwd.lock().ok().and_then(|guard| guard.clone());
+        sessions::append_turn(
+            session_id.0.as_ref(),
+            cwd.as_deref(),
+            &user_text,
+            &assistant_reply,
+        );
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
         Ok(PromptResponse::new(StopReason::EndTurn))
@@ -2109,6 +2183,8 @@ async fn exec_slash_acp(
         }
         SlashCommand::Clear => {
             let cleared = agent.engine.clear_history().await;
+            // Also forget the persisted transcript so the wipe survives a reload.
+            sessions::clear(session_id.0.as_ref());
             agent
                 .send_assistant_message(
                     cx,

@@ -111,7 +111,17 @@ verbosity with `RUST_LOG`.
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
+`SIGIT_MODEL`, `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`, `SIGIT_DISABLE_APP_GROUP` (macOS: skip the
+shared Onde App Group model cache so the cross-app data privacy prompt never fires; falls back to
+`~/.cache/huggingface`).
+
+## Session persistence (ACP)
+
+ACP chat transcripts persist per `SessionId` under `$SIGIT_CONFIG_DIR/sessions/<id>.json` (see
+`src/sessions.rs`). Each completed user/assistant turn is appended in `handle_prompt`; on
+`session/load` (and `session/fork`) the transcript is replayed to the editor and pushed back into
+the active backend via `InferenceBackend::restore_history`, so reopening a thread in Zed resumes it
+instead of starting blank. `/clear` wipes both the engine history and the stored file.
 
 ## Releasing
 

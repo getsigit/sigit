@@ -59,6 +59,21 @@ pub struct TurnResult {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Author of a turn replayed into a backend when a persisted session reopens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRole {
+    User,
+    Assistant,
+}
+
+/// A prior user/assistant turn restored into a backend's context when a
+/// persisted session is reopened (see [`InferenceBackend::restore_history`]).
+#[derive(Debug, Clone)]
+pub struct HistoryMessage {
+    pub role: HistoryRole,
+    pub content: String,
+}
+
 /// Backend errors are plain strings. Callers map them to ACP errors.
 pub type BackendError = String;
 
@@ -102,6 +117,12 @@ pub trait InferenceBackend: Send + Sync {
     /// than on-device. Drives UI labelling so the displayed model can't claim a
     /// local model while requests actually go to the cloud.
     fn is_remote(&self) -> bool;
+
+    /// Replay prior user/assistant turns into the backend's context after a
+    /// persisted session is reopened, so the model continues with its history
+    /// rather than starting blank. Called once on session load, before any new
+    /// prompt. The default does nothing.
+    async fn restore_history(&self, _messages: &[HistoryMessage]) {}
 }
 
 // ── Local backend (onde ChatEngine) ──────────────────────────────────────────────
@@ -197,6 +218,21 @@ impl InferenceBackend for LocalBackend {
 
     fn is_remote(&self) -> bool {
         false
+    }
+
+    async fn restore_history(&self, messages: &[HistoryMessage]) {
+        // Push the saved turns straight into onde's conversation history so the
+        // next prompt sees them. The system context is re-pushed separately by
+        // the caller, so only user/assistant turns flow through here.
+        for message in messages {
+            let chat_message = match message.role {
+                HistoryRole::User => onde::inference::ChatMessage::user(message.content.clone()),
+                HistoryRole::Assistant => {
+                    onde::inference::ChatMessage::assistant(message.content.clone())
+                }
+            };
+            self.engine.push_history(chat_message).await;
+        }
     }
 }
 
@@ -564,6 +600,19 @@ impl InferenceBackend for OpenAiBackend {
 
     fn is_remote(&self) -> bool {
         true
+    }
+
+    async fn restore_history(&self, messages: &[HistoryMessage]) {
+        // Splice the saved turns in after the seeded system prompt and before
+        // any new request, matching the OpenAI chat history shape.
+        let mut history = self.history.lock().await;
+        for message in messages {
+            let role = match message.role {
+                HistoryRole::User => "user",
+                HistoryRole::Assistant => "assistant",
+            };
+            history.push(serde_json::json!({ "role": role, "content": message.content }));
+        }
     }
 }
 
