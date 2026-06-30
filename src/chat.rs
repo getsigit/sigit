@@ -738,6 +738,8 @@ mod tui {
         Local(Option<bool>),
         /// List discovered Agent Skills.
         Skills,
+        /// List configured MCP servers and their tools.
+        Mcp,
         /// explicitly load the selected (or default) on-device model
         Load,
         /// `/login <email> <password>` — the raw argument, parsed when executed.
@@ -763,6 +765,7 @@ mod tui {
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
             "/local" => SlashCommand::Local(parse_on_off(arg)),
             "/skills" => SlashCommand::Skills,
+            "/mcp" => SlashCommand::Mcp,
             "/load" => SlashCommand::Load,
             "/login" => SlashCommand::Login(arg.map(str::to_string)),
             "/logout" => SlashCommand::Logout,
@@ -1359,6 +1362,7 @@ mod tui {
                      /models N      — switch to model N\n\
                      /local [on|off]— toggle on-device inference mode\n\
                      /skills        — list available Agent Skills\n\
+                     /mcp           — list MCP servers and their tools\n\
                      /load          — load the selected on-device model\n\
                      /login E P     — sign in to siGit Code Cloud\n\
                      /logout        — sign out\n\
@@ -1387,6 +1391,10 @@ mod tui {
             SlashCommand::Skills => {
                 app.messages
                     .push(ChatMessage::system(crate::skills::format_skills_list()));
+            }
+            SlashCommand::Mcp => {
+                app.messages
+                    .push(ChatMessage::system(crate::mcp::status_summary()));
             }
             SlashCommand::Models(selection) => match selection {
                 None => {
@@ -1532,6 +1540,9 @@ mod tui {
                 parameters_schema: crate::skills::skill_tool_schema().to_string(),
             });
         }
+
+        // Tools discovered from configured MCP servers (incl. the official one).
+        specs.extend(crate::mcp::tool_specs());
 
         specs
     }
