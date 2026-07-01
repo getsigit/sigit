@@ -209,4 +209,4 @@ ACP and editor mode work on Windows. The part that is still missing is the inter
 
 ---
 
-*© 2026 [smbCloud](https://smbcloud.xyz/) (Splitfire AB).*
+*© 2026 [Splitfire AB](https://5mb.app) ([siGit Code & Deploy](https://sigit.si)).*
