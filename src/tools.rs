@@ -1159,8 +1159,8 @@ fn exec_glob(arguments: &str) -> String {
         return format!("No files match glob: {pattern}");
     }
 
-    // Most-recently-modified first, like Claude Code's Glob.
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    // Most-recently-modified first.
+    found.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
 
     let total = found.len();
     let mut paths: Vec<String> = found.into_iter().map(|(_, p)| p).collect();

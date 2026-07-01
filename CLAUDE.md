@@ -81,8 +81,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
 - **`src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
-  `list_directory`, `search_files`, `read_website`, `create_file`, `edit_file`, `delete_file`,
-  `run_command`. Add a tool in both the spec list and the execute `match`.
+  `list_directory`, `search_files`, `glob`, `read_website`, `create_file`, `edit_file`,
+  `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
+  spec list (`all_tools`) and the execute `match` (`execute_tool`).
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
   instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,
