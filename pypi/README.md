@@ -84,4 +84,4 @@ This package ships a prebuilt binary. The source code lives at [github.com/getsi
 
 ## Copyright
 
-© 2026 [smbCloud](https://smbcloud.xyz/) (Splitfire AB).
+© 2026 [Splitfire AB](https://5mb.app) ([siGit Code & Deploy](https://sigit.si)).
