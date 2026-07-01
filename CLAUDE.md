@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents when working with code in this repository.
 
 ## What this is
 
@@ -22,7 +22,19 @@ Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit 
 **IMPORTANT — branch naming:** Name every working branch after the *changes it contains*, not
 after a task, ticket, or session id. Use a short, descriptive, kebab-case slug so the branch is
 self-explanatory from its name alone (e.g. `claude/agent-tools-multiedit-glob-todos-remember`,
-not `claude/code-feature-parity-q003hm`).
+not `claude/task-q003hm`).
+
+**IMPORTANT — pull request target:** Always open pull requests against the `development` branch,
+never `main`. `main` is release-only; `development` is where day-to-day work integrates.
+
+**IMPORTANT — run CI before pushing:** Run the full CI gate locally and confirm it is green
+*before* pushing a branch or opening a pull request — never push work that fails these:
+
+```sh
+cargo fmt -- --check                  # formatting
+cargo clippy --tests -- -D warnings   # lint (warnings are errors)
+cargo test --locked                   # tests
+```
 
 ## Build / test / lint
 
