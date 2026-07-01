@@ -254,6 +254,9 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
         "delete_file" => exec_delete_file(arguments),
         "run_command" => exec_run_command(arguments),
         "skill" => crate::skills::activate_skill(arguments),
+        // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
+        // and forwarded to the owning server.
+        _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
         _ => format!("Unknown tool: {name}"),
     }
 }

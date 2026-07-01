@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Adds [Model Context Protocol](https://modelcontextprotocol.io) (MCP) client
+support and bakes in the official siGit Code MCP server.
+
+### What changed
+
+- siGit Code is now an MCP client: it connects to MCP servers over the Streamable HTTP transport (a single JSON-RPC endpoint), discovers the tools they expose, and offers them to the model alongside the built-in tools. When the model calls one, the call is forwarded to the owning server and the result fed back into the agent loop
+- Bakes in the official siGit Code MCP server at `https://sigit.si/api/v1/mcp` (follows `SIGIT_CLOUD_URL`). When you are signed in (`sigit login`), the cloud session token is sent as the bearer credential
+- Configure additional servers in `mcp.toml` — global (`~/.config/sigit/mcp.toml`) or project-local (`.sigit/mcp.toml`). Each `[[server]]` has a `name`, `url`, optional `enabled`, and optional `[server.headers]`; set `official = false` to opt out of the baked-in server
+- MCP tools are namespaced `mcp__<server>__<tool>` so they never collide with built-in tools or across servers; tool output is capped to protect the model's context
+- Discovery is best-effort at startup and bounded by a per-server timeout, so an unreachable server never blocks startup — it just contributes no tools
+- Added a `/mcp` slash command (TUI and ACP) that lists configured servers, their connection status, and the tools each exposes
+- Disable MCP entirely with `SIGIT_MCP=off`, or just the official server with `SIGIT_MCP_OFFICIAL=off`
+
 ## 1.3.0
 
 Adds a Local Inference on/off toggle, the open [Agent Skills](https://agentskills.io)

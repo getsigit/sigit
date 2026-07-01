@@ -33,6 +33,7 @@ mod backend;
 mod chat;
 mod credentials;
 mod instructions;
+mod mcp;
 mod models;
 mod provider;
 mod settings;
@@ -274,6 +275,9 @@ fn agent_tools_as_specs() -> Vec<ToolSpec> {
             parameters_schema: skills::skill_tool_schema().to_string(),
         });
     }
+
+    // Tools discovered from configured MCP servers (incl. the official one).
+    specs.extend(mcp::tool_specs());
 
     specs
 }
@@ -717,6 +721,7 @@ impl SiGitAgent {
                 "on|off (optional)",
             ),
             AvailableCommand::new("skills", "List available Agent Skills"),
+            AvailableCommand::new("mcp", "List MCP servers and their tools"),
             AvailableCommand::new("load", "Load the selected on-device model"),
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
             AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
@@ -1962,6 +1967,8 @@ enum SlashCommand {
     Local(Option<bool>),
     /// List discovered Agent Skills.
     Skills,
+    /// List configured MCP servers and their tools.
+    Mcp,
     /// Explicitly load the selected (or default) on-device model.
     Load,
     /// `/login <email> <password>` — the raw argument, parsed when executed.
@@ -1989,6 +1996,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
         "/local" => SlashCommand::Local(parse_on_off(argument)),
         "/skills" => SlashCommand::Skills,
+        "/mcp" => SlashCommand::Mcp,
         "/load" => SlashCommand::Load,
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
         "/logout" => SlashCommand::Logout,
@@ -2096,6 +2104,7 @@ async fn exec_slash_acp(
                      /models N      - switch to model N\n\
                      /local [on|off]- toggle on-device inference mode\n\
                      /skills        - list available Agent Skills\n\
+                     /mcp           - list MCP servers and their tools\n\
                      /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
                      /logout        - sign out\n\
@@ -2141,6 +2150,11 @@ async fn exec_slash_acp(
         SlashCommand::Skills => {
             agent
                 .send_assistant_message(cx, session_id, skills::format_skills_list())
+                .ok();
+        }
+        SlashCommand::Mcp => {
+            agent
+                .send_assistant_message(cx, session_id, mcp::status_summary())
                 .ok();
         }
         SlashCommand::Models(Some(number)) => {
@@ -2775,6 +2789,9 @@ async fn main() -> anyhow::Result<()> {
             let (tty, cleanup_tty) = redirect_output_to_log()?;
             init_logging(true);
             setup::setup_shared_model_cache();
+            // Best-effort: discover MCP servers (incl. the official one) before
+            // the first turn so their tools are offered to the model.
+            mcp::init().await;
             run_interactive(tty, cleanup_tty).await
         }
         #[cfg(not(unix))]
@@ -2786,6 +2803,8 @@ async fn main() -> anyhow::Result<()> {
         // Logs already go to stderr via `init_logging(false)`.
         init_logging(false);
         setup::setup_shared_model_cache();
+        // Best-effort MCP discovery (incl. the official server) before serving.
+        mcp::init().await;
         log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));
         run_acp_server().await
     }

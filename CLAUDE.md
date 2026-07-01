@@ -72,6 +72,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
   `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
   and only when at least one skill exists.
+- **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Connects to
+  MCP servers over the **Streamable HTTP** transport (one JSON-RPC POST endpoint; replies are
+  `application/json` or SSE), runs the `initialize`/`tools/list` handshake, and forwards `tools/call`.
+  Discovery is best-effort at startup (`mcp::init`, called from both branches of `main()`) and cached
+  in a process-global so the synchronous spec builders (`mcp::tool_specs`) and the async dispatch
+  (`mcp::call_tool`) can both read it. Tools are namespaced `mcp__<server>__<tool>`, appended in the
+  `*_as_specs`/`build_tool_specs` layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. The
+  official server (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in and authed with the
+  cloud session token; extra servers live in `mcp.toml` (global `$SIGIT_CONFIG_DIR/mcp.toml` and
+  project-local `.sigit/mcp.toml`). stdio transport is not supported.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
@@ -89,7 +99,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
-Slash commands (`/help`, `/models`, `/skills`, `/login`, `/logout`, `/whoami`, `/reload`,
+Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
 `/clear`, `/status`) are advertised via `advertise_commands` in `main.rs` and handled in both the
 TUI and ACP sessions.
 
@@ -111,7 +121,8 @@ verbosity with `RUST_LOG`.
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
+`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
+server), `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
 
 ## Releasing
 
