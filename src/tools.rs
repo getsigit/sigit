@@ -13,6 +13,9 @@ const WEBSITE_USER_AGENT: &str =
 
 const READ_FILE_CHAR_LIMIT: usize = 10_000;
 const SEARCH_FILES_MATCH_LIMIT: usize = 50;
+/// Upper bound on `max_results` for `search_files` and the number of paths
+/// returned by `glob`, so a broad pattern can't flood the context window.
+const SEARCH_RESULTS_HARD_CAP: usize = 1_000;
 
 // ── Tool schemas ─────────────────────────────────────────────────────────────
 
@@ -93,7 +96,9 @@ pub fn all_tools() -> Vec<AgentTool> {
             description: "Search for a regex pattern across files in a directory tree. \
                            Prefer an absolute root path when possible. Returns matching \
                            lines in `file:line_number: content` format. Skips binary \
-                           files and hidden directories. Limited to the first 50 matches.",
+                           files and hidden directories. Pass `file_glob` to restrict the \
+                           search to files whose name matches a glob (e.g. \"*.rs\"), and \
+                           `max_results` to raise or lower the default cap of 50 matches.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -104,6 +109,14 @@ pub fn all_tools() -> Vec<AgentTool> {
                     "path": {
                         "type": "string",
                         "description": "Root directory to search in. Defaults to \".\" (current directory)."
+                    },
+                    "file_glob": {
+                        "type": "string",
+                        "description": "Optional glob on the file name (not the full path), e.g. \"*.rs\" or \"*.{ts,tsx}\". Only matching files are searched."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of matching lines to return (default 50, capped at 1000)."
                     }
                 },
                 "required": ["pattern"],
@@ -154,11 +167,12 @@ pub fn all_tools() -> Vec<AgentTool> {
         AgentTool {
             name: "edit_file",
             description: "Edit an existing file by replacing an exact substring (old_text) with \
-                           new text (new_text). Prefer an absolute path when possible. The \
-                           old_text must appear exactly once in the file. Use read_file first \
-                           to see the current content and identify the exact text to replace. \
-                           To append to a file, match the last few lines as old_text and \
-                           include them plus the new content as new_text.",
+                           new text (new_text). Prefer an absolute path when possible. By \
+                           default old_text must appear exactly once; set replace_all to true \
+                           to replace every occurrence (useful for renaming a symbol). Use \
+                           read_file first to see the current content and identify the exact \
+                           text to replace. To append to a file, match the last few lines as \
+                           old_text and include them plus the new content as new_text.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -168,11 +182,15 @@ pub fn all_tools() -> Vec<AgentTool> {
                     },
                     "old_text": {
                         "type": "string",
-                        "description": "The exact text span to find and replace. Must match exactly once."
+                        "description": "The exact text span to find and replace. Must match exactly once unless replace_all is true."
                     },
                     "new_text": {
                         "type": "string",
                         "description": "The replacement text that will take the place of old_text."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence of old_text instead of requiring a unique match. Defaults to false."
                     }
                 },
                 "required": ["path", "old_text", "new_text"],
@@ -231,6 +249,130 @@ pub fn all_tools() -> Vec<AgentTool> {
                 "additionalProperties": false
             }),
         },
+        AgentTool {
+            name: "multi_edit",
+            description: "Apply several exact-substring edits to a single file in one call. \
+                           Edits are applied in order, each to the result of the previous one, \
+                           and the whole batch is atomic — if any edit fails to match, the file \
+                           is left untouched and an error explains which edit failed. Prefer \
+                           this over multiple edit_file calls when changing several spots in the \
+                           same file. Each edit has old_text (must match exactly once, or every \
+                           time when replace_all is true) and new_text.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the existing file to edit."
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Ordered list of edits to apply to the file.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "The exact text span to find and replace."
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "The replacement text."
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": "Replace every occurrence instead of requiring a unique match. Defaults to false."
+                                }
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["path", "edits"],
+                "additionalProperties": false
+            }),
+        },
+        AgentTool {
+            name: "glob",
+            description: "Find files by name using a glob pattern (e.g. \"**/*.rs\", \
+                           \"src/**/*.{ts,tsx}\", \"Cargo.toml\"). Returns matching file paths, \
+                           most-recently-modified first. Supports `*` (any run of non-separator \
+                           characters), `**` (any number of directories), `?` (one character), \
+                           and `{a,b}` alternation. Use this to locate files by name; use \
+                           search_files to search file contents.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern matched against paths relative to the search root."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Root directory to search in. Defaults to \".\" (current directory)."
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        },
+        AgentTool {
+            name: "write_todos",
+            description: "Record or update a checklist of the steps for the current task. \
+                           Use this for any multi-step task to plan the work and show progress: \
+                           call it once up front with all the steps as `pending`, then call it \
+                           again whenever a step's status changes. Mark exactly one step \
+                           `in_progress` at a time and `completed` as soon as it is done. \
+                           Keep the list short and outcome-focused.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The full, current checklist (replaces any previous list).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "Short imperative description of the step."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Current status of the step."
+                                }
+                            },
+                            "required": ["content", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["todos"],
+                "additionalProperties": false
+            }),
+        },
+        AgentTool {
+            name: "remember",
+            description: "Persist a durable note, preference, or convention by appending it to \
+                           this project's instruction file (AGENTS.md / CLAUDE.md). Use this \
+                           when the user asks you to remember something for next time, or states \
+                           a lasting preference about how to work in this project. The note is \
+                           written to the nearest existing instruction file, or a new CLAUDE.md \
+                           at the repository root if none exists yet.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "note": {
+                        "type": "string",
+                        "description": "The fact or preference to remember, phrased as a standalone instruction."
+                    }
+                },
+                "required": ["note"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -251,6 +393,10 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
         "create_directory" => exec_create_directory(arguments),
         "create_file" => exec_create_file(arguments),
         "edit_file" => exec_edit_file(arguments),
+        "multi_edit" => exec_multi_edit(arguments),
+        "glob" => exec_glob(arguments),
+        "write_todos" => exec_write_todos(arguments),
+        "remember" => exec_remember(arguments),
         "delete_file" => exec_delete_file(arguments),
         "run_command" => exec_run_command(arguments),
         "skill" => crate::skills::activate_skill(arguments),
@@ -428,6 +574,21 @@ fn exec_search_files(arguments: &str) -> String {
         Err(err) => return format!("Error: invalid regex pattern: {err}"),
     };
 
+    // Optional file-name filter compiled from a glob (e.g. "*.rs").
+    let name_filter = match args.get("file_glob").and_then(Value::as_str) {
+        Some(glob) => match Regex::new(&glob_to_regex(glob)) {
+            Ok(r) => Some(r),
+            Err(err) => return format!("Error: invalid file_glob: {err}"),
+        },
+        None => None,
+    };
+
+    let limit = args
+        .get("max_results")
+        .and_then(Value::as_u64)
+        .map(|n| (n as usize).clamp(1, SEARCH_RESULTS_HARD_CAP))
+        .unwrap_or(SEARCH_FILES_MATCH_LIMIT);
+
     let root = Path::new(root_str);
     let absolute_root = absolute_path(root);
     let absolute_root_str = absolute_root.display().to_string();
@@ -441,27 +602,38 @@ fn exec_search_files(arguments: &str) -> String {
     }
 
     let mut matches: Vec<String> = Vec::new();
-    walk_and_search(&absolute_root, &re, &mut matches);
+    walk_and_search(
+        &absolute_root,
+        &re,
+        name_filter.as_ref(),
+        limit,
+        &mut matches,
+    );
 
     if matches.is_empty() {
         return format!("No matches found for pattern: {pattern_str}");
     }
 
     let total = matches.len();
-    if total > SEARCH_FILES_MATCH_LIMIT {
-        matches.truncate(SEARCH_FILES_MATCH_LIMIT);
+    if total > limit {
+        matches.truncate(limit);
         matches.push(format!(
-            "\n--- truncated (showing {SEARCH_FILES_MATCH_LIMIT} of {total} matches) ---"
+            "\n--- truncated (showing {limit} of {total}+ matches; raise max_results to see more) ---"
         ));
     }
 
     matches.join("\n")
 }
 
-/// caps collected matches at 2x the public limit to bound work on large trees.
-fn walk_and_search(dir: &Path, re: &Regex, matches: &mut Vec<String>) {
-    const WALK_CAP: usize = SEARCH_FILES_MATCH_LIMIT * 2;
-
+/// Collects up to `limit + 1` matches (the extra signals truncation) so a broad
+/// pattern can't walk an entire tree once enough hits are found.
+fn walk_and_search(
+    dir: &Path,
+    re: &Regex,
+    name_filter: Option<&Regex>,
+    limit: usize,
+    matches: &mut Vec<String>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return,
@@ -471,7 +643,7 @@ fn walk_and_search(dir: &Path, re: &Regex, matches: &mut Vec<String>) {
     sorted.sort_by_key(|e| e.file_name());
 
     for entry in sorted {
-        if matches.len() >= WALK_CAP {
+        if matches.len() > limit {
             return;
         }
 
@@ -484,8 +656,13 @@ fn walk_and_search(dir: &Path, re: &Regex, matches: &mut Vec<String>) {
         }
 
         if path.is_dir() {
-            walk_and_search(&path, re, matches);
+            walk_and_search(&path, re, name_filter, limit, matches);
         } else if path.is_file() {
+            if let Some(filter) = name_filter
+                && !filter.is_match(&name_str)
+            {
+                continue;
+            }
             search_file(&path, re, matches);
         }
     }
@@ -698,9 +875,68 @@ fn exec_create_file(arguments: &str) -> String {
     }
 }
 
-// ── edit_file ────────────────────────────────────────────────────────────────
+// ── edit_file / multi_edit ─────────────────────────────────────────────────
 
-/// `old_text` must match exactly once — ambiguity means the LLM didn't read the file first.
+/// Apply one exact-substring replacement to `contents`. Returns the updated
+/// string, or a human-readable explanation of why the match failed so the model
+/// can correct itself in a single follow-up instead of guessing blindly.
+fn apply_edit(
+    contents: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+) -> Result<String, String> {
+    if old_text.is_empty() {
+        return Err("old_text is empty; nothing to match".to_string());
+    }
+    if old_text == new_text {
+        return Err("old_text and new_text are identical; no change to make".to_string());
+    }
+
+    let occurrences = contents.matches(old_text).count();
+
+    if occurrences == 0 {
+        return Err(format!(
+            "old_text not found. Use read_file to copy the exact text \
+             (including whitespace and indentation) to replace.{}",
+            nearest_line_hint(contents, old_text)
+        ));
+    }
+
+    if occurrences > 1 && !replace_all {
+        return Err(format!(
+            "old_text appears {occurrences} times; include more surrounding context so it \
+             matches exactly once, or set replace_all to true to change every occurrence."
+        ));
+    }
+
+    if replace_all {
+        Ok(contents.replace(old_text, new_text))
+    } else {
+        Ok(contents.replacen(old_text, new_text, 1))
+    }
+}
+
+/// When `old_text` doesn't match verbatim, point at the line whose trimmed text
+/// equals the first trimmed line of `old_text` — the usual culprit is a
+/// whitespace/indentation mismatch, and naming the line lets the model fix it.
+fn nearest_line_hint(contents: &str, old_text: &str) -> String {
+    let first = old_text.lines().find(|l| !l.trim().is_empty());
+    let Some(first) = first.map(str::trim) else {
+        return String::new();
+    };
+    for (idx, line) in contents.lines().enumerate() {
+        if line.trim() == first {
+            return format!(
+                " (the first line of old_text appears at line {}, so the difference is likely \
+                 whitespace or indentation)",
+                idx + 1
+            );
+        }
+    }
+    String::new()
+}
+
 fn exec_edit_file(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -722,6 +958,11 @@ fn exec_edit_file(arguments: &str) -> String {
         None => return "Error: missing required parameter \"new_text\"".to_string(),
     };
 
+    let replace_all = args
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     let path = Path::new(path_str);
     let absolute_path = absolute_path(path);
     let absolute_path_str = absolute_path.display().to_string();
@@ -741,23 +982,10 @@ fn exec_edit_file(arguments: &str) -> String {
         Err(err) => return format!("Error: could not read file: {err}"),
     };
 
-    let occurrences = contents.matches(old_text).count();
-
-    if occurrences == 0 {
-        return format!(
-            "Error: old_text not found in {absolute_path_str}. \
-             Use read_file to see the current content and copy the exact text to replace."
-        );
-    }
-
-    if occurrences > 1 {
-        return format!(
-            "Error: old_text appears {occurrences} times in {absolute_path_str}. \
-             Include more surrounding context in old_text so it matches exactly once."
-        );
-    }
-
-    let updated = contents.replacen(old_text, new_text, 1);
+    let updated = match apply_edit(&contents, old_text, new_text, replace_all) {
+        Ok(updated) => updated,
+        Err(why) => return format!("Error: {why} (in {absolute_path_str})"),
+    };
 
     match fs::write(&absolute_path, &updated) {
         Ok(()) => format!(
@@ -765,6 +993,346 @@ fn exec_edit_file(arguments: &str) -> String {
             updated.len()
         ),
         Err(err) => format!("Error: could not write file: {err}"),
+    }
+}
+
+/// Apply a batch of edits to one file atomically: each edit is applied to the
+/// result of the previous one, and the file is only written if *every* edit
+/// matches. A failure leaves the file untouched.
+fn exec_multi_edit(arguments: &str) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let path_str = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return "Error: missing required parameter \"path\"".to_string(),
+    };
+
+    let edits = match args.get("edits").and_then(Value::as_array) {
+        Some(e) if !e.is_empty() => e,
+        Some(_) => return "Error: \"edits\" must contain at least one edit".to_string(),
+        None => return "Error: missing required parameter \"edits\"".to_string(),
+    };
+
+    let path = Path::new(path_str);
+    let absolute_path = absolute_path(path);
+    let absolute_path_str = absolute_path.display().to_string();
+
+    if !absolute_path.exists() {
+        return format!(
+            "Error: file does not exist: {absolute_path_str} — use create_file for new files"
+        );
+    }
+
+    if !absolute_path.is_file() {
+        return format!("Error: path is not a file: {absolute_path_str}");
+    }
+
+    let mut working = match fs::read_to_string(&absolute_path) {
+        Ok(c) => c,
+        Err(err) => return format!("Error: could not read file: {err}"),
+    };
+
+    for (idx, edit) in edits.iter().enumerate() {
+        let old_text = match edit.get("old_text").and_then(Value::as_str) {
+            Some(t) => t,
+            None => return format!("Error: edit #{} is missing \"old_text\"", idx + 1),
+        };
+        let new_text = match edit.get("new_text").and_then(Value::as_str) {
+            Some(t) => t,
+            None => return format!("Error: edit #{} is missing \"new_text\"", idx + 1),
+        };
+        let replace_all = edit
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        match apply_edit(&working, old_text, new_text, replace_all) {
+            Ok(updated) => working = updated,
+            Err(why) => {
+                return format!(
+                    "Error: edit #{} failed: {why}. No changes were written to {absolute_path_str}.",
+                    idx + 1
+                );
+            }
+        }
+    }
+
+    match fs::write(&absolute_path, &working) {
+        Ok(()) => format!(
+            "Applied {} edits to {absolute_path_str} ({} bytes written)",
+            edits.len(),
+            working.len()
+        ),
+        Err(err) => format!("Error: could not write file: {err}"),
+    }
+}
+
+// ── glob ─────────────────────────────────────────────────────────────────────
+
+/// Translate a shell-style glob into an anchored regex. Supports `*`
+/// (non-separator run), `**` (any number of directories), `?` (one
+/// non-separator), and `{a,b}` alternation; everything else is matched
+/// literally. Used both by the `glob` tool (against relative paths) and by
+/// `search_files`' `file_glob` filter (against bare file names).
+fn glob_to_regex(glob: &str) -> String {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut re = String::from("^");
+    let mut brace_depth = 0usize;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    i += 1; // consume the second '*'
+                    if i + 1 < chars.len() && chars[i + 1] == '/' {
+                        // `**/` matches zero or more leading directories.
+                        re.push_str("(?:.*/)?");
+                        i += 1; // consume the '/'
+                    } else {
+                        re.push_str(".*");
+                    }
+                } else {
+                    re.push_str("[^/]*");
+                }
+            }
+            '?' => re.push_str("[^/]"),
+            '{' => {
+                brace_depth += 1;
+                re.push_str("(?:");
+            }
+            '}' if brace_depth > 0 => {
+                brace_depth -= 1;
+                re.push(')');
+            }
+            ',' if brace_depth > 0 => re.push('|'),
+            // Escape regex metacharacters so they match literally. (`{` is always
+            // consumed by the brace arm above; an unmatched `}` lands here.)
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '\\' | '[' | ']' | '}' => {
+                re.push('\\');
+                re.push(c);
+            }
+            other => re.push(other),
+        }
+        i += 1;
+    }
+
+    re.push('$');
+    re
+}
+
+fn exec_glob(arguments: &str) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let pattern = match args.get("pattern").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return "Error: missing required parameter \"pattern\"".to_string(),
+    };
+
+    let re = match Regex::new(&glob_to_regex(pattern)) {
+        Ok(r) => r,
+        Err(err) => return format!("Error: invalid glob pattern: {err}"),
+    };
+
+    let root_str = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let absolute_root = absolute_path(Path::new(root_str));
+    let absolute_root_str = absolute_root.display().to_string();
+
+    if !absolute_root.exists() {
+        return format!("Error: path does not exist: {absolute_root_str}");
+    }
+    if !absolute_root.is_dir() {
+        return format!("Error: path is not a directory: {absolute_root_str}");
+    }
+
+    let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+    glob_walk(&absolute_root, &absolute_root, &re, &mut found);
+
+    if found.is_empty() {
+        return format!("No files match glob: {pattern}");
+    }
+
+    // Most-recently-modified first.
+    found.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+
+    let total = found.len();
+    let mut paths: Vec<String> = found.into_iter().map(|(_, p)| p).collect();
+    if total > SEARCH_RESULTS_HARD_CAP {
+        paths.truncate(SEARCH_RESULTS_HARD_CAP);
+        paths.push(format!(
+            "\n--- truncated (showing {SEARCH_RESULTS_HARD_CAP} of {total} files) ---"
+        ));
+    }
+
+    paths.join("\n")
+}
+
+fn glob_walk(root: &Path, dir: &Path, re: &Regex, out: &mut Vec<(std::time::SystemTime, String)>) {
+    if out.len() > SEARCH_RESULTS_HARD_CAP {
+        return;
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+
+    let mut sorted: Vec<fs::DirEntry> = entries.filter_map(Result::ok).collect();
+    sorted.sort_by_key(|e| e.file_name());
+
+    for entry in sorted {
+        if out.len() > SEARCH_RESULTS_HARD_CAP {
+            return;
+        }
+
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            glob_walk(root, &path, re, out);
+        } else if path.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if re.is_match(&relative) {
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                out.push((mtime, absolute_path_string(&path)));
+            }
+        }
+    }
+}
+
+// ── write_todos ──────────────────────────────────────────────────────────────
+
+/// Renders the model's task checklist back as the tool result so the surface
+/// (TUI / ACP client) can show live progress. Pure presentation — the list is
+/// owned by the model, not persisted here.
+fn exec_write_todos(arguments: &str) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let todos = match args.get("todos").and_then(Value::as_array) {
+        Some(t) if !t.is_empty() => t,
+        Some(_) => return "Error: \"todos\" must contain at least one item".to_string(),
+        None => return "Error: missing required parameter \"todos\"".to_string(),
+    };
+
+    let mut lines = Vec::with_capacity(todos.len());
+    let mut completed = 0usize;
+
+    for (idx, todo) in todos.iter().enumerate() {
+        let content = match todo.get("content").and_then(Value::as_str) {
+            Some(c) => c.trim(),
+            None => return format!("Error: todo #{} is missing \"content\"", idx + 1),
+        };
+        let status = todo
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+
+        let marker = match status {
+            "completed" => {
+                completed += 1;
+                "[x]"
+            }
+            "in_progress" => "[~]",
+            _ => "[ ]",
+        };
+        lines.push(format!("{marker} {content}"));
+    }
+
+    format!(
+        "Task list updated ({completed}/{} done):\n{}",
+        todos.len(),
+        lines.join("\n")
+    )
+}
+
+// ── remember ─────────────────────────────────────────────────────────────────
+
+/// Appends a durable note to the project's instruction file so it persists
+/// across sessions (the always-on counterpart to a one-off chat message).
+fn exec_remember(arguments: &str) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let note = match args.get("note").and_then(Value::as_str) {
+        Some(n) if !n.trim().is_empty() => n.trim(),
+        Some(_) => return "Error: \"note\" must not be empty".to_string(),
+        None => return "Error: missing required parameter \"note\"".to_string(),
+    };
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    remember_at(&cwd, note)
+}
+
+/// Core of `remember`, parameterized on the working directory so it can be
+/// tested without mutating the process-global current directory.
+fn remember_at(cwd: &Path, note: &str) -> String {
+    let target = crate::instructions::memory_file(cwd);
+    let target_str = target.display().to_string();
+
+    let existed = target.exists();
+    let mut body = if existed {
+        match fs::read_to_string(&target) {
+            Ok(c) => c,
+            Err(err) => return format!("Error: could not read {target_str}: {err}"),
+        }
+    } else {
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            return format!("Error: could not create parent directories: {err}");
+        }
+        String::new()
+    };
+
+    // Keep remembered notes grouped under one heading so the file stays tidy.
+    const HEADING: &str = "## Remembered notes";
+    if !body.contains(HEADING) {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(HEADING);
+        body.push('\n');
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str("- ");
+    body.push_str(note);
+    body.push('\n');
+
+    match fs::write(&target, &body) {
+        Ok(()) => {
+            let verb = if existed { "Appended to" } else { "Created" };
+            format!("{verb} {target_str}: remembered \"{note}\"")
+        }
+        Err(err) => format!("Error: could not write {target_str}: {err}"),
     }
 }
 
@@ -1028,7 +1596,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 13);
         assert_eq!(tools[0].name, "read_file");
         assert_eq!(tools[1].name, "create_directory");
         assert_eq!(tools[2].name, "list_directory");
@@ -1038,6 +1606,186 @@ mod tests {
         assert_eq!(tools[6].name, "edit_file");
         assert_eq!(tools[7].name, "delete_file");
         assert_eq!(tools[8].name, "run_command");
+        assert_eq!(tools[9].name, "multi_edit");
+        assert_eq!(tools[10].name, "glob");
+        assert_eq!(tools[11].name, "write_todos");
+        assert_eq!(tools[12].name, "remember");
+    }
+
+    #[test]
+    fn test_edit_file_replace_all() {
+        let dir = std::env::temp_dir().join("sigit_test_edit_replace_all");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        fs::write(&file, "foo foo foo").unwrap();
+
+        // Without replace_all an ambiguous match is rejected.
+        let args =
+            serde_json::json!({ "path": &file, "old_text": "foo", "new_text": "bar" }).to_string();
+        let result = exec_edit_file(&args);
+        assert!(result.contains("appears 3 times"), "{result}");
+
+        // With replace_all every occurrence is changed.
+        let args = serde_json::json!({
+            "path": &file, "old_text": "foo", "new_text": "bar", "replace_all": true
+        })
+        .to_string();
+        let result = exec_edit_file(&args);
+        assert!(result.starts_with("Edited file:"), "{result}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "bar bar bar");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_edit_file_whitespace_hint() {
+        let dir = std::env::temp_dir().join("sigit_test_edit_hint");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        fs::write(&file, "line one\n    indented\nline three\n").unwrap();
+
+        // old_text has more indentation than the file, so it isn't a substring,
+        // but its trimmed content still locates the intended line.
+        let args = serde_json::json!({
+            "path": &file, "old_text": "        indented", "new_text": "x"
+        })
+        .to_string();
+        let result = exec_edit_file(&args);
+        assert!(result.contains("line 2"), "{result}");
+        assert!(result.contains("whitespace"), "{result}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_multi_edit_atomic_on_failure() {
+        let dir = std::env::temp_dir().join("sigit_test_multi_edit");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        fs::write(&file, "alpha beta gamma").unwrap();
+
+        // Second edit can't match -> nothing should be written.
+        let args = serde_json::json!({
+            "path": &file,
+            "edits": [
+                { "old_text": "alpha", "new_text": "ALPHA" },
+                { "old_text": "nope", "new_text": "x" }
+            ]
+        })
+        .to_string();
+        let result = exec_multi_edit(&args);
+        assert!(result.contains("edit #2 failed"), "{result}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "alpha beta gamma");
+
+        // All-matching batch applies in sequence.
+        let args = serde_json::json!({
+            "path": &file,
+            "edits": [
+                { "old_text": "alpha", "new_text": "ALPHA" },
+                { "old_text": "gamma", "new_text": "GAMMA" }
+            ]
+        })
+        .to_string();
+        let result = exec_multi_edit(&args);
+        assert!(result.contains("Applied 2 edits"), "{result}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "ALPHA beta GAMMA");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_glob_to_regex() {
+        let re = Regex::new(&glob_to_regex("**/*.rs")).unwrap();
+        assert!(re.is_match("src/tools.rs"));
+        assert!(re.is_match("main.rs")); // `**/` matches zero directories too
+        assert!(!re.is_match("src/tools.txt"));
+
+        let re = Regex::new(&glob_to_regex("*.{ts,tsx}")).unwrap();
+        assert!(re.is_match("app.ts"));
+        assert!(re.is_match("app.tsx"));
+        assert!(!re.is_match("app.js"));
+    }
+
+    #[test]
+    fn test_glob_tool_success() {
+        let dir = std::env::temp_dir().join("sigit_test_glob");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("Cargo.toml"), "").unwrap();
+        fs::write(dir.join("src/main.rs"), "").unwrap();
+        fs::write(dir.join("src/lib.rs"), "").unwrap();
+
+        let args = serde_json::json!({ "pattern": "**/*.rs", "path": &dir }).to_string();
+        let result = exec_glob(&args);
+        assert!(result.contains("main.rs"), "{result}");
+        assert!(result.contains("lib.rs"), "{result}");
+        assert!(!result.contains("Cargo.toml"), "{result}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_files_file_glob_filter() {
+        let dir = std::env::temp_dir().join("sigit_test_search_glob");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("code.rs"), "needle here\n").unwrap();
+        fs::write(dir.join("notes.txt"), "needle here\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "needle", "path": &dir, "file_glob": "*.rs"
+        })
+        .to_string();
+        let result = exec_search_files(&args);
+        assert!(result.contains("code.rs"), "{result}");
+        assert!(!result.contains("notes.txt"), "{result}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_todos_renders_checklist() {
+        let args = serde_json::json!({
+            "todos": [
+                { "content": "Read code", "status": "completed" },
+                { "content": "Make change", "status": "in_progress" },
+                { "content": "Run tests", "status": "pending" }
+            ]
+        })
+        .to_string();
+        let result = exec_write_todos(&args);
+        assert!(result.contains("1/3 done"), "{result}");
+        assert!(result.contains("[x] Read code"), "{result}");
+        assert!(result.contains("[~] Make change"), "{result}");
+        assert!(result.contains("[ ] Run tests"), "{result}");
+    }
+
+    #[test]
+    fn test_remember_appends_to_instruction_file() {
+        let dir = std::env::temp_dir().join("sigit_test_remember");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        let claude_md = dir.join("CLAUDE.md");
+        fs::write(&claude_md, "# Project\n").unwrap();
+
+        let target = crate::instructions::memory_file(&dir);
+        // Should pick the existing CLAUDE.md at the repo root.
+        assert_eq!(
+            target.canonicalize().unwrap(),
+            claude_md.canonicalize().unwrap()
+        );
+
+        let result = remember_at(&dir, "remembered text");
+        assert!(result.contains("remembered"), "{result}");
+
+        let updated = fs::read_to_string(&claude_md).unwrap();
+        assert!(updated.contains("## Remembered notes"), "{updated}");
+        assert!(updated.contains("- remembered text"), "{updated}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

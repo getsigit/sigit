@@ -131,6 +131,26 @@ fn first_instruction_file(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The file the `remember` tool appends durable notes to: the nearest existing
+/// instruction file walking from `cwd` up to the repository root, or a new
+/// `CLAUDE.md` at the repo root (falling back to `cwd`) when none exists yet.
+pub fn memory_file(cwd: &Path) -> PathBuf {
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let root = repo_root(&canonical).unwrap_or_else(|| canonical.clone());
+
+    // Deepest (most specific) existing file wins, matching read precedence.
+    for dir in canonical
+        .ancestors()
+        .filter(|ancestor| ancestor.starts_with(&root))
+    {
+        if let Some(found) = first_instruction_file(dir) {
+            return found;
+        }
+    }
+
+    root.join("CLAUDE.md")
+}
+
 fn sigit_config_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("SIGIT_CONFIG_DIR")
         && !dir.is_empty()

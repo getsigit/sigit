@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents when working with code in this repository.
 
 ## What this is
 
@@ -16,6 +16,25 @@ is a TTY:
 
 Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit login`,
 `sigit logout`, `sigit whoami` (see `src/main.rs` `main()`).
+
+## Working in this repo
+
+**IMPORTANT — branch naming:** Name every working branch after the *changes it contains*, not
+after a task, ticket, or session id. Use a short, descriptive, kebab-case slug so the branch is
+self-explanatory from its name alone (e.g. `claude/agent-tools-multiedit-glob-todos-remember`,
+not `claude/task-q003hm`).
+
+**IMPORTANT — pull request target:** Always open pull requests against the `development` branch,
+never `main`. `main` is release-only; `development` is where day-to-day work integrates.
+
+**IMPORTANT — run CI before pushing:** Run the full CI gate locally and confirm it is green
+*before* pushing a branch or opening a pull request — never push work that fails these:
+
+```sh
+cargo fmt -- --check                  # formatting
+cargo clippy --tests -- -D warnings   # lint (warnings are errors)
+cargo test --locked                   # tests
+```
 
 ## Build / test / lint
 
@@ -62,8 +81,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
 - **`src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
-  `list_directory`, `search_files`, `read_website`, `create_file`, `edit_file`, `delete_file`,
-  `run_command`. Add a tool in both the spec list and the execute `match`.
+  `list_directory`, `search_files`, `glob`, `read_website`, `create_file`, `edit_file`,
+  `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
+  spec list (`all_tools`) and the execute `match` (`execute_tool`).
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
   instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,
