@@ -102,6 +102,17 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   official server (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in and authed with the
   cloud session token; extra servers live in `mcp.toml` (global `$SIGIT_CONFIG_DIR/mcp.toml` and
   project-local `.sigit/mcp.toml`). stdio transport is not supported.
+- **`src/permissions.rs`** — tool permission policy. Every tool call passes through
+  `decision_for` before executing: read-only tools always run; mutating tools (and all
+  `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
+  mutating tools with a present-a-plan message), session "always allow" grants, per-tool
+  overrides and the default mode from `[permissions]` in `settings.toml` (`allow`/`ask`/`deny`,
+  default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`, the ACP path sends
+  `session/request_permission` (allow once / allow for session / deny) and the TUI pauses the
+  inference task on a y/a/n prompt. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
+  serialized by `SiGitAgent::turn_lock` so the dispatch loop can route the client's permission
+  answer mid-turn — don't move them back inline, and don't await client requests from inline
+  handlers (deadlock).
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
@@ -120,8 +131,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/models.rs`** — model-picker types shared across platforms.
 
 Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
-`/clear`, `/status`) are advertised via `advertise_commands` in `main.rs` and handled in both the
-TUI and ACP sessions.
+`/plan`, `/permissions`, `/clear`, `/status`) are advertised via `advertise_commands` in `main.rs`
+and handled in both the TUI and ACP sessions.
 
 ## Model cache (macOS)
 
@@ -142,7 +153,9 @@ verbosity with `RUST_LOG`.
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
 `SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
-server), `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
+server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
+mutating tools; the escape hatch for clients without permission-request support),
+`HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
 
 ## Releasing
 
