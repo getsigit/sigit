@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.3.1
 
 Adds [Model Context Protocol](https://modelcontextprotocol.io) (MCP) client
-support and bakes in the official siGit Code MCP server.
+support with the official siGit Code MCP server baked in, a set of agent tools
+that close parity gaps in the tool layer, and refreshed branding and licensing.
 
 ### What changed
 
@@ -14,6 +15,10 @@ support and bakes in the official siGit Code MCP server.
 - Discovery is best-effort at startup and bounded by a per-server timeout, so an unreachable server never blocks startup — it just contributes no tools
 - Added a `/mcp` slash command (TUI and ACP) that lists configured servers, their connection status, and the tools each exposes
 - Disable MCP entirely with `SIGIT_MCP=off`, or just the official server with `SIGIT_MCP_OFFICIAL=off`
+- New agent tools that close parity gaps in the tool layer: `multi_edit` (apply a batch of exact-substring edits to one file atomically — written only if every edit matches), `glob` (locate files by name pattern with `**`/`*`/`?`/`{a,b}`, most-recently-modified first), `write_todos` (render a live task checklist through the tool result for multi-step work), and `remember` (append durable notes to the nearest `AGENTS.md`/`CLAUDE.md`)
+- `edit_file` now supports `replace_all` and returns actionable failure context — naming the line whose trimmed text matches when only whitespace differs — so the model self-corrects in one round
+- `search_files` gained a `file_glob` filter and a `max_results` cap (default 50, hard-capped at 1000) that also bounds the directory walk
+- Refreshed branding and legal: updated `LICENSE`, `README`, and the npm/PyPI package descriptions
 
 ## 1.3.0
 
