@@ -5,12 +5,14 @@
 //! [`crate::credentials`] but holds preferences rather than secrets, so it is
 //! not permission-restricted.
 //!
-//! The only setting today is `local_inference`: whether on-device inference is
-//! the active mode. It is the source of truth for the local/cloud toggle and
-//! drives how `/models` presents the picker. It is stored locally so the toggle
-//! works even on ACP clients that do not support slash commands (e.g. Xcode),
-//! where it is also surfaced as a session config option.
+//! Settings today: `local_inference` (whether on-device inference is the
+//! active mode — the source of truth for the local/cloud toggle, also surfaced
+//! as a session config option for ACP clients without slash commands, e.g.
+//! Xcode) and `[permissions]` (the tool permission policy consumed by
+//! `crate::permissions`: a default mode for mutating tools plus per-tool
+//! overrides).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,71 @@ use serde::{Deserialize, Serialize};
 /// style); it never writes the file.
 const LOCAL_INFERENCE_ENV: &str = "SIGIT_LOCAL_INFERENCE";
 
+/// Env override for the default permission mode (`allow`/`ask`/`deny`). Wins
+/// over the stored default (but not over per-tool overrides); never writes the
+/// file. The escape hatch for ACP clients that cannot answer permission
+/// requests and for headless runs.
+const PERMISSIONS_ENV: &str = "SIGIT_PERMISSIONS";
+
 fn default_local_inference() -> bool {
     true
+}
+
+/// What to do when the model calls a mutating tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    /// Run without asking.
+    Allow,
+    /// Ask the user first (ACP permission request / TUI approval prompt).
+    #[default]
+    Ask,
+    /// Never run; the model gets an explanatory tool result.
+    Deny,
+}
+
+impl PermissionMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(Self::Allow),
+            "ask" => Some(Self::Ask),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        })
+    }
+}
+
+/// The `[permissions]` table: a default mode for mutating tools plus per-tool
+/// overrides, e.g.
+///
+/// ```toml
+/// [permissions]
+/// default = "ask"
+///
+/// [permissions.tools]
+/// edit_file = "allow"
+/// delete_file = "deny"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PermissionSettings {
+    /// Mode for mutating tools without a per-tool override. `ask` on a fresh
+    /// install.
+    #[serde(default)]
+    pub default: PermissionMode,
+    /// Per-tool overrides by tool name (MCP tools use their full
+    /// `mcp__<server>__<tool>` name).
+    #[serde(default)]
+    pub tools: BTreeMap<String, PermissionMode>,
 }
 
 /// Persisted preferences. New fields must carry `#[serde(default)]` so older
@@ -32,12 +97,16 @@ pub struct Settings {
     /// fresh install.
     #[serde(default = "default_local_inference")]
     pub local_inference: bool,
+    /// Permission policy for mutating agent tools.
+    #[serde(default)]
+    pub permissions: PermissionSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             local_inference: default_local_inference(),
+            permissions: PermissionSettings::default(),
         }
     }
 }
@@ -108,6 +177,32 @@ pub fn set_local_inference(enabled: bool) -> Result<(), String> {
     store(&settings)
 }
 
+/// The default permission mode for mutating tools: the `SIGIT_PERMISSIONS` env
+/// var when set to a recognized mode, else the stored `[permissions] default`.
+pub fn permission_default() -> PermissionMode {
+    if let Ok(raw) = std::env::var(PERMISSIONS_ENV)
+        && let Some(mode) = PermissionMode::parse(&raw)
+    {
+        return mode;
+    }
+    load().permissions.default
+}
+
+/// The effective permission mode for one tool: its `[permissions.tools]`
+/// override when present, else the default (see [`permission_default`]).
+pub fn permission_mode_for(tool_name: &str) -> PermissionMode {
+    let settings = load();
+    if let Some(mode) = settings.permissions.tools.get(tool_name) {
+        return *mode;
+    }
+    if let Ok(raw) = std::env::var(PERMISSIONS_ENV)
+        && let Some(mode) = PermissionMode::parse(&raw)
+    {
+        return mode;
+    }
+    settings.permissions.default
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +241,40 @@ mod tests {
             "unrecognized env value falls back to stored setting"
         );
 
+        // Permissions: fresh install asks; per-tool overrides win over the
+        // default; the env var overrides the stored default but not per-tool
+        // overrides.
+        unsafe { std::env::remove_var(PERMISSIONS_ENV) };
+        assert_eq!(permission_default(), PermissionMode::Ask);
+        assert_eq!(permission_mode_for("run_command"), PermissionMode::Ask);
+
+        let mut settings = load();
+        settings.permissions.default = PermissionMode::Allow;
+        settings
+            .permissions
+            .tools
+            .insert("delete_file".to_string(), PermissionMode::Deny);
+        store(&settings).unwrap();
+        assert_eq!(permission_default(), PermissionMode::Allow);
+        assert_eq!(permission_mode_for("run_command"), PermissionMode::Allow);
+        assert_eq!(permission_mode_for("delete_file"), PermissionMode::Deny);
+
+        unsafe { std::env::set_var(PERMISSIONS_ENV, "deny") };
+        assert_eq!(permission_default(), PermissionMode::Deny);
+        assert_eq!(permission_mode_for("run_command"), PermissionMode::Deny);
+        assert_eq!(
+            permission_mode_for("delete_file"),
+            PermissionMode::Deny,
+            "per-tool override still wins"
+        );
+        unsafe { std::env::set_var(PERMISSIONS_ENV, "garbage") };
+        assert_eq!(
+            permission_default(),
+            PermissionMode::Allow,
+            "unrecognized env value falls back to stored setting"
+        );
+
+        unsafe { std::env::remove_var(PERMISSIONS_ENV) };
         unsafe { std::env::remove_var(LOCAL_INFERENCE_ENV) };
         unsafe { std::env::remove_var("SIGIT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
