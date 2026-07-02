@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents when working with code in this repository.
 
 ## What this is
 
@@ -16,6 +16,25 @@ is a TTY:
 
 Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit login`,
 `sigit logout`, `sigit whoami` (see `src/main.rs` `main()`).
+
+## Working in this repo
+
+**IMPORTANT — branch naming:** Name every working branch after the *changes it contains*, not
+after a task, ticket, or session id. Use a short, descriptive, kebab-case slug so the branch is
+self-explanatory from its name alone (e.g. `claude/agent-tools-multiedit-glob-todos-remember`,
+not `claude/task-q003hm`).
+
+**IMPORTANT — pull request target:** Always open pull requests against the `development` branch,
+never `main`. `main` is release-only; `development` is where day-to-day work integrates.
+
+**IMPORTANT — run CI before pushing:** Run the full CI gate locally and confirm it is green
+*before* pushing a branch or opening a pull request — never push work that fails these:
+
+```sh
+cargo fmt -- --check                  # formatting
+cargo clippy --tests -- -D warnings   # lint (warnings are errors)
+cargo test --locked                   # tests
+```
 
 ## Build / test / lint
 
@@ -62,8 +81,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
 - **`src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
-  `list_directory`, `search_files`, `read_website`, `create_file`, `edit_file`, `delete_file`,
-  `run_command`. Add a tool in both the spec list and the execute `match`.
+  `list_directory`, `search_files`, `glob`, `read_website`, `create_file`, `edit_file`,
+  `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
+  spec list (`all_tools`) and the execute `match` (`execute_tool`).
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
   instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,
@@ -72,6 +92,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
   `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
   and only when at least one skill exists.
+- **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Connects to
+  MCP servers over the **Streamable HTTP** transport (one JSON-RPC POST endpoint; replies are
+  `application/json` or SSE), runs the `initialize`/`tools/list` handshake, and forwards `tools/call`.
+  Discovery is best-effort at startup (`mcp::init`, called from both branches of `main()`) and cached
+  in a process-global so the synchronous spec builders (`mcp::tool_specs`) and the async dispatch
+  (`mcp::call_tool`) can both read it. Tools are namespaced `mcp__<server>__<tool>`, appended in the
+  `*_as_specs`/`build_tool_specs` layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. The
+  official server (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in and authed with the
+  cloud session token; extra servers live in `mcp.toml` (global `$SIGIT_CONFIG_DIR/mcp.toml` and
+  project-local `.sigit/mcp.toml`). stdio transport is not supported.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
@@ -89,7 +119,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
-Slash commands (`/help`, `/models`, `/skills`, `/login`, `/logout`, `/whoami`, `/reload`,
+Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
 `/clear`, `/status`) are advertised via `advertise_commands` in `main.rs` and handled in both the
 TUI and ACP sessions.
 
@@ -111,7 +141,8 @@ verbosity with `RUST_LOG`.
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
+`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
+server), `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
 
 ## Releasing
 

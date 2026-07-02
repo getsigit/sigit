@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.1
+
+Adds [Model Context Protocol](https://modelcontextprotocol.io) (MCP) client
+support with the official siGit Code MCP server baked in, a set of agent tools
+that close parity gaps in the tool layer, and refreshed branding and licensing.
+
+### What changed
+
+- siGit Code is now an MCP client: it connects to MCP servers over the Streamable HTTP transport (a single JSON-RPC endpoint), discovers the tools they expose, and offers them to the model alongside the built-in tools. When the model calls one, the call is forwarded to the owning server and the result fed back into the agent loop
+- Bakes in the official siGit Code MCP server at `https://sigit.si/api/v1/mcp` (follows `SIGIT_CLOUD_URL`). When you are signed in (`sigit login`), the cloud session token is sent as the bearer credential
+- Configure additional servers in `mcp.toml` — global (`~/.config/sigit/mcp.toml`) or project-local (`.sigit/mcp.toml`). Each `[[server]]` has a `name`, `url`, optional `enabled`, and optional `[server.headers]`; set `official = false` to opt out of the baked-in server
+- MCP tools are namespaced `mcp__<server>__<tool>` so they never collide with built-in tools or across servers; tool output is capped to protect the model's context
+- Discovery is best-effort at startup and bounded by a per-server timeout, so an unreachable server never blocks startup — it just contributes no tools
+- Added a `/mcp` slash command (TUI and ACP) that lists configured servers, their connection status, and the tools each exposes
+- Disable MCP entirely with `SIGIT_MCP=off`, or just the official server with `SIGIT_MCP_OFFICIAL=off`
+- New agent tools that close parity gaps in the tool layer: `multi_edit` (apply a batch of exact-substring edits to one file atomically — written only if every edit matches), `glob` (locate files by name pattern with `**`/`*`/`?`/`{a,b}`, most-recently-modified first), `write_todos` (render a live task checklist through the tool result for multi-step work), and `remember` (append durable notes to the nearest `AGENTS.md`/`CLAUDE.md`)
+- `edit_file` now supports `replace_all` and returns actionable failure context — naming the line whose trimmed text matches when only whitespace differs — so the model self-corrects in one round
+- `search_files` gained a `file_glob` filter and a `max_results` cap (default 50, hard-capped at 1000) that also bounds the directory walk
+- Refreshed branding and legal: updated `LICENSE`, `README`, and the npm/PyPI package descriptions
+
 ## 1.3.0
 
 Adds a Local Inference on/off toggle, the open [Agent Skills](https://agentskills.io)
@@ -212,4 +232,4 @@ ACP and editor mode work on Windows. The part that is still missing is the inter
 
 ---
 
-*© 2026 [smbCloud](https://smbcloud.xyz/) (Splitfire AB).*
+*© 2026 [Splitfire AB](https://5mb.app) ([siGit Code & Deploy](https://sigit.si)).*
