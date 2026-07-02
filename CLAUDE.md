@@ -28,6 +28,13 @@ a task, ticket, or session id (not `feature/task-q003hm`).
 **IMPORTANT — pull request target:** Always open pull requests against the `development` branch,
 never `main`. `main` is release-only; `development` is where day-to-day work integrates.
 
+**IMPORTANT — branch off `development`:** Start every working branch from the latest
+`origin/development`. Exception: when new work *depends on* a feature branch that has not merged
+yet (e.g. it builds on tools or APIs that branch introduces), it may be stacked on top of that
+branch instead. When stacking: merge the base PR into `development` first, then rebase the
+stacked branch onto `development` before opening its pull request, so each PR shows only its own
+commits.
+
 **IMPORTANT — run CI before pushing:** Run the full CI gate locally and confirm it is green
 *before* pushing a branch or opening a pull request — never push work that fails these:
 
