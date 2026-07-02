@@ -19,10 +19,11 @@ Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit 
 
 ## Working in this repo
 
-**IMPORTANT — branch naming:** Name every working branch after the *changes it contains*, not
-after a task, ticket, or session id. Use a short, descriptive, kebab-case slug so the branch is
-self-explanatory from its name alone (e.g. `claude/agent-tools-multiedit-glob-todos-remember`,
-not `claude/task-q003hm`).
+**IMPORTANT — branch naming:** Prefix every working branch with `feature/` (new functionality)
+or `fix/` (bug fixes) — never a tool- or agent-name prefix like `claude/`. Name the branch after
+the *changes it contains*, as a short, descriptive, kebab-case slug that is self-explanatory
+from the name alone (e.g. `feature/tool-permission-system`, `fix/glob-mtime-sort`), never after
+a task, ticket, or session id (not `feature/task-q003hm`).
 
 **IMPORTANT — pull request target:** Always open pull requests against the `development` branch,
 never `main`. `main` is release-only; `development` is where day-to-day work integrates.
