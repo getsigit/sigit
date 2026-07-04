@@ -777,6 +777,10 @@ mod tui {
         Plan(Option<bool>),
         /// Show the effective permission policy for this session.
         Permissions,
+        /// Summarize-and-shrink the conversation history on demand.
+        Compact,
+        /// Restore the saved TUI session from disk.
+        Resume,
         Exit,
         Unknown(String),
     }
@@ -803,6 +807,8 @@ mod tui {
             "/whoami" => SlashCommand::Whoami,
             "/plan" => SlashCommand::Plan(parse_on_off(arg)),
             "/permissions" => SlashCommand::Permissions,
+            "/compact" => SlashCommand::Compact,
+            "/resume" => SlashCommand::Resume,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -1407,6 +1413,8 @@ mod tui {
                      /whoami        — show the signed-in account\n\
                      /plan [on|off] — plan mode: research only, no edits or commands\n\
                      /permissions   — show the tool permission policy\n\
+                     /compact       — summarize and shrink conversation history\n\
+                     /resume        — restore the saved session from disk\n\
                      /clear         — wipe conversation history\n\
                      /status        — show engine status\n\
                      /exit          — quit chat",
@@ -1416,10 +1424,53 @@ mod tui {
                 let cleared = engine.clear_history().await;
                 app.messages.clear();
                 crate::permissions::reset_session(crate::permissions::TUI_SESSION);
+                // The saved session must not resurrect what the user just wiped.
+                crate::session_store::delete(TUI_STORE_SESSION);
                 app.messages.push(ChatMessage::system(format!(
                     "Cleared {cleared} turn(s). History is empty.",
                 )));
             }
+            SlashCommand::Compact => {
+                let before = crate::backend::estimate_tokens(&app.backend.history_snapshot().await);
+                match app
+                    .backend
+                    .compact_history(crate::backend::COMPACT_KEEP_LAST)
+                    .await
+                {
+                    Ok(()) => {
+                        let snapshot = app.backend.history_snapshot().await;
+                        let after = crate::backend::estimate_tokens(&snapshot);
+                        // Keep the saved session in step with the compacted state.
+                        if let Err(error) = crate::session_store::save(TUI_STORE_SESSION, &snapshot)
+                        {
+                            log::warn!("session save after /compact failed: {error}");
+                        }
+                        app.messages.push(ChatMessage::system(format!(
+                            "Compacted history: ~{before} → ~{after} tokens (estimated)."
+                        )));
+                    }
+                    Err(error) => {
+                        app.messages
+                            .push(ChatMessage::system(format!("Compaction failed: {error}")));
+                    }
+                }
+            }
+            SlashCommand::Resume => match crate::session_store::load(TUI_STORE_SESSION) {
+                Some(history) if !history.is_empty() => {
+                    let restored = history.len();
+                    app.backend.restore_history(history).await;
+                    app.messages.push(ChatMessage::system(format!(
+                        "Restored {restored} message(s) from the saved session. \
+                         The model remembers the conversation; the scrollback above does not \
+                         replay it."
+                    )));
+                }
+                _ => {
+                    app.messages.push(ChatMessage::system(
+                        "No saved session to resume. Sessions are saved after each turn.",
+                    ));
+                }
+            },
             SlashCommand::Plan(value) => {
                 use crate::permissions::{self, TUI_SESSION};
                 let enabled = value.unwrap_or_else(|| !permissions::plan_mode(TUI_SESSION));
@@ -1575,8 +1626,13 @@ mod tui {
 
     // ── Background inference task ─────────────────────────────────────────────
 
-    /// cap tool rounds so a confused model can't loop forever
-    const MAX_TOOL_ROUNDS: usize = 10;
+    /// cap tool rounds so a confused model can't loop forever; auto-compaction
+    /// keeps long runs inside the context window, so the cap can be generous
+    const MAX_TOOL_ROUNDS: usize = 24;
+
+    /// The TUI is a single conversation, so it persists under one fixed
+    /// session-store id (ACP sessions use their protocol-assigned ids).
+    const TUI_STORE_SESSION: &str = "tui";
 
     fn build_tool_specs() -> Vec<ToolSpec> {
         let mut specs: Vec<ToolSpec> = crate::tools::all_tools()
@@ -1685,6 +1741,27 @@ mod tui {
             streamed = false;
             round += 1;
             log::info!("tool round {} — {} call(s)", round, result.tool_calls.len());
+
+            // Auto-compaction: long tool runs grow history fast; fold it into
+            // a summary before the next round rather than blowing the window.
+            let estimate = crate::backend::estimate_tokens(&backend.history_snapshot().await);
+            if estimate > crate::backend::DEFAULT_CONTEXT_TOKEN_BUDGET {
+                log::info!(
+                    "history ≈{estimate} tokens exceeds budget {} — compacting",
+                    crate::backend::DEFAULT_CONTEXT_TOKEN_BUDGET
+                );
+                match backend
+                    .compact_history(crate::backend::COMPACT_KEEP_LAST)
+                    .await
+                {
+                    Ok(()) => {
+                        let after =
+                            crate::backend::estimate_tokens(&backend.history_snapshot().await);
+                        log::info!("compacted history to ≈{after} tokens");
+                    }
+                    Err(error) => log::warn!("history compaction failed: {error}"),
+                }
+            }
 
             let mut tool_results = Vec::new();
 
@@ -1821,6 +1898,13 @@ mod tui {
             } else {
                 let _ = tx.send(InferenceUpdate::Response(result.text)).await;
             }
+        }
+
+        // Persist the completed turn so /resume (or a restart) can pick the
+        // conversation back up.
+        let snapshot = backend.history_snapshot().await;
+        if let Err(error) = crate::session_store::save(TUI_STORE_SESSION, &snapshot) {
+            log::warn!("session save failed: {error}");
         }
 
         log::info!("inference complete — {} tool round(s)", round);

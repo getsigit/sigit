@@ -37,6 +37,7 @@ mod mcp;
 mod models;
 mod permissions;
 mod provider;
+mod session_store;
 mod settings;
 mod setup;
 mod skills;
@@ -229,8 +230,10 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
     }
 }
 
-/// cap tool-call loops so a confused model can't spin forever
-const MAX_TOOL_ROUNDS: usize = 10;
+/// cap tool-call loops so a confused model can't spin forever; auto-compaction
+/// (see [`backend::DEFAULT_CONTEXT_TOKEN_BUDGET`]) keeps long runs inside the
+/// context window, so the cap can afford to be generous
+const MAX_TOOL_ROUNDS: usize = 24;
 
 /// Outcome of asking the client for permission to run one tool call.
 enum PermissionVerdict {
@@ -769,6 +772,7 @@ impl SiGitAgent {
                 "on|off (optional)",
             ),
             AvailableCommand::new("permissions", "Show the tool permission policy"),
+            AvailableCommand::new("compact", "Summarize and shrink the conversation history"),
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
@@ -961,7 +965,7 @@ impl SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
-        // no session persistence, so "load" just resets
+        // start from a clean slate; a stored session (below) replaces it
         self.engine.clear_history().await;
 
         self.engine
@@ -972,6 +976,20 @@ impl SiGitAgent {
 
         // Honor the persisted Local Inference toggle (off + signed in → cloud).
         self.apply_startup_inference_mode().await;
+
+        // Durable sessions: when this session id was saved before, restore its
+        // history into the active backend. The snapshot includes the system
+        // messages that were live when it was saved, so restore replaces the
+        // freshly seeded state wholesale.
+        if let Some(history) = session_store::load(&args.session_id.to_string()) {
+            let restored = history.len();
+            let backend = self.backend.lock().await.clone();
+            backend.restore_history(history).await;
+            log::info!(
+                "load_session: restored {restored} message(s) for {}",
+                args.session_id
+            );
+        }
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1300,6 +1318,25 @@ impl SiGitAgent {
                 result.tool_calls.len()
             );
 
+            // Auto-compaction: long tool runs grow history fast; fold it into
+            // a summary before the next round rather than blowing the window.
+            let estimate = backend::estimate_tokens(&backend.history_snapshot().await);
+            if estimate > backend::DEFAULT_CONTEXT_TOKEN_BUDGET {
+                log::info!(
+                    "prompt({}) history ≈{} tokens exceeds budget {} — compacting",
+                    session_id,
+                    estimate,
+                    backend::DEFAULT_CONTEXT_TOKEN_BUDGET
+                );
+                match backend.compact_history(backend::COMPACT_KEEP_LAST).await {
+                    Ok(()) => {
+                        let after = backend::estimate_tokens(&backend.history_snapshot().await);
+                        log::info!("prompt({}) compacted to ≈{} tokens", session_id, after);
+                    }
+                    Err(error) => log::warn!("prompt({}) compaction failed: {error}", session_id),
+                }
+            }
+
             let mut tool_results = Vec::new();
 
             for (call_index, tc) in result.tool_calls.iter().enumerate() {
@@ -1415,6 +1452,13 @@ impl SiGitAgent {
                 self.send_assistant_message(cx, session_id.clone(), final_text)
                     .ok();
             }
+        }
+
+        // Persist the completed turn so a restart (or session/load) can pick
+        // the conversation back up.
+        let snapshot = backend.history_snapshot().await;
+        if let Err(error) = session_store::save(&session_id.to_string(), &snapshot) {
+            log::warn!("prompt({}) session save failed: {error}", session_id);
         }
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
@@ -2155,6 +2199,8 @@ enum SlashCommand {
     Plan(Option<bool>),
     /// Show the effective permission policy for this session.
     Permissions,
+    /// Summarize-and-shrink the conversation history on demand.
+    Compact,
     Exit,
     Unknown(String),
 }
@@ -2182,6 +2228,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/reload" => SlashCommand::Reload,
         "/plan" => SlashCommand::Plan(parse_on_off(argument)),
         "/permissions" => SlashCommand::Permissions,
+        "/compact" => SlashCommand::Compact,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -2292,6 +2339,7 @@ async fn exec_slash_acp(
                      /reload        - re-sync sign-in and model state\n\
                      /plan [on|off] - plan mode: research only, no edits or commands\n\
                      /permissions   - show the tool permission policy\n\
+                     /compact       - summarize and shrink conversation history\n\
                      /clear         - wipe conversation history\n\
                      /status        - show engine status\n\
                      /exit          - end this turn",
@@ -2301,6 +2349,8 @@ async fn exec_slash_acp(
         SlashCommand::Clear => {
             let cleared = agent.engine.clear_history().await;
             permissions::reset_session(&session_id.to_string());
+            // The saved session must not resurrect what the user just wiped.
+            session_store::delete(&session_id.to_string());
             agent
                 .send_assistant_message(
                     cx,
@@ -2325,6 +2375,23 @@ async fn exec_slash_acp(
         SlashCommand::Permissions => {
             let summary = permissions::describe(&session_id.to_string());
             agent.send_assistant_message(cx, session_id, summary).ok();
+        }
+        SlashCommand::Compact => {
+            let backend = agent.backend.lock().await.clone();
+            let before = backend::estimate_tokens(&backend.history_snapshot().await);
+            let message = match backend.compact_history(backend::COMPACT_KEEP_LAST).await {
+                Ok(()) => {
+                    let snapshot = backend.history_snapshot().await;
+                    let after = backend::estimate_tokens(&snapshot);
+                    // Keep the saved session in step with the compacted state.
+                    if let Err(error) = session_store::save(&session_id.to_string(), &snapshot) {
+                        log::warn!("session save after /compact failed: {error}");
+                    }
+                    format!("Compacted history: ~{before} → ~{after} tokens (estimated).")
+                }
+                Err(error) => format!("Compaction failed: {error}"),
+            };
+            agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Status => {
             let info = agent.engine.info().await;
