@@ -37,6 +37,7 @@ mod mcp;
 mod models;
 mod permissions;
 mod provider;
+mod session_store;
 mod settings;
 mod setup;
 mod skills;
@@ -86,8 +87,7 @@ use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-const SYSTEM_PROMPT: &str = concat!(
-    "\
+const SYSTEM_PROMPT: &str = "\
 Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
 Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
 
@@ -143,9 +143,10 @@ Git operations — always use run_command:
 - if a clone or init fails, check the error, fix the cause (wrong path, missing \
   directory, permissions), and retry
 - when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: Co-Authored-By: siGit Code ",
-    env!("CARGO_PKG_VERSION"),
-    " <sigit@sigit.si>
+  then this trailer on its own line: Co-Authored-By: siGit Code <sigit@sigit.si> \
+  — GitHub reads that exact format and credits siGit as co-author. If a commit \
+  lands without it, siGit Code amends the trailer in automatically and the tool \
+  output says so; do not amend again yourself.
 
 Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
@@ -209,8 +210,7 @@ force smbCloud-specific advice into the answer. When it is about smbCloud, be \
 specific and practical.
 
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever."
-);
+root cause, not the symptom. Correct beats clever.";
 
 /// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
 /// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
@@ -229,8 +229,10 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
     }
 }
 
-/// cap tool-call loops so a confused model can't spin forever
-const MAX_TOOL_ROUNDS: usize = 10;
+/// cap tool-call loops so a confused model can't spin forever; auto-compaction
+/// (see [`backend::DEFAULT_CONTEXT_TOKEN_BUDGET`]) keeps long runs inside the
+/// context window, so the cap can afford to be generous
+const MAX_TOOL_ROUNDS: usize = 24;
 
 /// Outcome of asking the client for permission to run one tool call.
 enum PermissionVerdict {
@@ -305,10 +307,35 @@ fn agent_tools_as_specs() -> Vec<ToolSpec> {
         });
     }
 
+    // Delegated research (`task`) is offered only when a subagent backend can
+    // actually be built — same conditional pattern as the `skill` tool above.
+    if tools::subagent_available() {
+        specs.push(tools::task_tool_spec());
+    }
+
     // Tools discovered from configured MCP servers (incl. the official one).
     specs.extend(mcp::tool_specs());
 
     specs
+}
+
+/// Register the `task` tool's subagent factory for an OpenAI-compatible
+/// provider: each subagent run gets a FRESH `OpenAiBackend` against the same
+/// endpoint (its own conversation history), seeded with the subagent system
+/// prompt. The provider config is captured by clone. Called once at startup by
+/// whichever surface resolved the provider; on-device paths register a factory
+/// that returns `None` instead (onde has a single shared history, so a second
+/// concurrent context is not possible yet).
+fn register_subagent_factory_for(cfg: &provider::ProviderConfig) {
+    let cfg = cfg.clone();
+    tools::set_subagent_factory(Box::new(move || {
+        Some(Arc::new(OpenAiBackend::new(
+            cfg.base_url.clone(),
+            cfg.api_key.clone(),
+            cfg.model.clone(),
+            Some(tools::SUBAGENT_SYSTEM_PROMPT.to_string()),
+        )) as Arc<dyn InferenceBackend>)
+    }));
 }
 
 fn initialize_meta() -> Meta {
@@ -769,6 +796,7 @@ impl SiGitAgent {
                 "on|off (optional)",
             ),
             AvailableCommand::new("permissions", "Show the tool permission policy"),
+            AvailableCommand::new("compact", "Summarize and shrink the conversation history"),
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
@@ -961,7 +989,7 @@ impl SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", args.cwd.display());
         }
 
-        // no session persistence, so "load" just resets
+        // start from a clean slate; a stored session (below) replaces it
         self.engine.clear_history().await;
 
         self.engine
@@ -972,6 +1000,20 @@ impl SiGitAgent {
 
         // Honor the persisted Local Inference toggle (off + signed in → cloud).
         self.apply_startup_inference_mode().await;
+
+        // Durable sessions: when this session id was saved before, restore its
+        // history into the active backend. The snapshot includes the system
+        // messages that were live when it was saved, so restore replaces the
+        // freshly seeded state wholesale.
+        if let Some(history) = session_store::load(&args.session_id.to_string()) {
+            let restored = history.len();
+            let backend = self.backend.lock().await.clone();
+            backend.restore_history(history).await;
+            log::info!(
+                "load_session: restored {restored} message(s) for {}",
+                args.session_id
+            );
+        }
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1300,6 +1342,25 @@ impl SiGitAgent {
                 result.tool_calls.len()
             );
 
+            // Auto-compaction: long tool runs grow history fast; fold it into
+            // a summary before the next round rather than blowing the window.
+            let estimate = backend::estimate_tokens(&backend.history_snapshot().await);
+            if estimate > backend::DEFAULT_CONTEXT_TOKEN_BUDGET {
+                log::info!(
+                    "prompt({}) history ≈{} tokens exceeds budget {} — compacting",
+                    session_id,
+                    estimate,
+                    backend::DEFAULT_CONTEXT_TOKEN_BUDGET
+                );
+                match backend.compact_history(backend::COMPACT_KEEP_LAST).await {
+                    Ok(()) => {
+                        let after = backend::estimate_tokens(&backend.history_snapshot().await);
+                        log::info!("prompt({}) compacted to ≈{} tokens", session_id, after);
+                    }
+                    Err(error) => log::warn!("prompt({}) compaction failed: {error}", session_id),
+                }
+            }
+
             let mut tool_results = Vec::new();
 
             for (call_index, tc) in result.tool_calls.iter().enumerate() {
@@ -1415,6 +1476,13 @@ impl SiGitAgent {
                 self.send_assistant_message(cx, session_id.clone(), final_text)
                     .ok();
             }
+        }
+
+        // Persist the completed turn so a restart (or session/load) can pick
+        // the conversation back up.
+        let snapshot = backend.history_snapshot().await;
+        if let Err(error) = session_store::save(&session_id.to_string(), &snapshot) {
+            log::warn!("prompt({}) session save failed: {error}", session_id);
         }
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
@@ -2155,6 +2223,8 @@ enum SlashCommand {
     Plan(Option<bool>),
     /// Show the effective permission policy for this session.
     Permissions,
+    /// Summarize-and-shrink the conversation history on demand.
+    Compact,
     Exit,
     Unknown(String),
 }
@@ -2182,6 +2252,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/reload" => SlashCommand::Reload,
         "/plan" => SlashCommand::Plan(parse_on_off(argument)),
         "/permissions" => SlashCommand::Permissions,
+        "/compact" => SlashCommand::Compact,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -2292,6 +2363,7 @@ async fn exec_slash_acp(
                      /reload        - re-sync sign-in and model state\n\
                      /plan [on|off] - plan mode: research only, no edits or commands\n\
                      /permissions   - show the tool permission policy\n\
+                     /compact       - summarize and shrink conversation history\n\
                      /clear         - wipe conversation history\n\
                      /status        - show engine status\n\
                      /exit          - end this turn",
@@ -2301,6 +2373,8 @@ async fn exec_slash_acp(
         SlashCommand::Clear => {
             let cleared = agent.engine.clear_history().await;
             permissions::reset_session(&session_id.to_string());
+            // The saved session must not resurrect what the user just wiped.
+            session_store::delete(&session_id.to_string());
             agent
                 .send_assistant_message(
                     cx,
@@ -2325,6 +2399,23 @@ async fn exec_slash_acp(
         SlashCommand::Permissions => {
             let summary = permissions::describe(&session_id.to_string());
             agent.send_assistant_message(cx, session_id, summary).ok();
+        }
+        SlashCommand::Compact => {
+            let backend = agent.backend.lock().await.clone();
+            let before = backend::estimate_tokens(&backend.history_snapshot().await);
+            let message = match backend.compact_history(backend::COMPACT_KEEP_LAST).await {
+                Ok(()) => {
+                    let snapshot = backend.history_snapshot().await;
+                    let after = backend::estimate_tokens(&snapshot);
+                    // Keep the saved session in step with the compacted state.
+                    if let Err(error) = session_store::save(&session_id.to_string(), &snapshot) {
+                        log::warn!("session save after /compact failed: {error}");
+                    }
+                    format!("Compacted history: ~{before} → ~{after} tokens (estimated).")
+                }
+                Err(error) => format!("Compaction failed: {error}"),
+            };
+            agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Status => {
             let info = agent.engine.info().await;
@@ -2700,6 +2791,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 // No local model to load; the endpoint is ready immediately.
                 let _ = load_tx.send(Ok(()));
                 let label = provider.display_name.clone();
+                register_subagent_factory_for(&provider);
                 let backend = Arc::new(OpenAiBackend::new(
                     provider.base_url,
                     provider.api_key,
@@ -2729,6 +2821,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                         );
                         let _ = load_tx.send(Ok(()));
                         let label = provider.display_name.clone();
+                        register_subagent_factory_for(&provider);
                         let backend = Arc::new(OpenAiBackend::new(
                             provider.base_url,
                             provider.api_key,
@@ -2745,6 +2838,9 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                             );
                         }
                         let _ = load_tx.send(Ok(()));
+                        // On-device inference has a single shared history; no
+                        // subagent context is possible yet.
+                        tools::set_subagent_factory(Box::new(|| None));
                         let backend = Arc::new(LocalBackend::new(Arc::clone(&engine)))
                             as Arc<dyn InferenceBackend>;
                         (backend, startup_model_name)
@@ -2867,6 +2963,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
             cfg.model,
             cfg.base_url
         );
+        register_subagent_factory_for(&cfg);
         let override_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
             cfg.base_url,
             cfg.api_key,
@@ -2874,6 +2971,10 @@ async fn run_acp_server() -> anyhow::Result<()> {
             Some(system_prompt_for_model(true).to_string()),
         ));
         *state.backend.lock().await = override_backend;
+    } else {
+        // On-device inference has a single shared conversation history, so a
+        // second concurrent subagent context is not possible yet.
+        tools::set_subagent_factory(Box::new(|| None));
     }
 
     let stdin = tokio::io::stdin().compat();
@@ -3066,6 +3167,17 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_advertises_the_commit_co_author_trailer() {
+        // The prompt instructs the model with the exact trailer that
+        // `tools::ensure_commit_co_author` enforces; if the two drift apart the
+        // safety net would re-amend commits the model already attributed.
+        assert!(
+            SYSTEM_PROMPT.contains(tools::COMMIT_CO_AUTHOR_TRAILER),
+            "SYSTEM_PROMPT must quote tools::COMMIT_CO_AUTHOR_TRAILER verbatim"
+        );
+    }
 
     #[test]
     fn ascii_safe_replaces_multibyte_chars() {

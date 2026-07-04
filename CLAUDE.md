@@ -91,7 +91,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
   `list_directory`, `search_files`, `glob`, `read_website`, `create_file`, `edit_file`,
   `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
-  spec list (`all_tools`) and the execute `match` (`execute_tool`).
+  spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
+  commit attribution: when a command creates a new commit that lacks the
+  `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
+  unless the commit already exists on a remote, which is never rewritten.
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
   instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,

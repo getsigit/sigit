@@ -9,6 +9,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::backend::{InferenceBackend, ToolResult, ToolSpec};
+
 const WEBSITE_READ_CHAR_LIMIT: usize = 20_000;
 const WEBSITE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const WEBSITE_USER_AGENT: &str =
@@ -450,11 +452,230 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
         "command_output" => exec_command_output(arguments),
         "kill_command" => exec_kill_command(arguments),
         "skill" => crate::skills::activate_skill(arguments),
+        TASK_TOOL_NAME => exec_task(arguments).await,
         // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
         // and forwarded to the owning server.
         _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
         _ => format!("Unknown tool: {name}"),
     }
+}
+
+// ── task (subagent) ──────────────────────────────────────────────────────────
+//
+// The `task` tool delegates a self-contained research question to a *nested*
+// agent loop running in a fresh conversation, so the main thread receives only
+// the final answer instead of every intermediate file read. The subagent's
+// toolset is strictly read-only and never includes `task` itself (no
+// recursion), so a delegated agent can research but not mutate state.
+//
+// This module is backend-agnostic and cannot construct a backend, so the
+// surface that knows the active provider (`run_acp_server` / `run_interactive`
+// in `main.rs`) registers a factory at startup. The factory returns `None`
+// when inference runs on-device: onde has a single shared conversation
+// history, so a second concurrent context is not possible yet.
+
+pub const TASK_TOOL_NAME: &str = "task";
+
+/// The tool names a subagent may call, filtered from [`all_tools`].
+const SUBAGENT_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "list_directory",
+    "search_files",
+    "glob",
+    "read_website",
+];
+
+/// System prompt seeding every subagent conversation.
+pub const SUBAGENT_SYSTEM_PROMPT: &str = "You are a focused research subagent. \
+You are given one self-contained task by a calling agent. Investigate it using \
+the read-only tools available to you (read_file, list_directory, search_files, \
+glob, read_website) and answer it thoroughly but concisely. You cannot modify \
+files or run commands. Your final message is returned verbatim to the caller, \
+so make it a complete, self-contained answer — include the concrete facts, \
+paths, and code excerpts the caller needs, and nothing else.";
+
+/// Rounds of tool calls a subagent may use before it is forced to answer.
+const SUBAGENT_MAX_TOOL_ROUNDS: usize = 8;
+/// Cap on the answer text returned to the caller.
+const SUBAGENT_RESULT_CHAR_LIMIT: usize = 8_000;
+
+/// Returned when `task` is called but no subagent backend can be built.
+const SUBAGENT_UNAVAILABLE: &str = "The task tool is not available on-device \
+yet: on-device inference has a single conversation context. Do the research \
+yourself with the read-only tools.";
+
+/// Builds a fresh backend for one subagent run, or `None` when the active
+/// inference cannot host a second conversation (on-device).
+pub type SubagentFactory = Box<dyn Fn() -> Option<Arc<dyn InferenceBackend>> + Send + Sync>;
+
+static SUBAGENT_FACTORY: OnceLock<SubagentFactory> = OnceLock::new();
+
+/// Register the process-wide subagent factory. Called once at startup by the
+/// surface that resolved the inference provider; later calls are ignored.
+pub fn set_subagent_factory(factory: SubagentFactory) {
+    let _ = SUBAGENT_FACTORY.set(factory);
+}
+
+/// Whether a `task` call could run right now: a factory is registered and it
+/// can build a backend. The spec builders (`agent_tools_as_specs` /
+/// `build_tool_specs`) use this to offer the tool only when it works, the same
+/// conditional pattern as the `skill` tool.
+pub fn subagent_available() -> bool {
+    SUBAGENT_FACTORY
+        .get()
+        .is_some_and(|factory| factory().is_some())
+}
+
+/// The read-only toolset offered to a subagent, filtered from [`all_tools`] by
+/// name. Never contains `task` (recursion) or any mutating tool.
+pub fn subagent_tool_specs() -> Vec<ToolSpec> {
+    all_tools()
+        .into_iter()
+        .filter(|tool| SUBAGENT_TOOL_NAMES.contains(&tool.name))
+        .map(|tool| ToolSpec {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+            parameters_schema: tool.parameters_schema.to_string(),
+        })
+        .collect()
+}
+
+/// Spec for the `task` tool. Lives in the `*_as_specs`/`build_tool_specs`
+/// layer (like `skill` and MCP tools), not in [`all_tools`], because it is
+/// only offered when [`subagent_available`] is true.
+pub fn task_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: TASK_TOOL_NAME.to_string(),
+        description: "Delegate a self-contained research task to a subagent that \
+             runs in a fresh conversation and returns only its final answer. The \
+             subagent can read files, list directories, search, glob, and read \
+             websites, but cannot modify anything. Use this for exploratory \
+             questions whose intermediate file reads would otherwise clutter this \
+             conversation (e.g. \"where is X implemented and how does it work?\"). \
+             The subagent cannot see this conversation, so the prompt must be \
+             fully self-contained: include absolute paths, symbol names, and \
+             exactly what the answer should contain."
+            .to_string(),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "A short (3-5 word) summary of the task, for progress display."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The full task for the subagent. Must be self-contained: the subagent sees nothing of this conversation."
+                }
+            },
+            "required": ["description", "prompt"],
+            "additionalProperties": false
+        })
+        .to_string(),
+    }
+}
+
+/// The `task` tool entry point used by [`execute_tool`].
+async fn exec_task(arguments: &str) -> String {
+    exec_task_with(arguments, SUBAGENT_FACTORY.get()).await
+}
+
+/// Core of the `task` tool, parameterized on the factory so tests can exercise
+/// the unavailable path without touching the process-global `OnceLock`.
+async fn exec_task_with(arguments: &str, factory: Option<&SubagentFactory>) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let prompt = match args.get("prompt").and_then(Value::as_str) {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return "Error: missing required parameter \"prompt\"".to_string(),
+    };
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("(no description)");
+
+    let Some(backend) = factory.and_then(|build| build()) else {
+        return SUBAGENT_UNAVAILABLE.to_string();
+    };
+
+    log::info!("task: running subagent — {description}");
+    run_subagent(backend.as_ref(), prompt).await
+}
+
+/// The nested agent loop: a fresh conversation, read-only tools, a round cap,
+/// and only the final text returned. Mirrors the main loops in `main.rs` /
+/// `chat.rs`: offer tools each round, and pass `tools = None` on the last
+/// round to force a text answer.
+async fn run_subagent(backend: &dyn InferenceBackend, prompt: &str) -> String {
+    let specs = subagent_tool_specs();
+
+    let mut result = match backend.send_message_with_tools(prompt, &specs, None).await {
+        Ok(r) => r,
+        Err(err) => return format!("Error: subagent inference failed: {err}"),
+    };
+
+    let mut round = 0;
+    while !result.tool_calls.is_empty() && round < SUBAGENT_MAX_TOOL_ROUNDS {
+        round += 1;
+        log::info!(
+            "task: subagent tool round {round} — {} call(s)",
+            result.tool_calls.len()
+        );
+
+        let mut tool_results = Vec::with_capacity(result.tool_calls.len());
+        for call in &result.tool_calls {
+            // Hard gate, not just advertisement: even if the model asks for a
+            // tool outside the offered set, only read-only tools execute here.
+            let content = if SUBAGENT_TOOL_NAMES.contains(&call.name.as_str()) {
+                // Boxed to break the async cycle: execute_tool → task →
+                // run_subagent → execute_tool.
+                Box::pin(execute_tool(&call.name, &call.arguments)).await
+            } else {
+                format!(
+                    "Error: `{}` is not available to a subagent. Only these \
+                     read-only tools are: {}.",
+                    call.name,
+                    SUBAGENT_TOOL_NAMES.join(", ")
+                )
+            };
+            tool_results.push(ToolResult {
+                tool_call_id: call.id.clone(),
+                content,
+            });
+        }
+
+        // On the last round, offer no tools so the model must produce text.
+        let next_tools = if round < SUBAGENT_MAX_TOOL_ROUNDS {
+            Some(specs.as_slice())
+        } else {
+            None
+        };
+        result = match backend
+            .send_tool_results(tool_results, next_tools, None)
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => return format!("Error: subagent inference failed: {err}"),
+        };
+    }
+
+    let text = result.text.trim();
+    if text.is_empty() {
+        return "The subagent finished without a text answer.".to_string();
+    }
+
+    let total = text.chars().count();
+    if total > SUBAGENT_RESULT_CHAR_LIMIT {
+        let truncated: String = text.chars().take(SUBAGENT_RESULT_CHAR_LIMIT).collect();
+        return format!(
+            "{truncated}\n\n--- truncated (showing {SUBAGENT_RESULT_CHAR_LIMIT} of {total} \
+             characters of the subagent's answer) ---"
+        );
+    }
+    text.to_string()
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -1446,6 +1667,77 @@ fn spawn_shell(command_str: &str, cwd_path: &Path) -> std::io::Result<std::proce
         .spawn()
 }
 
+/// Trailer identifying siGit Code as the co-author of commits it creates.
+/// GitHub detects `Co-authored-by:` trailers on the last lines of a commit
+/// message (separated from the body by a blank line) and lists the agent
+/// alongside the human author; `sigit@sigit.si` belongs to the
+/// <https://github.com/sigitc> account ("siGit Code"), so the co-author is
+/// rendered with that account's avatar and profile link. The system prompt
+/// asks the model to add this itself; [`ensure_commit_co_author`] is the
+/// safety net when it forgets.
+pub const COMMIT_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: siGit Code <sigit@sigit.si>";
+
+/// Run `git <args>` in `cwd`, returning trimmed stdout on success.
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_head(cwd: &Path) -> Option<String> {
+    git_stdout(cwd, &["rev-parse", "HEAD"])
+}
+
+/// Deterministic co-author attribution: if the commit at HEAD lacks the
+/// siGit Code trailer, amend it in (via `git commit --amend --trailer`, which
+/// places it after a blank line — the format GitHub detects). Never rewrites
+/// a commit that is already on a remote. Returns a note describing the amend
+/// so the model and user can see it happened.
+fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
+    let message = git_stdout(cwd, &["log", "-1", "--format=%B"])?;
+    if message
+        .to_lowercase()
+        .contains("co-authored-by: sigit code")
+    {
+        return None;
+    }
+    // Amending changes the commit id; a commit that any remote ref already
+    // contains must be left alone or the branch diverges from its upstream.
+    match git_stdout(cwd, &["branch", "-r", "--contains", "HEAD"]) {
+        Some(remotes) if remotes.is_empty() => {}
+        _ => return None,
+    }
+    let amend = Command::new("git")
+        .args(["commit", "--amend", "--no-edit", "--trailer"])
+        .arg(COMMIT_CO_AUTHOR_TRAILER)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if amend.status.success() {
+        log::info!(
+            "appended co-author trailer to the new commit in {}",
+            cwd.display()
+        );
+        Some(format!(
+            "[siGit Code] The new commit was amended to append the co-author trailer \
+             \"{COMMIT_CO_AUTHOR_TRAILER}\" (its hash changed)."
+        ))
+    } else {
+        log::warn!(
+            "could not append co-author trailer in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&amend.stderr).trim()
+        );
+        None
+    }
+}
+
 /// runs via `sh -c` / `cmd /C`; killed after COMMAND_TIMEOUT unless
 /// `run_in_background` is set, in which case the child is registered as a
 /// background task and polled with `command_output` / stopped with
@@ -1484,6 +1776,19 @@ fn exec_run_command(arguments: &str) -> String {
         return start_background_task(command_str, &cwd_path);
     }
 
+    // Co-author attribution: note where HEAD is before a command that looks
+    // like it may commit, so a new commit can be detected afterwards. The
+    // string check is only a cheap trigger — a false positive costs one
+    // `git rev-parse` and nothing else. Background tasks skip the gate: their
+    // commits finish after the tool returns, when there is nothing to amend
+    // from.
+    let may_commit = command_str.contains("git") && command_str.contains("commit");
+    let head_before = if may_commit {
+        git_head(&cwd_path)
+    } else {
+        None
+    };
+
     let mut child = match spawn_shell(command_str, &cwd_path) {
         Ok(c) => c,
         Err(err) => return format!("Error: failed to spawn command: {err}"),
@@ -1516,6 +1821,21 @@ fn exec_run_command(arguments: &str) -> String {
     let mut combined = String::new();
     combined.push_str(&String::from_utf8_lossy(&output.stdout));
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    // A new commit appeared under this command: make sure it carries the
+    // siGit co-author trailer (see `ensure_commit_co_author`).
+    if may_commit {
+        let head_after = git_head(&cwd_path);
+        if head_after.is_some()
+            && head_after != head_before
+            && let Some(note) = ensure_commit_co_author(&cwd_path)
+        {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&note);
+        }
+    }
 
     let truncated = if combined.len() > COMMAND_OUTPUT_LIMIT {
         let truncated_str = &combined[..COMMAND_OUTPUT_LIMIT];
@@ -2444,6 +2764,137 @@ mod tests {
         assert!(result.contains("Exit code 0"), "got: {result}");
     }
 
+    /// Fresh git repo with one commit, test identity, and signing off (the
+    /// developer's global gpgsign must not leak into sandbox commits).
+    fn init_test_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sigit_test_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        test_git(&dir, &["init", "-q", "-b", "main"]);
+        test_git(&dir, &["config", "user.name", "Test User"]);
+        test_git(&dir, &["config", "user.email", "test@example.com"]);
+        test_git(&dir, &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.join("file.txt"), "one\n").unwrap();
+        test_git(&dir, &["add", "file.txt"]);
+        test_git(&dir, &["commit", "-q", "-m", "Initial"]);
+        dir
+    }
+
+    fn test_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn run_command_appends_co_author_trailer_to_new_commits() {
+        let dir = init_test_repo("coauthor_append");
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        // Quote-free command: `cmd /C` does not strip double quotes the way
+        // `sh -c` does, so quoted arguments would break on Windows.
+        let args = serde_json::json!({
+            "command": "git add file.txt && git commit -m Update",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args);
+        assert!(result.contains("co-author trailer"), "got: {result}");
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            message.ends_with(COMMIT_CO_AUTHOR_TRAILER),
+            "trailer must be the last line: {message:?}"
+        );
+        assert!(
+            message.contains(&format!("\n\n{COMMIT_CO_AUTHOR_TRAILER}")),
+            "trailer needs a blank line before it for GitHub to detect it: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_keeps_existing_co_author_trailer() {
+        let dir = init_test_repo("coauthor_present");
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        // The trailer contains spaces and angle brackets, which `cmd /C`
+        // mis-tokenizes (`<` is redirection), so create the trailer-carrying
+        // commit with direct git args and let run_command amend it without
+        // editing: HEAD changes, the message already has the trailer, and the
+        // gate must leave it alone.
+        test_git(&dir, &["add", "file.txt"]);
+        test_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                &format!("Update file\n\n{COMMIT_CO_AUTHOR_TRAILER}"),
+            ],
+        );
+        let args = serde_json::json!({
+            "command": "git commit --amend --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args);
+        assert!(
+            !result.contains("[siGit Code]"),
+            "no amend expected: {result}"
+        );
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message.matches("Co-Authored-By: siGit Code").count(),
+            1,
+            "trailer must not be duplicated: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_never_amends_pushed_commits() {
+        let dir = init_test_repo("coauthor_pushed");
+        let remote = std::env::temp_dir().join(format!(
+            "sigit_test_coauthor_remote_{}.git",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&remote);
+        fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "-q", "--bare"]);
+        test_git(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        let args = serde_json::json!({
+            "command": "git add file.txt && git commit -m Update && git push -q origin main",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args);
+        assert!(
+            !result.contains("[siGit Code]"),
+            "no amend expected: {result}"
+        );
+
+        // Already on the remote when the gate ran, so it must be untouched.
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            !message.contains("Co-Authored-By"),
+            "pushed commit must not be rewritten: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
     #[test]
     fn test_run_command_failure() {
         #[cfg(unix)]
@@ -2631,11 +3082,79 @@ mod tests {
         );
     }
 
+    // ── task (subagent) tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_subagent_toolset_is_read_only() {
+        let specs = subagent_tool_specs();
+        let mut names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "glob",
+                "list_directory",
+                "read_file",
+                "read_website",
+                "search_files"
+            ]
+        );
+
+        // No recursion and no mutating tools, ever.
+        assert!(!names.contains(&TASK_TOOL_NAME));
+        for banned in [
+            "create_file",
+            "create_directory",
+            "edit_file",
+            "multi_edit",
+            "delete_file",
+            "run_command",
+            "write_todos",
+            "remember",
+        ] {
+            assert!(!names.contains(&banned), "{banned} leaked into subagent");
+        }
+
+        // Every spec came from `all_tools()` (schemas intact).
+        for spec in &specs {
+            assert!(
+                serde_json::from_str::<Value>(&spec.parameters_schema)
+                    .unwrap()
+                    .is_object()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_reports_unavailable_without_factory() {
+        let args = serde_json::json!({
+            "description": "look around",
+            "prompt": "What is in the current directory?"
+        })
+        .to_string();
+        // `None` is exactly what `exec_task` passes before any surface has
+        // registered the process-global factory.
+        let result = exec_task_with(&args, None).await;
+        assert!(
+            result.contains("not available on-device yet"),
+            "got: {result}"
+        );
+    }
+
     #[test]
     fn test_kill_command_unknown_task() {
         let result = exec_kill_command(r#"{"task_id": 9999999}"#);
         assert!(
             result.contains("no background task with id"),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_missing_prompt() {
+        let result = exec_task_with(r#"{"description": "x"}"#, None).await;
+        assert!(
+            result.contains("missing required parameter \"prompt\""),
             "got: {result}"
         );
     }
@@ -2661,9 +3180,14 @@ mod tests {
              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; \
              i=$((i+1)); done"#;
+        // Quote-free on purpose: `cmd /C` does not strip double quotes the
+        // way `sh -c` does, so a quoted PowerShell one-liner gets mangled.
+        // A cmd-native for /L loop needs no quoting at all.
         #[cfg(windows)]
-        let command = "powershell -NoProfile -Command \"1..200 | ForEach-Object { \
-             ('line-{0:d4} ' -f $_) + ('a' * 330) }\"";
+        let command = &format!(
+            "for /L %i in (1,1,200) do @echo line-%i-end {}",
+            "a".repeat(330)
+        );
 
         let args = serde_json::json!({
             "command": command,
@@ -2684,9 +3208,14 @@ mod tests {
             poll.contains("earlier output was dropped"),
             "expected truncation note, got: {poll}"
         );
-        // The oldest lines were dropped; the newest survived.
-        assert!(!poll.contains("line-0000"), "oldest output not dropped");
-        assert!(poll.contains("line-0199"), "newest output missing");
+        // The oldest lines were dropped; the newest survived. The two
+        // platforms number lines differently (printf %04d vs cmd's %i).
+        #[cfg(unix)]
+        let (oldest, newest) = ("line-0000", "line-0199");
+        #[cfg(windows)]
+        let (oldest, newest) = ("line-1-end", "line-200-end");
+        assert!(!poll.contains(oldest), "oldest output not dropped");
+        assert!(poll.contains(newest), "newest output missing");
         // Buffer stayed within the cap, plus the framing: the status line
         // (which quotes the command) and the truncation note.
         assert!(
@@ -2694,5 +3223,181 @@ mod tests {
             "poll result too large: {} bytes",
             poll.len()
         );
+    }
+
+    // ── task (subagent) end-to-end against a scripted endpoint ──────────
+
+    /// A completion whose assistant message requests one tool call.
+    fn completion_tool_call(id: &str, name: &str, arguments: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }],
+            }}]
+        })
+        .to_string()
+    }
+
+    /// A completion whose assistant message is a plain text answer.
+    fn completion_text(text: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": text}}]
+        })
+        .to_string()
+    }
+
+    /// Minimal scripted OpenAI-compatible endpoint (same pattern as
+    /// `tests/acp_permissions.rs`): serves one canned chat-completion JSON body
+    /// per request and records each request body. The subagent loop passes
+    /// `sink: None`, so the backend takes the non-streaming path and expects
+    /// plain JSON rather than SSE.
+    fn start_scripted_endpoint(responses: Vec<String>) -> (u16, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind endpoint");
+        let port = listener.local_addr().unwrap().port();
+        let requests: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let recorded = Arc::clone(&requests);
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::from(responses));
+
+        std::thread::spawn(move || {
+            // `connection: close` means one request per connection, matching
+            // the backend's serial completion requests.
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(clone) => clone,
+                    Err(_) => continue,
+                });
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let line = line.trim();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = length.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                if let Ok(request) = serde_json::from_slice::<Value>(&body) {
+                    recorded.lock().unwrap().push(request);
+                }
+                let payload = queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| completion_text("out of scripted responses"));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        (port, requests)
+    }
+
+    #[tokio::test]
+    async fn test_task_runs_subagent_end_to_end() {
+        // A file only the subagent's read_file call can surface.
+        let dir = std::env::temp_dir().join("sigit_test_subagent_e2e");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        fs::write(&file, "subagent secret: 4217").unwrap();
+
+        // Script: one read_file tool call, then a final text answer.
+        let (port, requests) = start_scripted_endpoint(vec![
+            completion_tool_call(
+                "call_1",
+                "read_file",
+                &serde_json::json!({ "path": file }).to_string(),
+            ),
+            completion_text("The file contains the number 4217."),
+        ]);
+
+        // Register the real process-global factory, pointing a fresh
+        // OpenAiBackend at the scripted endpoint — exactly what the surfaces
+        // do at startup. This is the only test that touches the OnceLock.
+        set_subagent_factory(Box::new(move || {
+            Some(Arc::new(crate::backend::OpenAiBackend::new(
+                format!("http://127.0.0.1:{port}"),
+                "test-key",
+                "scripted-model",
+                Some(SUBAGENT_SYSTEM_PROMPT.to_string()),
+            )) as Arc<dyn InferenceBackend>)
+        }));
+        assert!(subagent_available());
+
+        let args = serde_json::json!({
+            "description": "read the notes file",
+            "prompt": format!("What number is recorded in {}?", file.display()),
+        })
+        .to_string();
+        let result = execute_tool(TASK_TOOL_NAME, &args).await;
+
+        // Only the subagent's final text comes back.
+        assert_eq!(result, "The file contains the number 4217.");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "expected exactly two completions");
+
+        // The subagent conversation is fresh (subagent system prompt) and was
+        // offered only the read-only toolset.
+        let first = &recorded[0];
+        assert_eq!(first["messages"][0]["role"], "system");
+        assert!(
+            first["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("research subagent")
+        );
+        let offered: Vec<&str> = first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        for name in &offered {
+            assert!(
+                SUBAGENT_TOOL_NAMES.contains(name),
+                "non-read-only tool offered: {name}"
+            );
+        }
+        assert!(!offered.contains(&TASK_TOOL_NAME));
+
+        // The read-only tool actually executed: its output travelled back to
+        // the endpoint as a tool result on the second request.
+        let messages = recorded[1]["messages"].as_array().unwrap();
+        let tool_message = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("no tool result in second request");
+        assert_eq!(tool_message["tool_call_id"], "call_1");
+        assert!(
+            tool_message["content"]
+                .as_str()
+                .unwrap()
+                .contains("subagent secret: 4217")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
