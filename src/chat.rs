@@ -88,7 +88,7 @@ mod tui {
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph, Wrap},
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::time::{Duration, Instant, interval};
 
     // ── Message types ─────────────────────────────────────────────────────────
@@ -157,6 +157,25 @@ mod tui {
         /// a complete (non-streamed) assistant reply
         Response(String),
         Error(String),
+        /// the inference task wants to run a mutating tool and is paused on
+        /// `reply`; the user answers with y (once) / a (session) / n (deny)
+        ApprovalRequest {
+            tool: String,
+            /// arguments preview so the user can see what they are approving
+            args: String,
+            reply: oneshot::Sender<ApprovalChoice>,
+        },
+    }
+
+    /// The user's answer to a tool-approval prompt. Dropping the reply channel
+    /// (quit, cancel) counts as a denial on the inference side.
+    enum ApprovalChoice {
+        /// run this one call
+        Once,
+        /// run it and stop asking for this tool for the rest of the session
+        Session,
+        /// skip the call; the model gets an explanatory tool result
+        Deny,
     }
 
     enum ModelLoadUpdate {
@@ -175,6 +194,9 @@ mod tui {
         stream_buf: String,
         inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
         model_load_rx: Option<mpsc::Receiver<ModelLoadUpdate>>,
+        /// a tool call waiting on the user's y/a/n answer; the inference task is
+        /// paused on the other end of the channel
+        pending_approval: Option<(String, oneshot::Sender<ApprovalChoice>)>,
         thinking: bool,
         thinking_tick: u8,
         quit: bool,
@@ -270,6 +292,7 @@ mod tui {
                 stream_buf: String::new(),
                 inference_rx: None,
                 model_load_rx: None,
+                pending_approval: None,
                 thinking: false,
                 thinking_tick: 0,
                 quit: false,
@@ -342,6 +365,9 @@ mod tui {
         fn stop_thinking(&mut self) {
             self.thinking = false;
             self.inference_rx = None;
+            // Dropping a pending reply channel reads as a denial on the
+            // inference side, so a cancelled turn can't leave a tool waiting.
+            self.pending_approval = None;
         }
 
         fn tick_thinking(&mut self) {
@@ -746,6 +772,11 @@ mod tui {
         Login(Option<String>),
         Logout,
         Whoami,
+        /// Toggle plan mode (research only; mutating tools are denied with a
+        /// prompt to present a plan). `Some(true/false)` sets it, `None` flips it.
+        Plan(Option<bool>),
+        /// Show the effective permission policy for this session.
+        Permissions,
         Exit,
         Unknown(String),
     }
@@ -770,6 +801,8 @@ mod tui {
             "/login" => SlashCommand::Login(arg.map(str::to_string)),
             "/logout" => SlashCommand::Logout,
             "/whoami" => SlashCommand::Whoami,
+            "/plan" => SlashCommand::Plan(parse_on_off(arg)),
+            "/permissions" => SlashCommand::Permissions,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -1139,7 +1172,12 @@ mod tui {
             Span::styled(" quit", Style::default().fg(Color::DarkGray)),
         ];
 
-        if app.thinking || app.switching_model || app.is_streaming() {
+        if let Some((tool, _)) = &app.pending_approval {
+            spans.push(Span::styled(
+                format!("  allow {tool}? [y]es · [a]lways · [n]o"),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if app.thinking || app.switching_model || app.is_streaming() {
             spans.push(Span::styled(
                 "  (busy — Ctrl+C to cancel)",
                 Style::default().fg(Color::Yellow),
@@ -1367,6 +1405,8 @@ mod tui {
                      /login E P     — sign in to siGit Code Cloud\n\
                      /logout        — sign out\n\
                      /whoami        — show the signed-in account\n\
+                     /plan [on|off] — plan mode: research only, no edits or commands\n\
+                     /permissions   — show the tool permission policy\n\
                      /clear         — wipe conversation history\n\
                      /status        — show engine status\n\
                      /exit          — quit chat",
@@ -1375,9 +1415,28 @@ mod tui {
             SlashCommand::Clear => {
                 let cleared = engine.clear_history().await;
                 app.messages.clear();
+                crate::permissions::reset_session(crate::permissions::TUI_SESSION);
                 app.messages.push(ChatMessage::system(format!(
                     "Cleared {cleared} turn(s). History is empty.",
                 )));
+            }
+            SlashCommand::Plan(value) => {
+                use crate::permissions::{self, TUI_SESSION};
+                let enabled = value.unwrap_or_else(|| !permissions::plan_mode(TUI_SESSION));
+                permissions::set_plan_mode(TUI_SESSION, enabled);
+                app.messages.push(ChatMessage::system(if enabled {
+                    "Plan mode ON — research with read-only tools only; edits and commands \
+                     are blocked until /plan off."
+                } else {
+                    "Plan mode OFF — tools may execute again (subject to the permission \
+                     policy)."
+                }));
+            }
+            SlashCommand::Permissions => {
+                app.messages
+                    .push(ChatMessage::system(crate::permissions::describe(
+                        crate::permissions::TUI_SESSION,
+                    )));
             }
             SlashCommand::Status => {
                 let info = engine.as_ref().info().await;
@@ -1547,6 +1606,27 @@ mod tui {
         specs
     }
 
+    /// Close out a cancelled round in backend history: the results of tools
+    /// that already ran this round, plus cancellation notes for `unreached`
+    /// calls. Leaving a round's tool calls unanswered breaks strict
+    /// OpenAI-compatible endpoints on the session's next request.
+    async fn abandon_round(
+        backend: &dyn InferenceBackend,
+        mut tool_results: Vec<ToolResult>,
+        unreached: &[crate::backend::ToolCall],
+    ) {
+        for pending in unreached {
+            tool_results.push(ToolResult {
+                tool_call_id: pending.id.clone(),
+                content: format!(
+                    "`{}` was not executed: the user cancelled the turn.",
+                    pending.name
+                ),
+            });
+        }
+        backend.record_cancelled_tool_results(tool_results).await;
+    }
+
     /// run the tool-calling loop off the main thread, posting updates via `tx`.
     /// dropping `tx` signals completion to the event loop.
     async fn run_inference_task(
@@ -1608,7 +1688,16 @@ mod tui {
 
             let mut tool_results = Vec::new();
 
-            for tc in &result.tool_calls {
+            for (call_index, tc) in result.tool_calls.iter().enumerate() {
+                // The UI drops the receiver on Ctrl+C or quit. Stop the turn
+                // at the next boundary instead of burning model rounds (and
+                // possibly running granted tools) in the background.
+                if tx.is_closed() {
+                    log::info!("turn cancelled by the user — stopping the tool loop");
+                    abandon_round(&*backend, tool_results, &result.tool_calls[call_index..]).await;
+                    return;
+                }
+
                 log::info!(
                     "  → {}({})",
                     tc.name,
@@ -1617,13 +1706,70 @@ mod tui {
 
                 let _ = tx.send(InferenceUpdate::ToolUse(tc.name.clone())).await;
 
-                let output = crate::tools::execute_tool(&tc.name, &tc.arguments).await;
+                // Permission gate: read-only tools pass straight through; a
+                // mutating tool consults policy and may pause on the user's
+                // y/a/n answer (delivered over a oneshot from the event loop).
+                use crate::permissions::{self, Decision, TUI_SESSION};
+                let output = match permissions::decision_for(TUI_SESSION, &tc.name) {
+                    Decision::Allow => crate::tools::execute_tool(&tc.name, &tc.arguments).await,
+                    Decision::Deny(reason) => {
+                        log::info!("  ✗ {} denied by policy", tc.name);
+                        reason
+                    }
+                    Decision::Ask => {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        let _ = tx
+                            .send(InferenceUpdate::ApprovalRequest {
+                                tool: tc.name.clone(),
+                                args: permissions::approval_preview(&tc.arguments),
+                                reply: reply_tx,
+                            })
+                            .await;
+                        match reply_rx.await {
+                            Ok(ApprovalChoice::Once) => {
+                                crate::tools::execute_tool(&tc.name, &tc.arguments).await
+                            }
+                            Ok(ApprovalChoice::Session) => {
+                                permissions::grant_for_session(TUI_SESSION, &tc.name);
+                                crate::tools::execute_tool(&tc.name, &tc.arguments).await
+                            }
+                            Ok(ApprovalChoice::Deny) => {
+                                log::info!("  ✗ {} denied by user", tc.name);
+                                permissions::user_denial(&tc.name)
+                            }
+                            // The UI dropped the reply channel (Ctrl+C or
+                            // quit): the whole turn is over, not just this
+                            // call. Close out the round and stop instead of
+                            // continuing rounds in the background.
+                            Err(_) => {
+                                log::info!(
+                                    "turn cancelled at the approval prompt — stopping the tool loop"
+                                );
+                                abandon_round(
+                                    &*backend,
+                                    tool_results,
+                                    &result.tool_calls[call_index..],
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                };
                 log::info!("  ← {} chars", output.len());
 
                 tool_results.push(ToolResult {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
+            }
+
+            // Cancelled while the round's tools ran: record what executed and
+            // stop before paying for another model round nobody will see.
+            if tx.is_closed() {
+                log::info!("turn cancelled by the user — skipping the next model round");
+                abandon_round(&*backend, tool_results, &[]).await;
+                return;
             }
 
             // on the last round, pass no tools so the model must produce text —
@@ -1837,6 +1983,17 @@ mod tui {
                             app.stop_thinking();
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
+                        Some(InferenceUpdate::ApprovalRequest { tool, args, reply }) => {
+                            let call = if args.is_empty() {
+                                tool.clone()
+                            } else {
+                                format!("{tool}({args})")
+                            };
+                            app.messages.push(ChatMessage::system(format!(
+                                "⚠ permission — allow {call}?  [y]es · [a]lways this session · [n]o"
+                            )));
+                            app.pending_approval = Some((tool, reply));
+                        }
                         None => {
                             // task finished, possibly with no text to show
                             app.finalize_stream();
@@ -1876,6 +2033,53 @@ mod tui {
                                         || key.code == KeyCode::Char('d'))
                                 {
                                     app.quit = true;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // pending tool approval — y/a/n answer the prompt; the
+                        // inference task is paused on the reply channel. Checked
+                        // before the busy gate because the app *is* busy here.
+                        if app.pending_approval.is_some() {
+                            if key.kind == KeyEventKind::Press {
+                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                let choice = if ctrl
+                                    && (key.code == KeyCode::Char('c')
+                                        || key.code == KeyCode::Char('d'))
+                                {
+                                    // cancel the whole turn: denying is implicit
+                                    // in dropping the reply channel
+                                    app.pending_approval = None;
+                                    app.stop_thinking();
+                                    app.messages.push(ChatMessage::system("(cancelled)"));
+                                    continue;
+                                } else {
+                                    match key.code {
+                                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                            Some(ApprovalChoice::Once)
+                                        }
+                                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                                            Some(ApprovalChoice::Session)
+                                        }
+                                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                            Some(ApprovalChoice::Deny)
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                if let Some(choice) = choice
+                                    && let Some((tool, reply)) = app.pending_approval.take()
+                                {
+                                    let verdict = match &choice {
+                                        ApprovalChoice::Once => "allowed once",
+                                        ApprovalChoice::Session => "allowed for this session",
+                                        ApprovalChoice::Deny => "denied",
+                                    };
+                                    app.messages.push(ChatMessage::system(format!(
+                                        "{tool}: {verdict}"
+                                    )));
+                                    let _ = reply.send(choice);
                                 }
                             }
                             continue;

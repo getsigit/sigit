@@ -35,6 +35,7 @@ mod credentials;
 mod instructions;
 mod mcp;
 mod models;
+mod permissions;
 mod provider;
 mod settings;
 mod setup;
@@ -62,12 +63,13 @@ use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -230,6 +232,33 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
 /// cap tool-call loops so a confused model can't spin forever
 const MAX_TOOL_ROUNDS: usize = 10;
 
+/// Outcome of asking the client for permission to run one tool call.
+enum PermissionVerdict {
+    /// Run the tool.
+    Approved,
+    /// Skip the tool; the string becomes its tool result so the model adapts.
+    Denied(String),
+    /// The client cancelled the turn while the request was pending; stop the
+    /// whole prompt with `StopReason::Cancelled` instead of burning rounds.
+    TurnCancelled,
+}
+
+/// Display kind for the permission dialog, so editors can show a fitting icon.
+fn tool_kind_for(tool_name: &str) -> ToolKind {
+    match tool_name {
+        "edit_file" | "multi_edit" | "create_file" | "create_directory" | "remember" => {
+            ToolKind::Edit
+        }
+        "delete_file" => ToolKind::Delete,
+        "run_command" => ToolKind::Execute,
+        "read_file" | "list_directory" => ToolKind::Read,
+        "search_files" | "glob" => ToolKind::Search,
+        "read_website" => ToolKind::Fetch,
+        "write_todos" => ToolKind::Think,
+        _ => ToolKind::Other,
+    }
+}
+
 /// Shown when a siGit Code Cloud tier is selected without a signed-in account.
 const CLOUD_LOGIN_PROMPT: &str = "siGit Code Cloud needs an account. Sign in with \
     `/login <email> <password>` (or the Authenticate button), then pick the tier again. \
@@ -350,6 +379,12 @@ struct SiGitAgent {
     startup_model_name: String,
     /// for download-progress polling
     startup_model_id: String,
+    /// Serializes turn-affecting handlers (prompt, session lifecycle, config
+    /// changes). They run in `cx.spawn`ed tasks so the JSON-RPC dispatch loop
+    /// stays free to route client responses (e.g. permission answers) mid-turn;
+    /// this lock reproduces the strict ordering the dispatch loop used to give
+    /// them for free.
+    turn_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SiGitAgent {
@@ -375,6 +410,7 @@ impl SiGitAgent {
             startup_needs_download,
             startup_model_name,
             startup_model_id,
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -727,6 +763,12 @@ impl SiGitAgent {
             AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
             AvailableCommand::new("whoami", "Show the signed-in account"),
             AvailableCommand::new("reload", "Re-sync sign-in and model state"),
+            with_hint(
+                "plan",
+                "Plan mode: research only, no edits or commands",
+                "on|off (optional)",
+            ),
+            AvailableCommand::new("permissions", "Show the tool permission policy"),
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
@@ -907,6 +949,11 @@ impl SiGitAgent {
             *guard = Some(args.cwd.clone());
         }
 
+        // A session boundary: grants and plan mode from the previous life of
+        // this session id must not carry over — and since one shared engine
+        // means one live conversation, state for every other id is dead too.
+        permissions::reset_all();
+
         // tool calls use relative paths, so we need to match the editor's cwd
         if args.cwd.is_dir()
             && let Err(err) = std::env::set_current_dir(&args.cwd)
@@ -942,6 +989,9 @@ impl SiGitAgent {
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        // Session boundary: permission grants and plan mode never cross it
+        // (see handle_load_session), so a fork starts with a clean slate.
+        permissions::reset_all();
         log::info!(
             "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
             args.session_id,
@@ -989,6 +1039,9 @@ impl SiGitAgent {
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        // Session boundary: permission grants and plan mode never cross it
+        // (see handle_load_session), so stale ids stop accumulating state.
+        permissions::reset_all();
         log::info!(
             "new_session: id={session_id}, cwd={}, additional_directories={:?}",
             args.cwd.display(),
@@ -1249,14 +1302,59 @@ impl SiGitAgent {
 
             let mut tool_results = Vec::new();
 
-            for tc in &result.tool_calls {
+            for (call_index, tc) in result.tool_calls.iter().enumerate() {
                 log::info!(
                     "  → {}({})",
                     tc.name,
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                let output = tools::execute_tool(&tc.name, &tc.arguments).await;
+                // Permission gate: read-only tools pass straight through; a
+                // mutating tool consults policy and may ask the client.
+                let output = match permissions::decision_for(&session_id.to_string(), &tc.name) {
+                    permissions::Decision::Allow => {
+                        tools::execute_tool(&tc.name, &tc.arguments).await
+                    }
+                    permissions::Decision::Deny(reason) => {
+                        log::info!("  ✗ {} denied by policy", tc.name);
+                        reason
+                    }
+                    permissions::Decision::Ask => {
+                        match self
+                            .request_tool_permission(cx, &session_id, &tc.name, &tc.arguments)
+                            .await
+                        {
+                            PermissionVerdict::Approved => {
+                                tools::execute_tool(&tc.name, &tc.arguments).await
+                            }
+                            PermissionVerdict::Denied(reason) => {
+                                log::info!("  ✗ {} denied by user", tc.name);
+                                reason
+                            }
+                            PermissionVerdict::TurnCancelled => {
+                                log::info!("prompt({}) cancelled at permission gate", session_id);
+                                // The assistant message carrying these tool
+                                // calls is already in the backend history;
+                                // leaving any of them unanswered makes strict
+                                // OpenAI-compatible endpoints reject every
+                                // later request in the session. Close out this
+                                // call and the ones this round never reached.
+                                for pending in &result.tool_calls[call_index..] {
+                                    tool_results.push(BackendToolResult {
+                                        tool_call_id: pending.id.clone(),
+                                        content: format!(
+                                            "`{}` was not executed: the user cancelled the turn \
+                                             at the permission prompt.",
+                                            pending.name
+                                        ),
+                                    });
+                                }
+                                backend.record_cancelled_tool_results(tool_results).await;
+                                return Ok(PromptResponse::new(StopReason::Cancelled));
+                            }
+                        }
+                    }
+                };
 
                 log::info!("  ← {} chars", output.len());
 
@@ -1321,6 +1419,81 @@ impl SiGitAgent {
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
         Ok(PromptResponse::new(StopReason::EndTurn))
+    }
+
+    /// Ask the ACP client for permission to run one tool call. Presents
+    /// allow-once / allow-for-session / deny; an "always allow" choice is
+    /// recorded via [`permissions::grant_for_session`]. Only safe to call from
+    /// a spawned task (see the handler registration in `run_acp_server`): the
+    /// dispatch loop must be free to route the client's answer back to us.
+    async fn request_tool_permission(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        tool_name: &str,
+        arguments: &str,
+    ) -> PermissionVerdict {
+        // The user decides from this dialog, so show the arguments with any
+        // truncation flagged (a silently clipped command could hide its tail
+        // from the person approving it). The full arguments also travel as
+        // `raw_input` for clients that render it.
+        let args_preview = permissions::approval_preview(arguments);
+        let title = if args_preview.is_empty() {
+            tool_name.to_string()
+        } else {
+            format!("{tool_name}({args_preview})")
+        };
+        let raw_input: serde_json::Value = serde_json::from_str(arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()));
+
+        let request = RequestPermissionRequest::new(
+            session_id.clone(),
+            ToolCallUpdate::new(
+                format!("perm-{}", uuid::Uuid::new_v4()),
+                ToolCallUpdateFields::new()
+                    .title(title)
+                    .kind(tool_kind_for(tool_name))
+                    .status(ToolCallStatus::Pending)
+                    .raw_input(raw_input),
+            ),
+            vec![
+                PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
+                PermissionOption::new(
+                    "allow_session",
+                    "Allow for this session",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                PermissionOption::new("reject_once", "Deny", PermissionOptionKind::RejectOnce),
+            ],
+        );
+
+        match cx.send_request(request).block_task().await {
+            Ok(response) => match response.outcome {
+                RequestPermissionOutcome::Selected(selected) => {
+                    match selected.option_id.0.as_ref() {
+                        "allow_once" => PermissionVerdict::Approved,
+                        "allow_session" => {
+                            permissions::grant_for_session(&session_id.to_string(), tool_name);
+                            PermissionVerdict::Approved
+                        }
+                        _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
+                    }
+                }
+                RequestPermissionOutcome::Cancelled => PermissionVerdict::TurnCancelled,
+                // The outcome enum is non_exhaustive; treat anything unknown as
+                // a denial rather than running a mutating tool unapproved.
+                _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
+            },
+            Err(error) => {
+                log::warn!("permission request for `{tool_name}` failed: {error}");
+                PermissionVerdict::Denied(format!(
+                    "`{tool_name}` was not executed: this client could not answer the \
+                     permission request ({error}). The user can pre-approve tools in \
+                     settings.toml under [permissions], or set SIGIT_PERMISSIONS=allow \
+                     for clients without permission support."
+                ))
+            }
+        }
     }
 
     async fn handle_cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
@@ -1977,6 +2150,11 @@ enum SlashCommand {
     Whoami,
     /// Re-sync session state (auth, backend, picker) without a new session.
     Reload,
+    /// Toggle plan mode (read-only research; mutating tools denied with a
+    /// prompt to present a plan). `Some(true/false)` sets it, `None` flips it.
+    Plan(Option<bool>),
+    /// Show the effective permission policy for this session.
+    Permissions,
     Exit,
     Unknown(String),
 }
@@ -2002,6 +2180,8 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/logout" => SlashCommand::Logout,
         "/whoami" => SlashCommand::Whoami,
         "/reload" => SlashCommand::Reload,
+        "/plan" => SlashCommand::Plan(parse_on_off(argument)),
+        "/permissions" => SlashCommand::Permissions,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -2110,6 +2290,8 @@ async fn exec_slash_acp(
                      /logout        - sign out\n\
                      /whoami        - show the signed-in account\n\
                      /reload        - re-sync sign-in and model state\n\
+                     /plan [on|off] - plan mode: research only, no edits or commands\n\
+                     /permissions   - show the tool permission policy\n\
                      /clear         - wipe conversation history\n\
                      /status        - show engine status\n\
                      /exit          - end this turn",
@@ -2118,6 +2300,7 @@ async fn exec_slash_acp(
         }
         SlashCommand::Clear => {
             let cleared = agent.engine.clear_history().await;
+            permissions::reset_session(&session_id.to_string());
             agent
                 .send_assistant_message(
                     cx,
@@ -2125,6 +2308,23 @@ async fn exec_slash_acp(
                     format!("Cleared {cleared} turn(s). History is empty."),
                 )
                 .ok();
+        }
+        SlashCommand::Plan(value) => {
+            let session_key = session_id.to_string();
+            let enabled = value.unwrap_or_else(|| !permissions::plan_mode(&session_key));
+            permissions::set_plan_mode(&session_key, enabled);
+            let message = if enabled {
+                "Plan mode ON — the agent researches with read-only tools and presents a \
+                 plan; edits and commands are blocked until /plan off."
+            } else {
+                "Plan mode OFF — the agent may execute tools again (subject to the \
+                 permission policy)."
+            };
+            agent.send_assistant_message(cx, session_id, message).ok();
+        }
+        SlashCommand::Permissions => {
+            let summary = permissions::describe(&session_id.to_string());
+            agent.send_assistant_message(cx, session_id, summary).ok();
         }
         SlashCommand::Status => {
             let info = agent.engine.info().await;
@@ -2653,6 +2853,29 @@ async fn run_acp_server() -> anyhow::Result<()> {
         needs_download,
     ));
 
+    // Honor the explicit provider override (OPENAI_BASE_URL/OPENAI_API_KEY or
+    // an active providers.toml profile) in ACP mode too — the interactive
+    // client already does. Without this the override was silently ignored here
+    // and prompts insisted on a local model. It is also what lets the ACP
+    // integration test drive the agent against a scripted endpoint
+    // (tests/acp_permissions.rs). The model picker still shows the local
+    // selection; overrides are a power-user escape hatch, not a tier.
+    if let Some(cfg) = provider::active_provider() {
+        log::info!(
+            "inference: using {} (model {}) at {}",
+            cfg.display_name,
+            cfg.model,
+            cfg.base_url
+        );
+        let override_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
+            cfg.base_url,
+            cfg.api_key,
+            cfg.model,
+            Some(system_prompt_for_model(true).to_string()),
+        ));
+        *state.backend.lock().await = override_backend;
+    }
+
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
     let transport = ByteStreams::new(stdout, stdin);
@@ -2677,11 +2900,21 @@ async fn run_acp_server() -> anyhow::Result<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // Turn-affecting handlers below run in spawned tasks, serialized by
+        // `turn_lock`, so the dispatch loop stays free to route client
+        // responses (permission answers) while a turn is in flight. Awaiting a
+        // client request from *inside* a handler would deadlock: the dispatch
+        // loop can't read the response while the handler blocks it.
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
                 async move |req: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_load_session(&cx, req).await)
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let _turn = state.turn_lock.lock().await;
+                        handle_response(responder, state.handle_load_session(&task_cx, req).await)
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2690,7 +2923,12 @@ async fn run_acp_server() -> anyhow::Result<()> {
             {
                 let state = Arc::clone(&state);
                 async move |req: ForkSessionRequest, responder, cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_fork_session(&cx, req).await)
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let _turn = state.turn_lock.lock().await;
+                        handle_response(responder, state.handle_fork_session(&task_cx, req).await)
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2699,7 +2937,12 @@ async fn run_acp_server() -> anyhow::Result<()> {
             {
                 let state = Arc::clone(&state);
                 async move |req: NewSessionRequest, responder, cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_new_session(&cx, req).await)
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let _turn = state.turn_lock.lock().await;
+                        handle_response(responder, state.handle_new_session(&task_cx, req).await)
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2708,7 +2951,12 @@ async fn run_acp_server() -> anyhow::Result<()> {
             {
                 let state = Arc::clone(&state);
                 async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_prompt(&cx, req).await)
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let _turn = state.turn_lock.lock().await;
+                        handle_response(responder, state.handle_prompt(&task_cx, req).await)
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2719,10 +2967,15 @@ async fn run_acp_server() -> anyhow::Result<()> {
                 async move |req: SetSessionConfigOptionRequest,
                             responder,
                             cx: ConnectionTo<Client>| {
-                    handle_response(
-                        responder,
-                        state.handle_set_session_config_option(&cx, req).await,
-                    )
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let _turn = state.turn_lock.lock().await;
+                        handle_response(
+                            responder,
+                            state.handle_set_session_config_option(&task_cx, req).await,
+                        )
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),

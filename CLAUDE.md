@@ -19,13 +19,21 @@ Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit 
 
 ## Working in this repo
 
-**IMPORTANT — branch naming:** Name every working branch after the *changes it contains*, not
-after a task, ticket, or session id. Use a short, descriptive, kebab-case slug so the branch is
-self-explanatory from its name alone (e.g. `claude/agent-tools-multiedit-glob-todos-remember`,
-not `claude/task-q003hm`).
+**IMPORTANT — branch naming:** Prefix every working branch with `feature/` (new functionality)
+or `fix/` (bug fixes) — never a tool- or agent-name prefix like `claude/`. Name the branch after
+the *changes it contains*, as a short, descriptive, kebab-case slug that is self-explanatory
+from the name alone (e.g. `feature/tool-permission-system`, `fix/glob-mtime-sort`), never after
+a task, ticket, or session id (not `feature/task-q003hm`).
 
 **IMPORTANT — pull request target:** Always open pull requests against the `development` branch,
 never `main`. `main` is release-only; `development` is where day-to-day work integrates.
+
+**IMPORTANT — branch off `development`:** Start every working branch from the latest
+`origin/development`. Exception: when new work *depends on* a feature branch that has not merged
+yet (e.g. it builds on tools or APIs that branch introduces), it may be stacked on top of that
+branch instead. When stacking: merge the base PR into `development` first, then rebase the
+stacked branch onto `development` before opening its pull request, so each PR shows only its own
+commits.
 
 **IMPORTANT — run CI before pushing:** Run the full CI gate locally and confirm it is green
 *before* pushing a branch or opening a pull request — never push work that fails these:
@@ -55,10 +63,10 @@ Run a single test: `cargo test <test_name>`.
 
 ## Critical platform constraint: `#[cfg(unix)]` dead code
 
-The interactive client, the `InferenceBackend` seam (`backend.rs`), and provider resolution
-(`provider.rs`) are wired up **only** through `#[cfg(unix)]` code paths. On Windows the binary
-runs ACP-only and drives `onde` directly, so much of `backend.rs` and `provider.rs` is
-legitimately unused there and the dead-code lint is suppressed *on non-Unix targets only*.
+The interactive client is `#[cfg(unix)]`-only. The `InferenceBackend` seam (`backend.rs`) and
+provider resolution (`provider.rs`) are consumed by both the interactive client and the ACP
+server, but several of their items are reached only through the Unix-only interactive paths, so
+the dead-code lint is suppressed *on non-Unix targets only*.
 
 Consequence: code can pass clippy on macOS/Linux but fail on the Windows target (or vice versa).
 When touching `backend.rs`, `provider.rs`, or the interactive path, keep the `cfg` gates intact —
@@ -102,6 +110,17 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   official server (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in and authed with the
   cloud session token; extra servers live in `mcp.toml` (global `$SIGIT_CONFIG_DIR/mcp.toml` and
   project-local `.sigit/mcp.toml`). stdio transport is not supported.
+- **`src/permissions.rs`** — tool permission policy. Every tool call passes through
+  `decision_for` before executing: read-only tools always run; mutating tools (and all
+  `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
+  mutating tools with a present-a-plan message), session "always allow" grants, per-tool
+  overrides and the default mode from `[permissions]` in `settings.toml` (`allow`/`ask`/`deny`,
+  default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`, the ACP path sends
+  `session/request_permission` (allow once / allow for session / deny) and the TUI pauses the
+  inference task on a y/a/n prompt. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
+  serialized by `SiGitAgent::turn_lock` so the dispatch loop can route the client's permission
+  answer mid-turn — don't move them back inline, and don't await client requests from inline
+  handlers (deadlock).
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
@@ -120,8 +139,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/models.rs`** — model-picker types shared across platforms.
 
 Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
-`/clear`, `/status`) are advertised via `advertise_commands` in `main.rs` and handled in both the
-TUI and ACP sessions.
+`/plan`, `/permissions`, `/clear`, `/status`) are advertised via `advertise_commands` in `main.rs`
+and handled in both the TUI and ACP sessions.
 
 ## Model cache (macOS)
 
@@ -142,7 +161,9 @@ verbosity with `RUST_LOG`.
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
 `SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
-server), `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
+server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
+mutating tools; the escape hatch for clients without permission-request support),
+`HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
 
 ## Releasing
 
