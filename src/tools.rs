@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
+
+use crate::backend::{InferenceBackend, ToolResult, ToolSpec};
 
 const WEBSITE_READ_CHAR_LIMIT: usize = 20_000;
 const WEBSITE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -400,11 +403,230 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
         "delete_file" => exec_delete_file(arguments),
         "run_command" => exec_run_command(arguments),
         "skill" => crate::skills::activate_skill(arguments),
+        TASK_TOOL_NAME => exec_task(arguments).await,
         // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
         // and forwarded to the owning server.
         _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
         _ => format!("Unknown tool: {name}"),
     }
+}
+
+// ── task (subagent) ──────────────────────────────────────────────────────────
+//
+// The `task` tool delegates a self-contained research question to a *nested*
+// agent loop running in a fresh conversation, so the main thread receives only
+// the final answer instead of every intermediate file read. The subagent's
+// toolset is strictly read-only and never includes `task` itself (no
+// recursion), so a delegated agent can research but not mutate state.
+//
+// This module is backend-agnostic and cannot construct a backend, so the
+// surface that knows the active provider (`run_acp_server` / `run_interactive`
+// in `main.rs`) registers a factory at startup. The factory returns `None`
+// when inference runs on-device: onde has a single shared conversation
+// history, so a second concurrent context is not possible yet.
+
+pub const TASK_TOOL_NAME: &str = "task";
+
+/// The tool names a subagent may call, filtered from [`all_tools`].
+const SUBAGENT_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "list_directory",
+    "search_files",
+    "glob",
+    "read_website",
+];
+
+/// System prompt seeding every subagent conversation.
+pub const SUBAGENT_SYSTEM_PROMPT: &str = "You are a focused research subagent. \
+You are given one self-contained task by a calling agent. Investigate it using \
+the read-only tools available to you (read_file, list_directory, search_files, \
+glob, read_website) and answer it thoroughly but concisely. You cannot modify \
+files or run commands. Your final message is returned verbatim to the caller, \
+so make it a complete, self-contained answer — include the concrete facts, \
+paths, and code excerpts the caller needs, and nothing else.";
+
+/// Rounds of tool calls a subagent may use before it is forced to answer.
+const SUBAGENT_MAX_TOOL_ROUNDS: usize = 8;
+/// Cap on the answer text returned to the caller.
+const SUBAGENT_RESULT_CHAR_LIMIT: usize = 8_000;
+
+/// Returned when `task` is called but no subagent backend can be built.
+const SUBAGENT_UNAVAILABLE: &str = "The task tool is not available on-device \
+yet: on-device inference has a single conversation context. Do the research \
+yourself with the read-only tools.";
+
+/// Builds a fresh backend for one subagent run, or `None` when the active
+/// inference cannot host a second conversation (on-device).
+pub type SubagentFactory = Box<dyn Fn() -> Option<Arc<dyn InferenceBackend>> + Send + Sync>;
+
+static SUBAGENT_FACTORY: OnceLock<SubagentFactory> = OnceLock::new();
+
+/// Register the process-wide subagent factory. Called once at startup by the
+/// surface that resolved the inference provider; later calls are ignored.
+pub fn set_subagent_factory(factory: SubagentFactory) {
+    let _ = SUBAGENT_FACTORY.set(factory);
+}
+
+/// Whether a `task` call could run right now: a factory is registered and it
+/// can build a backend. The spec builders (`agent_tools_as_specs` /
+/// `build_tool_specs`) use this to offer the tool only when it works, the same
+/// conditional pattern as the `skill` tool.
+pub fn subagent_available() -> bool {
+    SUBAGENT_FACTORY
+        .get()
+        .is_some_and(|factory| factory().is_some())
+}
+
+/// The read-only toolset offered to a subagent, filtered from [`all_tools`] by
+/// name. Never contains `task` (recursion) or any mutating tool.
+pub fn subagent_tool_specs() -> Vec<ToolSpec> {
+    all_tools()
+        .into_iter()
+        .filter(|tool| SUBAGENT_TOOL_NAMES.contains(&tool.name))
+        .map(|tool| ToolSpec {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+            parameters_schema: tool.parameters_schema.to_string(),
+        })
+        .collect()
+}
+
+/// Spec for the `task` tool. Lives in the `*_as_specs`/`build_tool_specs`
+/// layer (like `skill` and MCP tools), not in [`all_tools`], because it is
+/// only offered when [`subagent_available`] is true.
+pub fn task_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: TASK_TOOL_NAME.to_string(),
+        description: "Delegate a self-contained research task to a subagent that \
+             runs in a fresh conversation and returns only its final answer. The \
+             subagent can read files, list directories, search, glob, and read \
+             websites, but cannot modify anything. Use this for exploratory \
+             questions whose intermediate file reads would otherwise clutter this \
+             conversation (e.g. \"where is X implemented and how does it work?\"). \
+             The subagent cannot see this conversation, so the prompt must be \
+             fully self-contained: include absolute paths, symbol names, and \
+             exactly what the answer should contain."
+            .to_string(),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "A short (3-5 word) summary of the task, for progress display."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The full task for the subagent. Must be self-contained: the subagent sees nothing of this conversation."
+                }
+            },
+            "required": ["description", "prompt"],
+            "additionalProperties": false
+        })
+        .to_string(),
+    }
+}
+
+/// The `task` tool entry point used by [`execute_tool`].
+async fn exec_task(arguments: &str) -> String {
+    exec_task_with(arguments, SUBAGENT_FACTORY.get()).await
+}
+
+/// Core of the `task` tool, parameterized on the factory so tests can exercise
+/// the unavailable path without touching the process-global `OnceLock`.
+async fn exec_task_with(arguments: &str, factory: Option<&SubagentFactory>) -> String {
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    };
+
+    let prompt = match args.get("prompt").and_then(Value::as_str) {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return "Error: missing required parameter \"prompt\"".to_string(),
+    };
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("(no description)");
+
+    let Some(backend) = factory.and_then(|build| build()) else {
+        return SUBAGENT_UNAVAILABLE.to_string();
+    };
+
+    log::info!("task: running subagent — {description}");
+    run_subagent(backend.as_ref(), prompt).await
+}
+
+/// The nested agent loop: a fresh conversation, read-only tools, a round cap,
+/// and only the final text returned. Mirrors the main loops in `main.rs` /
+/// `chat.rs`: offer tools each round, and pass `tools = None` on the last
+/// round to force a text answer.
+async fn run_subagent(backend: &dyn InferenceBackend, prompt: &str) -> String {
+    let specs = subagent_tool_specs();
+
+    let mut result = match backend.send_message_with_tools(prompt, &specs, None).await {
+        Ok(r) => r,
+        Err(err) => return format!("Error: subagent inference failed: {err}"),
+    };
+
+    let mut round = 0;
+    while !result.tool_calls.is_empty() && round < SUBAGENT_MAX_TOOL_ROUNDS {
+        round += 1;
+        log::info!(
+            "task: subagent tool round {round} — {} call(s)",
+            result.tool_calls.len()
+        );
+
+        let mut tool_results = Vec::with_capacity(result.tool_calls.len());
+        for call in &result.tool_calls {
+            // Hard gate, not just advertisement: even if the model asks for a
+            // tool outside the offered set, only read-only tools execute here.
+            let content = if SUBAGENT_TOOL_NAMES.contains(&call.name.as_str()) {
+                // Boxed to break the async cycle: execute_tool → task →
+                // run_subagent → execute_tool.
+                Box::pin(execute_tool(&call.name, &call.arguments)).await
+            } else {
+                format!(
+                    "Error: `{}` is not available to a subagent. Only these \
+                     read-only tools are: {}.",
+                    call.name,
+                    SUBAGENT_TOOL_NAMES.join(", ")
+                )
+            };
+            tool_results.push(ToolResult {
+                tool_call_id: call.id.clone(),
+                content,
+            });
+        }
+
+        // On the last round, offer no tools so the model must produce text.
+        let next_tools = if round < SUBAGENT_MAX_TOOL_ROUNDS {
+            Some(specs.as_slice())
+        } else {
+            None
+        };
+        result = match backend
+            .send_tool_results(tool_results, next_tools, None)
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => return format!("Error: subagent inference failed: {err}"),
+        };
+    }
+
+    let text = result.text.trim();
+    if text.is_empty() {
+        return "The subagent finished without a text answer.".to_string();
+    }
+
+    let total = text.chars().count();
+    if total > SUBAGENT_RESULT_CHAR_LIMIT {
+        let truncated: String = text.chars().take(SUBAGENT_RESULT_CHAR_LIMIT).collect();
+        return format!(
+            "{truncated}\n\n--- truncated (showing {SUBAGENT_RESULT_CHAR_LIMIT} of {total} \
+             characters of the subagent's answer) ---"
+        );
+    }
+    text.to_string()
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -2428,5 +2650,249 @@ mod tests {
         let args = serde_json::json!({ "command": command }).to_string();
         let result = exec_run_command(&args);
         assert!(result.contains("err"), "got: {result}");
+    }
+
+    // ── task (subagent) tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_subagent_toolset_is_read_only() {
+        let specs = subagent_tool_specs();
+        let mut names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "glob",
+                "list_directory",
+                "read_file",
+                "read_website",
+                "search_files"
+            ]
+        );
+
+        // No recursion and no mutating tools, ever.
+        assert!(!names.contains(&TASK_TOOL_NAME));
+        for banned in [
+            "create_file",
+            "create_directory",
+            "edit_file",
+            "multi_edit",
+            "delete_file",
+            "run_command",
+            "write_todos",
+            "remember",
+        ] {
+            assert!(!names.contains(&banned), "{banned} leaked into subagent");
+        }
+
+        // Every spec came from `all_tools()` (schemas intact).
+        for spec in &specs {
+            assert!(
+                serde_json::from_str::<Value>(&spec.parameters_schema)
+                    .unwrap()
+                    .is_object()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_reports_unavailable_without_factory() {
+        let args = serde_json::json!({
+            "description": "look around",
+            "prompt": "What is in the current directory?"
+        })
+        .to_string();
+        // `None` is exactly what `exec_task` passes before any surface has
+        // registered the process-global factory.
+        let result = exec_task_with(&args, None).await;
+        assert!(
+            result.contains("not available on-device yet"),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_missing_prompt() {
+        let result = exec_task_with(r#"{"description": "x"}"#, None).await;
+        assert!(
+            result.contains("missing required parameter \"prompt\""),
+            "got: {result}"
+        );
+    }
+
+    // ── task (subagent) end-to-end against a scripted endpoint ──────────
+
+    /// A completion whose assistant message requests one tool call.
+    fn completion_tool_call(id: &str, name: &str, arguments: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }],
+            }}]
+        })
+        .to_string()
+    }
+
+    /// A completion whose assistant message is a plain text answer.
+    fn completion_text(text: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": text}}]
+        })
+        .to_string()
+    }
+
+    /// Minimal scripted OpenAI-compatible endpoint (same pattern as
+    /// `tests/acp_permissions.rs`): serves one canned chat-completion JSON body
+    /// per request and records each request body. The subagent loop passes
+    /// `sink: None`, so the backend takes the non-streaming path and expects
+    /// plain JSON rather than SSE.
+    fn start_scripted_endpoint(responses: Vec<String>) -> (u16, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind endpoint");
+        let port = listener.local_addr().unwrap().port();
+        let requests: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let recorded = Arc::clone(&requests);
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::from(responses));
+
+        std::thread::spawn(move || {
+            // `connection: close` means one request per connection, matching
+            // the backend's serial completion requests.
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(clone) => clone,
+                    Err(_) => continue,
+                });
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let line = line.trim();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = length.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                if let Ok(request) = serde_json::from_slice::<Value>(&body) {
+                    recorded.lock().unwrap().push(request);
+                }
+                let payload = queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| completion_text("out of scripted responses"));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        (port, requests)
+    }
+
+    #[tokio::test]
+    async fn test_task_runs_subagent_end_to_end() {
+        // A file only the subagent's read_file call can surface.
+        let dir = std::env::temp_dir().join("sigit_test_subagent_e2e");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        fs::write(&file, "subagent secret: 4217").unwrap();
+
+        // Script: one read_file tool call, then a final text answer.
+        let (port, requests) = start_scripted_endpoint(vec![
+            completion_tool_call(
+                "call_1",
+                "read_file",
+                &serde_json::json!({ "path": file }).to_string(),
+            ),
+            completion_text("The file contains the number 4217."),
+        ]);
+
+        // Register the real process-global factory, pointing a fresh
+        // OpenAiBackend at the scripted endpoint — exactly what the surfaces
+        // do at startup. This is the only test that touches the OnceLock.
+        set_subagent_factory(Box::new(move || {
+            Some(Arc::new(crate::backend::OpenAiBackend::new(
+                format!("http://127.0.0.1:{port}"),
+                "test-key",
+                "scripted-model",
+                Some(SUBAGENT_SYSTEM_PROMPT.to_string()),
+            )) as Arc<dyn InferenceBackend>)
+        }));
+        assert!(subagent_available());
+
+        let args = serde_json::json!({
+            "description": "read the notes file",
+            "prompt": format!("What number is recorded in {}?", file.display()),
+        })
+        .to_string();
+        let result = execute_tool(TASK_TOOL_NAME, &args).await;
+
+        // Only the subagent's final text comes back.
+        assert_eq!(result, "The file contains the number 4217.");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "expected exactly two completions");
+
+        // The subagent conversation is fresh (subagent system prompt) and was
+        // offered only the read-only toolset.
+        let first = &recorded[0];
+        assert_eq!(first["messages"][0]["role"], "system");
+        assert!(
+            first["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("research subagent")
+        );
+        let offered: Vec<&str> = first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        for name in &offered {
+            assert!(
+                SUBAGENT_TOOL_NAMES.contains(name),
+                "non-read-only tool offered: {name}"
+            );
+        }
+        assert!(!offered.contains(&TASK_TOOL_NAME));
+
+        // The read-only tool actually executed: its output travelled back to
+        // the endpoint as a tool result on the second request.
+        let messages = recorded[1]["messages"].as_array().unwrap();
+        let tool_message = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("no tool result in second request");
+        assert_eq!(tool_message["tool_call_id"], "call_1");
+        assert!(
+            tool_message["content"]
+                .as_str()
+                .unwrap()
+                .contains("subagent secret: 4217")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
