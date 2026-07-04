@@ -305,10 +305,35 @@ fn agent_tools_as_specs() -> Vec<ToolSpec> {
         });
     }
 
+    // Delegated research (`task`) is offered only when a subagent backend can
+    // actually be built — same conditional pattern as the `skill` tool above.
+    if tools::subagent_available() {
+        specs.push(tools::task_tool_spec());
+    }
+
     // Tools discovered from configured MCP servers (incl. the official one).
     specs.extend(mcp::tool_specs());
 
     specs
+}
+
+/// Register the `task` tool's subagent factory for an OpenAI-compatible
+/// provider: each subagent run gets a FRESH `OpenAiBackend` against the same
+/// endpoint (its own conversation history), seeded with the subagent system
+/// prompt. The provider config is captured by clone. Called once at startup by
+/// whichever surface resolved the provider; on-device paths register a factory
+/// that returns `None` instead (onde has a single shared history, so a second
+/// concurrent context is not possible yet).
+fn register_subagent_factory_for(cfg: &provider::ProviderConfig) {
+    let cfg = cfg.clone();
+    tools::set_subagent_factory(Box::new(move || {
+        Some(Arc::new(OpenAiBackend::new(
+            cfg.base_url.clone(),
+            cfg.api_key.clone(),
+            cfg.model.clone(),
+            Some(tools::SUBAGENT_SYSTEM_PROMPT.to_string()),
+        )) as Arc<dyn InferenceBackend>)
+    }));
 }
 
 fn initialize_meta() -> Meta {
@@ -2700,6 +2725,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 // No local model to load; the endpoint is ready immediately.
                 let _ = load_tx.send(Ok(()));
                 let label = provider.display_name.clone();
+                register_subagent_factory_for(&provider);
                 let backend = Arc::new(OpenAiBackend::new(
                     provider.base_url,
                     provider.api_key,
@@ -2729,6 +2755,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                         );
                         let _ = load_tx.send(Ok(()));
                         let label = provider.display_name.clone();
+                        register_subagent_factory_for(&provider);
                         let backend = Arc::new(OpenAiBackend::new(
                             provider.base_url,
                             provider.api_key,
@@ -2745,6 +2772,9 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                             );
                         }
                         let _ = load_tx.send(Ok(()));
+                        // On-device inference has a single shared history; no
+                        // subagent context is possible yet.
+                        tools::set_subagent_factory(Box::new(|| None));
                         let backend = Arc::new(LocalBackend::new(Arc::clone(&engine)))
                             as Arc<dyn InferenceBackend>;
                         (backend, startup_model_name)
@@ -2867,6 +2897,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
             cfg.model,
             cfg.base_url
         );
+        register_subagent_factory_for(&cfg);
         let override_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
             cfg.base_url,
             cfg.api_key,
@@ -2874,6 +2905,10 @@ async fn run_acp_server() -> anyhow::Result<()> {
             Some(system_prompt_for_model(true).to_string()),
         ));
         *state.backend.lock().await = override_backend;
+    } else {
+        // On-device inference has a single shared conversation history, so a
+        // second concurrent subagent context is not possible yet.
+        tools::set_subagent_factory(Box::new(|| None));
     }
 
     let stdin = tokio::io::stdin().compat();

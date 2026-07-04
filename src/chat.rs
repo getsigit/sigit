@@ -1600,6 +1600,12 @@ mod tui {
             });
         }
 
+        // Delegated research (`task`) is offered only when a subagent backend
+        // can actually be built — same conditional pattern as `skill` above.
+        if crate::tools::subagent_available() {
+            specs.push(crate::tools::task_tool_spec());
+        }
+
         // Tools discovered from configured MCP servers (incl. the official one).
         specs.extend(crate::mcp::tool_specs());
 
