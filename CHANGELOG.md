@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.2
+
+Adds a tool permission system with plan mode, durable sessions with context
+compaction, background command execution, a subagent research tool, and commit
+co-author attribution.
+
+### What changed
+
+- Every tool call now passes a permission policy before executing. Read-only tools always run; mutating tools (and all MCP or unknown tools) are governed by, in order: plan mode, session grants, per-tool overrides, and a default mode from `[permissions]` in `settings.toml` (`allow`/`ask`/`deny`, default `ask`). On `ask`, editors get a native ACP permission dialog (allow once / allow for this session / deny) and the TUI pauses on a y/a/n prompt showing the tool and its arguments. `SIGIT_PERMISSIONS` overrides the default mode for headless runs and clients without permission support
+- New `/plan [on|off]` command: plan mode blocks mutating tools and asks the model to present a plan while research tools keep working. `/permissions` prints the effective policy
+- Sessions are durable: conversation history is saved per session under `~/.config/sigit/sessions/` after every turn. ACP `session/load` actually restores it, the TUI gets `/resume`, and `/clear` deletes the saved file
+- Context compaction: `/compact` compresses the conversation on demand, and the agent compacts automatically once the history approaches a 24k-token budget, summarizing older turns and keeping the recent ones. The tool-round cap rises from 10 to 24 now that long sessions have a defense other than the cap
+- `run_command` can run work in the background: pass `run_in_background` and the tool returns a task id immediately, so builds, test suites, and dev servers are no longer killed by the 120 second foreground timeout. Poll with the new `command_output` tool (read-only, never prompts) and stop with `kill_command`
+- New `task` tool: delegate research to a fresh subagent conversation that only gets the read-only tools and returns its final answer, keeping the main context small. Available on OpenAI-compatible backends; on-device returns a clear fallback until onde supports a second context
+- Commits created by the agent are co-authored: commit messages end with `Co-Authored-By: siGit Code <sigit@sigit.si>` (the [sigitc](https://github.com/sigitc) account), which GitHub renders next to the human author. If the model forgets the trailer, siGit amends it in, never rewriting commits that already exist on a remote
+- ACP mode now honors the `OPENAI_BASE_URL`/`OPENAI_API_KEY` provider override at startup, matching the interactive client
+
 ## 1.3.1
 
 Adds [Model Context Protocol](https://modelcontextprotocol.io) (MCP) client
