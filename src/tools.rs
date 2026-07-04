@@ -1379,6 +1379,77 @@ fn exec_delete_file(arguments: &str) -> String {
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const COMMAND_OUTPUT_LIMIT: usize = 50_000;
 
+/// Trailer identifying siGit Code as the co-author of commits it creates.
+/// GitHub detects `Co-authored-by:` trailers on the last lines of a commit
+/// message (separated from the body by a blank line) and lists the agent
+/// alongside the human author; `sigit@sigit.si` belongs to the
+/// <https://github.com/sigitc> account ("siGit Code"), so the co-author is
+/// rendered with that account's avatar and profile link. The system prompt
+/// asks the model to add this itself; [`ensure_commit_co_author`] is the
+/// safety net when it forgets.
+pub const COMMIT_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: siGit Code <sigit@sigit.si>";
+
+/// Run `git <args>` in `cwd`, returning trimmed stdout on success.
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_head(cwd: &Path) -> Option<String> {
+    git_stdout(cwd, &["rev-parse", "HEAD"])
+}
+
+/// Deterministic co-author attribution: if the commit at HEAD lacks the
+/// siGit Code trailer, amend it in (via `git commit --amend --trailer`, which
+/// places it after a blank line — the format GitHub detects). Never rewrites
+/// a commit that is already on a remote. Returns a note describing the amend
+/// so the model and user can see it happened.
+fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
+    let message = git_stdout(cwd, &["log", "-1", "--format=%B"])?;
+    if message
+        .to_lowercase()
+        .contains("co-authored-by: sigit code")
+    {
+        return None;
+    }
+    // Amending changes the commit id; a commit that any remote ref already
+    // contains must be left alone or the branch diverges from its upstream.
+    match git_stdout(cwd, &["branch", "-r", "--contains", "HEAD"]) {
+        Some(remotes) if remotes.is_empty() => {}
+        _ => return None,
+    }
+    let amend = Command::new("git")
+        .args(["commit", "--amend", "--no-edit", "--trailer"])
+        .arg(COMMIT_CO_AUTHOR_TRAILER)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if amend.status.success() {
+        log::info!(
+            "appended co-author trailer to the new commit in {}",
+            cwd.display()
+        );
+        Some(format!(
+            "[siGit Code] The new commit was amended to append the co-author trailer \
+             \"{COMMIT_CO_AUTHOR_TRAILER}\" (its hash changed)."
+        ))
+    } else {
+        log::warn!(
+            "could not append co-author trailer in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&amend.stderr).trim()
+        );
+        None
+    }
+}
+
 /// runs via `sh -c` / `cmd /C`; killed after COMMAND_TIMEOUT.
 fn exec_run_command(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
@@ -1404,6 +1475,17 @@ fn exec_run_command(arguments: &str) -> String {
     }
 
     log::info!("run_command: `{command_str}` in `{cwd_str}`");
+
+    // Co-author attribution: note where HEAD is before a command that looks
+    // like it may commit, so a new commit can be detected afterwards. The
+    // string check is only a cheap trigger — a false positive costs one
+    // `git rev-parse` and nothing else.
+    let may_commit = command_str.contains("git") && command_str.contains("commit");
+    let head_before = if may_commit {
+        git_head(&cwd_path)
+    } else {
+        None
+    };
 
     #[cfg(unix)]
     let mut child = match Command::new("sh")
@@ -1458,6 +1540,21 @@ fn exec_run_command(arguments: &str) -> String {
     let mut combined = String::new();
     combined.push_str(&String::from_utf8_lossy(&output.stdout));
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    // A new commit appeared under this command: make sure it carries the
+    // siGit co-author trailer (see `ensure_commit_co_author`).
+    if may_commit {
+        let head_after = git_head(&cwd_path);
+        if head_after.is_some()
+            && head_after != head_before
+            && let Some(note) = ensure_commit_co_author(&cwd_path)
+        {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&note);
+        }
+    }
 
     let truncated = if combined.len() > COMMAND_OUTPUT_LIMIT {
         let truncated_str = &combined[..COMMAND_OUTPUT_LIMIT];
@@ -2136,6 +2233,123 @@ mod tests {
         let result = exec_run_command(r#"{"command": "echo hello"}"#);
         assert!(result.contains("hello"), "got: {result}");
         assert!(result.contains("Exit code 0"), "got: {result}");
+    }
+
+    /// Fresh git repo with one commit, test identity, and signing off (the
+    /// developer's global gpgsign must not leak into sandbox commits).
+    fn init_test_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sigit_test_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        test_git(&dir, &["init", "-q", "-b", "main"]);
+        test_git(&dir, &["config", "user.name", "Test User"]);
+        test_git(&dir, &["config", "user.email", "test@example.com"]);
+        test_git(&dir, &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.join("file.txt"), "one\n").unwrap();
+        test_git(&dir, &["add", "file.txt"]);
+        test_git(&dir, &["commit", "-q", "-m", "Initial"]);
+        dir
+    }
+
+    fn test_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn run_command_appends_co_author_trailer_to_new_commits() {
+        let dir = init_test_repo("coauthor_append");
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        let args = serde_json::json!({
+            "command": "git add file.txt && git commit -m \"Update file\"",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args);
+        assert!(result.contains("co-author trailer"), "got: {result}");
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            message.ends_with(COMMIT_CO_AUTHOR_TRAILER),
+            "trailer must be the last line: {message:?}"
+        );
+        assert!(
+            message.contains(&format!("\n\n{COMMIT_CO_AUTHOR_TRAILER}")),
+            "trailer needs a blank line before it for GitHub to detect it: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_keeps_existing_co_author_trailer() {
+        let dir = init_test_repo("coauthor_present");
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        let command = format!(
+            "git add file.txt && git commit -m \"Update file\" -m \"{COMMIT_CO_AUTHOR_TRAILER}\""
+        );
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args);
+        assert!(
+            !result.contains("[siGit Code]"),
+            "no amend expected: {result}"
+        );
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message.matches("Co-Authored-By: siGit Code").count(),
+            1,
+            "trailer must not be duplicated: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_never_amends_pushed_commits() {
+        let dir = init_test_repo("coauthor_pushed");
+        let remote = std::env::temp_dir().join(format!(
+            "sigit_test_coauthor_remote_{}.git",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&remote);
+        fs::create_dir_all(&remote).unwrap();
+        test_git(&remote, &["init", "-q", "--bare"]);
+        test_git(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        let args = serde_json::json!({
+            "command": "git add file.txt && git commit -m \"Update file\" && git push -q origin main",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args);
+        assert!(
+            !result.contains("[siGit Code]"),
+            "no amend expected: {result}"
+        );
+
+        // Already on the remote when the gate ran, so it must be untouched.
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            !message.contains("Co-Authored-By"),
+            "pushed commit must not be rewritten: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&remote);
     }
 
     #[test]
