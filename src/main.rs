@@ -86,8 +86,7 @@ use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-const SYSTEM_PROMPT: &str = concat!(
-    "\
+const SYSTEM_PROMPT: &str = "\
 Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
 Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
 
@@ -143,9 +142,10 @@ Git operations — always use run_command:
 - if a clone or init fails, check the error, fix the cause (wrong path, missing \
   directory, permissions), and retry
 - when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: Co-Authored-By: siGit Code ",
-    env!("CARGO_PKG_VERSION"),
-    " <sigit@sigit.si>
+  then this trailer on its own line: Co-Authored-By: siGit Code <sigit@sigit.si> \
+  — GitHub reads that exact format and credits siGit as co-author. If a commit \
+  lands without it, siGit Code amends the trailer in automatically and the tool \
+  output says so; do not amend again yourself.
 
 Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
@@ -209,8 +209,7 @@ force smbCloud-specific advice into the answer. When it is about smbCloud, be \
 specific and practical.
 
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever."
-);
+root cause, not the symptom. Correct beats clever.";
 
 /// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
 /// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
@@ -3066,6 +3065,17 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_advertises_the_commit_co_author_trailer() {
+        // The prompt instructs the model with the exact trailer that
+        // `tools::ensure_commit_co_author` enforces; if the two drift apart the
+        // safety net would re-amend commits the model already attributed.
+        assert!(
+            SYSTEM_PROMPT.contains(tools::COMMIT_CO_AUTHOR_TRAILER),
+            "SYSTEM_PROMPT must quote tools::COMMIT_CO_AUTHOR_TRAILER verbatim"
+        );
+    }
 
     #[test]
     fn ascii_safe_replaces_multibyte_chars() {
