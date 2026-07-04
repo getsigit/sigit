@@ -250,8 +250,8 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
             ToolKind::Edit
         }
         "delete_file" => ToolKind::Delete,
-        "run_command" => ToolKind::Execute,
-        "read_file" | "list_directory" => ToolKind::Read,
+        "run_command" | "kill_command" => ToolKind::Execute,
+        "read_file" | "list_directory" | "command_output" => ToolKind::Read,
         "search_files" | "glob" => ToolKind::Search,
         "read_website" => ToolKind::Fetch,
         "write_todos" => ToolKind::Think,

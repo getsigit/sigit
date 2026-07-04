@@ -67,7 +67,7 @@ pub enum Decision {
 pub fn classify(tool_name: &str) -> ToolRisk {
     match tool_name {
         "read_file" | "list_directory" | "search_files" | "glob" | "read_website"
-        | "write_todos" | "skill" => ToolRisk::ReadOnly,
+        | "write_todos" | "skill" | "command_output" => ToolRisk::ReadOnly,
         _ => ToolRisk::Mutating,
     }
 }
@@ -247,6 +247,7 @@ mod tests {
             "read_website",
             "write_todos",
             "skill",
+            "command_output",
         ] {
             assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
             assert_eq!(decision_for("t-ro", tool), Decision::Allow, "{tool}");
@@ -262,6 +263,7 @@ mod tests {
             "create_directory",
             "delete_file",
             "run_command",
+            "kill_command",
             "remember",
             "mcp__server__anything",
             "totally_unknown_tool",
