@@ -63,10 +63,10 @@ Run a single test: `cargo test <test_name>`.
 
 ## Critical platform constraint: `#[cfg(unix)]` dead code
 
-The interactive client, the `InferenceBackend` seam (`backend.rs`), and provider resolution
-(`provider.rs`) are wired up **only** through `#[cfg(unix)]` code paths. On Windows the binary
-runs ACP-only and drives `onde` directly, so much of `backend.rs` and `provider.rs` is
-legitimately unused there and the dead-code lint is suppressed *on non-Unix targets only*.
+The interactive client is `#[cfg(unix)]`-only. The `InferenceBackend` seam (`backend.rs`) and
+provider resolution (`provider.rs`) are consumed by both the interactive client and the ACP
+server, but several of their items are reached only through the Unix-only interactive paths, so
+the dead-code lint is suppressed *on non-Unix targets only*.
 
 Consequence: code can pass clippy on macOS/Linux but fail on the Windows target (or vice versa).
 When touching `backend.rs`, `provider.rs`, or the interactive path, keep the `cfg` gates intact —

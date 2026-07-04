@@ -184,6 +184,18 @@ pub fn reset_session(session: &str) {
     map.remove(session);
 }
 
+/// Drop the recorded state for *every* session. Called at ACP session
+/// boundaries (new/load/fork): the agent drives one shared engine, so only one
+/// conversation is live at a time and grants must never cross a boundary. This
+/// also keeps the map from accumulating entries for session ids that will
+/// never be used again.
+pub fn reset_all() {
+    let mut map = sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.clear();
+}
+
 /// One-line status summary for `/permissions` and `/status`.
 pub fn describe(session: &str) -> String {
     let plan = if plan_mode(session) { "on" } else { "off" };

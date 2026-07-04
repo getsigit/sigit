@@ -1606,6 +1606,27 @@ mod tui {
         specs
     }
 
+    /// Close out a cancelled round in backend history: the results of tools
+    /// that already ran this round, plus cancellation notes for `unreached`
+    /// calls. Leaving a round's tool calls unanswered breaks strict
+    /// OpenAI-compatible endpoints on the session's next request.
+    async fn abandon_round(
+        backend: &dyn InferenceBackend,
+        mut tool_results: Vec<ToolResult>,
+        unreached: &[crate::backend::ToolCall],
+    ) {
+        for pending in unreached {
+            tool_results.push(ToolResult {
+                tool_call_id: pending.id.clone(),
+                content: format!(
+                    "`{}` was not executed: the user cancelled the turn.",
+                    pending.name
+                ),
+            });
+        }
+        backend.record_cancelled_tool_results(tool_results).await;
+    }
+
     /// run the tool-calling loop off the main thread, posting updates via `tx`.
     /// dropping `tx` signals completion to the event loop.
     async fn run_inference_task(
@@ -1667,7 +1688,16 @@ mod tui {
 
             let mut tool_results = Vec::new();
 
-            for tc in &result.tool_calls {
+            for (call_index, tc) in result.tool_calls.iter().enumerate() {
+                // The UI drops the receiver on Ctrl+C or quit. Stop the turn
+                // at the next boundary instead of burning model rounds (and
+                // possibly running granted tools) in the background.
+                if tx.is_closed() {
+                    log::info!("turn cancelled by the user — stopping the tool loop");
+                    abandon_round(&*backend, tool_results, &result.tool_calls[call_index..]).await;
+                    return;
+                }
+
                 log::info!(
                     "  → {}({})",
                     tc.name,
@@ -1703,11 +1733,25 @@ mod tui {
                                 permissions::grant_for_session(TUI_SESSION, &tc.name);
                                 crate::tools::execute_tool(&tc.name, &tc.arguments).await
                             }
-                            // An explicit "no", or the UI dropped the channel
-                            // (cancel/quit) — either way, do not run the tool.
-                            Ok(ApprovalChoice::Deny) | Err(_) => {
+                            Ok(ApprovalChoice::Deny) => {
                                 log::info!("  ✗ {} denied by user", tc.name);
                                 permissions::user_denial(&tc.name)
+                            }
+                            // The UI dropped the reply channel (Ctrl+C or
+                            // quit): the whole turn is over, not just this
+                            // call. Close out the round and stop instead of
+                            // continuing rounds in the background.
+                            Err(_) => {
+                                log::info!(
+                                    "turn cancelled at the approval prompt — stopping the tool loop"
+                                );
+                                abandon_round(
+                                    &*backend,
+                                    tool_results,
+                                    &result.tool_calls[call_index..],
+                                )
+                                .await;
+                                return;
                             }
                         }
                     }
@@ -1718,6 +1762,14 @@ mod tui {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
+            }
+
+            // Cancelled while the round's tools ran: record what executed and
+            // stop before paying for another model round nobody will see.
+            if tx.is_closed() {
+                log::info!("turn cancelled by the user — skipping the next model round");
+                abandon_round(&*backend, tool_results, &[]).await;
+                return;
             }
 
             // on the last round, pass no tools so the model must produce text —

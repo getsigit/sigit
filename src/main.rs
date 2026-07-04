@@ -949,9 +949,10 @@ impl SiGitAgent {
             *guard = Some(args.cwd.clone());
         }
 
-        // A reloaded session starts fresh: grants and plan mode from the
-        // previous life of this session id must not carry over.
-        permissions::reset_session(&args.session_id.to_string());
+        // A session boundary: grants and plan mode from the previous life of
+        // this session id must not carry over — and since one shared engine
+        // means one live conversation, state for every other id is dead too.
+        permissions::reset_all();
 
         // tool calls use relative paths, so we need to match the editor's cwd
         if args.cwd.is_dir()
@@ -988,6 +989,9 @@ impl SiGitAgent {
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        // Session boundary: permission grants and plan mode never cross it
+        // (see handle_load_session), so a fork starts with a clean slate.
+        permissions::reset_all();
         log::info!(
             "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
             args.session_id,
@@ -1035,6 +1039,9 @@ impl SiGitAgent {
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        // Session boundary: permission grants and plan mode never cross it
+        // (see handle_load_session), so stale ids stop accumulating state.
+        permissions::reset_all();
         log::info!(
             "new_session: id={session_id}, cwd={}, additional_directories={:?}",
             args.cwd.display(),
@@ -2845,6 +2852,29 @@ async fn run_acp_server() -> anyhow::Result<()> {
         model_load_error,
         needs_download,
     ));
+
+    // Honor the explicit provider override (OPENAI_BASE_URL/OPENAI_API_KEY or
+    // an active providers.toml profile) in ACP mode too — the interactive
+    // client already does. Without this the override was silently ignored here
+    // and prompts insisted on a local model. It is also what lets the ACP
+    // integration test drive the agent against a scripted endpoint
+    // (tests/acp_permissions.rs). The model picker still shows the local
+    // selection; overrides are a power-user escape hatch, not a tier.
+    if let Some(cfg) = provider::active_provider() {
+        log::info!(
+            "inference: using {} (model {}) at {}",
+            cfg.display_name,
+            cfg.model,
+            cfg.base_url
+        );
+        let override_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
+            cfg.base_url,
+            cfg.api_key,
+            cfg.model,
+            Some(system_prompt_for_model(true).to_string()),
+        ));
+        *state.backend.lock().await = override_backend;
+    }
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();

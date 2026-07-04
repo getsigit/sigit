@@ -8,11 +8,11 @@
 //!    endpoint and tier are built in, and the session token is the credential.
 //! 3. On-device: no login and no override, so inference runs locally.
 //!
-//! Provider resolution is consumed only by the interactive client, which is
-//! `#[cfg(unix)]`. The display helpers (`cloud_tier_label`, `CLOUD_TIERS`) are
-//! still used cross-platform by `/models`, but the resolution path is dead on
-//! non-Unix targets, where the binary runs ACP-only and on-device. Suppress the
-//! dead-code lint there only — Unix builds keep full coverage.
+//! Provider resolution runs at startup in both modes: the interactive client
+//! picks its whole backend from it, and `run_acp_server` applies the explicit
+//! override (env or `providers.toml`) the same way. Some items are still wired
+//! up only through `#[cfg(unix)]` interactive paths, so the dead-code lint
+//! stays suppressed on non-Unix targets only — Unix builds keep full coverage.
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::path::PathBuf;
