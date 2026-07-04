@@ -2268,8 +2268,10 @@ mod tests {
     fn run_command_appends_co_author_trailer_to_new_commits() {
         let dir = init_test_repo("coauthor_append");
         fs::write(dir.join("file.txt"), "two\n").unwrap();
+        // Quote-free command: `cmd /C` does not strip double quotes the way
+        // `sh -c` does, so quoted arguments would break on Windows.
         let args = serde_json::json!({
-            "command": "git add file.txt && git commit -m \"Update file\"",
+            "command": "git add file.txt && git commit -m Update",
             "cwd": dir.display().to_string(),
         })
         .to_string();
@@ -2293,11 +2295,23 @@ mod tests {
     fn run_command_keeps_existing_co_author_trailer() {
         let dir = init_test_repo("coauthor_present");
         fs::write(dir.join("file.txt"), "two\n").unwrap();
-        let command = format!(
-            "git add file.txt && git commit -m \"Update file\" -m \"{COMMIT_CO_AUTHOR_TRAILER}\""
+        // The trailer contains spaces and angle brackets, which `cmd /C`
+        // mis-tokenizes (`<` is redirection), so create the trailer-carrying
+        // commit with direct git args and let run_command amend it without
+        // editing: HEAD changes, the message already has the trailer, and the
+        // gate must leave it alone.
+        test_git(&dir, &["add", "file.txt"]);
+        test_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                &format!("Update file\n\n{COMMIT_CO_AUTHOR_TRAILER}"),
+            ],
         );
         let args = serde_json::json!({
-            "command": command,
+            "command": "git commit --amend --no-edit",
             "cwd": dir.display().to_string(),
         })
         .to_string();
@@ -2331,7 +2345,7 @@ mod tests {
 
         fs::write(dir.join("file.txt"), "two\n").unwrap();
         let args = serde_json::json!({
-            "command": "git add file.txt && git commit -m \"Update file\" && git push -q origin main",
+            "command": "git add file.txt && git commit -m Update && git push -q origin main",
             "cwd": dir.display().to_string(),
         })
         .to_string();
