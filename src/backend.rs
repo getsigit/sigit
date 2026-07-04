@@ -98,6 +98,14 @@ pub trait InferenceBackend: Send + Sync {
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError>;
 
+    /// Record tool results in the conversation history *without* asking the
+    /// model to continue the turn. Used when a turn is abandoned mid-round
+    /// (the user cancelled at the permission gate): by then the assistant
+    /// message carrying the tool calls is already in history, and leaving them
+    /// unanswered makes strict OpenAI-compatible endpoints reject every later
+    /// request in the session.
+    async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>);
+
     /// Whether inference runs over the network (a configured provider) rather
     /// than on-device. Drives UI labelling so the displayed model can't claim a
     /// local model while requests actually go to the cloud.
@@ -193,6 +201,13 @@ impl InferenceBackend for LocalBackend {
             .await
             .map_err(|error| error.to_string())?;
         Ok(onde_result_to_turn(result))
+    }
+
+    async fn record_cancelled_tool_results(&self, _results: Vec<ToolResult>) {
+        // onde's public API cannot append tool-result history entries without
+        // running another inference round, so the dangling tool call stays in
+        // its history. The chat template replays it as-is, which local models
+        // tolerate — worst case the model re-issues the call next turn.
     }
 
     fn is_remote(&self) -> bool {
@@ -562,6 +577,17 @@ impl InferenceBackend for OpenAiBackend {
         self.complete(tools, sink).await
     }
 
+    async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>) {
+        let mut history = self.history.lock().await;
+        for result in results {
+            history.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": result.tool_call_id,
+                "content": result.content,
+            }));
+        }
+    }
+
     fn is_remote(&self) -> bool {
         true
     }
@@ -725,6 +751,36 @@ mod tests {
             value["tool_calls"][0]["function"]["arguments"],
             r#"{"path":"a.rs"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_results_close_out_history() {
+        let backend = OpenAiBackend::new("http://localhost", "", "test-model", None);
+        backend
+            .history
+            .lock()
+            .await
+            .push(streamed_assistant_history(
+                "",
+                &[ToolCall {
+                    id: "call_9".to_string(),
+                    name: "run_command".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                }],
+            ));
+
+        backend
+            .record_cancelled_tool_results(vec![ToolResult {
+                tool_call_id: "call_9".to_string(),
+                content: "cancelled by the user".to_string(),
+            }])
+            .await;
+
+        let history = backend.history.lock().await;
+        let last = history.last().unwrap();
+        assert_eq!(last["role"], "tool");
+        assert_eq!(last["tool_call_id"], "call_9");
+        assert_eq!(last["content"], "cancelled by the user");
     }
 
     #[test]

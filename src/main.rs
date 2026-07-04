@@ -1295,7 +1295,7 @@ impl SiGitAgent {
 
             let mut tool_results = Vec::new();
 
-            for tc in &result.tool_calls {
+            for (call_index, tc) in result.tool_calls.iter().enumerate() {
                 log::info!(
                     "  → {}({})",
                     tc.name,
@@ -1326,6 +1326,23 @@ impl SiGitAgent {
                             }
                             PermissionVerdict::TurnCancelled => {
                                 log::info!("prompt({}) cancelled at permission gate", session_id);
+                                // The assistant message carrying these tool
+                                // calls is already in the backend history;
+                                // leaving any of them unanswered makes strict
+                                // OpenAI-compatible endpoints reject every
+                                // later request in the session. Close out this
+                                // call and the ones this round never reached.
+                                for pending in &result.tool_calls[call_index..] {
+                                    tool_results.push(BackendToolResult {
+                                        tool_call_id: pending.id.clone(),
+                                        content: format!(
+                                            "`{}` was not executed: the user cancelled the turn \
+                                             at the permission prompt.",
+                                            pending.name
+                                        ),
+                                    });
+                                }
+                                backend.record_cancelled_tool_results(tool_results).await;
                                 return Ok(PromptResponse::new(StopReason::Cancelled));
                             }
                         }
@@ -1409,12 +1426,18 @@ impl SiGitAgent {
         tool_name: &str,
         arguments: &str,
     ) -> PermissionVerdict {
-        let args_preview: String = arguments.chars().take(120).collect();
+        // The user decides from this dialog, so show the arguments with any
+        // truncation flagged (a silently clipped command could hide its tail
+        // from the person approving it). The full arguments also travel as
+        // `raw_input` for clients that render it.
+        let args_preview = permissions::approval_preview(arguments);
         let title = if args_preview.is_empty() {
             tool_name.to_string()
         } else {
             format!("{tool_name}({args_preview})")
         };
+        let raw_input: serde_json::Value = serde_json::from_str(arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()));
 
         let request = RequestPermissionRequest::new(
             session_id.clone(),
@@ -1423,7 +1446,8 @@ impl SiGitAgent {
                 ToolCallUpdateFields::new()
                     .title(title)
                     .kind(tool_kind_for(tool_name))
-                    .status(ToolCallStatus::Pending),
+                    .status(ToolCallStatus::Pending)
+                    .raw_input(raw_input),
             ),
             vec![
                 PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),

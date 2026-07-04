@@ -161,6 +161,8 @@ mod tui {
         /// `reply`; the user answers with y (once) / a (session) / n (deny)
         ApprovalRequest {
             tool: String,
+            /// arguments preview so the user can see what they are approving
+            args: String,
             reply: oneshot::Sender<ApprovalChoice>,
         },
     }
@@ -1689,6 +1691,7 @@ mod tui {
                         let _ = tx
                             .send(InferenceUpdate::ApprovalRequest {
                                 tool: tc.name.clone(),
+                                args: permissions::approval_preview(&tc.arguments),
                                 reply: reply_tx,
                             })
                             .await;
@@ -1928,9 +1931,14 @@ mod tui {
                             app.stop_thinking();
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
-                        Some(InferenceUpdate::ApprovalRequest { tool, reply }) => {
+                        Some(InferenceUpdate::ApprovalRequest { tool, args, reply }) => {
+                            let call = if args.is_empty() {
+                                tool.clone()
+                            } else {
+                                format!("{tool}({args})")
+                            };
                             app.messages.push(ChatMessage::system(format!(
-                                "⚠ permission — allow {tool}?  [y]es · [a]lways this session · [n]o"
+                                "⚠ permission — allow {call}?  [y]es · [a]lways this session · [n]o"
                             )));
                             app.pending_approval = Some((tool, reply));
                         }

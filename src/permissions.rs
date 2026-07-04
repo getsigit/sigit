@@ -113,6 +113,20 @@ pub fn user_denial(tool_name: &str) -> String {
     )
 }
 
+/// Render a tool call's arguments for an approval prompt. The person deciding
+/// must be able to see what they are approving, so the cap is generous and any
+/// cut is marked with how much is hidden — silently truncating could hide the
+/// tail of a command from the user who is about to allow it.
+pub fn approval_preview(arguments: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let total = arguments.chars().count();
+    if total <= MAX_CHARS {
+        return arguments.to_string();
+    }
+    let shown: String = arguments.chars().take(MAX_CHARS).collect();
+    format!("{shown}… [+{} more chars]", total - MAX_CHARS)
+}
+
 /// Policy check for one tool call. See the module docs for the layering.
 pub fn decision_for(session: &str, tool_name: &str) -> Decision {
     if classify(tool_name) == ToolRisk::ReadOnly {
@@ -270,6 +284,23 @@ mod tests {
         assert_ne!(decision_for(session, "delete_file"), Decision::Allow);
         reset_session(session);
         assert_ne!(decision_for(session, "edit_file"), Decision::Allow);
+    }
+
+    #[test]
+    fn approval_preview_shows_short_arguments_in_full() {
+        let args = r#"{"command":"cargo test"}"#;
+        assert_eq!(approval_preview(args), args);
+    }
+
+    #[test]
+    fn approval_preview_marks_truncation_explicitly() {
+        let args = format!(r#"{{"command":"echo {}; rm -rf /"}}"#, "x".repeat(600));
+        let preview = approval_preview(&args);
+        assert!(preview.chars().count() < args.chars().count());
+        assert!(
+            preview.contains("more chars]"),
+            "hidden content must be flagged, got: {preview}"
+        );
     }
 
     #[test]
