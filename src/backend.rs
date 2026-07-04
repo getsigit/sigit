@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use onde::inference::{ChatEngine, ToolDefinition};
+use onde::inference::{ChatEngine, ChatMessage, ChatRole, ToolDefinition};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -61,6 +61,30 @@ pub struct TurnResult {
 
 /// Backend errors are plain strings. Callers map them to ACP errors.
 pub type BackendError = String;
+
+/// Rough context budget for a conversation, in estimated tokens (see
+/// [`estimate_tokens`]). When a snapshot exceeds this, the agent loops compact
+/// history before the next tool round.
+pub const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 24_000;
+
+/// How many trailing messages survive a compaction verbatim (the rest are
+/// folded into the summary).
+pub const COMPACT_KEEP_LAST: usize = 6;
+
+/// The summarization request sent to the model when compacting history.
+const SUMMARIZE_PROMPT: &str = "Summarize this coding session so far: decisions made, \
+    files touched, current state, open items. Be concise and factual.";
+
+/// Crude token estimate for a history snapshot: serialized characters / 4.
+/// Deliberately model-agnostic — it only needs to be in the right ballpark to
+/// decide when compaction is worth an extra inference round.
+pub fn estimate_tokens(history: &[serde_json::Value]) -> usize {
+    let chars: usize = history
+        .iter()
+        .map(|message| message.to_string().chars().count())
+        .sum();
+    chars / 4
+}
 
 /// A sink for streaming assistant text deltas to the UI as they are produced.
 ///
@@ -110,6 +134,23 @@ pub trait InferenceBackend: Send + Sync {
     /// than on-device. Drives UI labelling so the displayed model can't claim a
     /// local model while requests actually go to the cloud.
     fn is_remote(&self) -> bool;
+
+    /// A serializable snapshot of the conversation history, one JSON object per
+    /// message (`{"role": ..., "content": ...}` at minimum). The snapshot is
+    /// what the session store persists; it includes any seeded system message
+    /// so [`InferenceBackend::restore_history`] can replace state wholesale.
+    async fn history_snapshot(&self) -> Vec<serde_json::Value>;
+
+    /// Replace the conversation history with a previously saved snapshot.
+    /// Backends that cannot represent every entry (e.g. on-device history has
+    /// no tool-call structure) flatten what they can and drop the rest.
+    async fn restore_history(&self, history: Vec<serde_json::Value>);
+
+    /// Shrink the conversation history: summarize everything so far with one
+    /// extra (non-streaming) inference round, then rebuild history as
+    /// `[system message, summary, last keep_last non-system messages]`. On
+    /// error the original history is left in place.
+    async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError>;
 }
 
 // ── Local backend (onde ChatEngine) ──────────────────────────────────────────────
@@ -212,6 +253,82 @@ impl InferenceBackend for LocalBackend {
 
     fn is_remote(&self) -> bool {
         false
+    }
+
+    async fn history_snapshot(&self) -> Vec<serde_json::Value> {
+        // onde's `history()` already flattens tool entries: assistant tool
+        // calls become plain assistant text and tool results are omitted, so
+        // the snapshot is lossy for tool-heavy turns (acceptable in this MVP).
+        self.engine
+            .history()
+            .await
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role.to_string(),
+                    "content": message.content,
+                })
+            })
+            .collect()
+    }
+
+    async fn restore_history(&self, history: Vec<serde_json::Value>) {
+        self.engine.clear_history().await;
+        for entry in history {
+            let role = entry["role"].as_str().unwrap_or("");
+            let content = entry["content"].as_str().unwrap_or("").to_string();
+            // Tool-call-only assistant entries and empty tool results carry no
+            // text a plain chat history can replay; drop them.
+            if content.is_empty() && role != "user" && role != "system" {
+                continue;
+            }
+            let message = match role {
+                "system" => ChatMessage::system(content),
+                "user" => ChatMessage::user(content),
+                "assistant" => ChatMessage::assistant(content),
+                // Tool results flatten to plain text (MVP; acceptable loss).
+                "tool" => ChatMessage::user(format!("[tool result]\n{content}")),
+                _ => continue,
+            };
+            self.engine.push_history(message).await;
+        }
+    }
+
+    async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
+        let snapshot = self.engine.history().await;
+        // One plain (tool-free) inference round produces the summary. On error
+        // history is untouched — send_message only mutates it on success, and
+        // whatever it appended is wiped by the clear below anyway.
+        let result = self
+            .engine
+            .send_message(SUMMARIZE_PROMPT)
+            .await
+            .map_err(|error| error.to_string())?;
+        // Local models may reason in <think> blocks; keep only the visible part.
+        let (_think, summary) = crate::chat::strip_think_blocks(&result.text);
+
+        self.engine.clear_history().await;
+        // Leading system messages carry the session context; keep them all.
+        for message in snapshot
+            .iter()
+            .take_while(|message| message.role == ChatRole::System)
+        {
+            self.engine.push_history(message.clone()).await;
+        }
+        self.engine
+            .push_history(ChatMessage::user(format!(
+                "[Conversation summary]\n{summary}"
+            )))
+            .await;
+        let non_system: Vec<&ChatMessage> = snapshot
+            .iter()
+            .filter(|message| message.role != ChatRole::System)
+            .collect();
+        let tail_start = non_system.len().saturating_sub(keep_last);
+        for message in &non_system[tail_start..] {
+            self.engine.push_history((*message).clone()).await;
+        }
+        Ok(())
     }
 }
 
@@ -591,6 +708,68 @@ impl InferenceBackend for OpenAiBackend {
     fn is_remote(&self) -> bool {
         true
     }
+
+    async fn history_snapshot(&self) -> Vec<serde_json::Value> {
+        self.history.lock().await.clone()
+    }
+
+    async fn restore_history(&self, history: Vec<serde_json::Value>) {
+        // The snapshot includes the seeded system message, so a wholesale
+        // replacement restores exactly what was saved.
+        *self.history.lock().await = history;
+    }
+
+    async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
+        let snapshot: Vec<serde_json::Value> = self.history.lock().await.clone();
+
+        // Ask the endpoint for a summary of the conversation so far, through
+        // the ordinary completion machinery (non-streaming).
+        self.history
+            .lock()
+            .await
+            .push(serde_json::json!({ "role": "user", "content": SUMMARIZE_PROMPT }));
+        let summary = match self.complete(None, None).await {
+            Ok(result) => result.text,
+            Err(error) => {
+                // Roll back the summarization request; the turn never happened.
+                *self.history.lock().await = snapshot;
+                return Err(error);
+            }
+        };
+
+        let system = snapshot
+            .first()
+            .filter(|message| message["role"] == "system")
+            .cloned();
+        let non_system: Vec<serde_json::Value> = snapshot
+            .iter()
+            .filter(|message| message["role"] != "system")
+            .cloned()
+            .collect();
+        let tail_start = non_system.len().saturating_sub(keep_last);
+        let mut tail = non_system[tail_start..].to_vec();
+        // Drop leading tool results whose assistant tool-call message was
+        // summarized away — strict endpoints reject orphaned `role: "tool"`
+        // entries on the very next request.
+        while tail
+            .first()
+            .is_some_and(|message| message["role"] == "tool")
+        {
+            tail.remove(0);
+        }
+
+        let mut rebuilt = Vec::new();
+        if let Some(system) = system {
+            rebuilt.push(system);
+        }
+        rebuilt.push(serde_json::json!({
+            "role": "user",
+            "content": format!("[Conversation summary]\n{summary}"),
+        }));
+        rebuilt.extend(tail);
+        *self.history.lock().await = rebuilt;
+        Ok(())
+    }
 }
 
 // ── OpenAI response shapes ────────────────────────────────────────────────────────
@@ -781,6 +960,159 @@ mod tests {
         assert_eq!(last["role"], "tool");
         assert_eq!(last["tool_call_id"], "call_9");
         assert_eq!(last["content"], "cancelled by the user");
+    }
+
+    #[test]
+    fn estimate_tokens_scales_with_serialized_size() {
+        assert_eq!(estimate_tokens(&[]), 0);
+
+        let short = vec![serde_json::json!({ "role": "user", "content": "hi" })];
+        let long = vec![serde_json::json!({ "role": "user", "content": "x".repeat(4_000) })];
+        let short_estimate = estimate_tokens(&short);
+        let long_estimate = estimate_tokens(&long);
+
+        assert!(short_estimate > 0, "non-empty history estimates > 0 tokens");
+        assert!(long_estimate > short_estimate, "longer history costs more");
+        // 4,000 content chars / 4 ≈ 1,000 tokens, plus a little JSON framing.
+        assert!((1_000..1_100).contains(&long_estimate), "{long_estimate}");
+    }
+
+    #[tokio::test]
+    async fn openai_snapshot_restore_round_trips_exactly() {
+        let backend = OpenAiBackend::new("http://localhost", "", "m", Some("be helpful".into()));
+        {
+            let mut history = backend.history.lock().await;
+            history.push(serde_json::json!({ "role": "user", "content": "hello" }));
+            history.push(streamed_assistant_history(
+                "",
+                &[ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"a.rs"}"#.to_string(),
+                }],
+            ));
+            history.push(serde_json::json!({
+                "role": "tool", "tool_call_id": "call_1", "content": "fn main() {}",
+            }));
+            history.push(serde_json::json!({ "role": "assistant", "content": "done" }));
+        }
+        let snapshot = backend.history_snapshot().await;
+        assert_eq!(
+            snapshot[0]["role"], "system",
+            "snapshot keeps the system message"
+        );
+
+        // Restoring into a backend seeded with a *different* system prompt must
+        // replace everything, including that seed.
+        let restored = OpenAiBackend::new("http://localhost", "", "m", Some("other seed".into()));
+        restored.restore_history(snapshot.clone()).await;
+        assert_eq!(restored.history_snapshot().await, snapshot);
+    }
+
+    /// Minimal scripted OpenAI-compatible endpoint: accepts one HTTP request on
+    /// a std listener and answers with a fixed non-streaming completion.
+    fn spawn_completion_stub(summary: &str) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": summary } }]
+        })
+        .to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read until the full request (headers + content-length body) is in.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(headers_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn compact_history_rebuilds_system_summary_and_tail() {
+        let addr = spawn_completion_stub("We refactored backend.rs; tests pass.");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("be helpful".into()),
+        );
+        {
+            let mut history = backend.history.lock().await;
+            for i in 0..5 {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                history.push(serde_json::json!({
+                    "role": role, "content": format!("message {i}"),
+                }));
+            }
+        }
+
+        backend.compact_history(2).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(history.len(), 4, "system + summary + last 2: {history:?}");
+        assert_eq!(history[0]["role"], "system");
+        assert_eq!(history[0]["content"], "be helpful");
+        assert_eq!(history[1]["role"], "user");
+        let summary_text = history[1]["content"].as_str().unwrap();
+        assert!(summary_text.starts_with("[Conversation summary]\n"));
+        assert!(summary_text.contains("We refactored backend.rs; tests pass."));
+        assert_eq!(
+            history[2],
+            serde_json::json!({ "role": "assistant", "content": "message 3" })
+        );
+        assert_eq!(
+            history[3],
+            serde_json::json!({ "role": "user", "content": "message 4" })
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_history_failure_leaves_history_intact() {
+        // No listener at this address: the summarization request fails, and
+        // history must roll back to exactly what it was.
+        let backend =
+            OpenAiBackend::new("http://127.0.0.1:9", "", "test-model", Some("sys".into()));
+        backend
+            .history
+            .lock()
+            .await
+            .push(serde_json::json!({ "role": "user", "content": "hello" }));
+        let before = backend.history_snapshot().await;
+
+        assert!(backend.compact_history(2).await.is_err());
+        assert_eq!(backend.history_snapshot().await, before);
     }
 
     #[test]
