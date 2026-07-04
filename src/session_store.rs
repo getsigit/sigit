@@ -104,6 +104,60 @@ pub fn delete(session_id: &str) {
     }
 }
 
+/// One saved session as seen on disk.
+///
+/// Cross-platform like the rest of the store, though today only the Unix-only
+/// TUI (`chat.rs` History tab) consumes it — hence the non-Unix dead-code gate,
+/// mirroring `permissions::TUI_SESSION`.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    /// The sanitized id (the file stem), which `load`/`delete` accept as-is.
+    pub id: String,
+    /// Last-modified time of the session file; `UNIX_EPOCH` when unreadable.
+    pub modified: std::time::SystemTime,
+    /// Number of history messages (non-empty lines) in the file.
+    pub message_count: usize,
+}
+
+/// List the saved sessions, newest first. Non-`.jsonl` entries (temp files,
+/// stray junk) are skipped. A missing or unreadable sessions dir yields an
+/// empty list.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn list() -> Vec<SessionEntry> {
+    let Some(dir) = sessions_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<SessionEntry> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                return None;
+            }
+            let id = path.file_stem()?.to_str()?.to_string();
+            // Cheap line count: no JSON parsing, just non-empty lines.
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let message_count = contents.lines().filter(|l| !l.trim().is_empty()).count();
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            Some(SessionEntry {
+                id,
+                modified,
+                message_count,
+            })
+        })
+        .collect();
+    sessions.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
+    sessions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +214,46 @@ mod tests {
         assert_eq!(load("sess-1"), None);
         // Deleting a missing session is a no-op.
         delete("sess-1");
+
+        unsafe { std::env::remove_var("SIGIT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Same single-test-per-env-var pattern as `save_load_delete_round_trip`:
+    // this mutates `SIGIT_CONFIG_DIR`, so everything runs under one lock hold.
+    #[test]
+    fn list_returns_sessions_newest_first_and_skips_junk() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("sigit_sessions_list_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by ENV_TEST_LOCK; restored below.
+        unsafe { std::env::set_var("SIGIT_CONFIG_DIR", &dir) };
+
+        // No sessions dir at all → empty list, not an error.
+        assert!(list().is_empty());
+
+        let msg = |text: &str| serde_json::json!({ "role": "user", "content": text });
+        save("older", &[msg("a"), msg("b"), msg("c")]).unwrap();
+        // Distinct mtimes so the newest-first order is deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        save("newer", &[msg("x")]).unwrap();
+
+        // Junk the lister must skip: wrong extension, a stray temp file, and a
+        // subdirectory.
+        let sessions = dir.join("sessions");
+        std::fs::write(sessions.join("notes.txt"), "not a session\n").unwrap();
+        std::fs::write(sessions.join(".older.999.tmp"), "half-written\n").unwrap();
+        std::fs::create_dir_all(sessions.join("nested.jsonl")).unwrap();
+
+        let listed = list();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, "newer");
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(listed[1].id, "older");
+        assert_eq!(listed[1].message_count, 3);
+        assert!(listed[0].modified >= listed[1].modified);
 
         unsafe { std::env::remove_var("SIGIT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
