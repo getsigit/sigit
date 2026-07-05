@@ -55,6 +55,26 @@ use crate::backend::ToolSpec;
 /// `mcp__<server>__<tool>`.
 pub const MCP_PREFIX: &str = "mcp__";
 
+/// Name of the baked-in official siGit Code server; its tools are namespaced
+/// `mcp__sigit__<tool>`. A user-defined `mcp.toml` entry with this name
+/// overrides the baked-in URL/headers but keeps the namespace, so callers of
+/// [`official_tool_name`] reach whatever the user pointed `sigit` at.
+pub const OFFICIAL_SERVER_NAME: &str = "sigit";
+
+/// The full namespaced name of a tool on the official server, e.g.
+/// `official_tool_name("list_issues")` → `mcp__sigit__list_issues`.
+pub fn official_tool_name(tool: &str) -> String {
+    format!("{MCP_PREFIX}{OFFICIAL_SERVER_NAME}__{tool}")
+}
+
+/// The bare tool name when `name` belongs to the official server
+/// (`mcp__sigit__list_issues` → `Some("list_issues")`), else `None`.
+pub fn official_tool_suffix(name: &str) -> Option<&str> {
+    name.strip_prefix(MCP_PREFIX)?
+        .strip_prefix(OFFICIAL_SERVER_NAME)?
+        .strip_prefix("__")
+}
+
 /// JSON-RPC / MCP protocol version we advertise in the handshake.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -251,13 +271,13 @@ fn load_configs() -> Vec<ServerDef> {
 
     // Add the baked-in official server, but never clobber a user-defined entry
     // named `sigit` — an explicit config (e.g. a custom URL or headers) wins.
-    if include_official && !defs.iter().any(|d| d.name == "sigit") {
+    if include_official && !defs.iter().any(|d| d.name == OFFICIAL_SERVER_NAME) {
         let mut headers = Vec::new();
         if let Some(token) = crate::credentials::load_token() {
             headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         }
         defs.push(ServerDef {
-            name: "sigit".to_string(),
+            name: OFFICIAL_SERVER_NAME.to_string(),
             url: official_url(),
             headers,
         });
@@ -826,6 +846,28 @@ mod tests {
         assert!(is_mcp_tool("mcp__sigit__search"));
         assert!(!is_mcp_tool("read_file"));
         assert!(!is_mcp_tool("skill"));
+    }
+
+    #[test]
+    fn official_tool_name_matches_the_namespacing_convention() {
+        assert_eq!(official_tool_name("list_issues"), "mcp__sigit__list_issues");
+        assert_eq!(
+            official_tool_name("get_pull_request"),
+            "mcp__sigit__get_pull_request"
+        );
+    }
+
+    #[test]
+    fn official_tool_suffix_strips_only_the_official_namespace() {
+        assert_eq!(
+            official_tool_suffix("mcp__sigit__list_issues"),
+            Some("list_issues")
+        );
+        assert_eq!(official_tool_suffix("mcp__other__list_issues"), None);
+        // `sigit` must be the whole server name, not a prefix of it.
+        assert_eq!(official_tool_suffix("mcp__sigitx__list_issues"), None);
+        assert_eq!(official_tool_suffix("list_issues"), None);
+        assert_eq!(official_tool_suffix("mcp__sigit__"), Some(""));
     }
 
     #[test]
