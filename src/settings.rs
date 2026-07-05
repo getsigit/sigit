@@ -66,8 +66,29 @@ impl std::fmt::Display for PermissionMode {
     }
 }
 
+/// The `[permissions.rules]` table: ordered allow/deny lists of rule strings.
+/// A rule is `tool_name` or `tool_name(argument_pattern)`; the pattern is
+/// matched against the command string for `run_command` and the path for the
+/// file-mutating tools (see `crate::permissions` for the matching semantics).
+///
+/// ```toml
+/// [permissions.rules]
+/// allow = ["run_command(git *)", "edit_file(src/*)"]
+/// deny = ["run_command(git push*)"]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PermissionRules {
+    /// Rules that let a matching call run without asking.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Rules that block a matching call. Checked before `allow`, so a deny
+    /// always beats an allow that matches the same call.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
 /// The `[permissions]` table: a default mode for mutating tools plus per-tool
-/// overrides, e.g.
+/// overrides and argument-level rule lists, e.g.
 ///
 /// ```toml
 /// [permissions]
@@ -76,6 +97,10 @@ impl std::fmt::Display for PermissionMode {
 /// [permissions.tools]
 /// edit_file = "allow"
 /// delete_file = "deny"
+///
+/// [permissions.rules]
+/// allow = ["run_command(cargo *)"]
+/// deny = ["run_command(git push*)"]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PermissionSettings {
@@ -87,6 +112,10 @@ pub struct PermissionSettings {
     /// `mcp__<server>__<tool>` name).
     #[serde(default)]
     pub tools: BTreeMap<String, PermissionMode>,
+    /// Argument-level allow/deny rules, consulted after session grants and
+    /// before the per-tool overrides.
+    #[serde(default)]
+    pub rules: PermissionRules,
 }
 
 /// Persisted preferences. New fields must carry `#[serde(default)]` so older
@@ -188,6 +217,11 @@ pub fn permission_default() -> PermissionMode {
     load().permissions.default
 }
 
+/// The stored `[permissions.rules]` allow/deny lists.
+pub fn permission_rules() -> PermissionRules {
+    load().permissions.rules
+}
+
 /// The effective permission mode for one tool: its `[permissions.tools]`
 /// override when present, else the default (see [`permission_default`]).
 pub fn permission_mode_for(tool_name: &str) -> PermissionMode {
@@ -272,6 +306,25 @@ mod tests {
             permission_default(),
             PermissionMode::Allow,
             "unrecognized env value falls back to stored setting"
+        );
+
+        // Permission rules: absent on a fresh file, and they survive a
+        // store/load round trip without disturbing the other settings.
+        assert_eq!(permission_rules(), PermissionRules::default());
+        let mut settings = load();
+        settings.permissions.rules.allow = vec![
+            "run_command(git *)".to_string(),
+            "edit_file(src/*)".to_string(),
+        ];
+        settings.permissions.rules.deny = vec!["run_command(git push*)".to_string()];
+        store(&settings).unwrap();
+        let reloaded = load();
+        assert_eq!(reloaded.permissions.rules, settings.permissions.rules);
+        assert_eq!(permission_rules(), settings.permissions.rules);
+        assert_eq!(
+            reloaded.permissions.tools.get("delete_file"),
+            Some(&PermissionMode::Deny),
+            "storing rules preserves the per-tool overrides"
         );
 
         unsafe { std::env::remove_var(PERMISSIONS_ENV) };

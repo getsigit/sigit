@@ -1372,7 +1372,11 @@ impl SiGitAgent {
 
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may ask the client.
-                let output = match permissions::decision_for(&session_id.to_string(), &tc.name) {
+                let output = match permissions::decision_for(
+                    &session_id.to_string(),
+                    &tc.name,
+                    &tc.arguments,
+                ) {
                     permissions::Decision::Allow => {
                         tools::execute_tool(&tc.name, &tc.arguments).await
                     }
@@ -1541,7 +1545,11 @@ impl SiGitAgent {
                     match selected.option_id.0.as_ref() {
                         "allow_once" => PermissionVerdict::Approved,
                         "allow_session" => {
-                            permissions::grant_for_session(&session_id.to_string(), tool_name);
+                            permissions::grant_for_session(
+                                &session_id.to_string(),
+                                tool_name,
+                                arguments,
+                            );
                             PermissionVerdict::Approved
                         }
                         _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
