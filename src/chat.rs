@@ -37,6 +37,62 @@ pub(crate) fn strip_think_blocks(raw: &str) -> (String, String) {
     (thinking, remainder.trim().to_string())
 }
 
+/// The live reasoning tail to show while a streaming buffer holds only
+/// `<think>` content (no visible reply yet).
+///
+/// Returns the last `max_lines` lines of the in-progress thinking text after
+/// word-wrapping at `width` columns, so the TUI can render them under the
+/// "thinking…" label and the user watches the model reason. Returns an empty
+/// vec once visible text has arrived (the reply streams instead) or when
+/// there is no thinking text yet (plain spinner).
+pub(crate) fn streaming_think_tail(raw: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let (thinking, visible) = strip_think_blocks(raw);
+    if thinking.is_empty() || !visible.trim().is_empty() || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let width = width.max(1);
+    let mut wrapped: Vec<String> = Vec::new();
+    for line in thinking.lines() {
+        let mut current = String::new();
+        for word in line.split_whitespace() {
+            // hard-split words wider than the wrap column
+            let mut word = word;
+            while word.chars().count() > width {
+                if !current.is_empty() {
+                    wrapped.push(std::mem::take(&mut current));
+                }
+                let head: String = word.chars().take(width).collect();
+                word = &word[head.len()..];
+                wrapped.push(head);
+            }
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                wrapped.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            wrapped.push(current);
+        }
+    }
+
+    let skip = wrapped.len().saturating_sub(max_lines);
+    wrapped.split_off(skip)
+}
+
+/// One-line dim indicator shown above a reply whose reasoning is collapsed,
+/// e.g. `· thought for a bit (12 lines) — /thinking to show`.
+pub(crate) fn think_indicator(think: &str) -> String {
+    let count = think.lines().count().max(1);
+    let noun = if count == 1 { "line" } else { "lines" };
+    format!("· thought for a bit ({count} {noun}) — /thinking to show")
+}
+
 pub(crate) fn parse_rich_text_segments(text: &str) -> Vec<(String, bool)> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -223,6 +279,9 @@ mod tui {
         model_picker_items: Vec<ModelPickerItem>,
         current_model_name: String,
         tool_calling: bool,
+        /// `/thinking` — expand the model's reasoning on rendered messages.
+        /// Display-only: never changes what is sent to the model or saved.
+        show_thinking: bool,
 
         // ── Model-switch download progress ────────────────────────────────────
         switching_model_id: Option<String>,
@@ -313,6 +372,7 @@ mod tui {
                 model_picker_items: items,
                 current_model_name,
                 tool_calling,
+                show_thinking: false,
                 backend,
             }
         }
@@ -777,6 +837,9 @@ mod tui {
         Plan(Option<bool>),
         /// Show the effective permission policy for this session.
         Permissions,
+        /// Expand or collapse model reasoning on rendered messages.
+        /// `Some(true/false)` sets it, `None` flips it.
+        Thinking(Option<bool>),
         /// Summarize-and-shrink the conversation history on demand.
         Compact,
         /// Restore the saved TUI session from disk.
@@ -807,6 +870,7 @@ mod tui {
             "/whoami" => SlashCommand::Whoami,
             "/plan" => SlashCommand::Plan(parse_on_off(arg)),
             "/permissions" => SlashCommand::Permissions,
+            "/thinking" => SlashCommand::Thinking(parse_on_off(arg)),
             "/compact" => SlashCommand::Compact,
             "/resume" => SlashCommand::Resume,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
@@ -953,7 +1017,7 @@ mod tui {
         let mut lines: Vec<Line> = Vec::new();
 
         for msg in &app.messages {
-            render_chat_message(&mut lines, msg, inner_width as usize);
+            render_chat_message(&mut lines, msg, inner_width as usize, app.show_thinking);
         }
 
         let streamed_visible = app.visible_stream();
@@ -963,7 +1027,7 @@ mod tui {
                 text: streamed_visible,
                 think_block: None,
             };
-            render_chat_message(&mut lines, &fake, inner_width as usize);
+            render_chat_message(&mut lines, &fake, inner_width as usize, app.show_thinking);
             if app.blink_on
                 && let Some(last) = lines.last_mut()
             {
@@ -977,6 +1041,17 @@ mod tui {
                 format!("  {} thinking…", app.thinking_frame()),
                 Style::default().fg(Color::DarkGray),
             )));
+            // While the stream buffer holds only reasoning, show its live tail
+            // under the label so the user watches the model think.
+            let tail_width = (inner_width as usize).saturating_sub(4).max(8);
+            for tail_line in super::streaming_think_tail(&app.stream_buf, tail_width, 3) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {tail_line}"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                )));
+            }
         } else if app.switching_model {
             // Once the weights have fully landed on disk, swap the spinner for a
             // checkmark so it's clear the download finished and we're now loading
@@ -1033,7 +1108,12 @@ mod tui {
         frame.render_widget(paragraph.scroll((scroll, 0)), inner);
     }
 
-    fn render_chat_message(lines: &mut Vec<Line<'static>>, msg: &ChatMessage, _width: usize) {
+    fn render_chat_message(
+        lines: &mut Vec<Line<'static>>,
+        msg: &ChatMessage,
+        _width: usize,
+        show_thinking: bool,
+    ) {
         match msg.role {
             Role::Banner => {
                 let palette = [
@@ -1098,20 +1178,33 @@ mod tui {
             }
             Role::Assistant => {
                 if let Some(ref think) = msg.think_block {
-                    lines.push(Line::from(Span::styled(
-                        "  ┌ thinking ".to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    for think_line in think.split('\n') {
+                    if show_thinking {
+                        // /thinking on — the full reasoning, dim italic, with a
+                        // blank line separating it from the answer below.
                         lines.push(Line::from(Span::styled(
-                            format!("  │ {think_line}"),
-                            Style::default().fg(Color::DarkGray),
+                            "  · thinking".to_string(),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        )));
+                        for think_line in think.split('\n') {
+                            lines.push(Line::from(Span::styled(
+                                format!("    {think_line}"),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                            )));
+                        }
+                        lines.push(Line::from(""));
+                    } else {
+                        // collapsed — one dim line noting reasoning exists
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", super::think_indicator(think)),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
                         )));
                     }
-                    lines.push(Line::from(Span::styled(
-                        "  └─────────".to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
                 }
 
                 let prefix = Span::styled(
@@ -1413,6 +1506,7 @@ mod tui {
                      /whoami        — show the signed-in account\n\
                      /plan [on|off] — plan mode: research only, no edits or commands\n\
                      /permissions   — show the tool permission policy\n\
+                     /thinking [on|off] — expand or collapse model reasoning\n\
                      /compact       — summarize and shrink conversation history\n\
                      /resume        — restore the saved session from disk\n\
                      /clear         — wipe conversation history\n\
@@ -1488,6 +1582,15 @@ mod tui {
                     .push(ChatMessage::system(crate::permissions::describe(
                         crate::permissions::TUI_SESSION,
                     )));
+            }
+            SlashCommand::Thinking(value) => {
+                app.show_thinking = value.unwrap_or(!app.show_thinking);
+                app.messages.push(ChatMessage::system(if app.show_thinking {
+                    "Thinking display ON — model reasoning is shown above each reply."
+                } else {
+                    "Thinking display OFF — replies show a one-line indicator; \
+                     /thinking to expand."
+                }));
             }
             SlashCommand::Status => {
                 let info = engine.as_ref().info().await;
@@ -2290,7 +2393,9 @@ pub use tui::run_with;
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rich_text_segments, strip_think_blocks};
+    use super::{
+        parse_rich_text_segments, streaming_think_tail, strip_think_blocks, think_indicator,
+    };
 
     #[test]
     fn strip_think_blocks_separates_thinking_and_visible_reply() {
@@ -2317,6 +2422,69 @@ mod tests {
 
         assert_eq!(thinking, "");
         assert_eq!(visible, "No hidden reasoning here.");
+    }
+
+    #[test]
+    fn streaming_think_tail_shows_last_lines_of_unclosed_think_buffer() {
+        // the common mid-stream shape: `<think>` opened, not yet closed
+        let raw = "<think>First thought.\nSecond thought.\nThird thought.\nFourth thought.";
+        let tail = streaming_think_tail(raw, 40, 3);
+
+        assert_eq!(
+            tail,
+            vec!["Second thought.", "Third thought.", "Fourth thought."]
+        );
+    }
+
+    #[test]
+    fn streaming_think_tail_wraps_long_lines_at_width() {
+        let raw = "<think>one two three four five six seven";
+        let tail = streaming_think_tail(raw, 10, 3);
+
+        // wrapped at 10 cols: ["one two", "three four", "five six", "seven"];
+        // the tail keeps only the last 3
+        assert_eq!(tail, vec!["three four", "five six", "seven"]);
+    }
+
+    #[test]
+    fn streaming_think_tail_is_empty_once_visible_text_arrives() {
+        let raw = "<think>hidden reasoning</think>The answer is 42.";
+        assert!(streaming_think_tail(raw, 40, 3).is_empty());
+    }
+
+    #[test]
+    fn streaming_think_tail_is_empty_for_only_think_closed_but_no_visible_yet() {
+        // closed think, visible not started: still show the reasoning tail
+        let raw = "<think>done reasoning</think>";
+        assert_eq!(streaming_think_tail(raw, 40, 3), vec!["done reasoning"]);
+    }
+
+    #[test]
+    fn streaming_think_tail_is_empty_for_empty_or_plain_buffers() {
+        assert!(streaming_think_tail("", 40, 3).is_empty());
+        assert!(streaming_think_tail("plain visible text", 40, 3).is_empty());
+        assert!(streaming_think_tail("<think>", 40, 3).is_empty());
+    }
+
+    #[test]
+    fn streaming_think_tail_hard_splits_words_wider_than_the_wrap_column() {
+        let raw = "<think>abcdefghijkl";
+        assert_eq!(
+            streaming_think_tail(raw, 5, 3),
+            vec!["abcde", "fghij", "kl"]
+        );
+    }
+
+    #[test]
+    fn think_indicator_counts_lines_and_pluralizes() {
+        assert_eq!(
+            think_indicator("only one line of reasoning"),
+            "· thought for a bit (1 line) — /thinking to show"
+        );
+        assert_eq!(
+            think_indicator("a\nb\nc"),
+            "· thought for a bit (3 lines) — /thinking to show"
+        );
     }
 
     #[test]
