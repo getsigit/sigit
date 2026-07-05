@@ -62,6 +62,77 @@ pub(crate) fn parse_rich_text_segments(text: &str) -> Vec<(String, bool)> {
     segments
 }
 
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+//
+// The top-level tab bar (GitHub Copilot CLI-style). Defined outside `mod tui`
+// so the pure cycling/formatting logic is testable on every target; only the
+// Unix-only TUI consumes it at runtime, hence the non-Unix dead-code gates
+// (same pattern as `permissions::TUI_SESSION`).
+
+/// The three top-level TUI tabs, cycled with the Tab key.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tab {
+    /// The chat itself (default).
+    Session,
+    /// Saved sessions from the session store.
+    History,
+    /// siGit Code Cloud status and settings.
+    Cloud,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl Tab {
+    pub(crate) const TITLES: [&'static str; 3] = ["Session", "History", "Cloud"];
+
+    /// Session → History → Cloud → Session.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Tab::Session => Tab::History,
+            Tab::History => Tab::Cloud,
+            Tab::Cloud => Tab::Session,
+        }
+    }
+
+    /// Position in [`Tab::TITLES`], for the ratatui `Tabs` widget.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Tab::Session => 0,
+            Tab::History => 1,
+            Tab::Cloud => 2,
+        }
+    }
+}
+
+/// Coarse "how long ago" label for the History tab (no date dependency).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn format_age(age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// One History-tab row: id, age, message count. `age` is `None` when the
+/// file's mtime could not be read (or lies in the future).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn history_row(
+    id: &str,
+    age: Option<std::time::Duration>,
+    message_count: usize,
+) -> String {
+    let when = age
+        .map(format_age)
+        .unwrap_or_else(|| "age unknown".to_string());
+    format!("{id}  ·  {when}  ·  {message_count} message(s)")
+}
+
 // ── Unix-only TUI ─────────────────────────────────────────────────────────────
 //
 // macOS + Linux only. Windows uses ACP mode instead.
@@ -77,16 +148,18 @@ mod tui {
     use futures::StreamExt;
     use onde::inference::{ChatEngine, SamplingConfig};
 
+    use super::Tab;
     use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
     use crate::models::{
         InferenceKind, ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items,
     };
+    use crate::session_store::SessionEntry;
     use ratatui::{
         Frame,
         layout::{Constraint, Layout, Position},
         style::{Color, Modifier, Style},
         text::{Line, Span},
-        widgets::{Block, Borders, Clear, Paragraph, Wrap},
+        widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
     };
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::{Duration, Instant, interval};
@@ -233,6 +306,24 @@ mod tui {
         /// The backend serving inference. Swapped in place when the user picks a
         /// different model or cloud tier via `/models`.
         backend: Arc<dyn InferenceBackend>,
+
+        // ── Tab bar state ─────────────────────────────────────────────────────
+        /// Which top-level tab is showing. Inference keeps running while the
+        /// user is on History/Cloud; updates land in `messages` regardless.
+        active_tab: Tab,
+
+        // History tab: saved sessions from the session store.
+        history_sessions: Vec<SessionEntry>,
+        history_index: usize,
+        /// Session id awaiting the confirming second `d`; any other key clears it.
+        history_pending_delete: Option<String>,
+        /// One-shot notice shown under the session list (e.g. a failed restore).
+        history_notice: Option<String>,
+
+        // Cloud tab: status text is fetched async when the tab opens and cached.
+        /// `None` while a fetch is in flight (renders as "fetching…").
+        cloud_lines: Option<Vec<String>>,
+        cloud_rx: Option<oneshot::Receiver<Vec<String>>>,
     }
 
     const BANNER_ART: &str = "\
@@ -314,7 +405,29 @@ mod tui {
                 current_model_name,
                 tool_calling,
                 backend,
+                active_tab: Tab::Session,
+                history_sessions: Vec::new(),
+                history_index: 0,
+                history_pending_delete: None,
+                history_notice: None,
+                cloud_lines: None,
+                cloud_rx: None,
             }
+        }
+
+        /// Reload the History tab's session list, keeping the selection in
+        /// bounds and dropping any pending delete confirmation.
+        fn refresh_history(&mut self) {
+            self.history_sessions = crate::session_store::list();
+            self.history_index = self
+                .history_index
+                .min(self.history_sessions.len().saturating_sub(1));
+            self.history_pending_delete = None;
+        }
+
+        /// The History entry the cursor is on, if any.
+        fn selected_session(&self) -> Option<&SessionEntry> {
+            self.history_sessions.get(self.history_index)
         }
 
         fn is_busy(&self) -> bool {
@@ -752,6 +865,267 @@ mod tui {
         .split(vertical[1])[1]
     }
 
+    // ── Tab bar (Session / History / Cloud) ───────────────────────────────────
+
+    /// Switch to `tab`, refreshing the data it shows. Entering History rescans
+    /// the sessions dir; entering Cloud kicks off the async status fetch.
+    fn switch_tab(app: &mut App, tab: Tab, engine: &Arc<ChatEngine>) {
+        app.active_tab = tab;
+        match tab {
+            Tab::Session => {}
+            Tab::History => {
+                app.refresh_history();
+                app.history_notice = None;
+            }
+            Tab::Cloud => refresh_cloud(app, engine),
+        }
+    }
+
+    /// Fetch the Cloud tab's status text on a background task and cache it.
+    /// Account status and engine info are async (the account check may hit the
+    /// network), so the tab shows "fetching…" until the oneshot resolves in
+    /// the event loop.
+    fn refresh_cloud(app: &mut App, engine: &Arc<ChatEngine>) {
+        let (tx, rx) = oneshot::channel();
+        app.cloud_rx = Some(rx);
+        app.cloud_lines = None;
+
+        let engine = Arc::clone(engine);
+        let is_remote = app.backend.is_remote();
+        let model_name = app.current_model_name.clone();
+        tokio::spawn(async move {
+            // `status_line` already folds failures into its message, so a dead
+            // network degrades to an error string rather than a stuck tab.
+            let account = crate::account::status_line().await;
+            let info = engine.info().await;
+
+            let mut lines = Vec::new();
+            lines.push(format!("Account:          {account}"));
+            lines.push(format!(
+                "Inference:        {}",
+                if is_remote {
+                    "remote (siGit Code Cloud / hosted endpoint)"
+                } else {
+                    "on-device"
+                }
+            ));
+            lines.push(format!("Model:            {model_name}"));
+            lines.push(format!(
+                "Engine:           status: {:?}  model: {}  memory: {}  history: {} turns",
+                info.status,
+                info.model_name.as_deref().unwrap_or("(none)"),
+                info.approx_memory.as_deref().unwrap_or("unknown"),
+                info.history_length,
+            ));
+            lines.push(format!(
+                "Local inference:  {}",
+                if crate::settings::local_inference_enabled() {
+                    "on"
+                } else {
+                    "off"
+                }
+            ));
+            let config_dir = std::env::var("SIGIT_CONFIG_DIR").unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                format!("{home}/.config/sigit")
+            });
+            lines.push(format!("Config dir:       {config_dir}"));
+            lines.push(String::new());
+            for perm_line in crate::permissions::describe(crate::permissions::TUI_SESSION).lines() {
+                lines.push(perm_line.to_string());
+            }
+
+            let _ = tx.send(lines);
+        });
+    }
+
+    /// Keys on the History and Cloud tabs (the Session tab keeps `handle_key`).
+    /// Tab/Esc navigation is handled earlier in the event loop; this gets the
+    /// rest.
+    async fn handle_tab_key(app: &mut App, key: KeyEvent, engine: &Arc<ChatEngine>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
+            app.quit = true;
+            return;
+        }
+
+        match app.active_tab {
+            Tab::Session => {}
+            Tab::History => match key.code {
+                KeyCode::Up => {
+                    app.history_pending_delete = None;
+                    app.history_index = app.history_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    app.history_pending_delete = None;
+                    if app.history_index + 1 < app.history_sessions.len() {
+                        app.history_index += 1;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    app.refresh_history();
+                    app.history_notice = None;
+                }
+                KeyCode::Char('d') => {
+                    let Some(id) = app.selected_session().map(|e| e.id.clone()) else {
+                        return;
+                    };
+                    if app.history_pending_delete.as_deref() == Some(id.as_str()) {
+                        crate::session_store::delete(&id);
+                        app.refresh_history();
+                        app.history_notice = Some(format!("Deleted session '{id}'."));
+                    } else {
+                        app.history_pending_delete = Some(id);
+                    }
+                }
+                KeyCode::Enter => {
+                    app.history_pending_delete = None;
+                    let Some(id) = app.selected_session().map(|e| e.id.clone()) else {
+                        return;
+                    };
+                    match crate::session_store::load(&id) {
+                        Some(history) if !history.is_empty() => {
+                            let restored = history.len();
+                            app.backend.restore_history(history).await;
+                            app.messages.push(ChatMessage::system(format!(
+                                "Restored {restored} message(s) from session '{id}'. \
+                                 The model remembers the conversation; the scrollback \
+                                 above does not replay it."
+                            )));
+                            app.active_tab = Tab::Session;
+                        }
+                        _ => {
+                            app.history_notice = Some(format!(
+                                "Could not restore '{id}': the session is empty or unreadable."
+                            ));
+                        }
+                    }
+                }
+                // Any other key cancels a pending delete confirmation.
+                _ => app.history_pending_delete = None,
+            },
+            Tab::Cloud => match key.code {
+                KeyCode::Char('l') => {
+                    let enabled = !crate::settings::local_inference_enabled();
+                    match crate::settings::set_local_inference(enabled) {
+                        Ok(()) => refresh_cloud(app, engine),
+                        Err(error) => {
+                            app.cloud_lines
+                                .get_or_insert_with(Vec::new)
+                                .push(format!("error: could not save the setting: {error}"));
+                        }
+                    }
+                }
+                KeyCode::Char('r') => refresh_cloud(app, engine),
+                _ => {}
+            },
+        }
+    }
+
+    fn render_tab_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let tabs = Tabs::new(Tab::TITLES.map(Line::from).to_vec())
+            .select(app.active_tab.index())
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(tabs, area);
+    }
+
+    fn render_history_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" saved sessions ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        if app.history_sessions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No saved sessions yet. Sessions are saved after each turn.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            let now = std::time::SystemTime::now();
+            for (index, entry) in app.history_sessions.iter().enumerate() {
+                let selected = index == app.history_index;
+                let marker = if selected { "› " } else { "  " };
+                let age = now.duration_since(entry.modified).ok();
+                let row = super::history_row(&entry.id, age, entry.message_count);
+                let style = if selected {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(format!("{marker}{row}"), style)));
+            }
+        }
+
+        if let Some(ref id) = app.history_pending_delete {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Delete '{id}'? Press d again to confirm — any other key cancels."),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if let Some(ref notice) = app.history_notice {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {notice}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+
+        // Keep the selection visible when the list outgrows the pane.
+        let inner_height = inner.height as usize;
+        let scroll = app
+            .history_index
+            .saturating_sub(inner_height.saturating_sub(1)) as u16;
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            inner,
+        );
+    }
+
+    fn render_cloud_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" siGit Code Cloud ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line> = Vec::new();
+        match app.cloud_lines {
+            None => lines.push(Line::from(Span::styled(
+                "  fetching status…",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Some(ref cloud_lines) => {
+                for text in cloud_lines {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {text}"),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Note: toggling Local Inference takes effect for the next model \
+             selection (/models); the running backend is not swapped.",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
     // ── Slash commands ────────────────────────────────────────────────────────
 
     enum SlashCommand {
@@ -842,18 +1216,43 @@ mod tui {
             return;
         }
 
-        let zones = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        match app.active_tab {
+            Tab::Session => {
+                let zones = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(area);
 
-        render_title(frame, app, zones[0]);
-        render_messages(frame, app, zones[1]);
-        render_input(frame, app, zones[2]);
-        render_footer(frame, app, zones[3]);
+                render_tab_bar(frame, app, zones[0]);
+                render_title(frame, app, zones[1]);
+                render_messages(frame, app, zones[2]);
+                render_input(frame, app, zones[3]);
+                render_footer(frame, app, zones[4]);
+            }
+            // No input pane on the non-chat tabs: the Tab key always cycles.
+            Tab::History | Tab::Cloud => {
+                let zones = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+
+                render_tab_bar(frame, app, zones[0]);
+                render_title(frame, app, zones[1]);
+                if app.active_tab == Tab::History {
+                    render_history_tab(frame, app, zones[2]);
+                } else {
+                    render_cloud_tab(frame, app, zones[2]);
+                }
+                render_footer(frame, app, zones[3]);
+            }
+        }
 
         if app.show_model_picker {
             render_model_picker(frame, app, area);
@@ -1163,12 +1562,40 @@ mod tui {
     }
 
     fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let key_style = Style::default().fg(Color::Black).bg(Color::Green);
+        let label_style = Style::default().fg(Color::DarkGray);
+
+        if app.active_tab != Tab::Session {
+            let hints: &[(&str, &str)] = match app.active_tab {
+                Tab::History => &[
+                    (" ↑/↓ ", " select  "),
+                    (" Enter ", " resume  "),
+                    (" d ", " delete  "),
+                    (" r ", " refresh  "),
+                    (" Tab ", " next tab  "),
+                    (" Esc ", " session"),
+                ],
+                _ => &[
+                    (" l ", " toggle local inference  "),
+                    (" r ", " refresh  "),
+                    (" Tab ", " next tab  "),
+                    (" Esc ", " session"),
+                ],
+            };
+            let mut spans = Vec::new();
+            for (key, label) in hints {
+                spans.push(Span::styled(key.to_string(), key_style));
+                spans.push(Span::styled(label.to_string(), label_style));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
+
         let mut spans = vec![
-            Span::styled(
-                " Enter ",
-                Style::default().fg(Color::Black).bg(Color::Green),
-            ),
-            Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", key_style),
+            Span::styled(" send  ", label_style),
+            Span::styled(" Tab ", key_style),
+            Span::styled(" tabs  ", label_style),
             Span::styled(
                 " /help ",
                 Style::default().fg(Color::Black).bg(Color::DarkGray),
@@ -2074,6 +2501,9 @@ mod tui {
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
                         Some(InferenceUpdate::ApprovalRequest { tool, args, reply }) => {
+                            // The y/a/n prompt lives on the Session tab; make
+                            // sure the user can see what they're answering.
+                            app.active_tab = Tab::Session;
                             let call = if args.is_empty() {
                                 tool.clone()
                             } else {
@@ -2090,6 +2520,19 @@ mod tui {
                             app.stop_thinking();
                         }
                     }
+                }
+
+                // ── Cloud tab status fetch resolving ─────────────────────────
+                status = async {
+                    match app.cloud_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => pending().await,
+                    }
+                } => {
+                    app.cloud_rx = None;
+                    app.cloud_lines = Some(status.unwrap_or_else(|_| {
+                        vec!["error: the status fetch task died — press r to retry".to_string()]
+                    }));
                 }
 
                 // ── thinking / switching spinner tick (100ms) ────────────────
@@ -2175,6 +2618,28 @@ mod tui {
                             continue;
                         }
 
+                        // ── Tab-bar navigation ────────────────────────────────
+                        // Handled before the busy gate so the user can look at
+                        // History/Cloud while inference runs (updates keep
+                        // landing in the Session tab's message list). The Tab
+                        // key only cycles when the input buffer is empty, so
+                        // pasted text containing tabs can't fight it; on
+                        // non-Session tabs the input is hidden, so it always
+                        // cycles there.
+                        if key.kind == KeyEventKind::Press && !app.show_model_picker {
+                            if key.code == KeyCode::Tab
+                                && (app.active_tab != Tab::Session || app.input.is_empty())
+                            {
+                                let next = app.active_tab.next();
+                                switch_tab(&mut app, next, &engine);
+                                continue;
+                            }
+                            if app.active_tab != Tab::Session && key.code == KeyCode::Esc {
+                                app.active_tab = Tab::Session;
+                                continue;
+                            }
+                        }
+
                         // busy — only cancel keys work
                         if app.is_busy() {
                             if key.kind == KeyEventKind::Press {
@@ -2200,6 +2665,15 @@ mod tui {
                                             .push(ChatMessage::system("(download cancelled — model switch aborted)"));
                                     }
                                 }
+                            }
+                            continue;
+                        }
+
+                        // History / Cloud tabs have their own key handling; the
+                        // chat input is inactive there.
+                        if app.active_tab != Tab::Session {
+                            if key.kind == KeyEventKind::Press {
+                                handle_tab_key(&mut app, key, &engine).await;
                             }
                             continue;
                         }
@@ -2290,7 +2764,49 @@ pub use tui::run_with;
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rich_text_segments, strip_think_blocks};
+    use std::time::Duration;
+
+    use super::{Tab, format_age, history_row, parse_rich_text_segments, strip_think_blocks};
+
+    #[test]
+    fn tab_next_cycles_session_history_cloud() {
+        assert_eq!(Tab::Session.next(), Tab::History);
+        assert_eq!(Tab::History.next(), Tab::Cloud);
+        assert_eq!(Tab::Cloud.next(), Tab::Session);
+        // Three hops return to the start, matching the tab bar's order.
+        assert_eq!(Tab::Session.next().next().next(), Tab::Session);
+    }
+
+    #[test]
+    fn tab_index_matches_titles_order() {
+        assert_eq!(Tab::TITLES[Tab::Session.index()], "Session");
+        assert_eq!(Tab::TITLES[Tab::History.index()], "History");
+        assert_eq!(Tab::TITLES[Tab::Cloud.index()], "Cloud");
+    }
+
+    #[test]
+    fn format_age_picks_the_coarsest_sensible_unit() {
+        assert_eq!(format_age(Duration::from_secs(0)), "0s ago");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s ago");
+        assert_eq!(format_age(Duration::from_secs(60)), "1m ago");
+        assert_eq!(format_age(Duration::from_secs(3_599)), "59m ago");
+        assert_eq!(format_age(Duration::from_secs(3_600)), "1h ago");
+        assert_eq!(format_age(Duration::from_secs(86_399)), "23h ago");
+        assert_eq!(format_age(Duration::from_secs(86_400)), "1d ago");
+        assert_eq!(format_age(Duration::from_secs(3 * 86_400)), "3d ago");
+    }
+
+    #[test]
+    fn history_row_formats_id_age_and_count() {
+        assert_eq!(
+            history_row("tui", Some(Duration::from_secs(120)), 7),
+            "tui  ·  2m ago  ·  7 message(s)"
+        );
+        assert_eq!(
+            history_row("sess-1", None, 0),
+            "sess-1  ·  age unknown  ·  0 message(s)"
+        );
+    }
 
     #[test]
     fn strip_think_blocks_separates_thinking_and_visible_reply() {
