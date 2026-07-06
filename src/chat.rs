@@ -2416,7 +2416,7 @@ mod tui {
                 // mutating tool consults policy and may pause on the user's
                 // y/a/n answer (delivered over a oneshot from the event loop).
                 use crate::permissions::{self, Decision, TUI_SESSION};
-                let output = match permissions::decision_for(TUI_SESSION, &tc.name) {
+                let output = match permissions::decision_for(TUI_SESSION, &tc.name, &tc.arguments) {
                     Decision::Allow => crate::tools::execute_tool(&tc.name, &tc.arguments).await,
                     Decision::Deny(reason) => {
                         log::info!("  ✗ {} denied by policy", tc.name);
@@ -2436,7 +2436,11 @@ mod tui {
                                 crate::tools::execute_tool(&tc.name, &tc.arguments).await
                             }
                             Ok(ApprovalChoice::Session) => {
-                                permissions::grant_for_session(TUI_SESSION, &tc.name);
+                                permissions::grant_for_session(
+                                    TUI_SESSION,
+                                    &tc.name,
+                                    &tc.arguments,
+                                );
                                 crate::tools::execute_tool(&tc.name, &tc.arguments).await
                             }
                             Ok(ApprovalChoice::Deny) => {
