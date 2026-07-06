@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### What changed
+
+- New headless one-shot mode: `sigit run [--prompt <text> | --prompt-file <path>] [--cwd <dir>] [--max-rounds <n>] [--output jsonl|text]` runs a single task non-interactively and exits. Progress is emitted as JSONL events on stdout (`run_started`, `turn_text`, `tool_call`, `tool_result`, `compaction`, and a final `result`), logs stay on stderr, and exit codes are 0 (completed), 1 (run failed), 2 (usage/configuration error). The provider resolves like other modes (`OPENAI_BASE_URL`/`OPENAI_API_KEY` override first), never falling back to on-device inference, and a tool that would normally prompt for permission is declined with a pointer to `SIGIT_PERMISSIONS=allow` instead of hanging. This is the execution engine for siGit Code Cloud Agent runners
+
 ## 1.3.2
 
 Adds a tool permission system with plan mode, durable sessions with context

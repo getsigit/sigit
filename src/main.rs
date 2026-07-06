@@ -32,6 +32,7 @@ mod account;
 mod backend;
 mod chat;
 mod credentials;
+mod headless;
 mod instructions;
 mod mcp;
 mod models;
@@ -3129,6 +3130,20 @@ async fn main() -> anyhow::Result<()> {
                 init_logging(true);
                 println!("{}", account::status_line().await);
                 return Ok(());
+            }
+            "run" => {
+                // Headless one-shot mode: stdout carries JSONL run events, so
+                // logs go to stderr exactly like ACP mode.
+                init_logging(false);
+                setup::setup_shared_model_cache();
+                // Best-effort MCP discovery so `mcp__*` tools are offered
+                // (`SIGIT_MCP=off` skips this, the cloud-runner default).
+                mcp::init().await;
+                log::info!(
+                    "siGit v{} starting (headless run)",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return headless::run(std::env::args().skip(2)).await;
             }
             _ => {}
         }

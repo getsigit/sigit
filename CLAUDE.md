@@ -15,7 +15,12 @@ is a TTY:
   it relies on fd redirection to keep logs out of the TUI, so Windows gets ACP mode only.
 
 Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit login`,
-`sigit logout`, `sigit whoami` (see `src/main.rs` `main()`).
+`sigit logout`, `sigit whoami`, and the headless one-shot mode `sigit run` (see `src/main.rs`
+`main()`). `sigit run` (`src/headless.rs`) executes a single task non-interactively — JSONL
+progress events on stdout, logs on stderr, exit 0/1/2 — and is what cloud runners (siGit Code
+Cloud Agent) drive; it never falls back to on-device inference and declines permission prompts
+unless `SIGIT_PERMISSIONS=allow` is set. Its tool loop mirrors `handle_prompt`; keep the two in
+sync.
 
 ## Working in this repo
 
