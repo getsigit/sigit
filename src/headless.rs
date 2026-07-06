@@ -144,6 +144,8 @@ pub async fn run(config: HeadlessConfig) -> i32 {
     // Fresh permission state for the run, then apply the flag grants.
     permissions::reset_session(HEADLESS_SESSION);
     for tool in &config.allow_tools {
+        // No call arguments at grant time: the empty string records the bare
+        // tool name, granting the whole tool — the --allow-tool contract.
         permissions::grant_for_session(HEADLESS_SESSION, tool, "");
     }
     let denied: HashSet<&str> = config.deny_tools.iter().map(String::as_str).collect();
