@@ -798,6 +798,7 @@ impl SiGitAgent {
             ),
             AvailableCommand::new("permissions", "Show the tool permission policy"),
             AvailableCommand::new("compact", "Summarize and shrink the conversation history"),
+            AvailableCommand::new("init", "Generate or improve the repo's AGENTS.md"),
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
@@ -1268,9 +1269,15 @@ impl SiGitAgent {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
-        if let Some(command) = parse_slash(&user_text) {
-            return exec_slash_acp(self, cx, session_id, command).await;
-        }
+        let user_text = match parse_slash(&user_text) {
+            // `/init` is not a status command: it substitutes the canned
+            // AGENTS.md-generation prompt and runs a normal agent turn, so the
+            // exploration and file write go through the ordinary tools and
+            // permission checks.
+            Some(SlashCommand::Init) => instructions::INIT_PROMPT.to_string(),
+            Some(command) => return exec_slash_acp(self, cx, session_id, command).await,
+            None => user_text,
+        };
 
         log::info!(
             "prompt({}): \"{}\"",
@@ -2234,6 +2241,9 @@ enum SlashCommand {
     Permissions,
     /// Summarize-and-shrink the conversation history on demand.
     Compact,
+    /// Generate (or improve) the repo's AGENTS.md by running an agent turn
+    /// with [`instructions::INIT_PROMPT`] as the user text.
+    Init,
     Exit,
     Unknown(String),
 }
@@ -2262,6 +2272,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/plan" => SlashCommand::Plan(parse_on_off(argument)),
         "/permissions" => SlashCommand::Permissions,
         "/compact" => SlashCommand::Compact,
+        "/init" => SlashCommand::Init,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -2373,6 +2384,7 @@ async fn exec_slash_acp(
                      /plan [on|off] - plan mode: research only, no edits or commands\n\
                      /permissions   - show the tool permission policy\n\
                      /compact       - summarize and shrink conversation history\n\
+                     /init          - generate or improve the repo's AGENTS.md\n\
                      /clear         - wipe conversation history\n\
                      /status        - show engine status\n\
                      /exit          - end this turn",
@@ -2640,6 +2652,13 @@ async fn exec_slash_acp(
                     session_id,
                     "Use the panel controls to close or switch threads.",
                 )
+                .ok();
+        }
+        SlashCommand::Init => {
+            // Handled in the prompt path (it runs a real turn); reaching this
+            // arm means a caller forgot that special case.
+            agent
+                .send_assistant_message(cx, session_id, "Send /init as a prompt to run it.")
                 .ok();
         }
         SlashCommand::Unknown(command) => {
@@ -3221,6 +3240,13 @@ mod tests {
             SYSTEM_PROMPT.contains(tools::COMMIT_CO_AUTHOR_TRAILER),
             "SYSTEM_PROMPT must quote tools::COMMIT_CO_AUTHOR_TRAILER verbatim"
         );
+    }
+
+    #[test]
+    fn parse_slash_maps_init() {
+        assert!(matches!(parse_slash("/init"), Some(SlashCommand::Init)));
+        // Trailing whitespace comes from editors that submit the raw line.
+        assert!(matches!(parse_slash(" /init "), Some(SlashCommand::Init)));
     }
 
     #[test]

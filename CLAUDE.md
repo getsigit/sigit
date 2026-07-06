@@ -150,8 +150,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/models.rs`** — model-picker types shared across platforms.
 
 Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
-`/plan`, `/permissions`, `/clear`, `/status`) are advertised via `advertise_commands` in `main.rs`
-and handled in both the TUI and ACP sessions.
+`/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via `advertise_commands` in
+`main.rs` and handled in both the TUI and ACP sessions. `/init` is special: instead of replying
+directly it substitutes `instructions::INIT_PROMPT` for the user text and runs a normal agent
+turn that explores the repo and writes (or improves) `AGENTS.md` through the ordinary tools and
+permission checks.
 
 ## Model cache (macOS)
 
