@@ -62,6 +62,127 @@ pub(crate) fn parse_rich_text_segments(text: &str) -> Vec<(String, bool)> {
     segments
 }
 
+// ── Tool-call display helpers ─────────────────────────────────────────────────
+//
+// Pure helpers for the TUI's collapsible tool-call entries. Top-level (not in
+// `mod tui`) so they are testable on every target; only the Unix TUI consumes
+// them, hence the non-Unix dead-code allowance.
+
+/// Max characters for the summary half of a tool-call title line.
+#[cfg_attr(not(unix), allow(dead_code))]
+const TOOL_TITLE_SUMMARY_MAX: usize = 60;
+
+/// Max characters of tool output kept for the expanded-entry result preview.
+#[cfg_attr(not(unix), allow(dead_code))]
+const TOOL_RESULT_PREVIEW_MAX: usize = 2000;
+
+/// Truncate to `max_chars` characters, ending with an ellipsis when cut.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// One-line title for a tool call, Claude Code style: the tool name plus the
+/// argument that best identifies the call (`run_command · cargo test`,
+/// `edit_file · src/main.rs`, `sigit · list_issues` for MCP tools). Falls back
+/// to the bare tool name when the arguments are malformed or carry nothing
+/// summarizable.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn tool_title(name: &str, arguments_json: &str) -> String {
+    let args: Option<serde_json::Value> = serde_json::from_str(arguments_json).ok();
+    let str_arg =
+        |key: &str| -> Option<String> { Some(args.as_ref()?.get(key)?.as_str()?.to_string()) };
+
+    let (label, summary) = if let Some(rest) = name.strip_prefix("mcp__") {
+        // mcp__<server>__<tool> → "<server> · <tool>"
+        match rest.split_once("__") {
+            Some((server, tool)) => (server.to_string(), Some(tool.to_string())),
+            None => (rest.to_string(), None),
+        }
+    } else {
+        let summary = match name {
+            "run_command" => str_arg("command"),
+            "read_file" | "create_file" | "edit_file" | "multi_edit" | "delete_file" => {
+                str_arg("path")
+            }
+            "search_files" | "glob" => str_arg("pattern"),
+            _ => None,
+        };
+        (name.to_string(), summary)
+    };
+
+    // A title is a single line: collapse any internal whitespace runs
+    // (multi-line commands) before truncating.
+    let summary = summary
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_with_ellipsis(&s, TOOL_TITLE_SUMMARY_MAX));
+
+    match summary {
+        Some(summary) => format!("{label} · {summary}"),
+        None => label,
+    }
+}
+
+/// Pretty-print a tool call's JSON arguments for the expanded view; malformed
+/// JSON is shown raw.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn pretty_tool_arguments(arguments_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments_json)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| arguments_json.to_string())
+}
+
+/// The tail of a tool's output for display under an expanded tool entry,
+/// capped at [`TOOL_RESULT_PREVIEW_MAX`] chars with a truncation note. Display
+/// only — the model always receives the full output.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn cap_output_preview(output: &str) -> String {
+    let total = output.chars().count();
+    if total <= TOOL_RESULT_PREVIEW_MAX {
+        return output.to_string();
+    }
+    let tail: String = output
+        .chars()
+        .skip(total - TOOL_RESULT_PREVIEW_MAX)
+        .collect();
+    format!("… (truncated — showing the last {TOOL_RESULT_PREVIEW_MAX} of {total} chars)\n{tail}")
+}
+
+/// The display lines of one tool-call entry. Collapsed: a single `▸ 🔧 title`
+/// line. Expanded: `▾ 🔧 title`, the indented argument detail, and the result
+/// preview under a `result:` label when present.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn tool_entry_lines(
+    title: &str,
+    detail: &str,
+    result_preview: Option<&str>,
+    expanded: bool,
+) -> Vec<String> {
+    if !expanded {
+        return vec![format!("▸ 🔧 {title}")];
+    }
+    let mut out = vec![format!("▾ 🔧 {title}")];
+    if !detail.is_empty() {
+        for line in detail.split('\n') {
+            out.push(format!("    {line}"));
+        }
+    }
+    if let Some(result) = result_preview {
+        out.push("    result:".to_string());
+        for line in result.split('\n') {
+            out.push(format!("      {line}"));
+        }
+    }
+    out
+}
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 //
 // The top-level tab bar (GitHub Copilot CLI-style). Defined outside `mod tui`
@@ -173,6 +294,8 @@ mod tui {
         System,
         /// rainbow-colored banner art
         Banner,
+        /// a collapsible tool-call entry (`text` holds the title line)
+        Tool,
     }
 
     struct ChatMessage {
@@ -180,6 +303,11 @@ mod tui {
         text: String,
         /// Qwen 3 reasoning extracted from `<think>` tags, if any.
         think_block: Option<String>,
+        /// pretty-printed tool arguments (Role::Tool only)
+        tool_detail: Option<String>,
+        /// tail of the tool output, filled in when the call finishes
+        /// (Role::Tool only)
+        tool_result: Option<String>,
     }
 
     impl ChatMessage {
@@ -188,6 +316,8 @@ mod tui {
                 role: Role::User,
                 text: text.into(),
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
             }
         }
 
@@ -198,6 +328,8 @@ mod tui {
                 role: Role::Assistant,
                 text: visible,
                 think_block: if think.is_empty() { None } else { Some(think) },
+                tool_detail: None,
+                tool_result: None,
             }
         }
 
@@ -206,6 +338,8 @@ mod tui {
                 role: Role::System,
                 text: text.into(),
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
             }
         }
 
@@ -214,6 +348,18 @@ mod tui {
                 role: Role::Banner,
                 text: text.into(),
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
+            }
+        }
+
+        fn tool_call(title: impl Into<String>, detail: impl Into<String>) -> Self {
+            Self {
+                role: Role::Tool,
+                text: title.into(),
+                think_block: None,
+                tool_detail: Some(detail.into()),
+                tool_result: None,
             }
         }
     }
@@ -221,8 +367,17 @@ mod tui {
     // ── Inference updates from background task ────────────────────────────────
 
     enum InferenceUpdate {
-        /// show tool name in chat while it runs
-        ToolUse(String),
+        /// a tool call started — show a collapsible entry in the transcript
+        ToolUse {
+            name: String,
+            /// raw JSON arguments, pretty-printed by the UI for the expanded view
+            arguments: String,
+        },
+        /// the most recent tool call finished; attach a display-only preview of
+        /// the tail of its output (the model always gets the full output)
+        ToolDone {
+            output_preview: String,
+        },
         /// a streamed token fragment of the assistant's reply
         Delta(String),
         /// the streamed reply is complete; commit the accumulated buffer
@@ -296,6 +451,8 @@ mod tui {
         model_picker_items: Vec<ModelPickerItem>,
         current_model_name: String,
         tool_calling: bool,
+        /// `/tools` — expand every tool-call entry (default: collapsed titles)
+        tools_expanded: bool,
 
         // ── Model-switch download progress ────────────────────────────────────
         switching_model_id: Option<String>,
@@ -404,6 +561,7 @@ mod tui {
                 model_picker_items: items,
                 current_model_name,
                 tool_calling,
+                tools_expanded: false,
                 backend,
                 active_tab: Tab::Session,
                 history_sessions: Vec::new(),
@@ -1151,6 +1309,9 @@ mod tui {
         Plan(Option<bool>),
         /// Show the effective permission policy for this session.
         Permissions,
+        /// Expand or collapse all tool-call entries in the transcript.
+        /// `Some(true/false)` sets it, `None` flips it. TUI-only.
+        Tools(Option<bool>),
         /// Summarize-and-shrink the conversation history on demand.
         Compact,
         /// Restore the saved TUI session from disk.
@@ -1181,6 +1342,7 @@ mod tui {
             "/whoami" => SlashCommand::Whoami,
             "/plan" => SlashCommand::Plan(parse_on_off(arg)),
             "/permissions" => SlashCommand::Permissions,
+            "/tools" => SlashCommand::Tools(parse_on_off(arg)),
             "/compact" => SlashCommand::Compact,
             "/resume" => SlashCommand::Resume,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
@@ -1352,7 +1514,7 @@ mod tui {
         let mut lines: Vec<Line> = Vec::new();
 
         for msg in &app.messages {
-            render_chat_message(&mut lines, msg, inner_width as usize);
+            render_chat_message(&mut lines, msg, app.tools_expanded);
         }
 
         let streamed_visible = app.visible_stream();
@@ -1361,8 +1523,10 @@ mod tui {
                 role: Role::Assistant,
                 text: streamed_visible,
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
             };
-            render_chat_message(&mut lines, &fake, inner_width as usize);
+            render_chat_message(&mut lines, &fake, app.tools_expanded);
             if app.blink_on
                 && let Some(last) = lines.last_mut()
             {
@@ -1432,8 +1596,25 @@ mod tui {
         frame.render_widget(paragraph.scroll((scroll, 0)), inner);
     }
 
-    fn render_chat_message(lines: &mut Vec<Line<'static>>, msg: &ChatMessage, _width: usize) {
+    fn render_chat_message(
+        lines: &mut Vec<Line<'static>>,
+        msg: &ChatMessage,
+        tools_expanded: bool,
+    ) {
         match msg.role {
+            Role::Tool => {
+                let dim = Style::default()
+                    .fg(Color::Rgb(132, 132, 145))
+                    .add_modifier(Modifier::DIM);
+                for entry_line in super::tool_entry_lines(
+                    &msg.text,
+                    msg.tool_detail.as_deref().unwrap_or(""),
+                    msg.tool_result.as_deref(),
+                    tools_expanded,
+                ) {
+                    lines.push(Line::from(Span::styled(format!("  {entry_line}"), dim)));
+                }
+            }
             Role::Banner => {
                 let palette = [
                     Color::Red,
@@ -1840,6 +2021,7 @@ mod tui {
                      /whoami        — show the signed-in account\n\
                      /plan [on|off] — plan mode: research only, no edits or commands\n\
                      /permissions   — show the tool permission policy\n\
+                     /tools [on|off]— expand or collapse tool-call details\n\
                      /compact       — summarize and shrink conversation history\n\
                      /resume        — restore the saved session from disk\n\
                      /clear         — wipe conversation history\n\
@@ -1915,6 +2097,15 @@ mod tui {
                     .push(ChatMessage::system(crate::permissions::describe(
                         crate::permissions::TUI_SESSION,
                     )));
+            }
+            SlashCommand::Tools(value) => {
+                app.tools_expanded = value.unwrap_or(!app.tools_expanded);
+                app.messages
+                    .push(ChatMessage::system(if app.tools_expanded {
+                        "Tool calls expanded — /tools off to collapse them."
+                    } else {
+                        "Tool calls collapsed — /tools on to expand them."
+                    }));
             }
             SlashCommand::Status => {
                 let info = engine.as_ref().info().await;
@@ -2214,7 +2405,12 @@ mod tui {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                let _ = tx.send(InferenceUpdate::ToolUse(tc.name.clone())).await;
+                let _ = tx
+                    .send(InferenceUpdate::ToolUse {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    })
+                    .await;
 
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may pause on the user's
@@ -2267,6 +2463,14 @@ mod tui {
                     }
                 };
                 log::info!("  ← {} chars", output.len());
+
+                // Display-only preview of the output tail; the model gets the
+                // full output through `tool_results` below.
+                let _ = tx
+                    .send(InferenceUpdate::ToolDone {
+                        output_preview: super::cap_output_preview(&output),
+                    })
+                    .await;
 
                 tool_results.push(ToolResult {
                     tool_call_id: tc.id.clone(),
@@ -2482,8 +2686,22 @@ mod tui {
                     }
                 } => {
                     match update {
-                        Some(InferenceUpdate::ToolUse(name)) => {
-                            app.messages.push(ChatMessage::system(format!("🔧 {name}")));
+                        Some(InferenceUpdate::ToolUse { name, arguments }) => {
+                            let title = super::tool_title(&name, &arguments);
+                            let detail = super::pretty_tool_arguments(&arguments);
+                            app.messages.push(ChatMessage::tool_call(title, detail));
+                        }
+                        Some(InferenceUpdate::ToolDone { output_preview }) => {
+                            // Attach to the most recent tool entry still
+                            // waiting for its result.
+                            if let Some(entry) = app
+                                .messages
+                                .iter_mut()
+                                .rev()
+                                .find(|m| m.role == Role::Tool && m.tool_result.is_none())
+                            {
+                                entry.tool_result = Some(output_preview);
+                            }
                         }
                         Some(InferenceUpdate::Delta(delta)) => {
                             app.push_stream_delta(&delta);
@@ -2766,7 +2984,174 @@ pub use tui::run_with;
 mod tests {
     use std::time::Duration;
 
-    use super::{Tab, format_age, history_row, parse_rich_text_segments, strip_think_blocks};
+    use super::{
+        TOOL_RESULT_PREVIEW_MAX, Tab, cap_output_preview, format_age, history_row,
+        parse_rich_text_segments, pretty_tool_arguments, strip_think_blocks, tool_entry_lines,
+        tool_title,
+    };
+
+    // ── tool_title ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_title_run_command_shows_the_command() {
+        assert_eq!(
+            tool_title("run_command", r#"{"command":"cargo test"}"#),
+            "run_command · cargo test"
+        );
+    }
+
+    #[test]
+    fn tool_title_file_tools_show_the_path() {
+        for name in [
+            "read_file",
+            "create_file",
+            "edit_file",
+            "multi_edit",
+            "delete_file",
+        ] {
+            assert_eq!(
+                tool_title(name, r#"{"path":"src/main.rs","old_text":"a"}"#),
+                format!("{name} · src/main.rs")
+            );
+        }
+    }
+
+    #[test]
+    fn tool_title_pattern_tools_show_the_pattern() {
+        assert_eq!(
+            tool_title("search_files", r#"{"pattern":"fn main","path":"src"}"#),
+            "search_files · fn main"
+        );
+        assert_eq!(
+            tool_title("glob", r#"{"pattern":"**/*.rs"}"#),
+            "glob · **/*.rs"
+        );
+    }
+
+    #[test]
+    fn tool_title_mcp_tools_show_server_and_bare_tool_name() {
+        assert_eq!(
+            tool_title("mcp__sigit__list_issues", r#"{"repo":"getsigit/sigit"}"#),
+            "sigit · list_issues"
+        );
+    }
+
+    #[test]
+    fn tool_title_unknown_tool_is_the_name_alone() {
+        assert_eq!(
+            tool_title("write_todos", r#"{"todos":[{"text":"x"}]}"#),
+            "write_todos"
+        );
+    }
+
+    #[test]
+    fn tool_title_malformed_json_falls_back_to_the_name() {
+        assert_eq!(tool_title("run_command", "{not json"), "run_command");
+        assert_eq!(tool_title("edit_file", ""), "edit_file");
+    }
+
+    #[test]
+    fn tool_title_missing_or_non_string_arg_falls_back_to_the_name() {
+        assert_eq!(tool_title("run_command", r#"{"other":"x"}"#), "run_command");
+        assert_eq!(
+            tool_title("run_command", r#"{"command":42}"#),
+            "run_command"
+        );
+    }
+
+    #[test]
+    fn tool_title_truncates_long_summaries_with_an_ellipsis() {
+        let long = "a".repeat(100);
+        let title = tool_title("run_command", &format!(r#"{{"command":"{long}"}}"#));
+
+        let summary = title.strip_prefix("run_command · ").expect("summary");
+        assert_eq!(summary.chars().count(), 60);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_title_collapses_multiline_commands_to_one_line() {
+        assert_eq!(
+            tool_title("run_command", "{\"command\":\"echo a &&\\n  echo b\"}"),
+            "run_command · echo a && echo b"
+        );
+    }
+
+    // ── cap_output_preview ────────────────────────────────────────────────────
+
+    #[test]
+    fn cap_output_preview_passes_short_output_through() {
+        assert_eq!(cap_output_preview("hello\nworld"), "hello\nworld");
+    }
+
+    #[test]
+    fn cap_output_preview_keeps_the_tail_and_notes_the_truncation() {
+        let output = format!("{}{}", "x".repeat(3000), "the-very-end");
+        let preview = cap_output_preview(&output);
+
+        assert!(preview.starts_with("… (truncated — showing the last 2000 of 3012 chars)\n"));
+        assert!(preview.ends_with("the-very-end"));
+        let (_note, tail) = preview.split_once('\n').expect("note line");
+        assert_eq!(tail.chars().count(), TOOL_RESULT_PREVIEW_MAX);
+    }
+
+    // ── pretty_tool_arguments ─────────────────────────────────────────────────
+
+    #[test]
+    fn pretty_tool_arguments_pretty_prints_valid_json() {
+        assert_eq!(
+            pretty_tool_arguments(r#"{"command":"ls"}"#),
+            "{\n  \"command\": \"ls\"\n}"
+        );
+    }
+
+    #[test]
+    fn pretty_tool_arguments_shows_malformed_json_raw() {
+        assert_eq!(pretty_tool_arguments("{oops"), "{oops");
+    }
+
+    // ── tool_entry_lines ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_entry_lines_collapsed_is_a_single_title_line() {
+        let lines = tool_entry_lines(
+            "run_command · cargo test",
+            "{\n  \"command\": \"cargo test\"\n}",
+            Some("ok"),
+            false,
+        );
+        assert_eq!(lines, vec!["▸ 🔧 run_command · cargo test"]);
+    }
+
+    #[test]
+    fn tool_entry_lines_expanded_shows_detail_and_result() {
+        let lines = tool_entry_lines(
+            "run_command · cargo test",
+            "{\n  \"command\": \"cargo test\"\n}",
+            Some("test ok\ndone"),
+            true,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "▾ 🔧 run_command · cargo test",
+                "    {",
+                "      \"command\": \"cargo test\"",
+                "    }",
+                "    result:",
+                "      test ok",
+                "      done",
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_entry_lines_expanded_without_result_omits_the_result_block() {
+        let lines = tool_entry_lines("glob · **/*.rs", "{}", None, true);
+        assert_eq!(lines, vec!["▾ 🔧 glob · **/*.rs", "    {}"]);
+    }
+
+    // ── Tab / format_age / history_row ────────────────────────────────────────
 
     #[test]
     fn tab_next_cycles_session_history_cloud() {
