@@ -103,16 +103,24 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
   `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
   and only when at least one skill exists.
-- **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Connects to
-  MCP servers over the **Streamable HTTP** transport (one JSON-RPC POST endpoint; replies are
-  `application/json` or SSE), runs the `initialize`/`tools/list` handshake, and forwards `tools/call`.
-  Discovery is best-effort at startup (`mcp::init`, called from both branches of `main()`) and cached
-  in a process-global so the synchronous spec builders (`mcp::tool_specs`) and the async dispatch
-  (`mcp::call_tool`) can both read it. Tools are namespaced `mcp__<server>__<tool>`, appended in the
-  `*_as_specs`/`build_tool_specs` layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. The
-  official server (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in and authed with the
-  cloud session token; extra servers live in `mcp.toml` (global `$SIGIT_CONFIG_DIR/mcp.toml` and
-  project-local `.sigit/mcp.toml`). stdio transport is not supported.
+- **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Two
+  transports: **Streamable HTTP** (one JSON-RPC POST endpoint, `url` in `mcp.toml`; replies are
+  `application/json` or SSE) and **stdio** (`command` + optional `args`/`[server.env]` in
+  `mcp.toml`; sigit spawns the server and speaks newline-delimited JSON-RPC over its
+  stdin/stdout, stderr inherited into sigit's log). `url` and `command` are mutually exclusive —
+  both or neither is a config error, logged and skipped. Both transports run the same
+  `initialize`/`tools/list` handshake and forward `tools/call`. Discovery is best-effort at
+  startup (`mcp::init`, called from both branches of `main()`) and cached in a process-global so
+  the synchronous spec builders (`mcp::tool_specs`) and the async dispatch (`mcp::call_tool`) can
+  both read it; `/reload` does *not* re-run it, so config changes need a restart. stdio children
+  live for the process; a dead child fails calls with an in-band error string (no auto-restart).
+  Tools are namespaced `mcp__<server>__<tool>`, appended in the `*_as_specs`/`build_tool_specs`
+  layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. The official server
+  (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in (always HTTP) and authed
+  with the cloud session token; extra servers live in `mcp.toml` (global
+  `$SIGIT_CONFIG_DIR/mcp.toml` and project-local `.sigit/mcp.toml`). The stdio path is covered by
+  `tests/mcp_stdio.rs`, driven by the test-only `src/bin/mcp_stdio_stub.rs` helper binary
+  (excluded from the published crate via `exclude` in `Cargo.toml`).
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all

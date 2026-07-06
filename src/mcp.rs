@@ -6,11 +6,20 @@
 //! When the model calls an MCP tool, the call is forwarded to the owning server
 //! and the result fed back into the agent loop.
 //!
-//! Transport: the modern **Streamable HTTP** transport — a single HTTP endpoint
-//! the client POSTs JSON-RPC 2.0 messages to. The server answers either with a
-//! single `application/json` body or a `text/event-stream` (SSE) stream that
-//! carries the JSON-RPC response. Both are handled here. stdio transport is not
-//! supported (siGit Code never spawns child processes for inference).
+//! Transports:
+//!
+//! - **Streamable HTTP** — a single HTTP endpoint the client POSTs JSON-RPC 2.0
+//!   messages to. The server answers either with a single `application/json`
+//!   body or a `text/event-stream` (SSE) stream that carries the JSON-RPC
+//!   response. Both are handled here. Configured with `url` in `mcp.toml`.
+//! - **stdio** — siGit spawns the server as a child process and exchanges
+//!   newline-delimited JSON-RPC messages over its stdin/stdout (the server's
+//!   stderr flows into siGit's own log stream). Configured with `command`
+//!   (plus optional `args` and `[server.env]`) in `mcp.toml`. This is how most
+//!   published MCP servers (filesystem, Playwright, GitHub, ...) are run.
+//!
+//! `url` and `command` are mutually exclusive; an entry with both, or neither,
+//! is a config error that is logged and skipped.
 //!
 //! ## The official server
 //!
@@ -30,6 +39,13 @@
 //! stored in a process-global so the synchronous tool-spec builders
 //! ([`tool_specs`]) and the async dispatch ([`call_tool`]) can both read it.
 //!
+//! stdio children live for the sigit process. When a child dies (EOF or an I/O
+//! error on its pipes) the server is marked dead and later calls return an
+//! in-band error string the model can react to; there is no automatic restart.
+//! `/reload` does *not* re-run discovery ([`init`] is once-per-process), so a
+//! changed `mcp.toml` or a dead server needs a sigit restart. At process exit
+//! children see EOF on their stdin and exit on their own.
+//!
 //! Tools are namespaced `mcp__<server>__<tool>` so they never collide with
 //! built-in tools or with each other across servers. This mirrors the
 //! convention used by other MCP-aware agents.
@@ -39,15 +55,18 @@
 //! are unused, so the dead-code lint is suppressed there only.
 #![cfg_attr(not(unix), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{Mutex, oneshot};
 
 use crate::backend::ToolSpec;
 
@@ -91,6 +110,25 @@ struct McpTool {
 struct ServerConn {
     /// Sanitized server name used in tool namespacing and the `/mcp` listing.
     name: String,
+    /// Display endpoint for the `/mcp` listing: the URL for HTTP servers, the
+    /// command line for stdio servers.
+    endpoint: String,
+    /// The live transport. `None` when a stdio server failed to even spawn.
+    transport: Option<Transport>,
+    /// Tools discovered at startup. Empty when the server failed to connect.
+    tools: Vec<McpTool>,
+    /// Connection error, if the handshake failed. Surfaced by `/mcp`.
+    error: Option<String>,
+}
+
+/// How a connected server is reached.
+enum Transport {
+    Http(HttpConn),
+    Stdio(StdioConn),
+}
+
+/// Streamable HTTP connection state.
+struct HttpConn {
     /// Streamable HTTP endpoint (the single POST URL).
     url: String,
     /// Extra headers sent on every request (e.g. `Authorization`).
@@ -98,10 +136,59 @@ struct ServerConn {
     /// Session id handed back by the server on `initialize`, echoed on every
     /// later request via the `Mcp-Session-Id` header.
     session_id: Mutex<Option<String>>,
-    /// Tools discovered at startup. Empty when the server failed to connect.
-    tools: Vec<McpTool>,
-    /// Connection error, if the handshake failed. Surfaced by `/mcp`.
-    error: Option<String>,
+}
+
+/// stdio connection state: a child process speaking newline-delimited JSON-RPC
+/// over its stdin/stdout.
+struct StdioConn {
+    /// The child's stdin. The mutex serializes writes so concurrent requests
+    /// can't interleave bytes on the pipe; `None` once the pipe broke.
+    writer: Mutex<Option<ChildStdin>>,
+    /// State shared with the background reader task that owns the child's
+    /// stdout.
+    shared: Arc<StdioShared>,
+    /// JSON-RPC id source. Ids are per-connection so the reader task can route
+    /// each response to the request that carries its id.
+    next_id: AtomicI64,
+}
+
+/// State shared between a [`StdioConn`] and its background reader task.
+struct StdioShared {
+    /// Server name, for log lines.
+    name: String,
+    /// In-flight requests awaiting a response, keyed by JSON-RPC id. Dropping
+    /// a sender (when the connection dies) wakes the waiter with an error.
+    pending: StdMutex<HashMap<i64, oneshot::Sender<Value>>>,
+    /// Why the connection is unusable, once it is (EOF, I/O error, kill).
+    dead: StdMutex<Option<String>>,
+    /// The child handle, kept so a dead/failed connection can kill and reap
+    /// the process. Taken on death.
+    child: StdMutex<Option<Child>>,
+}
+
+impl StdioShared {
+    fn dead_reason(&self) -> Option<String> {
+        self.dead.lock().unwrap().clone()
+    }
+
+    /// Mark the connection unusable: record the reason (first one wins), fail
+    /// every in-flight request, and kill + reap the child, best effort.
+    fn mark_dead(&self, reason: &str) {
+        {
+            let mut dead = self.dead.lock().unwrap();
+            if dead.is_none() {
+                *dead = Some(reason.to_string());
+            }
+        }
+        // Dropping the senders wakes every waiter with a recv error.
+        self.pending.lock().unwrap().clear();
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.start_kill();
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
 }
 
 /// The process-global MCP state: a shared HTTP client plus every configured
@@ -125,17 +212,68 @@ fn official_url() -> String {
     )
 }
 
-/// A server entry as written in `mcp.toml`.
+/// A server entry as written in `mcp.toml`. Exactly one of `url` (Streamable
+/// HTTP) or `command` (stdio) selects the transport.
 #[derive(Debug, Deserialize)]
 struct ServerEntry {
     name: String,
-    url: String,
+    /// Streamable HTTP endpoint. Mutually exclusive with `command`.
+    #[serde(default)]
+    url: Option<String>,
+    /// stdio server executable. Mutually exclusive with `url`.
+    #[serde(default)]
+    command: Option<String>,
+    /// Arguments for `command`.
+    #[serde(default)]
+    args: Vec<String>,
+    /// Extra environment variables for `command`, added on top of the
+    /// inherited environment.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
     /// Set `enabled = false` to keep an entry in the file but skip connecting.
     #[serde(default)]
     enabled: Option<bool>,
-    /// Static headers, e.g. `Authorization = "Bearer ..."`.
+    /// Static headers, e.g. `Authorization = "Bearer ..."`. HTTP only.
     #[serde(default)]
     headers: BTreeMap<String, String>,
+}
+
+impl ServerEntry {
+    /// Resolve the entry's transport. `url` and `command` are mutually
+    /// exclusive and exactly one is required; anything else is a config error.
+    fn transport_def(&self) -> Result<TransportDef, String> {
+        let url = self.url.as_deref().map(str::trim).filter(|v| !v.is_empty());
+        let command = self
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        match (url, command) {
+            (Some(_), Some(_)) => {
+                Err("has both `url` and `command`; a server uses exactly one transport".to_string())
+            }
+            (None, None) => {
+                Err("needs either `url` (Streamable HTTP) or `command` (stdio)".to_string())
+            }
+            (Some(url), None) => Ok(TransportDef::Http {
+                url: url.to_string(),
+                headers: self
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            }),
+            (None, Some(command)) => Ok(TransportDef::Stdio {
+                command: command.to_string(),
+                args: self.args.clone(),
+                env: self
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            }),
+        }
+    }
 }
 
 /// The `mcp.toml` schema.
@@ -149,12 +287,43 @@ struct McpFile {
     server: Vec<ServerEntry>,
 }
 
+/// How to reach a configured server, before connecting.
+#[derive(Debug, Clone)]
+enum TransportDef {
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+}
+
+impl TransportDef {
+    /// Human-readable endpoint for logs and the `/mcp` listing: the URL for
+    /// HTTP, the command line for stdio.
+    fn endpoint(&self) -> String {
+        match self {
+            TransportDef::Http { url, .. } => url.clone(),
+            TransportDef::Stdio { command, args, .. } => {
+                let mut line = command.clone();
+                for arg in args {
+                    line.push(' ');
+                    line.push_str(arg);
+                }
+                line
+            }
+        }
+    }
+}
+
 /// A resolved server definition, before connecting.
 #[derive(Debug, Clone)]
 struct ServerDef {
     name: String,
-    url: String,
-    headers: Vec<(String, String)>,
+    transport: TransportDef,
 }
 
 /// Config files to read, in priority order (later wins on a name clash):
@@ -220,22 +389,21 @@ fn load_configs() -> Vec<ServerDef> {
                 continue;
             }
             let name = sanitize(&entry.name);
-            if name.is_empty() || entry.url.trim().is_empty() {
-                log::warn!(
-                    "mcp: skipping server with empty name/url in {}",
-                    path.display()
-                );
+            if name.is_empty() {
+                log::warn!("mcp: skipping server with empty name in {}", path.display());
                 continue;
             }
-            let headers = entry.headers.into_iter().collect();
-            upsert(
-                &mut defs,
-                ServerDef {
-                    name,
-                    url: entry.url.trim().to_string(),
-                    headers,
-                },
-            );
+            let transport = match entry.transport_def() {
+                Ok(transport) => transport,
+                Err(error) => {
+                    log::warn!(
+                        "mcp: skipping server '{name}' in {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            upsert(&mut defs, ServerDef { name, transport });
         }
     }
 
@@ -258,8 +426,10 @@ fn load_configs() -> Vec<ServerDef> {
         }
         defs.push(ServerDef {
             name: "sigit".to_string(),
-            url: official_url(),
-            headers,
+            transport: TransportDef::Http {
+                url: official_url(),
+                headers,
+            },
         });
     }
 
@@ -341,11 +511,33 @@ pub async fn init() {
 /// Run the handshake against one server and collect its tools. Always returns a
 /// `ServerConn`; failures land in its `error` field rather than propagating.
 async fn connect(http: &reqwest::Client, def: ServerDef) -> ServerConn {
+    let endpoint = def.transport.endpoint();
+    let transport = match &def.transport {
+        TransportDef::Http { url, headers } => Transport::Http(HttpConn {
+            url: url.clone(),
+            headers: headers.clone(),
+            session_id: Mutex::new(None),
+        }),
+        TransportDef::Stdio { command, args, env } => {
+            match spawn_stdio(&def.name, command, args, env) {
+                Ok(conn) => Transport::Stdio(conn),
+                Err(error) => {
+                    return ServerConn {
+                        name: def.name,
+                        endpoint,
+                        transport: None,
+                        tools: Vec::new(),
+                        error: Some(error),
+                    };
+                }
+            }
+        }
+    };
+
     let mut conn = ServerConn {
-        name: def.name.clone(),
-        url: def.url.clone(),
-        headers: def.headers.clone(),
-        session_id: Mutex::new(None),
+        name: def.name,
+        endpoint,
+        transport: Some(transport),
         tools: Vec::new(),
         error: None,
     };
@@ -364,31 +556,33 @@ async fn connect(http: &reqwest::Client, def: ServerDef) -> ServerConn {
         Err(_) => conn.error = Some(format!("timed out after {}s", HANDSHAKE_TIMEOUT.as_secs())),
     }
 
+    // A stdio child that failed its handshake is useless — kill it rather than
+    // leave it running for the rest of the process.
+    if let Some(error) = conn.error.clone()
+        && let Some(Transport::Stdio(stdio)) = &conn.transport
+    {
+        stdio.shared.mark_dead(&error);
+    }
+
     conn
 }
 
-/// The `initialize` request: negotiate protocol version and capture the session
-/// id from the response headers (handled inside [`post_rpc`]).
+/// The `initialize` request: negotiate protocol version and (on HTTP) capture
+/// the session id from the response headers (handled inside [`post_rpc`]).
 async fn initialize(http: &reqwest::Client, conn: &ServerConn) -> Result<(), String> {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "sigit", "version": env!("CARGO_PKG_VERSION") }
-        }
+    let params = json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": { "name": "sigit", "version": env!("CARGO_PKG_VERSION") }
     });
-    post_rpc(http, conn, &body, HANDSHAKE_TIMEOUT).await?;
+    rpc_request(http, conn, "initialize", params, HANDSHAKE_TIMEOUT).await?;
     Ok(())
 }
 
 /// The `notifications/initialized` notification. Servers expect it before
-/// fielding requests; it carries no id and yields a 202 with no body.
+/// fielding requests; it carries no id and no response.
 async fn notify_initialized(http: &reqwest::Client, conn: &ServerConn) -> Result<(), String> {
-    let body = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    post_notification(http, conn, &body, HANDSHAKE_TIMEOUT).await
+    rpc_notify(http, conn, "notifications/initialized", HANDSHAKE_TIMEOUT).await
 }
 
 /// `tools/list`, following `nextCursor` pagination, mapped into [`McpTool`]s.
@@ -401,8 +595,7 @@ async fn list_tools(http: &reqwest::Client, conn: &ServerConn) -> Result<Vec<Mcp
             Some(c) => json!({ "cursor": c }),
             None => json!({}),
         };
-        let body = json!({ "jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": params });
-        let result = post_rpc(http, conn, &body, HANDSHAKE_TIMEOUT).await?;
+        let result = rpc_request(http, conn, "tools/list", params, HANDSHAKE_TIMEOUT).await?;
 
         for tool in result
             .get("tools")
@@ -521,32 +714,40 @@ pub async fn call_tool(full_name: &str, arguments: &str) -> String {
 }
 
 impl Mcp {
-    /// Send a `tools/call` and render the result into text. Retries once after a
-    /// re-`initialize` if the session was dropped (HTTP 404), which is how
-    /// Streamable HTTP signals an expired session.
+    /// Send a `tools/call` and render the result into text. On HTTP, retries
+    /// once after a re-`initialize` if the session was dropped (HTTP 404),
+    /// which is how Streamable HTTP signals an expired session.
     async fn call(
         &self,
         server: &ServerConn,
         remote_name: &str,
         args: Value,
     ) -> Result<String, String> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "tools/call",
-            "params": { "name": remote_name, "arguments": args }
-        });
-
-        let result = match post_rpc(&self.http, server, &body, CALL_TIMEOUT).await {
-            Ok(result) => result,
-            Err(error) if error.contains("returned 404") => {
-                // Session expired — drop it, re-handshake, and retry once.
-                *server.session_id.lock().await = None;
-                initialize(&self.http, server).await?;
-                notify_initialized(&self.http, server).await?;
-                post_rpc(&self.http, server, &body, CALL_TIMEOUT).await?
+        let params = json!({ "name": remote_name, "arguments": args });
+        let result = match &server.transport {
+            None => return Err(format!("server '{}' is not connected", server.name)),
+            Some(Transport::Stdio(stdio)) => {
+                stdio.request("tools/call", params, CALL_TIMEOUT).await?
             }
-            Err(error) => return Err(error),
+            Some(Transport::Http(http_conn)) => {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "tools/call",
+                    "params": params
+                });
+                match post_rpc(&self.http, &server.name, http_conn, &body, CALL_TIMEOUT).await {
+                    Ok(result) => result,
+                    Err(error) if error.contains("returned 404") => {
+                        // Session expired — drop it, re-handshake, and retry once.
+                        *http_conn.session_id.lock().await = None;
+                        initialize(&self.http, server).await?;
+                        notify_initialized(&self.http, server).await?;
+                        post_rpc(&self.http, &server.name, http_conn, &body, CALL_TIMEOUT).await?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         };
 
         Ok(render_tool_result(&result))
@@ -611,6 +812,242 @@ fn truncate(text: String) -> String {
     format!("{kept}\n\n[output truncated to {RESULT_CHAR_LIMIT} characters]")
 }
 
+// ── Transport-generic JSON-RPC dispatch ─────────────────────────────────────
+
+/// Send a JSON-RPC request over whichever transport the server uses and return
+/// its `result`.
+async fn rpc_request(
+    http: &reqwest::Client,
+    conn: &ServerConn,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    match &conn.transport {
+        None => Err(format!("server '{}' is not connected", conn.name)),
+        Some(Transport::Http(http_conn)) => {
+            let body = json!({ "jsonrpc": "2.0", "id": 0, "method": method, "params": params });
+            post_rpc(http, &conn.name, http_conn, &body, timeout).await
+        }
+        Some(Transport::Stdio(stdio)) => stdio.request(method, params, timeout).await,
+    }
+}
+
+/// Send a JSON-RPC notification (no id, no response expected).
+async fn rpc_notify(
+    http: &reqwest::Client,
+    conn: &ServerConn,
+    method: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    match &conn.transport {
+        None => Err(format!("server '{}' is not connected", conn.name)),
+        Some(Transport::Http(http_conn)) => {
+            let body = json!({ "jsonrpc": "2.0", "method": method });
+            post_notification(http, &conn.name, http_conn, &body, timeout).await
+        }
+        Some(Transport::Stdio(stdio)) => stdio.notify(method).await,
+    }
+}
+
+// ── stdio JSON-RPC plumbing ─────────────────────────────────────────────────
+
+/// Spawn a stdio MCP server and start its background reader task. The child's
+/// stderr is inherited so it lands in sigit's own log stream; the given env
+/// vars are added on top of the inherited environment.
+fn spawn_stdio(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<StdioConn, String> {
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("failed to spawn `{command}`: {error}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "child stdin was not captured".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout was not captured".to_string())?;
+
+    let shared = Arc::new(StdioShared {
+        name: name.to_string(),
+        pending: StdMutex::new(HashMap::new()),
+        dead: StdMutex::new(None),
+        child: StdMutex::new(Some(child)),
+    });
+    tokio::spawn(stdio_reader(BufReader::new(stdout), Arc::clone(&shared)));
+
+    Ok(StdioConn {
+        writer: Mutex::new(Some(stdin)),
+        shared,
+        next_id: AtomicI64::new(1),
+    })
+}
+
+/// Background task owning a stdio child's stdout: parses one JSON-RPC message
+/// per line and routes each response to the pending request that carries its
+/// id. Server-initiated requests and notifications (anything with a `method`)
+/// are logged and ignored — siGit doesn't support server→client calls. On EOF
+/// or a read error the connection is marked dead, which fails every in-flight
+/// request and reaps the child.
+async fn stdio_reader(mut stdout: BufReader<ChildStdout>, shared: Arc<StdioShared>) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdout.read_line(&mut line).await {
+            Ok(0) => {
+                shared.mark_dead("server closed its stdout (process exited)");
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                shared.mark_dead(&format!("read error: {error}"));
+                return;
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let message: Value = match serde_json::from_str(trimmed) {
+            Ok(message) => message,
+            Err(error) => {
+                log::warn!("mcp: '{}' sent a non-JSON line: {error}", shared.name);
+                continue;
+            }
+        };
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            log::debug!(
+                "mcp: ignoring server-initiated '{method}' from '{}'",
+                shared.name
+            );
+            continue;
+        }
+        let Some(id) = message.get("id").and_then(Value::as_i64) else {
+            log::warn!(
+                "mcp: '{}' sent a response without a usable id; ignoring",
+                shared.name
+            );
+            continue;
+        };
+        let waiter = shared.pending.lock().unwrap().remove(&id);
+        match waiter {
+            Some(sender) => {
+                let _ = sender.send(message);
+            }
+            None => log::debug!(
+                "mcp: '{}' answered unknown/expired request id {id}; ignoring",
+                shared.name
+            ),
+        }
+    }
+}
+
+impl StdioConn {
+    /// Send a JSON-RPC request and await its response, correlated by id. Fails
+    /// fast (in-band, never panicking) when the child has died.
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let name = &self.shared.name;
+        if let Some(reason) = self.shared.dead_reason() {
+            return Err(format!("stdio server '{name}' is not running: {reason}"));
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let (sender, receiver) = oneshot::channel();
+        self.shared.pending.lock().unwrap().insert(id, sender);
+
+        if let Err(error) = self.write_line(&body).await {
+            self.shared.pending.lock().unwrap().remove(&id);
+            self.shared.mark_dead(&error);
+            return Err(format!("stdio server '{name}': {error}"));
+        }
+
+        let message = match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(message)) => message,
+            // Our sender was dropped: the connection died mid-request.
+            Ok(Err(_)) => {
+                let reason = self
+                    .shared
+                    .dead_reason()
+                    .unwrap_or_else(|| "connection closed".to_string());
+                return Err(format!("stdio server '{name}' is not running: {reason}"));
+            }
+            Err(_) => {
+                self.shared.pending.lock().unwrap().remove(&id);
+                return Err(format!(
+                    "request to stdio server '{name}' timed out after {}s",
+                    timeout.as_secs()
+                ));
+            }
+        };
+
+        if let Some(error) = message.get("error") {
+            let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+            let msg = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(format!("'{name}' JSON-RPC error {code}: {msg}"));
+        }
+        message
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("response from '{name}' had no result"))
+    }
+
+    /// Send a JSON-RPC notification (no id, no response).
+    async fn notify(&self, method: &str) -> Result<(), String> {
+        let body = json!({ "jsonrpc": "2.0", "method": method });
+        if let Err(error) = self.write_line(&body).await {
+            self.shared.mark_dead(&error);
+            return Err(format!("stdio server '{}': {error}", self.shared.name));
+        }
+        Ok(())
+    }
+
+    /// Write one newline-delimited JSON-RPC message. The writer mutex keeps
+    /// concurrent requests from interleaving bytes on the pipe.
+    async fn write_line(&self, body: &Value) -> Result<(), String> {
+        let mut guard = self.writer.lock().await;
+        let Some(writer) = guard.as_mut() else {
+            return Err("stdin already closed".to_string());
+        };
+        let mut line = body.to_string();
+        line.push('\n');
+        let result = async {
+            writer.write_all(line.as_bytes()).await?;
+            writer.flush().await
+        }
+        .await;
+        if let Err(error) = result {
+            // A broken pipe is unrecoverable; drop the writer so later calls
+            // fail fast.
+            *guard = None;
+            return Err(format!("write failed: {error}"));
+        }
+        Ok(())
+    }
+}
+
 // ── Streamable HTTP JSON-RPC plumbing ───────────────────────────────────────
 
 /// POST a JSON-RPC request and return its `result`. Handles both an
@@ -618,7 +1055,8 @@ fn truncate(text: String) -> String {
 /// session id from the response headers, and maps a JSON-RPC `error` to `Err`.
 async fn post_rpc(
     http: &reqwest::Client,
-    conn: &ServerConn,
+    name: &str,
+    conn: &HttpConn,
     body: &Value,
     timeout: Duration,
 ) -> Result<Value, String> {
@@ -659,8 +1097,7 @@ async fn post_rpc(
         let detail = response.text().await.unwrap_or_default();
         let detail: String = detail.chars().take(500).collect();
         return Err(format!(
-            "server '{}' returned {}: {detail}",
-            conn.name,
+            "server '{name}' returned {}: {detail}",
             status.as_u16()
         ));
     }
@@ -668,14 +1105,14 @@ async fn post_rpc(
     let text = response
         .text()
         .await
-        .map_err(|error| format!("reading response from '{}': {error}", conn.name))?;
+        .map_err(|error| format!("reading response from '{name}': {error}"))?;
 
     let message = if content_type.contains("text/event-stream") {
         parse_sse_response(&text)
-            .ok_or_else(|| format!("no JSON-RPC message in SSE reply from '{}'", conn.name))?
+            .ok_or_else(|| format!("no JSON-RPC message in SSE reply from '{name}'"))?
     } else {
         serde_json::from_str::<Value>(&text)
-            .map_err(|error| format!("parsing response from '{}': {error}", conn.name))?
+            .map_err(|error| format!("parsing response from '{name}': {error}"))?
     };
 
     if let Some(error) = message.get("error") {
@@ -684,20 +1121,21 @@ async fn post_rpc(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
-        return Err(format!("'{}' JSON-RPC error {code}: {msg}", conn.name));
+        return Err(format!("'{name}' JSON-RPC error {code}: {msg}"));
     }
 
     message
         .get("result")
         .cloned()
-        .ok_or_else(|| format!("response from '{}' had no result", conn.name))
+        .ok_or_else(|| format!("response from '{name}' had no result"))
 }
 
 /// POST a JSON-RPC notification (no id, no response expected). A non-success
 /// status is an error; an empty 202 body is the normal case.
 async fn post_notification(
     http: &reqwest::Client,
-    conn: &ServerConn,
+    name: &str,
+    conn: &HttpConn,
     body: &Value,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -708,8 +1146,7 @@ async fn post_notification(
         .map_err(|error| format!("notification to {} failed: {error}", conn.url))?;
     if !response.status().is_success() {
         return Err(format!(
-            "server '{}' rejected notification: {}",
-            conn.name,
+            "server '{name}' rejected notification: {}",
             response.status().as_u16()
         ));
     }
@@ -721,7 +1158,7 @@ async fn post_notification(
 /// session id once we have one.
 async fn build_request(
     http: &reqwest::Client,
-    conn: &ServerConn,
+    conn: &HttpConn,
     body: &Value,
     timeout: Duration,
 ) -> reqwest::RequestBuilder {
@@ -779,7 +1216,8 @@ fn parse_sse_response(body: &str) -> Option<Value> {
 // ── Status reporting (`/mcp`) ────────────────────────────────────────────────
 
 /// Human-readable summary of configured MCP servers and their tools, for the
-/// `/mcp` slash command.
+/// `/mcp` slash command. Shows the URL for HTTP servers and the command line
+/// for stdio servers.
 pub fn status_summary() -> String {
     let Some(mcp) = MCP.get() else {
         return "MCP is not initialized.".to_string();
@@ -799,13 +1237,13 @@ pub fn status_summary() -> String {
         match &server.error {
             Some(error) => lines.push(format!(
                 "- {} ({}) — unavailable: {error}",
-                server.name, server.url
+                server.name, server.endpoint
             )),
             None => {
                 lines.push(format!(
                     "- {} ({}) — {} tool(s)",
                     server.name,
-                    server.url,
+                    server.endpoint,
                     server.tools.len()
                 ));
                 for tool in &server.tools {
@@ -868,22 +1306,116 @@ mod tests {
     }
 
     #[test]
+    fn parses_stdio_server_with_args_and_env() {
+        let toml = r#"
+            [[server]]
+            name = "fs"
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+            [server.env]
+            LOG_LEVEL = "debug"
+            TOKEN = "abc"
+        "#;
+        let parsed: McpFile = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.server.len(), 1);
+        let entry = &parsed.server[0];
+        assert_eq!(entry.command.as_deref(), Some("npx"));
+        assert_eq!(entry.args.len(), 3);
+        assert_eq!(
+            entry.env.get("LOG_LEVEL").map(String::as_str),
+            Some("debug")
+        );
+        assert_eq!(entry.env.get("TOKEN").map(String::as_str), Some("abc"));
+
+        let def = entry.transport_def().expect("valid stdio entry");
+        match def {
+            TransportDef::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args[0], "-y");
+                assert_eq!(env.len(), 2);
+            }
+            TransportDef::Http { .. } => panic!("expected a stdio transport"),
+        }
+    }
+
+    #[test]
+    fn entry_with_url_and_command_is_a_config_error() {
+        let toml = r#"
+            [[server]]
+            name = "confused"
+            url = "https://example.com/mcp"
+            command = "npx"
+        "#;
+        let parsed: McpFile = toml::from_str(toml).unwrap();
+        let error = parsed.server[0].transport_def().unwrap_err();
+        assert!(error.contains("both"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn entry_with_neither_url_nor_command_is_a_config_error() {
+        let toml = r#"
+            [[server]]
+            name = "empty"
+        "#;
+        let parsed: McpFile = toml::from_str(toml).unwrap();
+        let error = parsed.server[0].transport_def().unwrap_err();
+        assert!(error.contains("needs"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn blank_url_or_command_counts_as_absent() {
+        let toml = r#"
+            [[server]]
+            name = "blank"
+            url = "  "
+            command = "server-bin"
+        "#;
+        let parsed: McpFile = toml::from_str(toml).unwrap();
+        // A blank url is treated as absent, so this resolves to stdio.
+        match parsed.server[0].transport_def().expect("stdio") {
+            TransportDef::Stdio { command, .. } => assert_eq!(command, "server-bin"),
+            TransportDef::Http { .. } => panic!("expected stdio"),
+        }
+    }
+
+    #[test]
+    fn endpoint_renders_url_or_command_line() {
+        let http = TransportDef::Http {
+            url: "https://example.com/mcp".into(),
+            headers: vec![],
+        };
+        assert_eq!(http.endpoint(), "https://example.com/mcp");
+
+        let stdio = TransportDef::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "server-fs".into()],
+            env: vec![],
+        };
+        assert_eq!(stdio.endpoint(), "npx -y server-fs");
+    }
+
+    #[test]
     fn upsert_replaces_same_name() {
         let mut defs = vec![ServerDef {
             name: "a".into(),
-            url: "u1".into(),
-            headers: vec![],
+            transport: TransportDef::Http {
+                url: "u1".into(),
+                headers: vec![],
+            },
         }];
         upsert(
             &mut defs,
             ServerDef {
                 name: "a".into(),
-                url: "u2".into(),
-                headers: vec![],
+                transport: TransportDef::Http {
+                    url: "u2".into(),
+                    headers: vec![],
+                },
             },
         );
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].url, "u2");
+        assert_eq!(defs[0].transport.endpoint(), "u2");
     }
 
     #[test]

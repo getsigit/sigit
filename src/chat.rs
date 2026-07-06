@@ -118,6 +118,198 @@ pub(crate) fn parse_rich_text_segments(text: &str) -> Vec<(String, bool)> {
     segments
 }
 
+// ── Tool-call display helpers ─────────────────────────────────────────────────
+//
+// Pure helpers for the TUI's collapsible tool-call entries. Top-level (not in
+// `mod tui`) so they are testable on every target; only the Unix TUI consumes
+// them, hence the non-Unix dead-code allowance.
+
+/// Max characters for the summary half of a tool-call title line.
+#[cfg_attr(not(unix), allow(dead_code))]
+const TOOL_TITLE_SUMMARY_MAX: usize = 60;
+
+/// Max characters of tool output kept for the expanded-entry result preview.
+#[cfg_attr(not(unix), allow(dead_code))]
+const TOOL_RESULT_PREVIEW_MAX: usize = 2000;
+
+/// Truncate to `max_chars` characters, ending with an ellipsis when cut.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// One-line title for a tool call, Claude Code style: the tool name plus the
+/// argument that best identifies the call (`run_command · cargo test`,
+/// `edit_file · src/main.rs`, `sigit · list_issues` for MCP tools). Falls back
+/// to the bare tool name when the arguments are malformed or carry nothing
+/// summarizable.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn tool_title(name: &str, arguments_json: &str) -> String {
+    let args: Option<serde_json::Value> = serde_json::from_str(arguments_json).ok();
+    let str_arg =
+        |key: &str| -> Option<String> { Some(args.as_ref()?.get(key)?.as_str()?.to_string()) };
+
+    let (label, summary) = if let Some(rest) = name.strip_prefix("mcp__") {
+        // mcp__<server>__<tool> → "<server> · <tool>"
+        match rest.split_once("__") {
+            Some((server, tool)) => (server.to_string(), Some(tool.to_string())),
+            None => (rest.to_string(), None),
+        }
+    } else {
+        let summary = match name {
+            "run_command" => str_arg("command"),
+            "read_file" | "create_file" | "edit_file" | "multi_edit" | "delete_file" => {
+                str_arg("path")
+            }
+            "search_files" | "glob" => str_arg("pattern"),
+            _ => None,
+        };
+        (name.to_string(), summary)
+    };
+
+    // A title is a single line: collapse any internal whitespace runs
+    // (multi-line commands) before truncating.
+    let summary = summary
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_with_ellipsis(&s, TOOL_TITLE_SUMMARY_MAX));
+
+    match summary {
+        Some(summary) => format!("{label} · {summary}"),
+        None => label,
+    }
+}
+
+/// Pretty-print a tool call's JSON arguments for the expanded view; malformed
+/// JSON is shown raw.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn pretty_tool_arguments(arguments_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments_json)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| arguments_json.to_string())
+}
+
+/// The tail of a tool's output for display under an expanded tool entry,
+/// capped at [`TOOL_RESULT_PREVIEW_MAX`] chars with a truncation note. Display
+/// only — the model always receives the full output.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn cap_output_preview(output: &str) -> String {
+    let total = output.chars().count();
+    if total <= TOOL_RESULT_PREVIEW_MAX {
+        return output.to_string();
+    }
+    let tail: String = output
+        .chars()
+        .skip(total - TOOL_RESULT_PREVIEW_MAX)
+        .collect();
+    format!("… (truncated — showing the last {TOOL_RESULT_PREVIEW_MAX} of {total} chars)\n{tail}")
+}
+
+/// The display lines of one tool-call entry. Collapsed: a single `▸ 🔧 title`
+/// line. Expanded: `▾ 🔧 title`, the indented argument detail, and the result
+/// preview under a `result:` label when present.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn tool_entry_lines(
+    title: &str,
+    detail: &str,
+    result_preview: Option<&str>,
+    expanded: bool,
+) -> Vec<String> {
+    if !expanded {
+        return vec![format!("▸ 🔧 {title}")];
+    }
+    let mut out = vec![format!("▾ 🔧 {title}")];
+    if !detail.is_empty() {
+        for line in detail.split('\n') {
+            out.push(format!("    {line}"));
+        }
+    }
+    if let Some(result) = result_preview {
+        out.push("    result:".to_string());
+        for line in result.split('\n') {
+            out.push(format!("      {line}"));
+        }
+    }
+    out
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+//
+// The top-level tab bar (GitHub Copilot CLI-style). Defined outside `mod tui`
+// so the pure cycling/formatting logic is testable on every target; only the
+// Unix-only TUI consumes it at runtime, hence the non-Unix dead-code gates
+// (same pattern as `permissions::TUI_SESSION`).
+
+/// The three top-level TUI tabs, cycled with the Tab key.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tab {
+    /// The chat itself (default).
+    Session,
+    /// Saved sessions from the session store.
+    History,
+    /// siGit Code Cloud status and settings.
+    Cloud,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl Tab {
+    pub(crate) const TITLES: [&'static str; 3] = ["Session", "History", "Cloud"];
+
+    /// Session → History → Cloud → Session.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Tab::Session => Tab::History,
+            Tab::History => Tab::Cloud,
+            Tab::Cloud => Tab::Session,
+        }
+    }
+
+    /// Position in [`Tab::TITLES`], for the ratatui `Tabs` widget.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Tab::Session => 0,
+            Tab::History => 1,
+            Tab::Cloud => 2,
+        }
+    }
+}
+
+/// Coarse "how long ago" label for the History tab (no date dependency).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn format_age(age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// One History-tab row: id, age, message count. `age` is `None` when the
+/// file's mtime could not be read (or lies in the future).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn history_row(
+    id: &str,
+    age: Option<std::time::Duration>,
+    message_count: usize,
+) -> String {
+    let when = age
+        .map(format_age)
+        .unwrap_or_else(|| "age unknown".to_string());
+    format!("{id}  ·  {when}  ·  {message_count} message(s)")
+}
+
 // ── Unix-only TUI ─────────────────────────────────────────────────────────────
 //
 // macOS + Linux only. Windows uses ACP mode instead.
@@ -133,16 +325,18 @@ mod tui {
     use futures::StreamExt;
     use onde::inference::{ChatEngine, SamplingConfig};
 
+    use super::Tab;
     use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
     use crate::models::{
         InferenceKind, ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items,
     };
+    use crate::session_store::SessionEntry;
     use ratatui::{
         Frame,
         layout::{Constraint, Layout, Position},
         style::{Color, Modifier, Style},
         text::{Line, Span},
-        widgets::{Block, Borders, Clear, Paragraph, Wrap},
+        widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
     };
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::{Duration, Instant, interval};
@@ -156,6 +350,8 @@ mod tui {
         System,
         /// rainbow-colored banner art
         Banner,
+        /// a collapsible tool-call entry (`text` holds the title line)
+        Tool,
     }
 
     struct ChatMessage {
@@ -163,6 +359,11 @@ mod tui {
         text: String,
         /// Qwen 3 reasoning extracted from `<think>` tags, if any.
         think_block: Option<String>,
+        /// pretty-printed tool arguments (Role::Tool only)
+        tool_detail: Option<String>,
+        /// tail of the tool output, filled in when the call finishes
+        /// (Role::Tool only)
+        tool_result: Option<String>,
     }
 
     impl ChatMessage {
@@ -171,6 +372,8 @@ mod tui {
                 role: Role::User,
                 text: text.into(),
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
             }
         }
 
@@ -181,6 +384,8 @@ mod tui {
                 role: Role::Assistant,
                 text: visible,
                 think_block: if think.is_empty() { None } else { Some(think) },
+                tool_detail: None,
+                tool_result: None,
             }
         }
 
@@ -189,6 +394,8 @@ mod tui {
                 role: Role::System,
                 text: text.into(),
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
             }
         }
 
@@ -197,6 +404,18 @@ mod tui {
                 role: Role::Banner,
                 text: text.into(),
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
+            }
+        }
+
+        fn tool_call(title: impl Into<String>, detail: impl Into<String>) -> Self {
+            Self {
+                role: Role::Tool,
+                text: title.into(),
+                think_block: None,
+                tool_detail: Some(detail.into()),
+                tool_result: None,
             }
         }
     }
@@ -204,8 +423,17 @@ mod tui {
     // ── Inference updates from background task ────────────────────────────────
 
     enum InferenceUpdate {
-        /// show tool name in chat while it runs
-        ToolUse(String),
+        /// a tool call started — show a collapsible entry in the transcript
+        ToolUse {
+            name: String,
+            /// raw JSON arguments, pretty-printed by the UI for the expanded view
+            arguments: String,
+        },
+        /// the most recent tool call finished; attach a display-only preview of
+        /// the tail of its output (the model always gets the full output)
+        ToolDone {
+            output_preview: String,
+        },
         /// a streamed token fragment of the assistant's reply
         Delta(String),
         /// the streamed reply is complete; commit the accumulated buffer
@@ -282,6 +510,8 @@ mod tui {
         /// `/thinking` — expand the model's reasoning on rendered messages.
         /// Display-only: never changes what is sent to the model or saved.
         show_thinking: bool,
+        /// `/tools` — expand every tool-call entry (default: collapsed titles)
+        tools_expanded: bool,
 
         // ── Model-switch download progress ────────────────────────────────────
         switching_model_id: Option<String>,
@@ -292,6 +522,24 @@ mod tui {
         /// The backend serving inference. Swapped in place when the user picks a
         /// different model or cloud tier via `/models`.
         backend: Arc<dyn InferenceBackend>,
+
+        // ── Tab bar state ─────────────────────────────────────────────────────
+        /// Which top-level tab is showing. Inference keeps running while the
+        /// user is on History/Cloud; updates land in `messages` regardless.
+        active_tab: Tab,
+
+        // History tab: saved sessions from the session store.
+        history_sessions: Vec<SessionEntry>,
+        history_index: usize,
+        /// Session id awaiting the confirming second `d`; any other key clears it.
+        history_pending_delete: Option<String>,
+        /// One-shot notice shown under the session list (e.g. a failed restore).
+        history_notice: Option<String>,
+
+        // Cloud tab: status text is fetched async when the tab opens and cached.
+        /// `None` while a fetch is in flight (renders as "fetching…").
+        cloud_lines: Option<Vec<String>>,
+        cloud_rx: Option<oneshot::Receiver<Vec<String>>>,
     }
 
     const BANNER_ART: &str = "\
@@ -373,8 +621,31 @@ mod tui {
                 current_model_name,
                 tool_calling,
                 show_thinking: false,
+                tools_expanded: false,
                 backend,
+                active_tab: Tab::Session,
+                history_sessions: Vec::new(),
+                history_index: 0,
+                history_pending_delete: None,
+                history_notice: None,
+                cloud_lines: None,
+                cloud_rx: None,
             }
+        }
+
+        /// Reload the History tab's session list, keeping the selection in
+        /// bounds and dropping any pending delete confirmation.
+        fn refresh_history(&mut self) {
+            self.history_sessions = crate::session_store::list();
+            self.history_index = self
+                .history_index
+                .min(self.history_sessions.len().saturating_sub(1));
+            self.history_pending_delete = None;
+        }
+
+        /// The History entry the cursor is on, if any.
+        fn selected_session(&self) -> Option<&SessionEntry> {
+            self.history_sessions.get(self.history_index)
         }
 
         fn is_busy(&self) -> bool {
@@ -812,6 +1083,267 @@ mod tui {
         .split(vertical[1])[1]
     }
 
+    // ── Tab bar (Session / History / Cloud) ───────────────────────────────────
+
+    /// Switch to `tab`, refreshing the data it shows. Entering History rescans
+    /// the sessions dir; entering Cloud kicks off the async status fetch.
+    fn switch_tab(app: &mut App, tab: Tab, engine: &Arc<ChatEngine>) {
+        app.active_tab = tab;
+        match tab {
+            Tab::Session => {}
+            Tab::History => {
+                app.refresh_history();
+                app.history_notice = None;
+            }
+            Tab::Cloud => refresh_cloud(app, engine),
+        }
+    }
+
+    /// Fetch the Cloud tab's status text on a background task and cache it.
+    /// Account status and engine info are async (the account check may hit the
+    /// network), so the tab shows "fetching…" until the oneshot resolves in
+    /// the event loop.
+    fn refresh_cloud(app: &mut App, engine: &Arc<ChatEngine>) {
+        let (tx, rx) = oneshot::channel();
+        app.cloud_rx = Some(rx);
+        app.cloud_lines = None;
+
+        let engine = Arc::clone(engine);
+        let is_remote = app.backend.is_remote();
+        let model_name = app.current_model_name.clone();
+        tokio::spawn(async move {
+            // `status_line` already folds failures into its message, so a dead
+            // network degrades to an error string rather than a stuck tab.
+            let account = crate::account::status_line().await;
+            let info = engine.info().await;
+
+            let mut lines = Vec::new();
+            lines.push(format!("Account:          {account}"));
+            lines.push(format!(
+                "Inference:        {}",
+                if is_remote {
+                    "remote (siGit Code Cloud / hosted endpoint)"
+                } else {
+                    "on-device"
+                }
+            ));
+            lines.push(format!("Model:            {model_name}"));
+            lines.push(format!(
+                "Engine:           status: {:?}  model: {}  memory: {}  history: {} turns",
+                info.status,
+                info.model_name.as_deref().unwrap_or("(none)"),
+                info.approx_memory.as_deref().unwrap_or("unknown"),
+                info.history_length,
+            ));
+            lines.push(format!(
+                "Local inference:  {}",
+                if crate::settings::local_inference_enabled() {
+                    "on"
+                } else {
+                    "off"
+                }
+            ));
+            let config_dir = std::env::var("SIGIT_CONFIG_DIR").unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                format!("{home}/.config/sigit")
+            });
+            lines.push(format!("Config dir:       {config_dir}"));
+            lines.push(String::new());
+            for perm_line in crate::permissions::describe(crate::permissions::TUI_SESSION).lines() {
+                lines.push(perm_line.to_string());
+            }
+
+            let _ = tx.send(lines);
+        });
+    }
+
+    /// Keys on the History and Cloud tabs (the Session tab keeps `handle_key`).
+    /// Tab/Esc navigation is handled earlier in the event loop; this gets the
+    /// rest.
+    async fn handle_tab_key(app: &mut App, key: KeyEvent, engine: &Arc<ChatEngine>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
+            app.quit = true;
+            return;
+        }
+
+        match app.active_tab {
+            Tab::Session => {}
+            Tab::History => match key.code {
+                KeyCode::Up => {
+                    app.history_pending_delete = None;
+                    app.history_index = app.history_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    app.history_pending_delete = None;
+                    if app.history_index + 1 < app.history_sessions.len() {
+                        app.history_index += 1;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    app.refresh_history();
+                    app.history_notice = None;
+                }
+                KeyCode::Char('d') => {
+                    let Some(id) = app.selected_session().map(|e| e.id.clone()) else {
+                        return;
+                    };
+                    if app.history_pending_delete.as_deref() == Some(id.as_str()) {
+                        crate::session_store::delete(&id);
+                        app.refresh_history();
+                        app.history_notice = Some(format!("Deleted session '{id}'."));
+                    } else {
+                        app.history_pending_delete = Some(id);
+                    }
+                }
+                KeyCode::Enter => {
+                    app.history_pending_delete = None;
+                    let Some(id) = app.selected_session().map(|e| e.id.clone()) else {
+                        return;
+                    };
+                    match crate::session_store::load(&id) {
+                        Some(history) if !history.is_empty() => {
+                            let restored = history.len();
+                            app.backend.restore_history(history).await;
+                            app.messages.push(ChatMessage::system(format!(
+                                "Restored {restored} message(s) from session '{id}'. \
+                                 The model remembers the conversation; the scrollback \
+                                 above does not replay it."
+                            )));
+                            app.active_tab = Tab::Session;
+                        }
+                        _ => {
+                            app.history_notice = Some(format!(
+                                "Could not restore '{id}': the session is empty or unreadable."
+                            ));
+                        }
+                    }
+                }
+                // Any other key cancels a pending delete confirmation.
+                _ => app.history_pending_delete = None,
+            },
+            Tab::Cloud => match key.code {
+                KeyCode::Char('l') => {
+                    let enabled = !crate::settings::local_inference_enabled();
+                    match crate::settings::set_local_inference(enabled) {
+                        Ok(()) => refresh_cloud(app, engine),
+                        Err(error) => {
+                            app.cloud_lines
+                                .get_or_insert_with(Vec::new)
+                                .push(format!("error: could not save the setting: {error}"));
+                        }
+                    }
+                }
+                KeyCode::Char('r') => refresh_cloud(app, engine),
+                _ => {}
+            },
+        }
+    }
+
+    fn render_tab_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let tabs = Tabs::new(Tab::TITLES.map(Line::from).to_vec())
+            .select(app.active_tab.index())
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(tabs, area);
+    }
+
+    fn render_history_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" saved sessions ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        if app.history_sessions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No saved sessions yet. Sessions are saved after each turn.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            let now = std::time::SystemTime::now();
+            for (index, entry) in app.history_sessions.iter().enumerate() {
+                let selected = index == app.history_index;
+                let marker = if selected { "› " } else { "  " };
+                let age = now.duration_since(entry.modified).ok();
+                let row = super::history_row(&entry.id, age, entry.message_count);
+                let style = if selected {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(format!("{marker}{row}"), style)));
+            }
+        }
+
+        if let Some(ref id) = app.history_pending_delete {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Delete '{id}'? Press d again to confirm — any other key cancels."),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if let Some(ref notice) = app.history_notice {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {notice}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+
+        // Keep the selection visible when the list outgrows the pane.
+        let inner_height = inner.height as usize;
+        let scroll = app
+            .history_index
+            .saturating_sub(inner_height.saturating_sub(1)) as u16;
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            inner,
+        );
+    }
+
+    fn render_cloud_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" siGit Code Cloud ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line> = Vec::new();
+        match app.cloud_lines {
+            None => lines.push(Line::from(Span::styled(
+                "  fetching status…",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Some(ref cloud_lines) => {
+                for text in cloud_lines {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {text}"),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Note: toggling Local Inference takes effect for the next model \
+             selection (/models); the running backend is not swapped.",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
     // ── Slash commands ────────────────────────────────────────────────────────
 
     enum SlashCommand {
@@ -840,6 +1372,9 @@ mod tui {
         /// Expand or collapse model reasoning on rendered messages.
         /// `Some(true/false)` sets it, `None` flips it.
         Thinking(Option<bool>),
+        /// Expand or collapse all tool-call entries in the transcript.
+        /// `Some(true/false)` sets it, `None` flips it. TUI-only.
+        Tools(Option<bool>),
         /// Summarize-and-shrink the conversation history on demand.
         Compact,
         /// Restore the saved TUI session from disk.
@@ -871,6 +1406,7 @@ mod tui {
             "/plan" => SlashCommand::Plan(parse_on_off(arg)),
             "/permissions" => SlashCommand::Permissions,
             "/thinking" => SlashCommand::Thinking(parse_on_off(arg)),
+            "/tools" => SlashCommand::Tools(parse_on_off(arg)),
             "/compact" => SlashCommand::Compact,
             "/resume" => SlashCommand::Resume,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
@@ -906,18 +1442,43 @@ mod tui {
             return;
         }
 
-        let zones = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        match app.active_tab {
+            Tab::Session => {
+                let zones = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(area);
 
-        render_title(frame, app, zones[0]);
-        render_messages(frame, app, zones[1]);
-        render_input(frame, app, zones[2]);
-        render_footer(frame, app, zones[3]);
+                render_tab_bar(frame, app, zones[0]);
+                render_title(frame, app, zones[1]);
+                render_messages(frame, app, zones[2]);
+                render_input(frame, app, zones[3]);
+                render_footer(frame, app, zones[4]);
+            }
+            // No input pane on the non-chat tabs: the Tab key always cycles.
+            Tab::History | Tab::Cloud => {
+                let zones = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+
+                render_tab_bar(frame, app, zones[0]);
+                render_title(frame, app, zones[1]);
+                if app.active_tab == Tab::History {
+                    render_history_tab(frame, app, zones[2]);
+                } else {
+                    render_cloud_tab(frame, app, zones[2]);
+                }
+                render_footer(frame, app, zones[3]);
+            }
+        }
 
         if app.show_model_picker {
             render_model_picker(frame, app, area);
@@ -1017,7 +1578,13 @@ mod tui {
         let mut lines: Vec<Line> = Vec::new();
 
         for msg in &app.messages {
-            render_chat_message(&mut lines, msg, inner_width as usize, app.show_thinking);
+            render_chat_message(
+                &mut lines,
+                msg,
+                inner_width as usize,
+                app.tools_expanded,
+                app.show_thinking,
+            );
         }
 
         let streamed_visible = app.visible_stream();
@@ -1026,8 +1593,16 @@ mod tui {
                 role: Role::Assistant,
                 text: streamed_visible,
                 think_block: None,
+                tool_detail: None,
+                tool_result: None,
             };
-            render_chat_message(&mut lines, &fake, inner_width as usize, app.show_thinking);
+            render_chat_message(
+                &mut lines,
+                &fake,
+                inner_width as usize,
+                app.tools_expanded,
+                app.show_thinking,
+            );
             if app.blink_on
                 && let Some(last) = lines.last_mut()
             {
@@ -1112,9 +1687,23 @@ mod tui {
         lines: &mut Vec<Line<'static>>,
         msg: &ChatMessage,
         _width: usize,
+        tools_expanded: bool,
         show_thinking: bool,
     ) {
         match msg.role {
+            Role::Tool => {
+                let dim = Style::default()
+                    .fg(Color::Rgb(132, 132, 145))
+                    .add_modifier(Modifier::DIM);
+                for entry_line in super::tool_entry_lines(
+                    &msg.text,
+                    msg.tool_detail.as_deref().unwrap_or(""),
+                    msg.tool_result.as_deref(),
+                    tools_expanded,
+                ) {
+                    lines.push(Line::from(Span::styled(format!("  {entry_line}"), dim)));
+                }
+            }
             Role::Banner => {
                 let palette = [
                     Color::Red,
@@ -1256,12 +1845,40 @@ mod tui {
     }
 
     fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let key_style = Style::default().fg(Color::Black).bg(Color::Green);
+        let label_style = Style::default().fg(Color::DarkGray);
+
+        if app.active_tab != Tab::Session {
+            let hints: &[(&str, &str)] = match app.active_tab {
+                Tab::History => &[
+                    (" ↑/↓ ", " select  "),
+                    (" Enter ", " resume  "),
+                    (" d ", " delete  "),
+                    (" r ", " refresh  "),
+                    (" Tab ", " next tab  "),
+                    (" Esc ", " session"),
+                ],
+                _ => &[
+                    (" l ", " toggle local inference  "),
+                    (" r ", " refresh  "),
+                    (" Tab ", " next tab  "),
+                    (" Esc ", " session"),
+                ],
+            };
+            let mut spans = Vec::new();
+            for (key, label) in hints {
+                spans.push(Span::styled(key.to_string(), key_style));
+                spans.push(Span::styled(label.to_string(), label_style));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
+
         let mut spans = vec![
-            Span::styled(
-                " Enter ",
-                Style::default().fg(Color::Black).bg(Color::Green),
-            ),
-            Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", key_style),
+            Span::styled(" send  ", label_style),
+            Span::styled(" Tab ", key_style),
+            Span::styled(" tabs  ", label_style),
             Span::styled(
                 " /help ",
                 Style::default().fg(Color::Black).bg(Color::DarkGray),
@@ -1507,6 +2124,7 @@ mod tui {
                      /plan [on|off] — plan mode: research only, no edits or commands\n\
                      /permissions   — show the tool permission policy\n\
                      /thinking [on|off] — expand or collapse model reasoning\n\
+                     /tools [on|off]— expand or collapse tool-call details\n\
                      /compact       — summarize and shrink conversation history\n\
                      /resume        — restore the saved session from disk\n\
                      /clear         — wipe conversation history\n\
@@ -1591,6 +2209,15 @@ mod tui {
                     "Thinking display OFF — replies show a one-line indicator; \
                      /thinking to expand."
                 }));
+            }
+            SlashCommand::Tools(value) => {
+                app.tools_expanded = value.unwrap_or(!app.tools_expanded);
+                app.messages
+                    .push(ChatMessage::system(if app.tools_expanded {
+                        "Tool calls expanded — /tools off to collapse them."
+                    } else {
+                        "Tool calls collapsed — /tools on to expand them."
+                    }));
             }
             SlashCommand::Status => {
                 let info = engine.as_ref().info().await;
@@ -1890,13 +2517,18 @@ mod tui {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                let _ = tx.send(InferenceUpdate::ToolUse(tc.name.clone())).await;
+                let _ = tx
+                    .send(InferenceUpdate::ToolUse {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    })
+                    .await;
 
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may pause on the user's
                 // y/a/n answer (delivered over a oneshot from the event loop).
                 use crate::permissions::{self, Decision, TUI_SESSION};
-                let output = match permissions::decision_for(TUI_SESSION, &tc.name) {
+                let output = match permissions::decision_for(TUI_SESSION, &tc.name, &tc.arguments) {
                     Decision::Allow => crate::tools::execute_tool(&tc.name, &tc.arguments).await,
                     Decision::Deny(reason) => {
                         log::info!("  ✗ {} denied by policy", tc.name);
@@ -1916,7 +2548,11 @@ mod tui {
                                 crate::tools::execute_tool(&tc.name, &tc.arguments).await
                             }
                             Ok(ApprovalChoice::Session) => {
-                                permissions::grant_for_session(TUI_SESSION, &tc.name);
+                                permissions::grant_for_session(
+                                    TUI_SESSION,
+                                    &tc.name,
+                                    &tc.arguments,
+                                );
                                 crate::tools::execute_tool(&tc.name, &tc.arguments).await
                             }
                             Ok(ApprovalChoice::Deny) => {
@@ -1943,6 +2579,14 @@ mod tui {
                     }
                 };
                 log::info!("  ← {} chars", output.len());
+
+                // Display-only preview of the output tail; the model gets the
+                // full output through `tool_results` below.
+                let _ = tx
+                    .send(InferenceUpdate::ToolDone {
+                        output_preview: super::cap_output_preview(&output),
+                    })
+                    .await;
 
                 tool_results.push(ToolResult {
                     tool_call_id: tc.id.clone(),
@@ -2158,8 +2802,22 @@ mod tui {
                     }
                 } => {
                     match update {
-                        Some(InferenceUpdate::ToolUse(name)) => {
-                            app.messages.push(ChatMessage::system(format!("🔧 {name}")));
+                        Some(InferenceUpdate::ToolUse { name, arguments }) => {
+                            let title = super::tool_title(&name, &arguments);
+                            let detail = super::pretty_tool_arguments(&arguments);
+                            app.messages.push(ChatMessage::tool_call(title, detail));
+                        }
+                        Some(InferenceUpdate::ToolDone { output_preview }) => {
+                            // Attach to the most recent tool entry still
+                            // waiting for its result.
+                            if let Some(entry) = app
+                                .messages
+                                .iter_mut()
+                                .rev()
+                                .find(|m| m.role == Role::Tool && m.tool_result.is_none())
+                            {
+                                entry.tool_result = Some(output_preview);
+                            }
                         }
                         Some(InferenceUpdate::Delta(delta)) => {
                             app.push_stream_delta(&delta);
@@ -2177,6 +2835,9 @@ mod tui {
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
                         Some(InferenceUpdate::ApprovalRequest { tool, args, reply }) => {
+                            // The y/a/n prompt lives on the Session tab; make
+                            // sure the user can see what they're answering.
+                            app.active_tab = Tab::Session;
                             let call = if args.is_empty() {
                                 tool.clone()
                             } else {
@@ -2193,6 +2854,19 @@ mod tui {
                             app.stop_thinking();
                         }
                     }
+                }
+
+                // ── Cloud tab status fetch resolving ─────────────────────────
+                status = async {
+                    match app.cloud_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => pending().await,
+                    }
+                } => {
+                    app.cloud_rx = None;
+                    app.cloud_lines = Some(status.unwrap_or_else(|_| {
+                        vec!["error: the status fetch task died — press r to retry".to_string()]
+                    }));
                 }
 
                 // ── thinking / switching spinner tick (100ms) ────────────────
@@ -2278,6 +2952,28 @@ mod tui {
                             continue;
                         }
 
+                        // ── Tab-bar navigation ────────────────────────────────
+                        // Handled before the busy gate so the user can look at
+                        // History/Cloud while inference runs (updates keep
+                        // landing in the Session tab's message list). The Tab
+                        // key only cycles when the input buffer is empty, so
+                        // pasted text containing tabs can't fight it; on
+                        // non-Session tabs the input is hidden, so it always
+                        // cycles there.
+                        if key.kind == KeyEventKind::Press && !app.show_model_picker {
+                            if key.code == KeyCode::Tab
+                                && (app.active_tab != Tab::Session || app.input.is_empty())
+                            {
+                                let next = app.active_tab.next();
+                                switch_tab(&mut app, next, &engine);
+                                continue;
+                            }
+                            if app.active_tab != Tab::Session && key.code == KeyCode::Esc {
+                                app.active_tab = Tab::Session;
+                                continue;
+                            }
+                        }
+
                         // busy — only cancel keys work
                         if app.is_busy() {
                             if key.kind == KeyEventKind::Press {
@@ -2303,6 +2999,15 @@ mod tui {
                                             .push(ChatMessage::system("(download cancelled — model switch aborted)"));
                                     }
                                 }
+                            }
+                            continue;
+                        }
+
+                        // History / Cloud tabs have their own key handling; the
+                        // chat input is inactive there.
+                        if app.active_tab != Tab::Session {
+                            if key.kind == KeyEventKind::Press {
+                                handle_tab_key(&mut app, key, &engine).await;
                             }
                             continue;
                         }
@@ -2393,9 +3098,216 @@ pub use tui::run_with;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        parse_rich_text_segments, streaming_think_tail, strip_think_blocks, think_indicator,
+        TOOL_RESULT_PREVIEW_MAX, Tab, cap_output_preview, format_age, history_row,
+        parse_rich_text_segments, pretty_tool_arguments, streaming_think_tail, strip_think_blocks,
+        think_indicator, tool_entry_lines, tool_title,
     };
+
+    // ── tool_title ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_title_run_command_shows_the_command() {
+        assert_eq!(
+            tool_title("run_command", r#"{"command":"cargo test"}"#),
+            "run_command · cargo test"
+        );
+    }
+
+    #[test]
+    fn tool_title_file_tools_show_the_path() {
+        for name in [
+            "read_file",
+            "create_file",
+            "edit_file",
+            "multi_edit",
+            "delete_file",
+        ] {
+            assert_eq!(
+                tool_title(name, r#"{"path":"src/main.rs","old_text":"a"}"#),
+                format!("{name} · src/main.rs")
+            );
+        }
+    }
+
+    #[test]
+    fn tool_title_pattern_tools_show_the_pattern() {
+        assert_eq!(
+            tool_title("search_files", r#"{"pattern":"fn main","path":"src"}"#),
+            "search_files · fn main"
+        );
+        assert_eq!(
+            tool_title("glob", r#"{"pattern":"**/*.rs"}"#),
+            "glob · **/*.rs"
+        );
+    }
+
+    #[test]
+    fn tool_title_mcp_tools_show_server_and_bare_tool_name() {
+        assert_eq!(
+            tool_title("mcp__sigit__list_issues", r#"{"repo":"getsigit/sigit"}"#),
+            "sigit · list_issues"
+        );
+    }
+
+    #[test]
+    fn tool_title_unknown_tool_is_the_name_alone() {
+        assert_eq!(
+            tool_title("write_todos", r#"{"todos":[{"text":"x"}]}"#),
+            "write_todos"
+        );
+    }
+
+    #[test]
+    fn tool_title_malformed_json_falls_back_to_the_name() {
+        assert_eq!(tool_title("run_command", "{not json"), "run_command");
+        assert_eq!(tool_title("edit_file", ""), "edit_file");
+    }
+
+    #[test]
+    fn tool_title_missing_or_non_string_arg_falls_back_to_the_name() {
+        assert_eq!(tool_title("run_command", r#"{"other":"x"}"#), "run_command");
+        assert_eq!(
+            tool_title("run_command", r#"{"command":42}"#),
+            "run_command"
+        );
+    }
+
+    #[test]
+    fn tool_title_truncates_long_summaries_with_an_ellipsis() {
+        let long = "a".repeat(100);
+        let title = tool_title("run_command", &format!(r#"{{"command":"{long}"}}"#));
+
+        let summary = title.strip_prefix("run_command · ").expect("summary");
+        assert_eq!(summary.chars().count(), 60);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_title_collapses_multiline_commands_to_one_line() {
+        assert_eq!(
+            tool_title("run_command", "{\"command\":\"echo a &&\\n  echo b\"}"),
+            "run_command · echo a && echo b"
+        );
+    }
+
+    // ── cap_output_preview ────────────────────────────────────────────────────
+
+    #[test]
+    fn cap_output_preview_passes_short_output_through() {
+        assert_eq!(cap_output_preview("hello\nworld"), "hello\nworld");
+    }
+
+    #[test]
+    fn cap_output_preview_keeps_the_tail_and_notes_the_truncation() {
+        let output = format!("{}{}", "x".repeat(3000), "the-very-end");
+        let preview = cap_output_preview(&output);
+
+        assert!(preview.starts_with("… (truncated — showing the last 2000 of 3012 chars)\n"));
+        assert!(preview.ends_with("the-very-end"));
+        let (_note, tail) = preview.split_once('\n').expect("note line");
+        assert_eq!(tail.chars().count(), TOOL_RESULT_PREVIEW_MAX);
+    }
+
+    // ── pretty_tool_arguments ─────────────────────────────────────────────────
+
+    #[test]
+    fn pretty_tool_arguments_pretty_prints_valid_json() {
+        assert_eq!(
+            pretty_tool_arguments(r#"{"command":"ls"}"#),
+            "{\n  \"command\": \"ls\"\n}"
+        );
+    }
+
+    #[test]
+    fn pretty_tool_arguments_shows_malformed_json_raw() {
+        assert_eq!(pretty_tool_arguments("{oops"), "{oops");
+    }
+
+    // ── tool_entry_lines ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_entry_lines_collapsed_is_a_single_title_line() {
+        let lines = tool_entry_lines(
+            "run_command · cargo test",
+            "{\n  \"command\": \"cargo test\"\n}",
+            Some("ok"),
+            false,
+        );
+        assert_eq!(lines, vec!["▸ 🔧 run_command · cargo test"]);
+    }
+
+    #[test]
+    fn tool_entry_lines_expanded_shows_detail_and_result() {
+        let lines = tool_entry_lines(
+            "run_command · cargo test",
+            "{\n  \"command\": \"cargo test\"\n}",
+            Some("test ok\ndone"),
+            true,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "▾ 🔧 run_command · cargo test",
+                "    {",
+                "      \"command\": \"cargo test\"",
+                "    }",
+                "    result:",
+                "      test ok",
+                "      done",
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_entry_lines_expanded_without_result_omits_the_result_block() {
+        let lines = tool_entry_lines("glob · **/*.rs", "{}", None, true);
+        assert_eq!(lines, vec!["▾ 🔧 glob · **/*.rs", "    {}"]);
+    }
+
+    // ── Tab / format_age / history_row ────────────────────────────────────────
+
+    #[test]
+    fn tab_next_cycles_session_history_cloud() {
+        assert_eq!(Tab::Session.next(), Tab::History);
+        assert_eq!(Tab::History.next(), Tab::Cloud);
+        assert_eq!(Tab::Cloud.next(), Tab::Session);
+        // Three hops return to the start, matching the tab bar's order.
+        assert_eq!(Tab::Session.next().next().next(), Tab::Session);
+    }
+
+    #[test]
+    fn tab_index_matches_titles_order() {
+        assert_eq!(Tab::TITLES[Tab::Session.index()], "Session");
+        assert_eq!(Tab::TITLES[Tab::History.index()], "History");
+        assert_eq!(Tab::TITLES[Tab::Cloud.index()], "Cloud");
+    }
+
+    #[test]
+    fn format_age_picks_the_coarsest_sensible_unit() {
+        assert_eq!(format_age(Duration::from_secs(0)), "0s ago");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s ago");
+        assert_eq!(format_age(Duration::from_secs(60)), "1m ago");
+        assert_eq!(format_age(Duration::from_secs(3_599)), "59m ago");
+        assert_eq!(format_age(Duration::from_secs(3_600)), "1h ago");
+        assert_eq!(format_age(Duration::from_secs(86_399)), "23h ago");
+        assert_eq!(format_age(Duration::from_secs(86_400)), "1d ago");
+        assert_eq!(format_age(Duration::from_secs(3 * 86_400)), "3d ago");
+    }
+
+    #[test]
+    fn history_row_formats_id_age_and_count() {
+        assert_eq!(
+            history_row("tui", Some(Duration::from_secs(120)), 7),
+            "tui  ·  2m ago  ·  7 message(s)"
+        );
+        assert_eq!(
+            history_row("sess-1", None, 0),
+            "sess-1  ·  age unknown  ·  0 message(s)"
+        );
+    }
 
     #[test]
     fn strip_think_blocks_separates_thinking_and_visible_reply() {

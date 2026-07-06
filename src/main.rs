@@ -32,6 +32,7 @@ mod account;
 mod backend;
 mod chat;
 mod credentials;
+mod headless;
 mod instructions;
 mod mcp;
 mod models;
@@ -1372,7 +1373,11 @@ impl SiGitAgent {
 
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may ask the client.
-                let output = match permissions::decision_for(&session_id.to_string(), &tc.name) {
+                let output = match permissions::decision_for(
+                    &session_id.to_string(),
+                    &tc.name,
+                    &tc.arguments,
+                ) {
                     permissions::Decision::Allow => {
                         tools::execute_tool(&tc.name, &tc.arguments).await
                     }
@@ -1541,7 +1546,11 @@ impl SiGitAgent {
                     match selected.option_id.0.as_ref() {
                         "allow_once" => PermissionVerdict::Approved,
                         "allow_session" => {
-                            permissions::grant_for_session(&session_id.to_string(), tool_name);
+                            permissions::grant_for_session(
+                                &session_id.to_string(),
+                                tool_name,
+                                arguments,
+                            );
                             PermissionVerdict::Approved
                         }
                         _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
@@ -3131,6 +3140,41 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             _ => {}
+        }
+    }
+
+    // Headless programmatic mode: `sigit -p "<prompt>"` runs one prompt and
+    // exits. Plain stdio and cross-platform (unlike the Unix-only TUI), so it
+    // is dispatched here, before the TTY/ACP split, like the account
+    // subcommands above.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    match headless::parse_args(&cli_args) {
+        Ok(None) => {}
+        Ok(Some(config)) => {
+            // Logs to stderr; stdout stays clean for the assistant's answer.
+            init_logging(false);
+            // Enter --cwd before anything loads, so instruction files and
+            // project-local MCP config resolve from it (the headless
+            // counterpart of the ACP session cwd handling).
+            if let Some(dir) = &config.cwd
+                && let Err(error) = std::env::set_current_dir(dir)
+            {
+                eprintln!("sigit: cannot use --cwd {}: {error}", dir.display());
+                std::process::exit(2);
+            }
+            setup::setup_shared_model_cache();
+            // Best-effort MCP discovery (incl. the official server), like the
+            // other entry points, so MCP tools are offered to the model.
+            mcp::init().await;
+            log::info!(
+                "siGit v{} starting (headless mode)",
+                env!("CARGO_PKG_VERSION")
+            );
+            std::process::exit(headless::run(config).await);
+        }
+        Err(error) => {
+            eprintln!("sigit: {error}\n{}", headless::USAGE);
+            std::process::exit(2);
         }
     }
 
