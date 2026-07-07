@@ -1346,9 +1346,10 @@ fn exec_multi_edit(arguments: &str) -> String {
 /// Translate a shell-style glob into an anchored regex. Supports `*`
 /// (non-separator run), `**` (any number of directories), `?` (one
 /// non-separator), and `{a,b}` alternation; everything else is matched
-/// literally. Used both by the `glob` tool (against relative paths) and by
-/// `search_files`' `file_glob` filter (against bare file names).
-fn glob_to_regex(glob: &str) -> String {
+/// literally. Used by the `glob` tool (against relative paths), by
+/// `search_files`' `file_glob` filter (against bare file names), and by
+/// `crate::permissions` rule patterns (which re-anchor the result).
+pub(crate) fn glob_to_regex(glob: &str) -> String {
     let chars: Vec<char> = glob.chars().collect();
     let mut re = String::from("^");
     let mut brace_depth = 0usize;

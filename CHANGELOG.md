@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.0
+
+Adds a headless one-shot mode, fine-grained permission rules, stdio transport
+for MCP servers, an `/init` command, and a set of TUI upgrades: tabs, a live
+thinking display, and collapsible tool calls.
+
+### What changed
+
+- New headless mode: `sigit -p "prompt"` runs one agent turn with tools and exits — 0 on a completed turn, 1 on inference errors, 2 on bad invocations. Assistant text streams to stdout while logs and tool progress stay on stderr; `--cwd` sets the working directory and `--quiet` prints only the final message. Nobody can answer a permission prompt in a headless run, so `ask` collapses to a denial: grant tools for the run with `--allow-tool`, block them with `--deny-tool`, or use `SIGIT_PERMISSIONS=allow`
+- Permission rules make autonomy granular: `[permissions.rules]` in `settings.toml` holds ordered `allow` and `deny` lists of `tool_name(pattern)` entries, e.g. `run_command(git *)` or `edit_file(src/*)`. Patterns match the command string for `run_command` and the path for file tools; deny always beats allow, and unparseable patterns fail closed, so a bad rule can only narrow access. Always-allow on a `run_command` prompt now grants that command family (its first two tokens), not the whole shell
+- The MCP client speaks stdio: `mcp.toml` server entries can give a `command`, `args`, and an `env` map instead of a `url`, so the stdio-first majority of published MCP servers plugs in. Same handshake, timeouts, tool namespacing, and output caps as HTTP; `/mcp` shows the command line for stdio servers
+- New `/init` command (TUI and ACP): runs a normal agent turn that explores the repository and writes an `AGENTS.md` — or improves an existing `AGENTS.md`/`CLAUDE.md` in place — going through the ordinary tools and permission checks
+- The TUI gains tabs, cycled with the Tab key: Session is the chat, History lists saved sessions (restore with Enter, delete with a confirmed double-`d`, refresh with `r`), and Cloud shows the signed-in account, inference mode, current model and engine state, permission policy, and config dir, with a live Local Inference toggle
+- The TUI shows model thinking: while a reply streams, the last three lines of the reasoning appear live under the spinner, dim and italic; finished replies collapse to a one-line indicator with the line count, and `/thinking` expands the full reasoning block above each reply. Display only — nothing changes in what is sent to the model, saved to sessions, or streamed over ACP
+- Tool calls in the TUI transcript collapse to single dim title lines (the command for `run_command`, the path for file tools, the pattern for search and glob); `/tools` expands every entry to show the pretty-printed arguments and a capped tail of the result. Permission prompts keep showing the full command, and the model still receives full outputs
+- When `AGENTS.md` and `CLAUDE.md` sit in the same directory, the instructions loader now prefers `AGENTS.md`, so shared content is injected once
+
 ## 1.3.2
 
 Adds a tool permission system with plan mode, durable sessions with context

@@ -24,6 +24,33 @@ use std::path::{Path, PathBuf};
 /// Only the first match in a given directory is loaded.
 const INSTRUCTION_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
+/// The prompt behind the `/init` slash command. Both the TUI and the ACP
+/// server substitute it for the user's input and run a normal agent turn, so
+/// generation goes through the ordinary tools and permission checks. It lives
+/// here, next to the loader that consumes the file it produces.
+pub const INIT_PROMPT: &str = "\
+Analyze this repository and write an AGENTS.md instruction file for AI coding \
+agents working in it.
+
+First explore, then write. Read the manifest/build files (Cargo.toml, \
+package.json, pyproject.toml, Makefile, or equivalents), the CI configuration, \
+the README, and the top one or two levels of the directory tree. Read broadly \
+but shallowly; do not descend into every subdirectory.
+
+Then create AGENTS.md at the repository root covering, briefly:
+- what the project is and does (a sentence or two)
+- how to build, test, and lint it (the exact commands)
+- the architecture: main modules/directories and what each owns
+- conventions an agent must follow (branch naming, commit rules, code style, \
+platform constraints) that the repository itself shows evidence of
+
+Keep it compact — aim for under 60 lines. State only what this repository \
+actually supports; no generic boilerplate.
+
+If AGENTS.md or CLAUDE.md already exists, read it first and improve it in \
+place (fix what is stale, add what is missing) instead of replacing it. \
+Always target AGENTS.md, never CLAUDE.md.";
+
 /// Per-file and total caps so an oversized file can't blow up the context window.
 const MAX_FILE_BYTES: usize = 32 * 1024;
 const MAX_TOTAL_BYTES: usize = 64 * 1024;
@@ -191,6 +218,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("sigit-instr-test-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn init_prompt_targets_agents_md_and_preserves_existing_files() {
+        assert!(INIT_PROMPT.contains("AGENTS.md"));
+        assert!(INIT_PROMPT.contains("improve it in place"));
+        assert!(INIT_PROMPT.contains("never CLAUDE.md"));
     }
 
     #[test]

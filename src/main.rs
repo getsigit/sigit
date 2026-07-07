@@ -32,6 +32,7 @@ mod account;
 mod backend;
 mod chat;
 mod credentials;
+mod headless;
 mod instructions;
 mod mcp;
 mod models;
@@ -797,6 +798,7 @@ impl SiGitAgent {
             ),
             AvailableCommand::new("permissions", "Show the tool permission policy"),
             AvailableCommand::new("compact", "Summarize and shrink the conversation history"),
+            AvailableCommand::new("init", "Generate or improve the repo's AGENTS.md"),
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
@@ -1267,9 +1269,15 @@ impl SiGitAgent {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
-        if let Some(command) = parse_slash(&user_text) {
-            return exec_slash_acp(self, cx, session_id, command).await;
-        }
+        let user_text = match parse_slash(&user_text) {
+            // `/init` is not a status command: it substitutes the canned
+            // AGENTS.md-generation prompt and runs a normal agent turn, so the
+            // exploration and file write go through the ordinary tools and
+            // permission checks.
+            Some(SlashCommand::Init) => instructions::INIT_PROMPT.to_string(),
+            Some(command) => return exec_slash_acp(self, cx, session_id, command).await,
+            None => user_text,
+        };
 
         log::info!(
             "prompt({}): \"{}\"",
@@ -1372,7 +1380,11 @@ impl SiGitAgent {
 
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may ask the client.
-                let output = match permissions::decision_for(&session_id.to_string(), &tc.name) {
+                let output = match permissions::decision_for(
+                    &session_id.to_string(),
+                    &tc.name,
+                    &tc.arguments,
+                ) {
                     permissions::Decision::Allow => {
                         tools::execute_tool(&tc.name, &tc.arguments).await
                     }
@@ -1541,7 +1553,11 @@ impl SiGitAgent {
                     match selected.option_id.0.as_ref() {
                         "allow_once" => PermissionVerdict::Approved,
                         "allow_session" => {
-                            permissions::grant_for_session(&session_id.to_string(), tool_name);
+                            permissions::grant_for_session(
+                                &session_id.to_string(),
+                                tool_name,
+                                arguments,
+                            );
                             PermissionVerdict::Approved
                         }
                         _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
@@ -2225,6 +2241,9 @@ enum SlashCommand {
     Permissions,
     /// Summarize-and-shrink the conversation history on demand.
     Compact,
+    /// Generate (or improve) the repo's AGENTS.md by running an agent turn
+    /// with [`instructions::INIT_PROMPT`] as the user text.
+    Init,
     Exit,
     Unknown(String),
 }
@@ -2253,6 +2272,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/plan" => SlashCommand::Plan(parse_on_off(argument)),
         "/permissions" => SlashCommand::Permissions,
         "/compact" => SlashCommand::Compact,
+        "/init" => SlashCommand::Init,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -2364,6 +2384,7 @@ async fn exec_slash_acp(
                      /plan [on|off] - plan mode: research only, no edits or commands\n\
                      /permissions   - show the tool permission policy\n\
                      /compact       - summarize and shrink conversation history\n\
+                     /init          - generate or improve the repo's AGENTS.md\n\
                      /clear         - wipe conversation history\n\
                      /status        - show engine status\n\
                      /exit          - end this turn",
@@ -2631,6 +2652,13 @@ async fn exec_slash_acp(
                     session_id,
                     "Use the panel controls to close or switch threads.",
                 )
+                .ok();
+        }
+        SlashCommand::Init => {
+            // Handled in the prompt path (it runs a real turn); reaching this
+            // arm means a caller forgot that special case.
+            agent
+                .send_assistant_message(cx, session_id, "Send /init as a prompt to run it.")
                 .ok();
         }
         SlashCommand::Unknown(command) => {
@@ -3134,6 +3162,41 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Headless programmatic mode: `sigit -p "<prompt>"` runs one prompt and
+    // exits. Plain stdio and cross-platform (unlike the Unix-only TUI), so it
+    // is dispatched here, before the TTY/ACP split, like the account
+    // subcommands above.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    match headless::parse_args(&cli_args) {
+        Ok(None) => {}
+        Ok(Some(config)) => {
+            // Logs to stderr; stdout stays clean for the assistant's answer.
+            init_logging(false);
+            // Enter --cwd before anything loads, so instruction files and
+            // project-local MCP config resolve from it (the headless
+            // counterpart of the ACP session cwd handling).
+            if let Some(dir) = &config.cwd
+                && let Err(error) = std::env::set_current_dir(dir)
+            {
+                eprintln!("sigit: cannot use --cwd {}: {error}", dir.display());
+                std::process::exit(2);
+            }
+            setup::setup_shared_model_cache();
+            // Best-effort MCP discovery (incl. the official server), like the
+            // other entry points, so MCP tools are offered to the model.
+            mcp::init().await;
+            log::info!(
+                "siGit v{} starting (headless mode)",
+                env!("CARGO_PKG_VERSION")
+            );
+            std::process::exit(headless::run(config).await);
+        }
+        Err(error) => {
+            eprintln!("sigit: {error}\n{}", headless::USAGE);
+            std::process::exit(2);
+        }
+    }
+
     let is_tty = std::io::stdin().is_terminal();
 
     if is_tty {
@@ -3177,6 +3240,13 @@ mod tests {
             SYSTEM_PROMPT.contains(tools::COMMIT_CO_AUTHOR_TRAILER),
             "SYSTEM_PROMPT must quote tools::COMMIT_CO_AUTHOR_TRAILER verbatim"
         );
+    }
+
+    #[test]
+    fn parse_slash_maps_init() {
+        assert!(matches!(parse_slash("/init"), Some(SlashCommand::Init)));
+        // Trailing whitespace comes from editors that submit the raw line.
+        assert!(matches!(parse_slash(" /init "), Some(SlashCommand::Init)));
     }
 
     #[test]
