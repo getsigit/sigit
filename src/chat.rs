@@ -1379,6 +1379,9 @@ mod tui {
         Compact,
         /// Restore the saved TUI session from disk.
         Resume,
+        /// Generate (or improve) the repo's AGENTS.md by running an agent
+        /// turn with [`crate::instructions::INIT_PROMPT`] as the user text.
+        Init,
         Exit,
         Unknown(String),
     }
@@ -1409,6 +1412,7 @@ mod tui {
             "/tools" => SlashCommand::Tools(parse_on_off(arg)),
             "/compact" => SlashCommand::Compact,
             "/resume" => SlashCommand::Resume,
+            "/init" => SlashCommand::Init,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -2127,6 +2131,7 @@ mod tui {
                      /tools [on|off]— expand or collapse tool-call details\n\
                      /compact       — summarize and shrink conversation history\n\
                      /resume        — restore the saved session from disk\n\
+                     /init          — generate or improve the repo's AGENTS.md\n\
                      /clear         — wipe conversation history\n\
                      /status        — show engine status\n\
                      /exit          — quit chat",
@@ -2343,6 +2348,12 @@ mod tui {
             SlashCommand::Whoami => {
                 let message = crate::account::status_line().await;
                 app.messages.push(ChatMessage::system(message));
+            }
+            SlashCommand::Init => {
+                // Handled in the input loop (it runs a real turn); reaching
+                // this arm means a caller forgot that special case.
+                app.messages
+                    .push(ChatMessage::system("Type /init in the chat to run it."));
             }
             SlashCommand::Exit => {
                 app.quit = true;
@@ -3013,9 +3024,21 @@ mod tui {
                         }
 
                         if let Some(text) = handle_key(&mut app, key) {
-                            if let Some(cmd) = parse_slash(&text) {
-                                exec_slash(&mut app, cmd, Arc::clone(&engine), terminal).await;
-                                continue;
+                            // `/init` runs a real agent turn: the transcript
+                            // shows the command the user typed, but the model
+                            // receives the canned AGENTS.md-generation prompt.
+                            let mut inference_text = text.clone();
+                            match parse_slash(&text) {
+                                Some(SlashCommand::Init) => {
+                                    inference_text =
+                                        crate::instructions::INIT_PROMPT.to_string();
+                                }
+                                Some(cmd) => {
+                                    exec_slash(&mut app, cmd, Arc::clone(&engine), terminal)
+                                        .await;
+                                    continue;
+                                }
+                                None => {}
                             }
 
                             // On-device inference needs a model in memory, and we
@@ -3041,7 +3064,7 @@ mod tui {
                             app.inference_rx = Some(rx);
 
                             let backend_handle = Arc::clone(&app.backend);
-                            let user_text = text.clone();
+                            let user_text = inference_text;
                             let tools_enabled = app.tool_calling;
                             tokio::spawn(async move {
                                 run_inference_task(backend_handle, user_text, tx, tools_enabled).await;
