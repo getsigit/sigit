@@ -134,7 +134,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. The official server
   (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in (always HTTP) and authed
   with the cloud session token; extra servers live in `mcp.toml` (global
-  `$SIGIT_CONFIG_DIR/mcp.toml` and project-local `.sigit/mcp.toml`). The stdio path is covered by
+  `$SIGIT_CONFIG_DIR/mcp.toml` and project-local `.sigit/mcp.toml`). On macOS, Xcode's stdio
+  server (`xcrun mcpbridge`) is also baked in — added only when Xcode is running, requiring
+  Xcode's "Allow external agents" setting, opt-out via `SIGIT_MCP_XCODE=off`, overridable by a
+  user `xcode` entry. The stdio path is covered by
   `tests/mcp_stdio.rs`, driven by the test-only `src/bin/mcp_stdio_stub.rs` helper binary
   (excluded from the published crate via `exclude` in `Cargo.toml`).
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
@@ -191,7 +194,7 @@ verbosity with `RUST_LOG`.
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
 `SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
-server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
+server), `SIGIT_MCP_XCODE` (`off` drops the baked-in macOS Xcode server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),
 `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.
 

@@ -29,6 +29,17 @@
 //! credential. Additional servers are configured in `mcp.toml` (see
 //! [`load_configs`]).
 //!
+//! ## Xcode (macOS)
+//!
+//! On macOS siGit Code also bakes in [Xcode's MCP server][xcode-mcp] over stdio
+//! (`xcrun mcpbridge`), so agents can build, test, and edit a project open in
+//! Xcode with no configuration. It is added only when Xcode is actually running,
+//! and still requires *Xcode ▸ Settings ▸ Intelligence ▸ "Allow external agents
+//! to use Xcode tools"* to be enabled. Opt out with `SIGIT_MCP_XCODE=off`; a
+//! user-defined `xcode` entry in `mcp.toml` overrides the baked-in default.
+//!
+//! [xcode-mcp]: https://developer.apple.com/documentation/xcode/giving-external-agents-access-to-xcode
+//!
 //! ## Lifecycle
 //!
 //! Discovery is best-effort and happens once at startup via [`init`]: each
@@ -433,7 +444,51 @@ fn load_configs() -> Vec<ServerDef> {
         });
     }
 
+    // On macOS, bake in Xcode's stdio MCP server (`xcrun mcpbridge`) so agents
+    // can drive a running Xcode with zero config. It is added only when Xcode is
+    // actually running — spawning `mcpbridge` with no Xcode to bridge into is
+    // pointless and would only add a failed handshake to every startup. A
+    // user-defined entry named `xcode` (e.g. a custom command) always wins, and
+    // `SIGIT_MCP_XCODE=off` opts out entirely. Note the server still requires
+    // Xcode ▸ Settings ▸ Intelligence ▸ "Allow external agents to use Xcode
+    // tools" to be enabled; without it the handshake fails and it contributes
+    // no tools.
+    #[cfg(target_os = "macos")]
+    if !xcode_opted_out() && is_xcode_running() && !defs.iter().any(|d| d.name == "xcode") {
+        defs.push(ServerDef {
+            name: "xcode".to_string(),
+            transport: TransportDef::Stdio {
+                command: "xcrun".to_string(),
+                args: vec!["mcpbridge".to_string()],
+                env: Vec::new(),
+            },
+        });
+    }
+
     defs
+}
+
+/// Whether the baked-in Xcode server is disabled via `SIGIT_MCP_XCODE=off`.
+#[cfg(target_os = "macos")]
+fn xcode_opted_out() -> bool {
+    std::env::var("SIGIT_MCP_XCODE").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | "disabled"
+        )
+    })
+}
+
+/// Best-effort check for a running Xcode, so the baked-in `xcode` server is only
+/// added when there's something for `xcrun mcpbridge` to bridge into. Any error
+/// (e.g. `pgrep` missing) is treated as "not running".
+#[cfg(target_os = "macos")]
+fn is_xcode_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-xq", "Xcode"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Insert `def`, replacing any existing entry with the same name.
@@ -1334,6 +1389,29 @@ mod tests {
                 assert_eq!(command, "npx");
                 assert_eq!(args[0], "-y");
                 assert_eq!(env.len(), 2);
+            }
+            TransportDef::Http { .. } => panic!("expected a stdio transport"),
+        }
+    }
+
+    #[test]
+    fn user_xcode_entry_resolves_to_its_stdio_command() {
+        // A user-defined `xcode` server in mcp.toml overrides the baked-in macOS
+        // default (which uses `xcrun mcpbridge`); it must resolve like any other
+        // stdio entry.
+        let toml = r#"
+            [[server]]
+            name = "xcode"
+            command = "xcrun"
+            args = ["mcpbridge"]
+        "#;
+        let parsed: McpFile = toml::from_str(toml).unwrap();
+        let entry = &parsed.server[0];
+        assert_eq!(sanitize(&entry.name), "xcode");
+        match entry.transport_def().expect("valid stdio entry") {
+            TransportDef::Stdio { command, args, .. } => {
+                assert_eq!(command, "xcrun");
+                assert_eq!(args, vec!["mcpbridge".to_string()]);
             }
             TransportDef::Http { .. } => panic!("expected a stdio transport"),
         }
