@@ -144,7 +144,7 @@ Git operations — always use run_command:
 - if a clone or init fails, check the error, fix the cause (wrong path, missing \
   directory, permissions), and retry
 - when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: Co-Authored-By: siGit Code <sigit@sigit.si> \
+  then this trailer on its own line: Co-Authored-By: siGit Code <297239231+sigitc@users.noreply.github.com> \
   — GitHub reads that exact format and credits siGit as co-author. If a commit \
   lands without it, siGit Code amends the trailer in automatically and the tool \
   output says so; do not amend again yourself.
