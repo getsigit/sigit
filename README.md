@@ -33,7 +33,7 @@ cargo install sigit
 
 | Method | Command |
 |--------|---------|
-| Homebrew | `brew tap --force-auto-update getsigit/tap && brew install sigit` |
+| Homebrew | `brew tap --force getsigit/tap && brew install sigit` |
 | pip | `pip install sigit-code` |
 | uv | `uvx --from sigit-code sigit` |
 | npm | `npm install -g @smbcloud/sigit` |
