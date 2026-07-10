@@ -54,7 +54,7 @@ Then pick **siGit Code** in the assistant panel.
 | Method | Command |
 |--------|---------|
 | npm | `npm install -g @smbcloud/sigit` |
-| Homebrew | `brew tap getsigit/tap && brew install sigit` |
+| Homebrew | `brew tap getsigit/tap && brew trust --tap getsigit/tap && brew install sigit` |
 | Cargo | `cargo install sigit` |
 
 ### From source
