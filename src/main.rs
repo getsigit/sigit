@@ -42,6 +42,7 @@ mod session_store;
 mod settings;
 mod setup;
 mod skills;
+mod subagents;
 mod tools;
 
 /// Serializes tests that mutate process-global env vars (`SIGIT_CONFIG_DIR`

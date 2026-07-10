@@ -332,7 +332,7 @@ fn parse_skill(contents: &str, dir: &Path) -> Result<Skill, String> {
 
 /// Validate the `name` field per the Agent Skills spec: 1-64 chars, lowercase
 /// alphanumeric and hyphens only, no leading/trailing or consecutive hyphens.
-fn validate_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_name(name: &str) -> Result<(), String> {
     let len = name.chars().count();
     if len == 0 {
         return Err("`name` must not be empty".to_string());
@@ -357,7 +357,7 @@ fn validate_name(name: &str) -> Result<(), String> {
 
 /// Extract the YAML frontmatter block from a `SKILL.md`: the text between a
 /// leading `---` line and the next `---` line. Returns `None` if absent.
-fn extract_frontmatter(contents: &str) -> Option<&str> {
+pub(crate) fn extract_frontmatter(contents: &str) -> Option<&str> {
     // Strip an optional UTF-8 BOM and leading blank lines before the opener.
     let trimmed = contents.trim_start_matches('\u{feff}');
     let mut rest = trimmed;
@@ -393,7 +393,7 @@ fn extract_frontmatter(contents: &str) -> Option<&str> {
 /// Parse top-level `key: value` scalar pairs from frontmatter, skipping nested
 /// mappings (indented lines) and comments. Quoted values are unquoted. We only
 /// need scalar metadata (`name`, `description`, `license`, `compatibility`).
-fn parse_frontmatter_fields(frontmatter: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_frontmatter_fields(frontmatter: &str) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     for line in frontmatter.lines() {
         // Indented lines belong to a nested mapping/sequence — skip them.
@@ -440,7 +440,7 @@ fn read_skill_body(skill_md: &Path) -> Result<String, String> {
 
 /// Return the content after the frontmatter block, or the whole input if there
 /// is no frontmatter.
-fn strip_frontmatter(contents: &str) -> &str {
+pub(crate) fn strip_frontmatter(contents: &str) -> &str {
     let trimmed = contents.trim_start_matches('\u{feff}');
     let after_opener = match trimmed.strip_prefix("---") {
         Some(rest) => match rest.strip_prefix('\n') {
