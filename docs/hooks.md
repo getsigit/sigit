@@ -36,6 +36,15 @@ Hooks support substitution for context variables:
 - `{tool_result_len}` - Length of the tool result in bytes
 - `{cwd}` - The session working directory
 
+Every `{var}` value is quote-escaped for the platform shell before it's spliced
+into the command line, so a directory name or an MCP-server-supplied tool name
+that happens to contain shell metacharacters is always treated as literal text,
+never executed. Windows `cmd.exe` quoting is best-effort (`cmd` has no fully
+safe quoting story); the same values are also exported as environment
+variables — `SIGIT_HOOK_CWD`, `SIGIT_HOOK_SESSION_ID`, `SIGIT_HOOK_TOOL_NAME`,
+`SIGIT_HOOK_TOOL_ARGS_LEN`, `SIGIT_HOOK_TOOL_RESULT_LEN` — and reading those
+in your script instead of `{var}` sidesteps quoting entirely on any platform.
+
 ## Examples
 
 ### Log all tool usage to a file
@@ -70,7 +79,14 @@ post_tool_use = ["wc -c <<< {tool_result_len} >> ~/.sigit/result_sizes.txt"]
 
 ## Notes
 
-- Hooks are optional. If no hooks are configured, there is no performance overhead.
+- Hooks are optional. When none are configured, each tool call still does one
+  lightweight settings-file read to check for that; there is no shell process
+  spawned and no other measurable overhead.
 - Hook failures (non-zero exit codes) are logged as warnings but do not interrupt the session.
-- Hooks are run synchronously, so slow hooks will impact agent responsiveness.
-- Hooks are not available in the interactive TUI yet—only in ACP mode and headless mode.
+- Hooks are run synchronously, so slow hooks will impact agent responsiveness — this applies
+  in the interactive TUI too, not just ACP/headless mode.
+- `PreToolUse` and `PostToolUse` hooks fire in every mode (TUI, ACP, headless) and for every
+  call to the shared tool-execution path — including tool calls made by a `task` subagent, not
+  just the top-level agent.
+- `SessionStart` hooks currently only fire on ACP session lifecycle events (new/load/fork
+  session). The interactive TUI does not have an equivalent session-start hook point yet.
