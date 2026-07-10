@@ -1356,6 +1356,8 @@ mod tui {
         Local(Option<bool>),
         /// List discovered Agent Skills.
         Skills,
+        /// List discovered user-defined commands (`.sigit/commands/*.md`).
+        Commands,
         /// List configured MCP servers and their tools.
         Mcp,
         /// explicitly load the selected (or default) on-device model
@@ -1383,7 +1385,10 @@ mod tui {
         /// turn with [`crate::instructions::INIT_PROMPT`] as the user text.
         Init,
         Exit,
-        Unknown(String),
+        /// An unrecognized command word, plus whatever followed it on the
+        /// line — a caller may still resolve it as a user-defined command
+        /// before falling back to "unknown command".
+        Unknown(String, Option<String>),
     }
 
     fn parse_slash(input: &str) -> Option<SlashCommand> {
@@ -1401,6 +1406,7 @@ mod tui {
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
             "/local" => SlashCommand::Local(parse_on_off(arg)),
             "/skills" => SlashCommand::Skills,
+            "/commands" => SlashCommand::Commands,
             "/mcp" => SlashCommand::Mcp,
             "/load" => SlashCommand::Load,
             "/login" => SlashCommand::Login(arg.map(str::to_string)),
@@ -1414,7 +1420,7 @@ mod tui {
             "/resume" => SlashCommand::Resume,
             "/init" => SlashCommand::Init,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
-            other => SlashCommand::Unknown(other.to_string()),
+            other => SlashCommand::Unknown(other.to_string(), arg.map(str::to_string)),
         })
     }
 
@@ -2120,6 +2126,7 @@ mod tui {
                      /models N      — switch to model N\n\
                      /local [on|off]— toggle on-device inference mode\n\
                      /skills        — list available Agent Skills\n\
+                     /commands      — list user-defined commands (.sigit/commands/*.md)\n\
                      /mcp           — list MCP servers and their tools\n\
                      /load          — load the selected on-device model\n\
                      /login E P     — sign in to siGit Code Cloud\n\
@@ -2236,6 +2243,10 @@ mod tui {
             SlashCommand::Skills => {
                 app.messages
                     .push(ChatMessage::system(crate::skills::format_skills_list()));
+            }
+            SlashCommand::Commands => {
+                app.messages
+                    .push(ChatMessage::system(crate::commands::format_commands_list()));
             }
             SlashCommand::Mcp => {
                 app.messages
@@ -2358,9 +2369,10 @@ mod tui {
             SlashCommand::Exit => {
                 app.quit = true;
             }
-            SlashCommand::Unknown(cmd) => {
-                app.messages
-                    .push(ChatMessage::system(format!("unknown command: {cmd}")));
+            SlashCommand::Unknown(cmd, _) => {
+                app.messages.push(ChatMessage::system(format!(
+                    "unknown command: {cmd}. Type /commands to list user-defined commands."
+                )));
             }
         }
     }
@@ -3027,11 +3039,34 @@ mod tui {
                             // `/init` runs a real agent turn: the transcript
                             // shows the command the user typed, but the model
                             // receives the canned AGENTS.md-generation prompt.
+                            // User-defined commands (`.sigit/commands/*.md`)
+                            // get the same treatment once `parse_slash`
+                            // reports the word unrecognized.
                             let mut inference_text = text.clone();
                             match parse_slash(&text) {
                                 Some(SlashCommand::Init) => {
                                     inference_text =
                                         crate::instructions::INIT_PROMPT.to_string();
+                                }
+                                Some(SlashCommand::Unknown(command, argument)) => {
+                                    match crate::commands::resolve_command(&command) {
+                                        Some(custom) => {
+                                            inference_text = crate::commands::render(
+                                                &custom.body,
+                                                argument.as_deref(),
+                                            );
+                                        }
+                                        None => {
+                                            exec_slash(
+                                                &mut app,
+                                                SlashCommand::Unknown(command, argument),
+                                                Arc::clone(&engine),
+                                                terminal,
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                    }
                                 }
                                 Some(cmd) => {
                                     exec_slash(&mut app, cmd, Arc::clone(&engine), terminal)
