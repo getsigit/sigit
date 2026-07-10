@@ -33,7 +33,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::skills::{extract_frontmatter, parse_frontmatter_fields, strip_frontmatter, validate_name};
+use crate::skills::{
+    extract_frontmatter, parse_frontmatter_fields, strip_frontmatter, validate_name,
+};
 
 /// A discovered subagent type.
 #[derive(Debug, Clone, PartialEq, Eq)]

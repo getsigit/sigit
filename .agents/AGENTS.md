@@ -110,7 +110,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
   `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
-  unless the commit already exists on a remote, which is never rewritten.
+  unless the commit already exists on a remote, which is never rewritten. Also owns the `task`
+  tool: a nested agent loop in a fresh conversation, offered only when `subagent_available()`
+  (a subagent factory is registered — see `register_subagent_factory_for` in `main.rs`; on-device
+  registers a `None`-returning factory since onde has a single shared history). A subagent's
+  toolset is a hard-gated read-only allow-list (`SUBAGENT_TOOL_NAMES`) that is never expanded by a
+  configurable subagent type (see `src/subagents.rs`) — only ever narrowed — so a `.sigit/agents/*.md`
+  file can't grant itself `edit_file`/`run_command` and bypass the permission system.
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
   instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,
@@ -119,6 +125,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
   `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
   and only when at least one skill exists.
+- **`src/subagents.rs`** — configurable subagent types for the `task` tool. Discovers Markdown
+  files (YAML frontmatter `name` + `description`, optional comma-separated `tools:` allow-list,
+  then a Markdown body that becomes the subagent's system prompt) from `.sigit/agents/` and
+  `.claude/agents/` in the cwd, `$SIGIT_CONFIG_DIR/agents/`, and `~/.claude/agents/`. Passing a
+  type's `name` as `task`'s `subagent_type` argument swaps in that system prompt and, if `tools:`
+  is set, narrows the offered toolset to its *intersection* with `SUBAGENT_TOOL_NAMES` — the
+  security-relevant narrowing logic lives in `tools.rs` next to that constant, not here; this
+  module only discovers and parses files. `SubagentFactory` (in `tools.rs`) takes the resolved
+  system prompt per call rather than baking one in at registration, so a single registered
+  factory serves both the default research subagent and every configured type.
 - **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Two
   transports: **Streamable HTTP** (one JSON-RPC POST endpoint, `url` in `mcp.toml`; replies are
   `application/json` or SSE) and **stdio** (`command` + optional `args`/`[server.env]` in
@@ -165,8 +181,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
-Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
-`/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via `advertise_commands` in
+Slash commands (`/help`, `/models`, `/skills`, `/agents`, `/mcp`, `/login`, `/logout`, `/whoami`,
+`/reload`, `/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via `advertise_commands` in
 `main.rs` and handled in both the TUI and ACP sessions. `/init` is special: instead of replying
 directly it substitutes `instructions::INIT_PROMPT` for the user text and runs a normal agent
 turn that explores the repo and writes (or improves) `AGENTS.md` through the ordinary tools and
