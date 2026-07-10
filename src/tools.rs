@@ -453,11 +453,107 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
         "kill_command" => exec_kill_command(arguments),
         "skill" => crate::skills::activate_skill(arguments),
         TASK_TOOL_NAME => exec_task(arguments).await,
+        WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await,
         // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
         // and forwarded to the owning server.
         _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
         _ => format!("Unknown tool: {name}"),
     }
+}
+
+// ── web_search ───────────────────────────────────────────────────────────────
+//
+// siGit Code Cloud runs a Brave-Search-backed `web_search` tool on its official
+// MCP server (`mcp.rs`'s baked-in "sigit" server, discovered as
+// `mcp__sigit__web_search`) — the API key and billing live server-side, so
+// there is no on-device/local equivalent. This is a thin native wrapper
+// around that MCP tool rather than a second implementation of it, for two
+// reasons: (1) `mcp.rs` already owns the auth, transport, and error handling,
+// so re-doing that here would just be a second copy of the same HTTP/JSON-RPC
+// code; (2) every `mcp__*` tool is classified `Mutating` by
+// `permissions::classify` (an unknown external tool's side effects can't be
+// assumed safe), which would put an "ask" prompt in front of a harmless
+// read-only search on every call. Presenting it under the clean `web_search`
+// name instead lets `permissions::classify` treat it as read-only, matching
+// `read_website`'s zero-friction behavior, while `execute_tool_impl` still
+// delegates the actual call to the exact same `mcp::call_tool` codepath as
+// any other MCP tool.
+//
+// Advertised only when the official server has actually discovered a
+// `web_search` tool (see `web_search_available`) — the same conditional
+// pattern as `skill` and `task` — so a signed-out or MCP-disabled session
+// never sees a capability it can't use.
+
+pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
+/// The discovered MCP tool this delegates to: siGit Code Cloud's official
+/// server is always registered under the name "sigit" (see `mcp.rs`), so its
+/// tools are namespaced `mcp__sigit__<tool>`.
+const WEB_SEARCH_MCP_DELEGATE: &str = "mcp__sigit__web_search";
+
+/// Whether `web_search` should be offered this turn: the official MCP server
+/// has to have actually discovered a `web_search` tool, which in turn only
+/// happens when the user is signed in to siGit Code Cloud (an unauthenticated
+/// request to the official server fails during `mcp::init`'s discovery and
+/// contributes no tools — see `mcp.rs`). No separate sign-in check is needed
+/// here: this is exactly the same conditional-advertisement pattern as
+/// `subagent_available`, just checking a tool name instead of a factory.
+pub fn web_search_available() -> bool {
+    crate::mcp::tool_specs()
+        .iter()
+        .any(|spec| spec.name == WEB_SEARCH_MCP_DELEGATE)
+}
+
+/// Whether `name` is the raw MCP tool [`web_search_tool_spec`] delegates to.
+/// Callers assembling the full tool list should exclude this name from
+/// whatever they append from `mcp::tool_specs()`, so the model sees the one
+/// clean `web_search` option rather than that *and* the raw `mcp__*` name for
+/// the same underlying tool.
+pub fn is_web_search_delegate(name: &str) -> bool {
+    name == WEB_SEARCH_MCP_DELEGATE
+}
+
+/// Spec for the `web_search` tool. Lives in the `*_as_specs`/`build_tool_specs`
+/// layer (like `skill` and `task`), not in [`all_tools`], because it is only
+/// offered when [`web_search_available`] is true. The schema mirrors
+/// siGit Code Cloud's actual `web_search` MCP tool exactly (`query` + `count`)
+/// so arguments pass through to [`exec_web_search`] unchanged.
+pub fn web_search_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: WEB_SEARCH_TOOL_NAME.to_string(),
+        description: "Search the public web and return matching pages as title, URL, and \
+             snippet. Use this to find pages when you don't already know the URL — for \
+             current events, library/API documentation, error messages, or anything else \
+             outside this repository. Once you have a promising URL, use read_website to \
+             fetch its full content. Requires a signed-in siGit Code Cloud account (the \
+             search runs server-side); rate-limited per account."
+            .to_string(),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query."
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of results to return (default 5, max 10)."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+        .to_string(),
+    }
+}
+
+/// The `web_search` tool entry point used by [`execute_tool`]: forward
+/// verbatim to the discovered MCP tool. `mcp::call_tool` already handles a
+/// missing/uninitialized server gracefully (an in-band error string, never a
+/// panic), so there's nothing extra to do here — see the module doc above for
+/// why this delegates instead of reimplementing the call.
+async fn exec_web_search(arguments: &str) -> String {
+    crate::mcp::call_tool(WEB_SEARCH_MCP_DELEGATE, arguments).await
 }
 
 // ── task (subagent) ──────────────────────────────────────────────────────────
@@ -3159,6 +3255,49 @@ mod tests {
             result.contains("missing required parameter \"prompt\""),
             "got: {result}"
         );
+    }
+
+    // ── web_search tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_web_search_tool_spec_matches_the_cloud_mcp_tools_contract() {
+        let spec = web_search_tool_spec();
+        assert_eq!(spec.name, "web_search");
+        let schema: Value = serde_json::from_str(&spec.parameters_schema).unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["query"]));
+        assert!(schema["properties"]["query"].is_object());
+        assert!(schema["properties"]["count"].is_object());
+    }
+
+    #[test]
+    fn test_is_web_search_delegate() {
+        assert!(is_web_search_delegate("mcp__sigit__web_search"));
+        assert!(!is_web_search_delegate("web_search"));
+        assert!(!is_web_search_delegate("mcp__other__web_search"));
+    }
+
+    #[test]
+    fn test_web_search_unavailable_without_mcp_init() {
+        // `mcp::init()` is never called anywhere in this test binary (it does
+        // real network I/O and is a one-shot `OnceLock`, same constraint as
+        // `SUBAGENT_FACTORY`), so the official server's tools — including
+        // web_search — are never discovered here. This proves the
+        // conditional-advertisement gate fails closed, matching a
+        // signed-out/MCP-disabled session, rather than defaulting to "always
+        // offered".
+        assert!(!web_search_available());
+    }
+
+    #[tokio::test]
+    async fn test_web_search_delegates_to_mcp_and_degrades_gracefully_when_uninitialized() {
+        // With MCP uninitialized (see the test above), `mcp::call_tool`
+        // returns its own in-band error string rather than panicking — proves
+        // execute_tool's WEB_SEARCH_TOOL_NAME arm actually reaches
+        // mcp::call_tool(WEB_SEARCH_MCP_DELEGATE, ...) instead of, say, silently
+        // no-op'ing or hitting the `Unknown tool` fallback.
+        let args = serde_json::json!({ "query": "siGit Code" }).to_string();
+        let result = execute_tool(WEB_SEARCH_TOOL_NAME, &args).await;
+        assert_eq!(result, "Error: MCP is not initialized.");
     }
 
     #[test]

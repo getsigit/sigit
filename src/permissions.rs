@@ -87,11 +87,14 @@ pub enum Decision {
 /// conservative default for anything whose side effects we can't see.
 /// `task` is read-only because the subagent it launches is restricted to the
 /// read-only toolset (see `SUBAGENT_TOOL_NAMES` in `tools.rs`), so delegated
-/// research stays available in plan mode.
+/// research stays available in plan mode. `web_search` is read-only for the
+/// same reason `read_website` is — it only ever returns data, even though it
+/// forwards to an `mcp__*` tool under the hood (see `tools.rs`'s `web_search`
+/// module doc for why it isn't classified by that `mcp__` prefix).
 pub fn classify(tool_name: &str) -> ToolRisk {
     match tool_name {
         "read_file" | "list_directory" | "search_files" | "glob" | "read_website"
-        | "write_todos" | "skill" | "task" | "command_output" => ToolRisk::ReadOnly,
+        | "write_todos" | "skill" | "task" | "command_output" | "web_search" => ToolRisk::ReadOnly,
         _ => ToolRisk::Mutating,
     }
 }
@@ -418,6 +421,7 @@ mod tests {
             "skill",
             "task",
             "command_output",
+            "web_search",
         ] {
             assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
             assert_eq!(decision_for("t-ro", tool, "{}"), Decision::Allow, "{tool}");

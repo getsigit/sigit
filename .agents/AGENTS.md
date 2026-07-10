@@ -110,7 +110,17 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
   `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
-  unless the commit already exists on a remote, which is never rewritten.
+  unless the commit already exists on a remote, which is never rewritten. Also owns `web_search`:
+  a thin native wrapper around the official MCP server's Brave-Search-backed `web_search` tool
+  (`mcp__sigit__web_search`, implemented server-side in `sigit-si`'s `WebSearchService` +
+  `Mcp::Tools::WebSearch`), offered only when that MCP tool was actually discovered (i.e. the
+  user is signed in to siGit Code Cloud — see `web_search_available`). Wrapping it natively
+  rather than leaving it as a raw `mcp__*` tool matters for two reasons: `permissions::classify`
+  treats every `mcp__*` tool as mutating (an "ask" prompt on every call), while `web_search` is
+  read-only like `read_website`; and the raw delegate name is filtered out of the assembled tool
+  list (`is_web_search_delegate`) so the model sees one clean option, not two names for the same
+  tool. Execution still forwards verbatim to `mcp::call_tool` — no second HTTP/JSON-RPC
+  implementation.
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
   instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,

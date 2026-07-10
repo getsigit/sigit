@@ -255,7 +255,7 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
         "delete_file" => ToolKind::Delete,
         "run_command" | "kill_command" => ToolKind::Execute,
         "read_file" | "list_directory" | "command_output" => ToolKind::Read,
-        "search_files" | "glob" => ToolKind::Search,
+        "search_files" | "glob" | "web_search" => ToolKind::Search,
         "read_website" => ToolKind::Fetch,
         "write_todos" => ToolKind::Think,
         _ => ToolKind::Other,
@@ -314,8 +314,24 @@ fn agent_tools_as_specs() -> Vec<ToolSpec> {
         specs.push(tools::task_tool_spec());
     }
 
+    // `web_search` is a native wrapper around the official MCP server's
+    // `web_search` tool (see the module doc in tools.rs), offered only when
+    // that MCP tool was actually discovered (i.e. the user is signed in to
+    // siGit Code Cloud).
+    let web_search_offered = tools::web_search_available();
+    if web_search_offered {
+        specs.push(tools::web_search_tool_spec());
+    }
+
     // Tools discovered from configured MCP servers (incl. the official one).
-    specs.extend(mcp::tool_specs());
+    // Exclude the raw web_search delegate when the native wrapper above is
+    // already offered, so the model sees one clean option, not two names for
+    // the same tool.
+    specs.extend(
+        mcp::tool_specs()
+            .into_iter()
+            .filter(|spec| !(web_search_offered && tools::is_web_search_delegate(&spec.name))),
+    );
 
     specs
 }
