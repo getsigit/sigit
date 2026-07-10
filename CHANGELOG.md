@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.1
+
+Two small fixes: correct co-author attribution and a Homebrew tap fix.
+
+### What changed
+
+- The `Co-Authored-By` trailer siGit Code adds to commits now uses the GitHub
+  noreply address for the [sigitc](https://github.com/sigitc) account instead
+  of `sigit@sigit.si`, so GitHub reliably attributes co-authored commits to
+  the siGit Code profile
+- Fixed the Homebrew tap install docs to trust the tap with `brew trust`
+  instead of a `brew tap --force` flag
+
 ## 1.4.0
 
 Adds a headless one-shot mode, fine-grained permission rules, stdio transport
