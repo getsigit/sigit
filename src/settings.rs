@@ -8,14 +8,17 @@
 //! Settings today: `local_inference` (whether on-device inference is the
 //! active mode — the source of truth for the local/cloud toggle, also surfaced
 //! as a session config option for ACP clients without slash commands, e.g.
-//! Xcode) and `[permissions]` (the tool permission policy consumed by
+//! Xcode), `[permissions]` (the tool permission policy consumed by
 //! `crate::permissions`: a default mode for mutating tools plus per-tool
-//! overrides).
+//! overrides), and `[hooks]` (extensibility hooks for session and tool
+//! lifecycle events).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::hooks;
 
 /// Env override for `local_inference`. When set to a truthy/falsy value it wins
 /// over the stored file for reads (matching the existing `SIGIT_*` override
@@ -129,6 +132,9 @@ pub struct Settings {
     /// Permission policy for mutating agent tools.
     #[serde(default)]
     pub permissions: PermissionSettings,
+    /// Extensibility hooks for session and tool lifecycle events.
+    #[serde(default)]
+    pub hooks: hooks::HookSettings,
 }
 
 impl Default for Settings {
@@ -136,6 +142,7 @@ impl Default for Settings {
         Self {
             local_inference: default_local_inference(),
             permissions: PermissionSettings::default(),
+            hooks: hooks::HookSettings::default(),
         }
     }
 }
