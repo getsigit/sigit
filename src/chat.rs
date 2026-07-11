@@ -2989,8 +2989,21 @@ mod tui {
             specs.push(crate::tools::task_tool_spec());
         }
 
-        // Tools discovered from configured MCP servers (incl. the official one).
-        specs.extend(crate::mcp::tool_specs());
+        // `web_search` is a native wrapper around the official MCP server's
+        // `web_search` tool, offered only when that MCP tool was actually
+        // discovered (i.e. the user is signed in to siGit Code Cloud).
+        let web_search_offered = crate::tools::web_search_available();
+        if web_search_offered {
+            specs.push(crate::tools::web_search_tool_spec());
+        }
+
+        // Tools discovered from configured MCP servers (incl. the official
+        // one). Exclude the raw web_search delegate when the native wrapper
+        // above is already offered, so the model sees one clean option, not
+        // two names for the same tool.
+        specs.extend(crate::mcp::tool_specs().into_iter().filter(|spec| {
+            !(web_search_offered && crate::tools::is_web_search_delegate(&spec.name))
+        }));
 
         specs
     }
