@@ -429,6 +429,30 @@ pub fn all_tools() -> Vec<AgentTool> {
 // ── Tool execution ───────────────────────────────────────────────────────────
 
 pub async fn execute_tool(name: &str, arguments: &str) -> String {
+    // Settings are read once per call (not once per hook phase) so a
+    // deployment without any [hooks] configured pays one cheap TOML parse
+    // per tool call rather than two.
+    let hook_settings = crate::settings::load().hooks;
+    let cwd = std::env::current_dir().ok();
+
+    if let Some(cwd) = &cwd
+        && !hook_settings.pre_tool_use.is_empty()
+    {
+        crate::hooks::run_pre_tool_use_hooks(&hook_settings, name, arguments, cwd);
+    }
+
+    let result = execute_tool_impl(name, arguments).await;
+
+    if let Some(cwd) = &cwd
+        && !hook_settings.post_tool_use.is_empty()
+    {
+        crate::hooks::run_post_tool_use_hooks(&hook_settings, name, &result, cwd);
+    }
+
+    result
+}
+
+async fn execute_tool_impl(name: &str, arguments: &str) -> String {
     match name {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),

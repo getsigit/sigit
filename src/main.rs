@@ -33,6 +33,7 @@ mod backend;
 mod chat;
 mod credentials;
 mod headless;
+mod hooks;
 mod instructions;
 mod mcp;
 mod models;
@@ -1024,6 +1025,12 @@ impl SiGitAgent {
 
         self.advertise_commands(cx, args.session_id.clone());
 
+        // Run SessionStart hooks
+        let hook_settings = settings::load().hooks;
+        if hook_settings.has_hooks() {
+            hooks::run_session_start_hooks(&hook_settings, &args.cwd, &args.session_id.to_string());
+        }
+
         Ok(LoadSessionResponse::new().config_options(config_options))
     }
 
@@ -1074,6 +1081,12 @@ impl SiGitAgent {
 
         self.advertise_commands(cx, new_id.clone());
 
+        // Run SessionStart hooks
+        let hook_settings = settings::load().hooks;
+        if hook_settings.has_hooks() {
+            hooks::run_session_start_hooks(&hook_settings, &args.cwd, &new_id.to_string());
+        }
+
         Ok(ForkSessionResponse::new(new_id).config_options(config_options))
     }
 
@@ -1121,6 +1134,12 @@ impl SiGitAgent {
         };
 
         self.advertise_commands(cx, session_id.clone());
+
+        // Run SessionStart hooks
+        let hook_settings = settings::load().hooks;
+        if hook_settings.has_hooks() {
+            hooks::run_session_start_hooks(&hook_settings, &args.cwd, &session_id.to_string());
+        }
 
         Ok(NewSessionResponse::new(session_id).config_options(config_options))
     }
