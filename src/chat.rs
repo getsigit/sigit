@@ -1907,6 +1907,8 @@ mod tui {
         Local(Option<bool>),
         /// List discovered Agent Skills.
         Skills,
+        /// List configured subagent types (`.sigit/agents/*.md`) for `task`.
+        Agents,
         /// List discovered user-defined commands (`.sigit/commands/*.md`).
         Commands,
         /// List configured MCP servers and their tools.
@@ -1957,6 +1959,7 @@ mod tui {
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
             "/local" => SlashCommand::Local(parse_on_off(arg)),
             "/skills" => SlashCommand::Skills,
+            "/agents" => SlashCommand::Agents,
             "/commands" => SlashCommand::Commands,
             "/mcp" => SlashCommand::Mcp,
             "/load" => SlashCommand::Load,
@@ -2691,6 +2694,7 @@ mod tui {
                      /models N      — switch to model N\n\
                      /local [on|off]— toggle on-device inference mode\n\
                      /skills        — list available Agent Skills\n\
+                     /agents        — list configured subagent types (.sigit/agents/*.md)\n\
                      /commands      — list user-defined commands (.sigit/commands/*.md)\n\
                      /mcp           — list MCP servers and their tools\n\
                      /load          — load the selected on-device model\n\
@@ -2808,6 +2812,11 @@ mod tui {
             SlashCommand::Skills => {
                 app.messages
                     .push(ChatMessage::system(crate::skills::format_skills_list()));
+            }
+            SlashCommand::Agents => {
+                app.messages.push(ChatMessage::system(
+                    crate::subagents::format_agent_types_list(),
+                ));
             }
             SlashCommand::Commands => {
                 app.messages

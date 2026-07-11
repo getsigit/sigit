@@ -334,7 +334,7 @@ fn parse_skill(contents: &str, dir: &Path) -> Result<Skill, String> {
 
 /// Validate the `name` field per the Agent Skills spec: 1-64 chars, lowercase
 /// alphanumeric and hyphens only, no leading/trailing or consecutive hyphens.
-fn validate_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_name(name: &str) -> Result<(), String> {
     let len = name.chars().count();
     if len == 0 {
         return Err("`name` must not be empty".to_string());

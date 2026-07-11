@@ -473,7 +473,11 @@ mod tests {
         ] {
             assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
             // Read-only means it never prompts, whatever the policy layers say.
-            assert_eq!(decision_for("t-official", tool, "{}"), Decision::Allow, "{tool}");
+            assert_eq!(
+                decision_for("t-official", tool, "{}"),
+                Decision::Allow,
+                "{tool}"
+            );
         }
     }
 

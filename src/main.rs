@@ -45,6 +45,7 @@ mod session_store;
 mod settings;
 mod setup;
 mod skills;
+mod subagents;
 mod tools;
 
 /// Serializes tests that mutate process-global env vars (`SIGIT_CONFIG_DIR`
@@ -331,19 +332,21 @@ fn agent_tools_as_specs() -> Vec<ToolSpec> {
 
 /// Register the `task` tool's subagent factory for an OpenAI-compatible
 /// provider: each subagent run gets a FRESH `OpenAiBackend` against the same
-/// endpoint (its own conversation history), seeded with the subagent system
-/// prompt. The provider config is captured by clone. Called once at startup by
-/// whichever surface resolved the provider; on-device paths register a factory
-/// that returns `None` instead (onde has a single shared history, so a second
-/// concurrent context is not possible yet).
+/// endpoint (its own conversation history), seeded with whichever system
+/// prompt the caller resolved (the default subagent prompt, or a configured
+/// subagent type's prompt — see `tools::exec_task_with`). The provider config
+/// is captured by clone. Called once at startup by whichever surface resolved
+/// the provider; on-device paths register a factory that returns `None`
+/// instead (onde has a single shared history, so a second concurrent context
+/// is not possible yet).
 fn register_subagent_factory_for(cfg: &provider::ProviderConfig) {
     let cfg = cfg.clone();
-    tools::set_subagent_factory(Box::new(move || {
+    tools::set_subagent_factory(Box::new(move |system_prompt: &str| {
         Some(Arc::new(OpenAiBackend::new(
             cfg.base_url.clone(),
             cfg.api_key.clone(),
             cfg.model.clone(),
-            Some(tools::SUBAGENT_SYSTEM_PROMPT.to_string()),
+            Some(system_prompt.to_string()),
         )) as Arc<dyn InferenceBackend>)
     }));
 }
@@ -794,6 +797,10 @@ impl SiGitAgent {
                 "on|off (optional)",
             ),
             AvailableCommand::new("skills", "List available Agent Skills"),
+            AvailableCommand::new(
+                "agents",
+                "List configured subagent types (.sigit/agents/*.md) for task",
+            ),
             AvailableCommand::new(
                 "commands",
                 "List user-defined commands (.sigit/commands/*.md)",
@@ -2299,6 +2306,8 @@ enum SlashCommand {
     Local(Option<bool>),
     /// List discovered Agent Skills.
     Skills,
+    /// List configured subagent types (`.sigit/agents/*.md`) for `task`.
+    Agents,
     /// List discovered user-defined commands (`.sigit/commands/*.md`).
     Commands,
     /// List configured MCP servers and their tools.
@@ -2343,6 +2352,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
         "/local" => SlashCommand::Local(parse_on_off(argument)),
         "/skills" => SlashCommand::Skills,
+        "/agents" => SlashCommand::Agents,
         "/commands" => SlashCommand::Commands,
         "/mcp" => SlashCommand::Mcp,
         "/load" => SlashCommand::Load,
@@ -2456,6 +2466,7 @@ async fn exec_slash_acp(
                      /models N      - switch to model N\n\
                      /local [on|off]- toggle on-device inference mode\n\
                      /skills        - list available Agent Skills\n\
+                     /agents        - list configured subagent types (.sigit/agents/*.md)\n\
                      /commands      - list user-defined commands (.sigit/commands/*.md)\n\
                      /mcp           - list MCP servers and their tools\n\
                      /load          - load the selected on-device model\n\
@@ -2544,6 +2555,11 @@ async fn exec_slash_acp(
         SlashCommand::Skills => {
             agent
                 .send_assistant_message(cx, session_id, skills::format_skills_list())
+                .ok();
+        }
+        SlashCommand::Agents => {
+            agent
+                .send_assistant_message(cx, session_id, subagents::format_agent_types_list())
                 .ok();
         }
         SlashCommand::Commands => {
@@ -2961,7 +2977,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                         let _ = load_tx.send(Ok(()));
                         // On-device inference has a single shared history; no
                         // subagent context is possible yet.
-                        tools::set_subagent_factory(Box::new(|| None));
+                        tools::set_subagent_factory(Box::new(|_system_prompt: &str| None));
                         let backend = Arc::new(LocalBackend::new(Arc::clone(&engine)))
                             as Arc<dyn InferenceBackend>;
                         (backend, startup_model_name)
@@ -3095,7 +3111,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
     } else {
         // On-device inference has a single shared conversation history, so a
         // second concurrent subagent context is not possible yet.
-        tools::set_subagent_factory(Box::new(|| None));
+        tools::set_subagent_factory(Box::new(|_system_prompt: &str| None));
     }
 
     let stdin = tokio::io::stdin().compat();

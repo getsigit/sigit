@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::backend::{InferenceBackend, ToolResult, ToolSpec};
+use crate::subagents;
 
 const WEBSITE_READ_CHAR_LIMIT: usize = 20_000;
 const WEBSITE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -492,6 +493,13 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
 // toolset is strictly read-only and never includes `task` itself (no
 // recursion), so a delegated agent can research but not mutate state.
 //
+// A caller may optionally pick a *configurable subagent type* (see
+// `crate::subagents`, `.sigit/agents/*.md`) via the `subagent_type` argument.
+// A type can only ever replace the system prompt and *narrow* the toolset —
+// never grant tools outside `SUBAGENT_TOOL_NAMES` — so this stays exactly as
+// safe as the default research subagent: a `.sigit/agents/*.md` file cannot
+// grant itself `edit_file` or `run_command` and bypass the permission system.
+//
 // This module is backend-agnostic and cannot construct a backend, so the
 // surface that knows the active provider (`run_acp_server` / `run_interactive`
 // in `main.rs`) registers a factory at startup. The factory returns `None`
@@ -500,7 +508,14 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
 
 pub const TASK_TOOL_NAME: &str = "task";
 
-/// The tool names a subagent may call, filtered from [`all_tools`].
+/// Hard cap on how many configurable subagent types are embedded in the
+/// `task` tool's description, to bound the tool description size — same
+/// rationale as `skills::MAX_ADVERTISED_SKILLS`.
+const MAX_ADVERTISED_AGENT_TYPES: usize = 100;
+
+/// The tool names a subagent may call, filtered from [`all_tools`]. This is
+/// the hard ceiling for every subagent, default or custom-typed — see the
+/// module doc above.
 const SUBAGENT_TOOL_NAMES: &[&str] = &[
     "read_file",
     "list_directory",
@@ -509,7 +524,8 @@ const SUBAGENT_TOOL_NAMES: &[&str] = &[
     "read_website",
 ];
 
-/// System prompt seeding every subagent conversation.
+/// System prompt seeding a subagent conversation when no `subagent_type` is
+/// given (or it doesn't resolve to a configured type).
 pub const SUBAGENT_SYSTEM_PROMPT: &str = "You are a focused research subagent. \
 You are given one self-contained task by a calling agent. Investigate it using \
 the read-only tools available to you (read_file, list_directory, search_files, \
@@ -528,9 +544,12 @@ const SUBAGENT_UNAVAILABLE: &str = "The task tool is not available on-device \
 yet: on-device inference has a single conversation context. Do the research \
 yourself with the read-only tools.";
 
-/// Builds a fresh backend for one subagent run, or `None` when the active
-/// inference cannot host a second conversation (on-device).
-pub type SubagentFactory = Box<dyn Fn() -> Option<Arc<dyn InferenceBackend>> + Send + Sync>;
+/// Builds a fresh backend for one subagent run seeded with the given system
+/// prompt, or `None` when the active inference cannot host a second
+/// conversation (on-device). Takes the prompt per call (rather than baking
+/// one in at registration) so a configurable subagent type's prompt can
+/// replace [`SUBAGENT_SYSTEM_PROMPT`] on a call-by-call basis.
+pub type SubagentFactory = Box<dyn Fn(&str) -> Option<Arc<dyn InferenceBackend>> + Send + Sync>;
 
 static SUBAGENT_FACTORY: OnceLock<SubagentFactory> = OnceLock::new();
 
@@ -543,19 +562,22 @@ pub fn set_subagent_factory(factory: SubagentFactory) {
 /// Whether a `task` call could run right now: a factory is registered and it
 /// can build a backend. The spec builders (`agent_tools_as_specs` /
 /// `build_tool_specs`) use this to offer the tool only when it works, the same
-/// conditional pattern as the `skill` tool.
+/// conditional pattern as the `skill` tool. Building a backend just to probe
+/// is cheap (no I/O happens until the first message), so this passes a
+/// placeholder prompt and discards the result.
 pub fn subagent_available() -> bool {
     SUBAGENT_FACTORY
         .get()
-        .is_some_and(|factory| factory().is_some())
+        .is_some_and(|factory| factory(SUBAGENT_SYSTEM_PROMPT).is_some())
 }
 
 /// The read-only toolset offered to a subagent, filtered from [`all_tools`] by
-/// name. Never contains `task` (recursion) or any mutating tool.
-pub fn subagent_tool_specs() -> Vec<ToolSpec> {
+/// name. `allowed` must already be a subset of [`SUBAGENT_TOOL_NAMES`] —
+/// see [`effective_subagent_tools`], the only intended way to build one.
+fn subagent_tool_specs(allowed: &[String]) -> Vec<ToolSpec> {
     all_tools()
         .into_iter()
-        .filter(|tool| SUBAGENT_TOOL_NAMES.contains(&tool.name))
+        .filter(|tool| allowed.iter().any(|name| name == tool.name))
         .map(|tool| ToolSpec {
             name: tool.name.to_string(),
             description: tool.description.to_string(),
@@ -564,22 +586,75 @@ pub fn subagent_tool_specs() -> Vec<ToolSpec> {
         .collect()
 }
 
+/// The toolset a subagent call should actually get: [`SUBAGENT_TOOL_NAMES`]
+/// by default, or — when `agent_type` sets a `tools:` allow-list — its
+/// *intersection* with that ceiling. A type can never add a tool outside the
+/// base read-only set; anything else it lists is dropped with a warning
+/// rather than silently granted, since that's the whole security property
+/// this function exists to enforce (see the module doc above).
+fn effective_subagent_tools(agent_type: Option<&subagents::AgentType>) -> Vec<String> {
+    let Some(agent_type) = agent_type else {
+        return SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+    };
+    let Some(requested) = &agent_type.tools else {
+        // No `tools:` field: inherit the full default read-only set.
+        return SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+    };
+
+    let mut effective = Vec::new();
+    for name in requested {
+        if SUBAGENT_TOOL_NAMES.contains(&name.as_str()) {
+            effective.push(name.clone());
+        } else {
+            log::warn!(
+                "agent type \"{}\" at {} lists tool \"{name}\", which is not in the \
+                 subagent read-only allow-list ({}) — ignoring it",
+                agent_type.name,
+                agent_type.path.display(),
+                SUBAGENT_TOOL_NAMES.join(", ")
+            );
+        }
+    }
+    effective
+}
+
 /// Spec for the `task` tool. Lives in the `*_as_specs`/`build_tool_specs`
 /// layer (like `skill` and MCP tools), not in [`all_tools`], because it is
 /// only offered when [`subagent_available`] is true.
 pub fn task_tool_spec() -> ToolSpec {
+    let types = subagents::discover_agent_types();
+    let mut description = "Delegate a self-contained task to a subagent that \
+             runs in a fresh conversation and returns only its final answer. The \
+             subagent's tools are read-only by default (read files, list \
+             directories, search, glob, read websites) — it cannot modify \
+             anything. Use this for exploratory questions whose intermediate \
+             file reads would otherwise clutter this conversation (e.g. \"where \
+             is X implemented and how does it work?\"). The subagent cannot see \
+             this conversation, so the prompt must be fully self-contained: \
+             include absolute paths, symbol names, and exactly what the answer \
+             should contain."
+        .to_string();
+    if !types.is_empty() {
+        description.push_str(
+            "\n\nOptionally pass `subagent_type` to use one of these specialized \
+             subagent types instead of the general-purpose default:\n",
+        );
+        // Same cap as `skills::MAX_ADVERTISED_SKILLS`: this list is baked into
+        // every turn's tool spec, so bound its context cost even though a
+        // pathological number of type files is unlikely. `/agents` (see
+        // `subagents::format_agent_types_list`) shows the full list on request.
+        for agent_type in types.iter().take(MAX_ADVERTISED_AGENT_TYPES) {
+            description.push_str("- ");
+            description.push_str(&agent_type.name);
+            description.push_str(": ");
+            description.push_str(&agent_type.description);
+            description.push('\n');
+        }
+    }
+
     ToolSpec {
         name: TASK_TOOL_NAME.to_string(),
-        description: "Delegate a self-contained research task to a subagent that \
-             runs in a fresh conversation and returns only its final answer. The \
-             subagent can read files, list directories, search, glob, and read \
-             websites, but cannot modify anything. Use this for exploratory \
-             questions whose intermediate file reads would otherwise clutter this \
-             conversation (e.g. \"where is X implemented and how does it work?\"). \
-             The subagent cannot see this conversation, so the prompt must be \
-             fully self-contained: include absolute paths, symbol names, and \
-             exactly what the answer should contain."
-            .to_string(),
+        description,
         parameters_schema: json!({
             "type": "object",
             "properties": {
@@ -590,6 +665,10 @@ pub fn task_tool_spec() -> ToolSpec {
                 "prompt": {
                     "type": "string",
                     "description": "The full task for the subagent. Must be self-contained: the subagent sees nothing of this conversation."
+                },
+                "subagent_type": {
+                    "type": "string",
+                    "description": "Optional: the name of a configured subagent type (listed in this tool's description) to use instead of the general-purpose default."
                 }
             },
             "required": ["description", "prompt"],
@@ -620,21 +699,64 @@ async fn exec_task_with(arguments: &str, factory: Option<&SubagentFactory>) -> S
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or("(no description)");
+    let subagent_type_name = args
+        .get("subagent_type")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
 
-    let Some(backend) = factory.and_then(|build| build()) else {
+    let agent_type = match subagent_type_name {
+        Some(name) => match subagents::resolve_agent_type(name) {
+            Some(agent_type) => Some(agent_type),
+            None => {
+                let available = subagents::discover_agent_types()
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>();
+                return if available.is_empty() {
+                    format!(
+                        "Error: no subagent type named \"{name}\" (none are configured). \
+                         Omit subagent_type to use the default research subagent."
+                    )
+                } else {
+                    format!(
+                        "Error: no subagent type named \"{name}\". Available: {}. Omit \
+                         subagent_type to use the default research subagent.",
+                        available.join(", ")
+                    )
+                };
+            }
+        },
+        None => None,
+    };
+
+    let system_prompt = agent_type
+        .as_ref()
+        .map(|t| t.system_prompt.as_str())
+        .unwrap_or(SUBAGENT_SYSTEM_PROMPT);
+    let allowed_tools = effective_subagent_tools(agent_type.as_ref());
+
+    let Some(backend) = factory.and_then(|build| build(system_prompt)) else {
         return SUBAGENT_UNAVAILABLE.to_string();
     };
 
-    log::info!("task: running subagent — {description}");
-    run_subagent(backend.as_ref(), prompt).await
+    log::info!(
+        "task: running subagent — {description} (type: {})",
+        agent_type
+            .as_ref()
+            .map(|t| t.name.as_str())
+            .unwrap_or("default")
+    );
+    run_subagent(backend.as_ref(), prompt, &allowed_tools).await
 }
 
-/// The nested agent loop: a fresh conversation, read-only tools, a round cap,
-/// and only the final text returned. Mirrors the main loops in `main.rs` /
-/// `chat.rs`: offer tools each round, and pass `tools = None` on the last
-/// round to force a text answer.
-async fn run_subagent(backend: &dyn InferenceBackend, prompt: &str) -> String {
-    let specs = subagent_tool_specs();
+/// The nested agent loop: a fresh conversation, a round cap, and only the
+/// final text returned. Mirrors the main loops in `main.rs` / `chat.rs`:
+/// offer tools each round, and pass `tools = None` on the last round to
+/// force a text answer. `allowed` is the toolset for this run — the default
+/// read-only set, or a configured type's narrowed subset of it (see
+/// [`effective_subagent_tools`]).
+async fn run_subagent(backend: &dyn InferenceBackend, prompt: &str, allowed: &[String]) -> String {
+    let specs = subagent_tool_specs(allowed);
 
     let mut result = match backend.send_message_with_tools(prompt, &specs, None).await {
         Ok(r) => r,
@@ -652,17 +774,17 @@ async fn run_subagent(backend: &dyn InferenceBackend, prompt: &str) -> String {
         let mut tool_results = Vec::with_capacity(result.tool_calls.len());
         for call in &result.tool_calls {
             // Hard gate, not just advertisement: even if the model asks for a
-            // tool outside the offered set, only read-only tools execute here.
-            let content = if SUBAGENT_TOOL_NAMES.contains(&call.name.as_str()) {
+            // tool outside the offered set, only the allowed tools execute here.
+            let content = if allowed.iter().any(|name| name == &call.name) {
                 // Boxed to break the async cycle: execute_tool → task →
                 // run_subagent → execute_tool.
                 Box::pin(execute_tool(&call.name, &call.arguments)).await
             } else {
                 format!(
-                    "Error: `{}` is not available to a subagent. Only these \
-                     read-only tools are: {}.",
+                    "Error: `{}` is not available to this subagent. Only these \
+                     tools are: {}.",
                     call.name,
-                    SUBAGENT_TOOL_NAMES.join(", ")
+                    allowed.join(", ")
                 )
             };
             tool_results.push(ToolResult {
@@ -3112,7 +3234,7 @@ mod tests {
 
     #[test]
     fn test_subagent_toolset_is_read_only() {
-        let specs = subagent_tool_specs();
+        let specs = subagent_tool_specs(&effective_subagent_tools(None));
         let mut names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -3349,7 +3471,8 @@ mod tests {
         let file = dir.join("notes.txt");
         fs::write(&file, "subagent secret: 4217").unwrap();
 
-        // Script: one read_file tool call, then a final text answer.
+        // Script: one read_file tool call, a final text answer, then a third
+        // response for the custom-agent-type phase further down.
         let (port, requests) = start_scripted_endpoint(vec![
             completion_tool_call(
                 "call_1",
@@ -3357,17 +3480,22 @@ mod tests {
                 &serde_json::json!({ "path": file }).to_string(),
             ),
             completion_text("The file contains the number 4217."),
+            completion_text("Custom type answer."),
         ]);
 
         // Register the real process-global factory, pointing a fresh
         // OpenAiBackend at the scripted endpoint — exactly what the surfaces
-        // do at startup. This is the only test that touches the OnceLock.
-        set_subagent_factory(Box::new(move || {
+        // do at startup. This is the only test that touches the OnceLock
+        // (it's a `OnceLock`: later `set_subagent_factory` calls from other
+        // tests are silently ignored, so every test needing a real factory
+        // has to share this one registration — see the custom-agent-type
+        // phase later in this same test).
+        set_subagent_factory(Box::new(move |system_prompt: &str| {
             Some(Arc::new(crate::backend::OpenAiBackend::new(
                 format!("http://127.0.0.1:{port}"),
                 "test-key",
                 "scripted-model",
-                Some(SUBAGENT_SYSTEM_PROMPT.to_string()),
+                Some(system_prompt.to_string()),
             )) as Arc<dyn InferenceBackend>)
         }));
         assert!(subagent_available());
@@ -3382,48 +3510,164 @@ mod tests {
         // Only the subagent's final text comes back.
         assert_eq!(result, "The file contains the number 4217.");
 
-        let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 2, "expected exactly two completions");
+        // Scoped so the `MutexGuard` is dropped before phase 2's `.await` —
+        // holding a `std::sync::MutexGuard` across an await point is a bug
+        // (it can deadlock or block the executor), and clippy's
+        // `await_holding_lock` lint doesn't reliably see through a manual
+        // `drop()` call, so use an explicit block instead.
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 2, "expected exactly two completions");
 
-        // The subagent conversation is fresh (subagent system prompt) and was
-        // offered only the read-only toolset.
-        let first = &recorded[0];
-        assert_eq!(first["messages"][0]["role"], "system");
-        assert!(
-            first["messages"][0]["content"]
-                .as_str()
+            // The subagent conversation is fresh (subagent system prompt) and
+            // was offered only the read-only toolset.
+            let first = &recorded[0];
+            assert_eq!(first["messages"][0]["role"], "system");
+            assert!(
+                first["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("research subagent")
+            );
+            let offered: Vec<&str> = first["tools"]
+                .as_array()
                 .unwrap()
-                .contains("research subagent")
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect();
+            for name in &offered {
+                assert!(
+                    SUBAGENT_TOOL_NAMES.contains(name),
+                    "non-read-only tool offered: {name}"
+                );
+            }
+            assert!(!offered.contains(&TASK_TOOL_NAME));
+
+            // The read-only tool actually executed: its output travelled back
+            // to the endpoint as a tool result on the second request.
+            let messages = recorded[1]["messages"].as_array().unwrap();
+            let tool_message = messages
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .expect("no tool result in second request");
+            assert_eq!(tool_message["tool_call_id"], "call_1");
+            assert!(
+                tool_message["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("subagent secret: 4217")
+            );
+        }
+
+        // ── Phase 2: a configured subagent type, on the same registered
+        // factory and endpoint (the third scripted response above). Proves
+        // `subagent_type` actually swaps the system prompt and narrows the
+        // offered toolset end to end, not just at the pure-function level
+        // (see `effective_subagent_tools_*` below for that).
+        let agents_root = dir.join(".sigit").join("agents");
+        fs::create_dir_all(&agents_root).unwrap();
+        fs::write(
+            agents_root.join("notes-reader.md"),
+            "---\nname: notes-reader\ndescription: Reads notes files only\ntools: read_file\n---\n\nYou only ever read notes files and report exactly what they say.\n",
+        )
+        .unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let args = serde_json::json!({
+            "description": "read a note",
+            "prompt": "What does the notes file say?",
+            "subagent_type": "notes-reader",
+        })
+        .to_string();
+        let result = execute_tool(TASK_TOOL_NAME, &args).await;
+        assert_eq!(result, "Custom type answer.");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 3, "expected a third recorded request");
+        let last = &recorded[2];
+        assert_eq!(last["messages"][0]["role"], "system");
+        assert_eq!(
+            last["messages"][0]["content"].as_str().unwrap(),
+            "You only ever read notes files and report exactly what they say."
         );
-        let offered: Vec<&str> = first["tools"]
+        let offered: Vec<&str> = last["tools"]
             .as_array()
             .unwrap()
             .iter()
             .map(|tool| tool["function"]["name"].as_str().unwrap())
             .collect();
-        for name in &offered {
-            assert!(
-                SUBAGENT_TOOL_NAMES.contains(name),
-                "non-read-only tool offered: {name}"
-            );
-        }
-        assert!(!offered.contains(&TASK_TOOL_NAME));
-
-        // The read-only tool actually executed: its output travelled back to
-        // the endpoint as a tool result on the second request.
-        let messages = recorded[1]["messages"].as_array().unwrap();
-        let tool_message = messages
-            .iter()
-            .find(|message| message["role"] == "tool")
-            .expect("no tool result in second request");
-        assert_eq!(tool_message["tool_call_id"], "call_1");
-        assert!(
-            tool_message["content"]
-                .as_str()
-                .unwrap()
-                .contains("subagent secret: 4217")
+        assert_eq!(
+            offered,
+            vec!["read_file"],
+            "notes-reader's tools: read_file should narrow the offered toolset to just that"
         );
+        drop(recorded);
 
+        std::env::set_current_dir(prev_cwd).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_subagent_tools_defaults_to_full_read_only_set_without_a_type() {
+        let mut tools = effective_subagent_tools(None);
+        tools.sort();
+        let mut expected: Vec<String> = SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(tools, expected);
+    }
+
+    #[test]
+    fn effective_subagent_tools_inherits_full_set_when_type_omits_tools_field() {
+        let agent_type = subagents::AgentType {
+            name: "generalist".to_string(),
+            description: "does anything".to_string(),
+            tools: None,
+            system_prompt: "Be helpful.".to_string(),
+            path: PathBuf::from("/x/generalist.md"),
+        };
+        let mut tools = effective_subagent_tools(Some(&agent_type));
+        tools.sort();
+        let mut expected: Vec<String> = SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(tools, expected);
+    }
+
+    #[test]
+    fn effective_subagent_tools_narrows_to_the_types_allow_list() {
+        let agent_type = subagents::AgentType {
+            name: "notes-reader".to_string(),
+            description: "reads notes".to_string(),
+            tools: Some(vec!["read_file".to_string(), "glob".to_string()]),
+            system_prompt: "Read notes.".to_string(),
+            path: PathBuf::from("/x/notes-reader.md"),
+        };
+        let tools = effective_subagent_tools(Some(&agent_type));
+        assert_eq!(tools, vec!["read_file".to_string(), "glob".to_string()]);
+    }
+
+    #[test]
+    fn effective_subagent_tools_drops_anything_outside_the_read_only_ceiling() {
+        // The security-critical case: a type file cannot grant itself a
+        // mutating tool by listing it in `tools:` — it's silently dropped,
+        // never passed through to the offered/gated toolset.
+        let agent_type = subagents::AgentType {
+            name: "sneaky".to_string(),
+            description: "tries to grant itself write access".to_string(),
+            tools: Some(vec![
+                "read_file".to_string(),
+                "edit_file".to_string(),
+                "run_command".to_string(),
+                "task".to_string(),
+            ]),
+            system_prompt: "...".to_string(),
+            path: PathBuf::from("/x/sneaky.md"),
+        };
+        let tools = effective_subagent_tools(Some(&agent_type));
+        assert_eq!(tools, vec!["read_file".to_string()]);
+        assert!(!tools.contains(&"edit_file".to_string()));
+        assert!(!tools.contains(&"run_command".to_string()));
+        assert!(!tools.contains(&"task".to_string()));
     }
 }
