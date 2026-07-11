@@ -33,8 +33,16 @@
 //! "top-level only" mode today.
 
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a single hook command may run before it is killed, unless
+/// `[hooks] timeout_secs` overrides it. Without a bound, a hook that never
+/// exits (waits on input, a stalled network mount, a deadlock) blocks the
+/// tool call or session start that fired it forever.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 /// Hook configuration: lists of shell commands to run at key moments.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +56,11 @@ pub struct HookSettings {
     /// Commands to run after a tool is executed.
     #[serde(default)]
     pub post_tool_use: Vec<String>,
+    /// Per-hook wall-clock limit in seconds. `None` uses
+    /// [`DEFAULT_HOOK_TIMEOUT_SECS`]. Raise it for slow hooks (a build, a
+    /// linter); a hook that exceeds it is killed and logged.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl HookSettings {
@@ -56,6 +69,11 @@ impl HookSettings {
         !self.session_start.is_empty()
             || !self.pre_tool_use.is_empty()
             || !self.post_tool_use.is_empty()
+    }
+
+    /// The wall-clock limit applied to each hook command.
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS))
     }
 }
 
@@ -167,37 +185,86 @@ fn windows_quote(value: &str) -> String {
 /// (`SIGIT_HOOK_CWD`, `SIGIT_HOOK_SESSION_ID`, `SIGIT_HOOK_TOOL_NAME`,
 /// `SIGIT_HOOK_TOOL_ARGS_LEN`, `SIGIT_HOOK_TOOL_RESULT_LEN`) so hook scripts
 /// can read them without any quoting concerns at all.
-fn run_hook(cmd: &str, context: &HookContext, cwd: &Path) {
+fn run_hook(cmd: &str, context: &HookContext, cwd: &Path, timeout: Duration) {
     #[cfg(unix)]
     let (shell, flag, substituted) = ("sh", "-c", context.substitute(cmd, posix_quote));
     #[cfg(windows)]
     let (shell, flag, substituted) = ("cmd", "/C", context.substitute(cmd, windows_quote));
 
     log::debug!("Running hook: {substituted}");
-    match Command::new(shell)
+    let mut child = match Command::new(shell)
         .arg(flag)
         .arg(&substituted)
         .current_dir(cwd)
         .envs(context.env_vars())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
     {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                log::warn!(
-                    "Hook failed with status {:?}: {}",
-                    output.status.code(),
-                    stderr.trim()
-                );
-            } else {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.is_empty() {
-                    log::debug!("Hook output: {}", stdout.trim());
-                }
-            }
-        }
+        Ok(child) => child,
         Err(err) => {
             log::warn!("Failed to run hook: {err}");
+            return;
+        }
+    };
+
+    // Drain stdout/stderr on their own threads so a hook that writes more than
+    // the pipe buffer holds (a build, say) keeps making progress instead of
+    // blocking on a full pipe and looking like a hang. The main thread polls
+    // for exit and enforces the deadline.
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let stdout_handle = drain(child.stdout.take());
+    let stderr_handle = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                log::warn!("Failed to wait on hook: {err}");
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    // The child has exited (or been killed), so both pipes are closed and the
+    // drain threads finish promptly.
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+
+    match status {
+        None => log::warn!(
+            "Hook timed out after {}s and was killed: {substituted}",
+            timeout.as_secs()
+        ),
+        Some(status) if !status.success() => log::warn!(
+            "Hook failed with status {:?}: {}",
+            status.code(),
+            String::from_utf8_lossy(&stderr).trim()
+        ),
+        Some(_) => {
+            let out = String::from_utf8_lossy(&stdout);
+            if !out.trim().is_empty() {
+                log::debug!("Hook output: {}", out.trim());
+            }
         }
     }
 }
@@ -214,7 +281,7 @@ pub fn run_session_start_hooks(hooks: &HookSettings, cwd: &Path, session_id: &st
         ..HookContext::new()
     };
     for cmd in &hooks.session_start {
-        run_hook(cmd, &context, cwd);
+        run_hook(cmd, &context, cwd, hooks.timeout());
     }
 }
 
@@ -231,7 +298,7 @@ pub fn run_pre_tool_use_hooks(hooks: &HookSettings, tool_name: &str, tool_args: 
         ..HookContext::new()
     };
     for cmd in &hooks.pre_tool_use {
-        run_hook(cmd, &context, cwd);
+        run_hook(cmd, &context, cwd, hooks.timeout());
     }
 }
 
@@ -253,13 +320,47 @@ pub fn run_post_tool_use_hooks(
         ..HookContext::new()
     };
     for cmd in &hooks.post_tool_use {
-        run_hook(cmd, &context, cwd);
+        run_hook(cmd, &context, cwd, hooks.timeout());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_that_hangs_is_killed_at_the_timeout() {
+        // A hook that would sleep far past the deadline must be killed near it,
+        // not block the caller for the full sleep.
+        let context = HookContext::new();
+        let start = Instant::now();
+        run_hook(
+            "sleep 30",
+            &context,
+            Path::new("."),
+            Duration::from_millis(300),
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hook should have been killed shortly after its 300ms timeout, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_when_unset_and_honors_override() {
+        let default = HookSettings::default();
+        assert_eq!(
+            default.timeout(),
+            Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS)
+        );
+        let custom = HookSettings {
+            timeout_secs: Some(5),
+            ..HookSettings::default()
+        };
+        assert_eq!(custom.timeout(), Duration::from_secs(5));
+    }
 
     #[test]
     fn test_hook_context_substitution() {
