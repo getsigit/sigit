@@ -152,6 +152,12 @@ Git operations — always use run_command:
   lands without it, siGit Code amends the trailer in automatically and the tool \
   output says so; do not amend again yourself.
 
+For repositories hosted on sigit.si, issue and pull request workflows go \
+through the official MCP tools: mcp__sigit__list_issues, mcp__sigit__get_issue, \
+mcp__sigit__create_issue, mcp__sigit__list_pull_requests, and \
+mcp__sigit__get_pull_request. Prefer these tools over shelling out to git (or \
+fetching web pages) for issue and PR queries on sigit.si repos.
+
 Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
 Fix root causes, not symptoms.
@@ -3334,6 +3340,25 @@ mod tests {
         assert!(matches!(parse_slash("/init"), Some(SlashCommand::Init)));
         // Trailing whitespace comes from editors that submit the raw line.
         assert!(matches!(parse_slash(" /init "), Some(SlashCommand::Init)));
+    }
+
+    #[test]
+    fn system_prompt_points_issue_and_pr_work_at_the_official_mcp_tools() {
+        // The guidance must reference the exact namespaced names the official
+        // server's tools get (see mcp::official_tool_name), or the model will
+        // call tools that don't exist.
+        for tool in [
+            "list_issues",
+            "get_issue",
+            "create_issue",
+            "list_pull_requests",
+            "get_pull_request",
+        ] {
+            assert!(
+                SYSTEM_PROMPT.contains(&mcp::official_tool_name(tool)),
+                "SYSTEM_PROMPT must mention mcp__sigit__{tool}"
+            );
+        }
     }
 
     #[test]

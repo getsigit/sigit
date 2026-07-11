@@ -40,7 +40,8 @@
 //!
 //! Tools discovered from MCP servers (`mcp__*`) and any unknown tool name are
 //! treated as mutating: external tools can have arbitrary side effects, so the
-//! safe assumption is to gate them.
+//! safe assumption is to gate them. The one exception is the official
+//! sigit.si server's query tools (see [`classify`]), which are read-only.
 //!
 //! Session state (grants + plan mode) lives in a process-global keyed by
 //! session id — the same pattern as `mcp.rs`'s server cache — so the ACP
@@ -88,11 +89,26 @@ pub enum Decision {
 /// `task` is read-only because the subagent it launches is restricted to the
 /// read-only toolset (see `SUBAGENT_TOOL_NAMES` in `tools.rs`), so delegated
 /// research stays available in plan mode.
+///
+/// One MCP exception: the *official* sigit.si server (`mcp__sigit__*`) is
+/// first-party, so its query tools — names starting `list_` or `get_`, plus
+/// `search_code` and `web_search` — are read-only and never prompt (the TUI's
+/// Repo tab depends on this). Every other `mcp__*` tool stays mutating.
 pub fn classify(tool_name: &str) -> ToolRisk {
     match tool_name {
         "read_file" | "list_directory" | "search_files" | "glob" | "read_website"
         | "write_todos" | "skill" | "task" | "command_output" => ToolRisk::ReadOnly,
-        _ => ToolRisk::Mutating,
+        _ => {
+            if let Some(bare) = crate::mcp::official_tool_suffix(tool_name)
+                && (bare.starts_with("list_")
+                    || bare.starts_with("get_")
+                    || bare == "search_code"
+                    || bare == "web_search")
+            {
+                return ToolRisk::ReadOnly;
+            }
+            ToolRisk::Mutating
+        }
     }
 }
 
@@ -437,6 +453,44 @@ mod tests {
             "remember",
             "mcp__server__anything",
             "totally_unknown_tool",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
+        }
+    }
+
+    #[test]
+    fn official_mcp_query_tools_are_read_only() {
+        let _guard = env_guard();
+        for tool in [
+            "mcp__sigit__list_issues",
+            "mcp__sigit__list_pull_requests",
+            "mcp__sigit__get_issue",
+            "mcp__sigit__get_pull_request",
+            "mcp__sigit__list_repositories",
+            "mcp__sigit__get_file_contents",
+            "mcp__sigit__search_code",
+            "mcp__sigit__web_search",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
+            // Read-only means it never prompts, whatever the policy layers say.
+            assert_eq!(decision_for("t-official", tool, "{}"), Decision::Allow, "{tool}");
+        }
+    }
+
+    #[test]
+    fn official_mcp_mutating_and_foreign_servers_stay_gated() {
+        for tool in [
+            // official server, but not a query tool
+            "mcp__sigit__create_issue",
+            "mcp__sigit__merge_pull_request",
+            "mcp__sigit__delete_repository",
+            "mcp__sigit__",
+            // query-shaped names on other servers get no exemption
+            "mcp__other__list_issues",
+            "mcp__other__get_issue",
+            "mcp__github__search_code",
+            // `sigit` must match the whole server name
+            "mcp__sigitx__list_issues",
         ] {
             assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
         }
