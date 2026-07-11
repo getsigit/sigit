@@ -119,6 +119,21 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
   `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
   and only when at least one skill exists.
+- **`src/commands.rs`** — user-defined slash commands. Discovers Markdown files (each an
+  optional YAML frontmatter block — `description`, `argument-hint` — followed by a prompt-template
+  body) from `.sigit/commands/` and `.claude/commands/` in the cwd, `$SIGIT_CONFIG_DIR/commands/`,
+  and `~/.claude/commands/`. A subdirectory namespaces the command with `:`
+  (`.sigit/commands/git/commit.md` → `/git:commit`). Unlike skills there's no tool-call
+  indirection: invoking one works exactly like the built-in `/init` — `commands::render`
+  substitutes `$ARGUMENTS`/`$1..$9` in the body against whatever followed the command on the
+  input line, and the result is fed to the model as a normal turn through the ordinary tools and
+  permission checks. Resolution happens where each surface (`main.rs`/`chat.rs`) already
+  special-cases `/init`: an unrecognized slash command is tried against `commands::resolve_command`
+  before falling back to "unknown command". A custom command sharing a name with a built-in is
+  unreachable (built-ins match first in `parse_slash`) and is skipped when advertised to ACP
+  clients, with a warning logged.
+- **`src/frontmatter.rs`** — shared "YAML frontmatter + Markdown body" parsing used by both
+  `src/skills.rs` (`SKILL.md`) and `src/commands.rs` (`.sigit/commands/*.md`).
 - **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Two
   transports: **Streamable HTTP** (one JSON-RPC POST endpoint, `url` in `mcp.toml`; replies are
   `application/json` or SSE) and **stdio** (`command` + optional `args`/`[server.env]` in
@@ -165,12 +180,14 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
-Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
-`/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via `advertise_commands` in
-`main.rs` and handled in both the TUI and ACP sessions. `/init` is special: instead of replying
-directly it substitutes `instructions::INIT_PROMPT` for the user text and runs a normal agent
-turn that explores the repo and writes (or improves) `AGENTS.md` through the ordinary tools and
-permission checks.
+Slash commands (`/help`, `/models`, `/skills`, `/commands`, `/mcp`, `/login`, `/logout`, `/whoami`,
+`/reload`, `/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via
+`advertise_commands` in `main.rs` and handled in both the TUI and ACP sessions. `/init` is
+special: instead of replying directly it substitutes `instructions::INIT_PROMPT` for the user
+text and runs a normal agent turn that explores the repo and writes (or improves) `AGENTS.md`
+through the ordinary tools and permission checks. User-defined commands (see `src/commands.rs`)
+get the same treatment via the `SlashCommand::Unknown` fallback path, so anyone can add their own
+`/name` commands without touching the built-in command list.
 
 ## Model cache (macOS)
 

@@ -31,7 +31,9 @@
 mod account;
 mod backend;
 mod chat;
+mod commands;
 mod credentials;
+mod frontmatter;
 mod headless;
 mod hooks;
 mod instructions;
@@ -773,7 +775,7 @@ impl SiGitAgent {
                 UnstructuredCommandInput::new(hint),
             ))
         };
-        let commands = vec![
+        let mut commands = vec![
             AvailableCommand::new("help", "Show available commands"),
             AvailableCommand::new("models", "List available models").input(
                 AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
@@ -786,6 +788,10 @@ impl SiGitAgent {
                 "on|off (optional)",
             ),
             AvailableCommand::new("skills", "List available Agent Skills"),
+            AvailableCommand::new(
+                "commands",
+                "List user-defined commands (.sigit/commands/*.md)",
+            ),
             AvailableCommand::new("mcp", "List MCP servers and their tools"),
             AvailableCommand::new("load", "Load the selected on-device model"),
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
@@ -803,6 +809,32 @@ impl SiGitAgent {
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
+
+        // User-defined commands (.sigit/commands/*.md etc.) are appended so
+        // clients that only forward advertised commands (Zed) can actually
+        // send them. A custom command sharing a name with a built-in is
+        // unreachable — parse_slash always matches built-ins first — so skip
+        // advertising the shadowed duplicate rather than confuse the client.
+        let built_in_names: Vec<String> = commands.iter().map(|c| c.name.to_string()).collect();
+        for command in commands::discover_commands() {
+            if built_in_names.contains(&command.name) {
+                log::warn!(
+                    "custom command \"{}\" at {} is shadowed by a built-in command of the same name",
+                    command.name,
+                    command.path.display()
+                );
+                continue;
+            }
+            let description = command
+                .description
+                .clone()
+                .unwrap_or_else(|| "User-defined command".to_string());
+            commands.push(match &command.argument_hint {
+                Some(hint) => with_hint(&command.name, &description, hint),
+                None => AvailableCommand::new(&command.name, &description),
+            });
+        }
+
         self.send_tool_call_update(
             cx,
             session_id,
@@ -1294,6 +1326,24 @@ impl SiGitAgent {
             // exploration and file write go through the ordinary tools and
             // permission checks.
             Some(SlashCommand::Init) => instructions::INIT_PROMPT.to_string(),
+            // A word `parse_slash` didn't recognize might be a user-defined
+            // command (`.sigit/commands/*.md`) — same substitute-and-run-a-
+            // real-turn treatment as `/init`. Only fall back to "unknown
+            // command" once that lookup also misses.
+            Some(SlashCommand::Unknown(command, argument)) => {
+                match commands::resolve_command(&command) {
+                    Some(custom) => commands::render(&custom.body, argument.as_deref()),
+                    None => {
+                        return exec_slash_acp(
+                            self,
+                            cx,
+                            session_id,
+                            SlashCommand::Unknown(command, argument),
+                        )
+                        .await;
+                    }
+                }
+            }
             Some(command) => return exec_slash_acp(self, cx, session_id, command).await,
             None => user_text,
         };
@@ -2243,6 +2293,8 @@ enum SlashCommand {
     Local(Option<bool>),
     /// List discovered Agent Skills.
     Skills,
+    /// List discovered user-defined commands (`.sigit/commands/*.md`).
+    Commands,
     /// List configured MCP servers and their tools.
     Mcp,
     /// Explicitly load the selected (or default) on-device model.
@@ -2264,7 +2316,10 @@ enum SlashCommand {
     /// with [`instructions::INIT_PROMPT`] as the user text.
     Init,
     Exit,
-    Unknown(String),
+    /// An unrecognized command word, plus whatever followed it on the line
+    /// (untouched — a caller may still resolve it as a user-defined command
+    /// before falling back to "unknown command").
+    Unknown(String, Option<String>),
 }
 
 fn parse_slash(input: &str) -> Option<SlashCommand> {
@@ -2282,6 +2337,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
         "/local" => SlashCommand::Local(parse_on_off(argument)),
         "/skills" => SlashCommand::Skills,
+        "/commands" => SlashCommand::Commands,
         "/mcp" => SlashCommand::Mcp,
         "/load" => SlashCommand::Load,
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
@@ -2293,7 +2349,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/compact" => SlashCommand::Compact,
         "/init" => SlashCommand::Init,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
-        other => SlashCommand::Unknown(other.to_string()),
+        other => SlashCommand::Unknown(other.to_string(), argument.map(str::to_string)),
     })
 }
 
@@ -2394,6 +2450,7 @@ async fn exec_slash_acp(
                      /models N      - switch to model N\n\
                      /local [on|off]- toggle on-device inference mode\n\
                      /skills        - list available Agent Skills\n\
+                     /commands      - list user-defined commands (.sigit/commands/*.md)\n\
                      /mcp           - list MCP servers and their tools\n\
                      /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
@@ -2481,6 +2538,11 @@ async fn exec_slash_acp(
         SlashCommand::Skills => {
             agent
                 .send_assistant_message(cx, session_id, skills::format_skills_list())
+                .ok();
+        }
+        SlashCommand::Commands => {
+            agent
+                .send_assistant_message(cx, session_id, commands::format_commands_list())
                 .ok();
         }
         SlashCommand::Mcp => {
@@ -2680,9 +2742,15 @@ async fn exec_slash_acp(
                 .send_assistant_message(cx, session_id, "Send /init as a prompt to run it.")
                 .ok();
         }
-        SlashCommand::Unknown(command) => {
+        SlashCommand::Unknown(command, _) => {
             agent
-                .send_assistant_message(cx, session_id, format!("unknown command: {command}"))
+                .send_assistant_message(
+                    cx,
+                    session_id,
+                    format!(
+                        "unknown command: {command}. Type /commands to list user-defined commands."
+                    ),
+                )
                 .ok();
         }
     }
