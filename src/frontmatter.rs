@@ -94,28 +94,35 @@ pub fn unquote(value: &str) -> String {
 /// Return the content after the frontmatter block, or the whole input if
 /// there is no frontmatter.
 pub fn strip_frontmatter(contents: &str) -> &str {
+    // Mirror `extract_frontmatter`'s leniency exactly: tolerate a UTF-8 BOM,
+    // leading blank lines before the opener, and CRLF line endings (compare
+    // trimmed lines). If the two disagree, a file whose frontmatter parses
+    // still leaks that raw block into the body — see the round-trip test.
     let trimmed = contents.trim_start_matches('\u{feff}');
-    let after_opener = match trimmed.strip_prefix("---") {
-        Some(rest) => match rest.strip_prefix('\n') {
-            Some(rest) => rest,
-            None => return contents,
-        },
-        None => return contents,
-    };
-    // Find the closing `---` line.
-    let mut search = after_opener;
-    let mut offset = 0;
+    let mut rest = trimmed;
     loop {
-        let end = search.find('\n').map(|i| i + 1).unwrap_or(search.len());
-        let (line, after) = search.split_at(end);
-        if line.trim() == "---" {
-            return &after_opener[offset + end..];
+        let line_end = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
+        let (line, after) = rest.split_at(line_end);
+        if line.trim().is_empty() {
+            rest = after;
+            continue;
         }
-        if after.is_empty() {
+        if line.trim() != "---" {
             return contents;
         }
-        offset += end;
-        search = after;
+        // `after` begins just past the opening `---` line; find the closing one.
+        let mut search = after;
+        loop {
+            let end = search.find('\n').map(|i| i + 1).unwrap_or(search.len());
+            let (l, a) = search.split_at(end);
+            if l.trim() == "---" {
+                return a;
+            }
+            if a.is_empty() {
+                return contents;
+            }
+            search = a;
+        }
     }
 }
 
@@ -165,5 +172,29 @@ mod tests {
     #[test]
     fn strip_frontmatter_passes_through_without_block() {
         assert_eq!(strip_frontmatter("just body"), "just body");
+    }
+
+    #[test]
+    fn extract_and_strip_agree_on_crlf_and_leading_blanks() {
+        // Whenever extract_frontmatter finds a block, strip_frontmatter must
+        // remove exactly that block and never leak it into the body. These
+        // inputs (CRLF endings, a leading blank line, a BOM) parse fine in
+        // extract but used to defeat strip's byte-exact opener check.
+        for md in [
+            "---\r\nname: foo\r\ndescription: bar\r\n---\r\n\r\nBody.\r\n",
+            "\n---\nname: foo\ndescription: bar\n---\n\nBody.\n",
+            "\u{feff}---\nname: foo\ndescription: bar\n---\n\nBody.\n",
+        ] {
+            assert!(
+                extract_frontmatter(md).is_some(),
+                "extract should find frontmatter in {md:?}"
+            );
+            let body = strip_frontmatter(md);
+            assert!(
+                !body.contains("name: foo"),
+                "frontmatter leaked into body for {md:?}: {body:?}"
+            );
+            assert_eq!(body.trim(), "Body.");
+        }
     }
 }
