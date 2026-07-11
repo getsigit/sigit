@@ -282,6 +282,9 @@ mod tests {
 
     #[test]
     fn discover_and_resolve_roundtrip() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = unique_dir("roundtrip");
         let agents_root = root.join(".sigit").join("agents");
         fs::create_dir_all(&agents_root).unwrap();
@@ -308,6 +311,9 @@ mod tests {
 
     #[test]
     fn format_agent_types_list_reports_none_found() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = unique_dir("empty");
         fs::create_dir_all(&root).unwrap();
         let prev = std::env::current_dir().unwrap();

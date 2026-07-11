@@ -414,6 +414,9 @@ mod tests {
 
     #[test]
     fn discover_and_activate_roundtrip() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = unique_dir("roundtrip");
         let skills_root = root.join(".sigit").join("skills");
         let skill_dir = skills_root.join("hello-world");
