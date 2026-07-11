@@ -688,13 +688,15 @@ fn subagent_tool_specs(allowed: &[String]) -> Vec<ToolSpec> {
 /// base read-only set; anything else it lists is dropped with a warning
 /// rather than silently granted, since that's the whole security property
 /// this function exists to enforce (see the module doc above).
-fn effective_subagent_tools(agent_type: Option<&subagents::AgentType>) -> Vec<String> {
+fn effective_subagent_tools(
+    agent_type: Option<&subagents::AgentType>,
+) -> Result<Vec<String>, String> {
     let Some(agent_type) = agent_type else {
-        return SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        return Ok(SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect());
     };
     let Some(requested) = &agent_type.tools else {
         // No `tools:` field: inherit the full default read-only set.
-        return SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        return Ok(SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect());
     };
 
     let mut effective = Vec::new();
@@ -711,7 +713,23 @@ fn effective_subagent_tools(agent_type: Option<&subagents::AgentType>) -> Vec<St
             );
         }
     }
-    effective
+
+    // A `tools:` field that intersects the ceiling to nothing is a
+    // misconfiguration, not a request for a toolless subagent: running it
+    // anyway would answer from the model's priors with no file access and no
+    // signal beyond a log line. Surface it as an error instead.
+    if effective.is_empty() {
+        return Err(format!(
+            "Error: subagent type \"{}\" at {} sets `tools: {}`, none of which \
+             is in the subagent read-only set ({}). Fix the type's `tools:` \
+             field, or omit it to inherit the default read-only tools.",
+            agent_type.name,
+            agent_type.path.display(),
+            requested.join(", "),
+            SUBAGENT_TOOL_NAMES.join(", "),
+        ));
+    }
+    Ok(effective)
 }
 
 /// Spec for the `task` tool. Lives in the `*_as_specs`/`build_tool_specs`
@@ -829,7 +847,10 @@ async fn exec_task_with(arguments: &str, factory: Option<&SubagentFactory>) -> S
         .as_ref()
         .map(|t| t.system_prompt.as_str())
         .unwrap_or(SUBAGENT_SYSTEM_PROMPT);
-    let allowed_tools = effective_subagent_tools(agent_type.as_ref());
+    let allowed_tools = match effective_subagent_tools(agent_type.as_ref()) {
+        Ok(tools) => tools,
+        Err(err) => return err,
+    };
 
     let Some(backend) = factory.and_then(|build| build(system_prompt)) else {
         return SUBAGENT_UNAVAILABLE.to_string();
@@ -3330,7 +3351,7 @@ mod tests {
 
     #[test]
     fn test_subagent_toolset_is_read_only() {
-        let specs = subagent_tool_specs(&effective_subagent_tools(None));
+        let specs = subagent_tool_specs(&effective_subagent_tools(None).unwrap());
         let mut names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -3762,7 +3783,7 @@ mod tests {
 
     #[test]
     fn effective_subagent_tools_defaults_to_full_read_only_set_without_a_type() {
-        let mut tools = effective_subagent_tools(None);
+        let mut tools = effective_subagent_tools(None).unwrap();
         tools.sort();
         let mut expected: Vec<String> = SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
         expected.sort();
@@ -3778,7 +3799,7 @@ mod tests {
             system_prompt: "Be helpful.".to_string(),
             path: PathBuf::from("/x/generalist.md"),
         };
-        let mut tools = effective_subagent_tools(Some(&agent_type));
+        let mut tools = effective_subagent_tools(Some(&agent_type)).unwrap();
         tools.sort();
         let mut expected: Vec<String> = SUBAGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
         expected.sort();
@@ -3794,7 +3815,7 @@ mod tests {
             system_prompt: "Read notes.".to_string(),
             path: PathBuf::from("/x/notes-reader.md"),
         };
-        let tools = effective_subagent_tools(Some(&agent_type));
+        let tools = effective_subagent_tools(Some(&agent_type)).unwrap();
         assert_eq!(tools, vec!["read_file".to_string(), "glob".to_string()]);
     }
 
@@ -3815,10 +3836,29 @@ mod tests {
             system_prompt: "...".to_string(),
             path: PathBuf::from("/x/sneaky.md"),
         };
-        let tools = effective_subagent_tools(Some(&agent_type));
+        let tools = effective_subagent_tools(Some(&agent_type)).unwrap();
         assert_eq!(tools, vec!["read_file".to_string()]);
         assert!(!tools.contains(&"edit_file".to_string()));
         assert!(!tools.contains(&"run_command".to_string()));
         assert!(!tools.contains(&"task".to_string()));
+    }
+
+    #[test]
+    fn effective_subagent_tools_errors_when_allow_list_intersects_to_nothing() {
+        // A type whose `tools:` names only out-of-ceiling tools (e.g. Claude
+        // Code names carried over) must error, not silently run toolless.
+        let agent_type = subagents::AgentType {
+            name: "misconfigured".to_string(),
+            description: "names only invalid tools".to_string(),
+            tools: Some(vec!["grep".to_string(), "bash".to_string()]),
+            system_prompt: "...".to_string(),
+            path: PathBuf::from("/x/misconfigured.md"),
+        };
+        let err = effective_subagent_tools(Some(&agent_type)).unwrap_err();
+        assert!(
+            err.contains("misconfigured"),
+            "message names the type: {err}"
+        );
+        assert!(err.contains("read-only set"), "message explains why: {err}");
     }
 }
