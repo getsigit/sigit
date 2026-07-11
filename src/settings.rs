@@ -229,6 +229,14 @@ pub fn permission_rules() -> PermissionRules {
     load().permissions.rules
 }
 
+/// The tool's explicit `[permissions.tools]` override, or `None` when it has
+/// no entry. Unlike [`permission_mode_for`] this never falls back to the
+/// default or the env override, so callers can tell "the user set a mode for
+/// this exact tool" apart from "the tool inherits the default".
+pub fn permission_mode_explicit(tool_name: &str) -> Option<PermissionMode> {
+    load().permissions.tools.get(tool_name).copied()
+}
+
 /// The effective permission mode for one tool: its `[permissions.tools]`
 /// override when present, else the default (see [`permission_default`]).
 pub fn permission_mode_for(tool_name: &str) -> PermissionMode {
