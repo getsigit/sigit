@@ -81,21 +81,41 @@ pub fn resolve_command(name: &str) -> Option<CustomCommand> {
 /// silently dropped.
 pub fn render(body: &str, arguments: Option<&str>) -> String {
     let arguments = arguments.unwrap_or("");
-    let mut result = body.to_string();
-    let mut substituted = false;
-
-    if result.contains("$ARGUMENTS") {
-        result = result.replace("$ARGUMENTS", arguments);
-        substituted = true;
-    }
-
     let positional: Vec<&str> = arguments.split_whitespace().collect();
-    for (i, arg) in positional.iter().enumerate() {
-        let placeholder = format!("${}", i + 1);
-        if result.contains(&placeholder) {
-            result = result.replace(&placeholder, arg);
-            substituted = true;
+
+    // Substitute in a single left-to-right pass over the template so text we
+    // insert is never re-scanned for further placeholders. A second pass (as
+    // this once did) would re-expand a literal `$1` that appeared inside the
+    // user's own `$ARGUMENTS`, corrupting prompts that mention shell
+    // positional variables.
+    let mut result = String::with_capacity(body.len());
+    let mut substituted = false;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < body.len() {
+        if bytes[i] == b'$' {
+            if body[i..].starts_with("$ARGUMENTS") {
+                result.push_str(arguments);
+                substituted = true;
+                i += "$ARGUMENTS".len();
+                continue;
+            }
+            // Positional `$1`..`$9`, but only when that argument was supplied;
+            // otherwise leave the placeholder untouched (as before).
+            if let Some(&d) = bytes.get(i + 1)
+                && d.is_ascii_digit()
+                && d != b'0'
+                && let Some(arg) = positional.get((d - b'1') as usize)
+            {
+                result.push_str(arg);
+                substituted = true;
+                i += 2;
+                continue;
+            }
         }
+        let ch = body[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     if !substituted && !arguments.is_empty() {
@@ -298,6 +318,24 @@ mod tests {
             render(body, Some("main feature-x")),
             "Compare main against feature-x."
         );
+    }
+
+    #[test]
+    fn render_does_not_re_expand_positional_vars_inside_arguments() {
+        // A literal `$1` typed by the user must survive: the single pass
+        // substitutes $ARGUMENTS once and never re-scans the inserted text.
+        let body = "Explain: $ARGUMENTS";
+        assert_eq!(
+            render(body, Some("what does $1 mean in bash")),
+            "Explain: what does $1 mean in bash"
+        );
+    }
+
+    #[test]
+    fn render_leaves_unsupplied_positional_placeholder_literal() {
+        let body = "Compare $1 against $2.";
+        // Only one argument supplied: $2 stays untouched, like the old pass.
+        assert_eq!(render(body, Some("main")), "Compare main against $2.");
     }
 
     #[test]
