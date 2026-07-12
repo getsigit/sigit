@@ -242,11 +242,42 @@ fn matchable_argument(tool_name: &str, arguments: &str) -> Option<String> {
 /// string, consulted by rule patterns and granular session grants. See the
 /// module docs for the layering.
 pub fn decision_for(session: &str, tool_name: &str, arguments: &str) -> Decision {
-    if classify(tool_name) == ToolRisk::ReadOnly {
+    let read_only = classify(tool_name) == ToolRisk::ReadOnly;
+    let argument = matchable_argument(tool_name, arguments);
+    let rules = settings::permission_rules();
+
+    // An explicit deny applies to every tool, read-only ones included. This is
+    // what lets a user still switch off a first-party query tool that
+    // `classify` now treats as read-only (`web_search`, `list_issues`, …);
+    // without it, the reclassification would silently stop honoring a deny that
+    // was enforced when those names counted as mutating.
+    if let Some(rule) = rules
+        .deny
+        .iter()
+        .find(|rule| rule_matches(rule, tool_name, argument.as_deref()))
+    {
+        return Decision::Deny(format!(
+            "`{tool_name}` is denied by the permission rule `{rule}` in settings.toml. \
+             Do not retry it; work without this tool or ask the user to change \
+             the policy."
+        ));
+    }
+
+    if read_only {
+        // Read-only tools never prompt and are never plan-mode blocked, but an
+        // explicit per-tool `deny` still turns one off. Crucially we consult
+        // the *explicit* override, not `permission_mode_for`, so the default
+        // `ask`/`deny` mode never starts prompting on every read_file.
+        if settings::permission_mode_explicit(tool_name) == Some(PermissionMode::Deny) {
+            return Decision::Deny(format!(
+                "`{tool_name}` is denied by the permission policy in settings.toml. \
+                 Do not retry it; work without this tool or ask the user to change \
+                 the policy."
+            ));
+        }
         return Decision::Allow;
     }
 
-    let argument = matchable_argument(tool_name, arguments);
     let (plan_mode, granted) = with_session(session, |s| {
         (
             s.plan_mode,
@@ -263,18 +294,6 @@ pub fn decision_for(session: &str, tool_name: &str, arguments: &str) -> Decision
         return Decision::Allow;
     }
 
-    let rules = settings::permission_rules();
-    if let Some(rule) = rules
-        .deny
-        .iter()
-        .find(|rule| rule_matches(rule, tool_name, argument.as_deref()))
-    {
-        return Decision::Deny(format!(
-            "`{tool_name}` is denied by the permission rule `{rule}` in settings.toml. \
-             Do not retry it; work without this tool or ask the user to change \
-             the policy."
-        ));
-    }
     if rules
         .allow
         .iter()
@@ -484,6 +503,39 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn read_only_tool_still_honors_an_explicit_deny() {
+        let _guard = env_guard();
+        // A deny rule listing a read-only first-party query tool is enforced,
+        // even though the tool never prompts otherwise.
+        store_rules(&[], &["mcp__sigit__web_search"]);
+        assert!(matches!(
+            decision_for("t", "mcp__sigit__web_search", "{}"),
+            Decision::Deny(_)
+        ));
+        // A tool with no deny rule is unaffected.
+        assert_eq!(
+            decision_for("t", "mcp__sigit__list_issues", "{}"),
+            Decision::Allow
+        );
+
+        // An explicit per-tool `deny` mode also turns a read-only tool off,
+        // while the default mode never makes read-only tools prompt.
+        let mut settings = settings::load();
+        settings.permissions.rules.deny.clear();
+        settings.permissions.default = PermissionMode::Ask;
+        settings
+            .permissions
+            .tools
+            .insert("mcp__sigit__web_search".to_string(), PermissionMode::Deny);
+        settings::store(&settings).unwrap();
+        assert!(matches!(
+            decision_for("t", "mcp__sigit__web_search", "{}"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(decision_for("t", "read_file", "{}"), Decision::Allow);
     }
 
     #[test]

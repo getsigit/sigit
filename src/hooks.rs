@@ -33,8 +33,16 @@
 //! "top-level only" mode today.
 
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a single hook command may run before it is killed, unless
+/// `[hooks] timeout_secs` overrides it. Without a bound, a hook that never
+/// exits (waits on input, a stalled network mount, a deadlock) blocks the
+/// tool call or session start that fired it forever.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 /// Hook configuration: lists of shell commands to run at key moments.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +56,11 @@ pub struct HookSettings {
     /// Commands to run after a tool is executed.
     #[serde(default)]
     pub post_tool_use: Vec<String>,
+    /// Per-hook wall-clock limit in seconds. `None` uses
+    /// [`DEFAULT_HOOK_TIMEOUT_SECS`]. Raise it for slow hooks (a build, a
+    /// linter); a hook that exceeds it is killed and logged.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl HookSettings {
@@ -56,6 +69,11 @@ impl HookSettings {
         !self.session_start.is_empty()
             || !self.pre_tool_use.is_empty()
             || !self.post_tool_use.is_empty()
+    }
+
+    /// The wall-clock limit applied to each hook command.
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS))
     }
 }
 
@@ -167,37 +185,123 @@ fn windows_quote(value: &str) -> String {
 /// (`SIGIT_HOOK_CWD`, `SIGIT_HOOK_SESSION_ID`, `SIGIT_HOOK_TOOL_NAME`,
 /// `SIGIT_HOOK_TOOL_ARGS_LEN`, `SIGIT_HOOK_TOOL_RESULT_LEN`) so hook scripts
 /// can read them without any quoting concerns at all.
-fn run_hook(cmd: &str, context: &HookContext, cwd: &Path) {
+fn run_hook(cmd: &str, context: &HookContext, cwd: &Path, timeout: Duration) {
     #[cfg(unix)]
     let (shell, flag, substituted) = ("sh", "-c", context.substitute(cmd, posix_quote));
     #[cfg(windows)]
     let (shell, flag, substituted) = ("cmd", "/C", context.substitute(cmd, windows_quote));
 
     log::debug!("Running hook: {substituted}");
-    match Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .arg(flag)
         .arg(&substituted)
         .current_dir(cwd)
         .envs(context.env_vars())
-        .output()
-    {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                log::warn!(
-                    "Hook failed with status {:?}: {}",
-                    output.status.code(),
-                    stderr.trim()
-                );
-            } else {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.is_empty() {
-                    log::debug!("Hook output: {}", stdout.trim());
-                }
-            }
-        }
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Put the hook in its own process group so a timeout kill can take out the
+    // whole tree. Killing just the shell is not enough: `sh -c` may fork
+    // rather than exec (dash does), and the surviving grandchild would both
+    // keep running and hold the pipe write ends open, blocking the drains
+    // below until it exits on its own.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(err) => {
             log::warn!("Failed to run hook: {err}");
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    fn kill_hook(child: &mut std::process::Child) {
+        // SIGKILL the process group (negative pid); the child is its leader.
+        // Fall back to killing the child alone if that fails.
+        if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } != 0 {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+    #[cfg(windows)]
+    fn kill_hook(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // Drain stdout/stderr on their own threads so a hook that writes more than
+    // the pipe buffer holds (a build, say) keeps making progress instead of
+    // blocking on a full pipe and looking like a hang. The threads report back
+    // over a channel rather than being joined: a receive can be bounded, while
+    // a join could block forever on a pipe a detached grandchild still holds.
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
+    let drain = |tag: u8, pipe: Option<Box<dyn Read + Send>>| {
+        let tx = out_tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            let _ = tx.send((tag, buf));
+        });
+    };
+    drain(0, child.stdout.take().map(|p| Box::new(p) as _));
+    drain(1, child.stderr.take().map(|p| Box::new(p) as _));
+    drop(out_tx);
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_hook(&mut child);
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                log::warn!("Failed to wait on hook: {err}");
+                kill_hook(&mut child);
+                break None;
+            }
+        }
+    };
+
+    // Collect what the drains read, bounded: if something in the hook's tree
+    // outlived the kill (or daemonized past the process group) and still holds
+    // a pipe open, give up on its output after a short grace instead of
+    // hanging the caller on it.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let grace = Duration::from_secs(1);
+    for _ in 0..2 {
+        match out_rx.recv_timeout(grace) {
+            Ok((0, buf)) => stdout = buf,
+            Ok((_, buf)) => stderr = buf,
+            Err(_) => {
+                log::debug!("Hook output pipe still open after exit; skipping its output");
+                break;
+            }
+        }
+    }
+
+    match status {
+        None => log::warn!(
+            "Hook timed out after {}s and was killed: {substituted}",
+            timeout.as_secs()
+        ),
+        Some(status) if !status.success() => log::warn!(
+            "Hook failed with status {:?}: {}",
+            status.code(),
+            String::from_utf8_lossy(&stderr).trim()
+        ),
+        Some(_) => {
+            let out = String::from_utf8_lossy(&stdout);
+            if !out.trim().is_empty() {
+                log::debug!("Hook output: {}", out.trim());
+            }
         }
     }
 }
@@ -214,7 +318,7 @@ pub fn run_session_start_hooks(hooks: &HookSettings, cwd: &Path, session_id: &st
         ..HookContext::new()
     };
     for cmd in &hooks.session_start {
-        run_hook(cmd, &context, cwd);
+        run_hook(cmd, &context, cwd, hooks.timeout());
     }
 }
 
@@ -231,7 +335,7 @@ pub fn run_pre_tool_use_hooks(hooks: &HookSettings, tool_name: &str, tool_args: 
         ..HookContext::new()
     };
     for cmd in &hooks.pre_tool_use {
-        run_hook(cmd, &context, cwd);
+        run_hook(cmd, &context, cwd, hooks.timeout());
     }
 }
 
@@ -253,13 +357,51 @@ pub fn run_post_tool_use_hooks(
         ..HookContext::new()
     };
     for cmd in &hooks.post_tool_use {
-        run_hook(cmd, &context, cwd);
+        run_hook(cmd, &context, cwd, hooks.timeout());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_that_hangs_is_killed_at_the_timeout() {
+        // A hook that would sleep far past the deadline must be killed near
+        // it, not block the caller for the full sleep. The two-command form
+        // forces the shell to fork `sleep` rather than exec it (what dash does
+        // even for a single command), so this also proves the kill takes out
+        // the whole process group: a surviving grandchild would hold the
+        // output pipes open and stall the caller until its own exit.
+        let context = HookContext::new();
+        let start = Instant::now();
+        run_hook(
+            "sleep 30; echo done",
+            &context,
+            Path::new("."),
+            Duration::from_millis(300),
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hook should have been killed shortly after its 300ms timeout, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_when_unset_and_honors_override() {
+        let default = HookSettings::default();
+        assert_eq!(
+            default.timeout(),
+            Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS)
+        );
+        let custom = HookSettings {
+            timeout_secs: Some(5),
+            ..HookSettings::default()
+        };
+        assert_eq!(custom.timeout(), Duration::from_secs(5));
+    }
 
     #[test]
     fn test_hook_context_substitution() {

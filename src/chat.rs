@@ -686,8 +686,20 @@ mod tui {
         }
     }
 
+    /// Identifies which list row a detail fetch belongs to, so a slow reply
+    /// can be matched against the currently-open detail and dropped if the
+    /// user has since navigated elsewhere.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct RepoTarget {
+        section: RepoSection,
+        number: u64,
+    }
+
     /// The full-tab detail view opened with Enter on a list row.
     struct RepoDetail {
+        /// Which issue/PR this view is showing; matched against arriving
+        /// `RepoUpdate::Detail` replies so a stale fetch can't fill it.
+        target: RepoTarget,
         title: String,
         /// `None` while the `get_issue` / `get_pull_request` fetch runs.
         text: Option<String>,
@@ -699,7 +711,7 @@ mod tui {
     enum RepoUpdate {
         Issues(Result<Vec<RepoItem>, String>),
         PullRequests(Result<Vec<RepoItem>, String>),
-        Detail(String),
+        Detail { target: RepoTarget, text: String },
     }
 
     // ── App state ─────────────────────────────────────────────────────────────
@@ -1514,7 +1526,12 @@ mod tui {
         };
 
         let number = item.number;
+        let target = RepoTarget {
+            section: app.repo_section,
+            number,
+        };
         app.repo_detail = Some(RepoDetail {
+            target,
             title: format!("{label} #{number} — {}", item.title),
             text: None,
             scroll: 0,
@@ -1527,7 +1544,10 @@ mod tui {
         let args = serde_json::json!({ "repo": repo, "number": number }).to_string();
         tokio::spawn(async move {
             let text = crate::mcp::call_tool(&tool, &args).await;
-            let _ = tx.send(RepoUpdate::Detail(super::format_repo_detail(&text)));
+            let _ = tx.send(RepoUpdate::Detail {
+                target,
+                text: super::format_repo_detail(&text),
+            });
         });
     }
 
@@ -1599,11 +1619,22 @@ mod tui {
             Tab::Repo => {
                 // Detail view open: Up/Down scroll it; Esc (handled in the
                 // event loop) closes it back to the list.
-                if let Some(detail) = app.repo_detail.as_mut() {
+                if app.repo_detail.is_some() {
                     match key.code {
-                        KeyCode::Up => detail.scroll = detail.scroll.saturating_sub(1),
-                        KeyCode::Down => detail.scroll = detail.scroll.saturating_add(1),
-                        KeyCode::Char('r') => refresh_repo(app),
+                        KeyCode::Up => {
+                            if let Some(detail) = app.repo_detail.as_mut() {
+                                detail.scroll = detail.scroll.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(detail) = app.repo_detail.as_mut() {
+                                detail.scroll = detail.scroll.saturating_add(1);
+                            }
+                        }
+                        // "r refresh" (as the footer advertises) re-fetches the
+                        // item on screen, rather than closing the view back to
+                        // the list as refresh_repo would.
+                        KeyCode::Char('r') => open_repo_detail(app),
                         _ => {}
                     }
                     return;
@@ -3505,9 +3536,14 @@ mod tui {
                                 .repo_pr_index
                                 .min(app.repo_prs.len().saturating_sub(1));
                         }
-                        Some(RepoUpdate::Detail(text)) => {
-                            // Ignored if the user already closed the view.
-                            if let Some(detail) = app.repo_detail.as_mut() {
+                        Some(RepoUpdate::Detail { target, text }) => {
+                            // Apply only to the matching open view: a reply for
+                            // a detail the user has since closed or navigated
+                            // away from is dropped, never shown under the wrong
+                            // title.
+                            if let Some(detail) = app.repo_detail.as_mut()
+                                && detail.target == target
+                            {
                                 detail.text = Some(text);
                             }
                         }
