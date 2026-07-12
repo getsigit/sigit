@@ -3602,6 +3602,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see the ENV_TEST_LOCK comment inside
     async fn test_task_runs_subagent_end_to_end() {
         // A file only the subagent's read_file call can surface.
         let dir = std::env::temp_dir().join("sigit_test_subagent_e2e");
@@ -3711,6 +3712,17 @@ mod tests {
         )
         .unwrap();
 
+        // Serialize the cwd change against the other discovery tests
+        // (skills/commands/subagents) — the cwd is process-global and cargo
+        // runs tests in parallel. The guard is held across the `.await`
+        // below on purpose: the cwd must stay pinned while `execute_tool`
+        // runs agent-type discovery. That's safe here — each `#[tokio::test]`
+        // gets its own single-threaded runtime on its own test thread, so no
+        // other task on this executor can contend for the lock — hence the
+        // `await_holding_lock` allow on this test.
+        let _env_guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
 

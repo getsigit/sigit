@@ -48,9 +48,11 @@ mod skills;
 mod subagents;
 mod tools;
 
-/// Serializes tests that mutate process-global env vars (`SIGIT_CONFIG_DIR`
-/// etc.). `cargo test` runs tests in parallel within a binary, so without this
-/// the credentials and settings round-trip tests clobber each other's env.
+/// Serializes tests that mutate process-global state: env vars
+/// (`SIGIT_CONFIG_DIR` etc.) and the current directory. `cargo test` runs
+/// tests in parallel within a binary, so without this the credentials and
+/// settings round-trip tests clobber each other's env, and the discovery
+/// tests (skills/commands/subagents) yank the cwd out from under each other.
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
