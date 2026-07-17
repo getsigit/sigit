@@ -2672,19 +2672,10 @@ mod tui {
         };
 
         // own thread + runtime so block_in_place doesn't starve the TUI loop.
-        // Fold in project instruction files (AGENTS.md / CLAUDE.md) for the launch
-        // directory so the on-device model gets the same always-on context the
-        // cloud and ACP paths get.
-        let system_prompt = {
-            let base = crate::system_prompt_for_model(model.tool_calling).to_string();
-            match std::env::current_dir()
-                .ok()
-                .and_then(|cwd| crate::instructions::load_project_instructions(&cwd))
-            {
-                Some(extra) => format!("{base}\n\n{extra}"),
-                None => base,
-            }
-        };
+        // Fold in the session context (cwd guidance + AGENTS.md / CLAUDE.md
+        // instruction files) for the launch directory so the on-device model
+        // gets the same always-on context the cloud and ACP paths get.
+        let system_prompt = crate::tui_system_prompt(model.tool_calling);
         let engine_handle = Arc::clone(&engine);
         let tool_calling = model.tool_calling;
         std::thread::spawn(move || {
@@ -2875,8 +2866,7 @@ mod tui {
                                 app.close_model_picker();
                                 match crate::provider::cloud_tier_provider(&tier) {
                                     Some(provider) => {
-                                        let system_prompt =
-                                            crate::system_prompt_for_model(true).to_string();
+                                        let system_prompt = crate::tui_system_prompt(true);
                                         app.backend = Arc::new(OpenAiBackend::new(
                                             provider.base_url,
                                             provider.api_key,

@@ -298,6 +298,21 @@ fn session_context_message(cwd: &std::path::Path) -> String {
     message
 }
 
+/// The full system prompt for a TUI backend: the model-appropriate base prompt
+/// plus [`session_context_message`] for the launch directory. The TUI
+/// counterpart of the ACP entry points, which push that context as a separate
+/// system message — without the cwd guidance the model doesn't know where the
+/// project lives and invents placeholder paths (e.g. `/init` trying to write
+/// `/path/to/repo/AGENTS.md`).
+#[cfg(unix)]
+pub(crate) fn tui_system_prompt(tool_calling: bool) -> String {
+    let base = system_prompt_for_model(tool_calling);
+    match std::env::current_dir() {
+        Ok(cwd) => format!("{base}\n\n{}", session_context_message(&cwd)),
+        Err(_) => base.to_string(),
+    }
+}
+
 fn agent_tools_as_specs() -> Vec<ToolSpec> {
     let mut specs: Vec<ToolSpec> = tools::all_tools()
         .into_iter()
@@ -2922,16 +2937,12 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     // channel so the loading-phase plumbing in `chat::run_with` is unchanged.
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    // Project instruction files (AGENTS.md / CLAUDE.md) for the launch directory,
-    // injected into the system prompt so the TUI shares the same always-on
-    // project context the ACP sessions get.
-    let project_instructions = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| instructions::load_project_instructions(&cwd));
-    let with_instructions = |base: String| match &project_instructions {
-        Some(extra) => format!("{base}\n\n{extra}"),
-        None => base,
-    };
+    // Session context (cwd guidance + AGENTS.md / CLAUDE.md instruction files)
+    // for the launch directory, injected into the system prompt so the TUI
+    // shares the same always-on project context the ACP sessions get — in
+    // particular the model must know the real working directory, or tools like
+    // `/init` write to invented paths.
+    let remote_system_prompt = tui_system_prompt(true);
 
     // Pick the inference backend: a configured provider if present, else on-device.
     let (inference_backend, startup_model_name): (Arc<dyn InferenceBackend>, String) =
@@ -2951,7 +2962,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                     provider.base_url,
                     provider.api_key,
                     provider.model,
-                    Some(with_instructions(SYSTEM_PROMPT.to_string())),
+                    Some(remote_system_prompt.clone()),
                 )) as Arc<dyn InferenceBackend>;
                 (backend, label)
             }
@@ -2959,7 +2970,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 // Honor the Local Inference toggle: when off and signed in, start
                 // on a cloud tier. Otherwise bring up on-device WITHOUT loading a
                 // model — the user loads it explicitly with /load (or /models), so
-                // the UI comes up immediately. Project instructions are injected at
+                // the UI comes up immediately. Session context is injected at
                 // load time in `chat.rs`.
                 let cloud_when_off = if settings::local_inference_enabled() {
                     None
@@ -2981,7 +2992,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                             provider.base_url,
                             provider.api_key,
                             provider.model,
-                            Some(with_instructions(SYSTEM_PROMPT.to_string())),
+                            Some(remote_system_prompt.clone()),
                         )) as Arc<dyn InferenceBackend>;
                         (backend, label)
                     }
@@ -3367,6 +3378,23 @@ mod tests {
             SYSTEM_PROMPT.contains(tools::COMMIT_CO_AUTHOR_TRAILER),
             "SYSTEM_PROMPT must quote tools::COMMIT_CO_AUTHOR_TRAILER verbatim"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tui_system_prompt_names_the_real_working_directory() {
+        // The /init flow relies on the model knowing where the project lives:
+        // without the cwd guidance it invents placeholder paths like
+        // `/path/to/repo/AGENTS.md` and misreads the failure as a filesystem
+        // permissions problem (issue #40).
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let prompt = tui_system_prompt(true);
+        assert!(prompt.starts_with(SYSTEM_PROMPT));
+        assert!(prompt.contains("project working directory"));
+        assert!(prompt.contains(&cwd.display().to_string()));
     }
 
     #[test]
