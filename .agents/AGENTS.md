@@ -172,9 +172,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   both read it; `/reload` does *not* re-run it, so config changes need a restart. stdio children
   live for the process; a dead child fails calls with an in-band error string (no auto-restart).
   Tools are namespaced `mcp__<server>__<tool>`, appended in the `*_as_specs`/`build_tool_specs`
-  layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. The official server
-  (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in (always HTTP) and authed
-  with the cloud session token; extra servers live in `mcp.toml` (global
+  layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. Two servers are baked in:
+  the official server (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`, always HTTP, authed
+  with the cloud session token) and the smbCloud CLI server (`smb --mcp`, stdio, added only when
+  the `smb` binary is on `PATH`; opt out with `smbcloud = false` in `mcp.toml` or
+  `SIGIT_MCP_SMBCLOUD=off`). A user-defined entry named `sigit` or `smbcloud` overrides the
+  corresponding baked-in one. Extra servers live in `mcp.toml` (global
   `$SIGIT_CONFIG_DIR/mcp.toml` and project-local `.sigit/mcp.toml`). The stdio path is covered by
   `tests/mcp_stdio.rs`, driven by the test-only `src/bin/mcp_stdio_stub.rs` helper binary
   (excluded from the published crate via `exclude` in `Cargo.toml`).
@@ -233,7 +236,8 @@ verbosity with `RUST_LOG`.
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
+`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
+smbCloud CLI server), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
 server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),
 `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.

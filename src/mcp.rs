@@ -21,13 +21,21 @@
 //! `url` and `command` are mutually exclusive; an entry with both, or neither,
 //! is a config error that is logged and skipped.
 //!
-//! ## The official server
+//! ## Baked-in servers
 //!
 //! siGit Code bakes in its official MCP server at `<cloud>/mcp` (default
 //! `https://sigit.si/api/v1/mcp`, following `SIGIT_CLOUD_URL`). When the user is
 //! signed in (`sigit login`) the cloud session token is sent as a bearer
-//! credential. Additional servers are configured in `mcp.toml` (see
-//! [`load_configs`]).
+//! credential.
+//!
+//! The smbCloud CLI's MCP server (`smb --mcp`, stdio) is also baked in, but
+//! only when the `smb` binary is actually on `PATH` — no binary, no entry, no
+//! error. Opt out with `smbcloud = false` in `mcp.toml` or
+//! `SIGIT_MCP_SMBCLOUD=off`.
+//!
+//! Both baked-in entries yield to a user-defined `mcp.toml` server of the same
+//! name, so either can be repointed or reconfigured without a special case.
+//! Additional servers are configured in `mcp.toml` (see [`load_configs`]).
 //!
 //! ## Lifecycle
 //!
@@ -93,6 +101,14 @@ pub fn official_tool_suffix(name: &str) -> Option<&str> {
         .strip_prefix(OFFICIAL_SERVER_NAME)?
         .strip_prefix("__")
 }
+
+/// Name of the baked-in smbCloud CLI server; its tools are namespaced
+/// `mcp__smbcloud__<tool>`. Like the official server, a user-defined `mcp.toml`
+/// entry with this name overrides the baked-in command line.
+const SMBCLOUD_SERVER_NAME: &str = "smbcloud";
+
+/// The smbCloud CLI binary the baked-in stdio entry spawns (`smb --mcp`).
+const SMBCLOUD_COMMAND: &str = "smb";
 
 /// JSON-RPC / MCP protocol version we advertise in the handshake.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -303,6 +319,10 @@ struct McpFile {
     /// opt out.
     #[serde(default)]
     official: Option<bool>,
+    /// Include the baked-in smbCloud CLI server (`smb --mcp`). Defaults to
+    /// `true`; set `false` to opt out. Moot when `smb` isn't installed.
+    #[serde(default)]
+    smbcloud: Option<bool>,
     #[serde(default)]
     server: Vec<ServerEntry>,
 }
@@ -386,6 +406,7 @@ fn load_configs() -> Vec<ServerDef> {
     }
 
     let mut include_official = true;
+    let mut include_smbcloud = true;
     // De-duplicated by sanitized name; a later config file overrides an earlier
     // one for the same name (project-local wins over global).
     let mut defs: Vec<ServerDef> = Vec::new();
@@ -403,6 +424,9 @@ fn load_configs() -> Vec<ServerDef> {
         };
         if let Some(official) = parsed.official {
             include_official = official;
+        }
+        if let Some(smbcloud) = parsed.smbcloud {
+            include_smbcloud = smbcloud;
         }
         for entry in parsed.server {
             if entry.enabled == Some(false) {
@@ -453,7 +477,46 @@ fn load_configs() -> Vec<ServerDef> {
         });
     }
 
+    // The smbCloud server can also be disabled with SIGIT_MCP_SMBCLOUD=off.
+    if let Ok(value) = std::env::var("SIGIT_MCP_SMBCLOUD")
+        && matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    {
+        include_smbcloud = false;
+    }
+
+    // Add the baked-in smbCloud CLI server, with the same never-clobber rule as
+    // the official one. Only when `smb` is actually installed: a hardwired
+    // entry for a binary most users don't have would surface a spawn failure
+    // in `/mcp` instead of just staying out of the way.
+    if include_smbcloud && !defs.iter().any(|d| d.name == SMBCLOUD_SERVER_NAME) {
+        if on_path(SMBCLOUD_COMMAND) {
+            defs.push(ServerDef {
+                name: SMBCLOUD_SERVER_NAME.to_string(),
+                transport: TransportDef::Stdio {
+                    command: SMBCLOUD_COMMAND.to_string(),
+                    args: vec!["--mcp".to_string()],
+                    env: Vec::new(),
+                },
+            });
+        } else {
+            log::debug!("mcp: `{SMBCLOUD_COMMAND}` not on PATH; skipping the smbcloud server");
+        }
+    }
+
     defs
+}
+
+/// Whether `binary` resolves to an executable file on `PATH` (with the
+/// platform's executable suffix, `.exe` on Windows).
+fn on_path(binary: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let file = format!("{binary}{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(&path).any(|dir| !dir.as_os_str().is_empty() && dir.join(&file).is_file())
 }
 
 /// Insert `def`, replacing any existing entry with the same name.
@@ -1335,6 +1398,7 @@ mod tests {
         "#;
         let parsed: McpFile = toml::from_str(toml).unwrap();
         assert_eq!(parsed.official, Some(false));
+        assert_eq!(parsed.smbcloud, None);
         assert_eq!(parsed.server.len(), 2);
         assert_eq!(parsed.server[0].name, "github");
         assert_eq!(parsed.server[1].enabled, Some(false));
@@ -1345,6 +1409,22 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer xyz")
         );
+    }
+
+    #[test]
+    fn parses_smbcloud_opt_out_flag() {
+        let parsed: McpFile = toml::from_str("smbcloud = false").unwrap();
+        assert_eq!(parsed.smbcloud, Some(false));
+        // Absent means "include" (the default stays true in load_configs).
+        let parsed: McpFile = toml::from_str("").unwrap();
+        assert_eq!(parsed.smbcloud, None);
+    }
+
+    #[test]
+    fn on_path_finds_real_binaries_only() {
+        assert!(!on_path("definitely-not-a-real-binary-xyzzy"));
+        #[cfg(unix)]
+        assert!(on_path("sh"));
     }
 
     #[test]
