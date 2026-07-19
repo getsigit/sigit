@@ -110,6 +110,14 @@ const SMBCLOUD_SERVER_NAME: &str = "smbcloud";
 /// The smbCloud CLI binary the baked-in stdio entry spawns (`smb --mcp`).
 const SMBCLOUD_COMMAND: &str = "smb";
 
+/// The bare tool name when `name` belongs to the smbCloud server
+/// (`mcp__smbcloud__project_list` → `Some("project_list")`), else `None`.
+pub fn smbcloud_tool_suffix(name: &str) -> Option<&str> {
+    name.strip_prefix(MCP_PREFIX)?
+        .strip_prefix(SMBCLOUD_SERVER_NAME)?
+        .strip_prefix("__")
+}
+
 /// JSON-RPC / MCP protocol version we advertise in the handshake.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -1369,6 +1377,19 @@ mod tests {
         assert_eq!(official_tool_suffix("mcp__sigitx__list_issues"), None);
         assert_eq!(official_tool_suffix("list_issues"), None);
         assert_eq!(official_tool_suffix("mcp__sigit__"), Some(""));
+    }
+
+    #[test]
+    fn smbcloud_tool_suffix_strips_only_the_smbcloud_namespace() {
+        assert_eq!(
+            smbcloud_tool_suffix("mcp__smbcloud__project_list"),
+            Some("project_list")
+        );
+        assert_eq!(smbcloud_tool_suffix("mcp__sigit__project_list"), None);
+        // `smbcloud` must be the whole server name, not a prefix of it.
+        assert_eq!(smbcloud_tool_suffix("mcp__smbcloudx__project_list"), None);
+        assert_eq!(smbcloud_tool_suffix("project_list"), None);
+        assert_eq!(smbcloud_tool_suffix("mcp__smbcloud__"), Some(""));
     }
 
     #[test]
