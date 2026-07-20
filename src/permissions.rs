@@ -40,8 +40,9 @@
 //!
 //! Tools discovered from MCP servers (`mcp__*`) and any unknown tool name are
 //! treated as mutating: external tools can have arbitrary side effects, so the
-//! safe assumption is to gate them. The one exception is the official
-//! sigit.si server's query tools (see [`classify`]), which are read-only.
+//! safe assumption is to gate them. The exceptions are the query tools of the
+//! two baked-in servers — the official sigit.si server and the smbCloud CLI —
+//! which are read-only (see [`classify`]).
 //!
 //! Session state (grants + plan mode) lives in a process-global keyed by
 //! session id — the same pattern as `mcp.rs`'s server cache — so the ACP
@@ -94,10 +95,14 @@ pub enum Decision {
 /// `tools.rs`'s `web_search` module doc for why it isn't classified by that
 /// `mcp__` prefix).
 ///
-/// One MCP exception: the *official* sigit.si server (`mcp__sigit__*`) is
-/// first-party, so its query tools — names starting `list_` or `get_`, plus
-/// `search_code` and `web_search` — are read-only and never prompt (the TUI's
-/// Repo tab depends on this). Every other `mcp__*` tool stays mutating.
+/// Two MCP exceptions, both baked-in first-party servers. The *official*
+/// sigit.si server's (`mcp__sigit__*`) query tools — names starting `list_`
+/// or `get_`, plus `search_code` and `web_search` — are read-only and never
+/// prompt (the TUI's Repo tab depends on this). The smbCloud CLI server's
+/// (`mcp__smbcloud__*`) read tools are exempted by an explicit allow-list
+/// rather than a name shape, since its names don't follow the `list_`/`get_`
+/// convention — a tool the list doesn't know (e.g. from a newer smb) fails
+/// safe to mutating. Every other `mcp__*` tool stays mutating.
 pub fn classify(tool_name: &str) -> ToolRisk {
     match tool_name {
         "read_file" | "list_directory" | "search_files" | "glob" | "read_website"
@@ -108,6 +113,11 @@ pub fn classify(tool_name: &str) -> ToolRisk {
                     || bare.starts_with("get_")
                     || bare == "search_code"
                     || bare == "web_search")
+            {
+                return ToolRisk::ReadOnly;
+            }
+            if let Some(bare) = crate::mcp::smbcloud_tool_suffix(tool_name)
+                && matches!(bare, "me" | "deployments" | "project_list" | "project_show")
             {
                 return ToolRisk::ReadOnly;
             }
@@ -502,6 +512,42 @@ mod tests {
                 Decision::Allow,
                 "{tool}"
             );
+        }
+    }
+
+    #[test]
+    fn smbcloud_mcp_read_tools_are_read_only() {
+        let _guard = env_guard();
+        for tool in [
+            "mcp__smbcloud__me",
+            "mcp__smbcloud__deployments",
+            "mcp__smbcloud__project_list",
+            "mcp__smbcloud__project_show",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
+            assert_eq!(
+                decision_for("t-smbcloud", tool, "{}"),
+                Decision::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn smbcloud_mcp_mutating_and_unknown_tools_stay_gated() {
+        for tool in [
+            // smbcloud server, but not on the read allow-list
+            "mcp__smbcloud__project_create",
+            "mcp__smbcloud__project_update",
+            "mcp__smbcloud__project_delete",
+            "mcp__smbcloud__",
+            // allow-listed names on other servers get no exemption
+            "mcp__other__project_list",
+            "mcp__other__me",
+            // `smbcloud` must match the whole server name
+            "mcp__smbcloudx__project_list",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
         }
     }
 
