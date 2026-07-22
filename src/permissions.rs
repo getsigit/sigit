@@ -40,7 +40,9 @@
 //!
 //! Tools discovered from MCP servers (`mcp__*`) and any unknown tool name are
 //! treated as mutating: external tools can have arbitrary side effects, so the
-//! safe assumption is to gate them.
+//! safe assumption is to gate them. The exceptions are the query tools of the
+//! two baked-in servers — the official sigit.si server and the smbCloud CLI —
+//! which are read-only (see [`classify`]).
 //!
 //! Session state (grants + plan mode) lives in a process-global keyed by
 //! session id — the same pattern as `mcp.rs`'s server cache — so the ACP
@@ -87,12 +89,40 @@ pub enum Decision {
 /// conservative default for anything whose side effects we can't see.
 /// `task` is read-only because the subagent it launches is restricted to the
 /// read-only toolset (see `SUBAGENT_TOOL_NAMES` in `tools.rs`), so delegated
-/// research stays available in plan mode.
+/// research stays available in plan mode. The native `web_search` tool is
+/// read-only for the same reason `read_website` is — it only ever returns
+/// data, even though it forwards to an `mcp__*` tool under the hood (see
+/// `tools.rs`'s `web_search` module doc for why it isn't classified by that
+/// `mcp__` prefix).
+///
+/// Two MCP exceptions, both baked-in first-party servers. The *official*
+/// sigit.si server's (`mcp__sigit__*`) query tools — names starting `list_`
+/// or `get_`, plus `search_code` and `web_search` — are read-only and never
+/// prompt (the TUI's Repo tab depends on this). The smbCloud CLI server's
+/// (`mcp__smbcloud__*`) read tools are exempted by an explicit allow-list
+/// rather than a name shape, since its names don't follow the `list_`/`get_`
+/// convention — a tool the list doesn't know (e.g. from a newer smb) fails
+/// safe to mutating. Every other `mcp__*` tool stays mutating.
 pub fn classify(tool_name: &str) -> ToolRisk {
     match tool_name {
         "read_file" | "list_directory" | "search_files" | "glob" | "read_website"
-        | "write_todos" | "skill" | "task" | "command_output" => ToolRisk::ReadOnly,
-        _ => ToolRisk::Mutating,
+        | "write_todos" | "skill" | "task" | "command_output" | "web_search" => ToolRisk::ReadOnly,
+        _ => {
+            if let Some(bare) = crate::mcp::official_tool_suffix(tool_name)
+                && (bare.starts_with("list_")
+                    || bare.starts_with("get_")
+                    || bare == "search_code"
+                    || bare == "web_search")
+            {
+                return ToolRisk::ReadOnly;
+            }
+            if let Some(bare) = crate::mcp::smbcloud_tool_suffix(tool_name)
+                && matches!(bare, "me" | "deployments" | "project_list" | "project_show")
+            {
+                return ToolRisk::ReadOnly;
+            }
+            ToolRisk::Mutating
+        }
     }
 }
 
@@ -222,11 +252,42 @@ fn matchable_argument(tool_name: &str, arguments: &str) -> Option<String> {
 /// string, consulted by rule patterns and granular session grants. See the
 /// module docs for the layering.
 pub fn decision_for(session: &str, tool_name: &str, arguments: &str) -> Decision {
-    if classify(tool_name) == ToolRisk::ReadOnly {
+    let read_only = classify(tool_name) == ToolRisk::ReadOnly;
+    let argument = matchable_argument(tool_name, arguments);
+    let rules = settings::permission_rules();
+
+    // An explicit deny applies to every tool, read-only ones included. This is
+    // what lets a user still switch off a first-party query tool that
+    // `classify` now treats as read-only (`web_search`, `list_issues`, …);
+    // without it, the reclassification would silently stop honoring a deny that
+    // was enforced when those names counted as mutating.
+    if let Some(rule) = rules
+        .deny
+        .iter()
+        .find(|rule| rule_matches(rule, tool_name, argument.as_deref()))
+    {
+        return Decision::Deny(format!(
+            "`{tool_name}` is denied by the permission rule `{rule}` in settings.toml. \
+             Do not retry it; work without this tool or ask the user to change \
+             the policy."
+        ));
+    }
+
+    if read_only {
+        // Read-only tools never prompt and are never plan-mode blocked, but an
+        // explicit per-tool `deny` still turns one off. Crucially we consult
+        // the *explicit* override, not `permission_mode_for`, so the default
+        // `ask`/`deny` mode never starts prompting on every read_file.
+        if settings::permission_mode_explicit(tool_name) == Some(PermissionMode::Deny) {
+            return Decision::Deny(format!(
+                "`{tool_name}` is denied by the permission policy in settings.toml. \
+                 Do not retry it; work without this tool or ask the user to change \
+                 the policy."
+            ));
+        }
         return Decision::Allow;
     }
 
-    let argument = matchable_argument(tool_name, arguments);
     let (plan_mode, granted) = with_session(session, |s| {
         (
             s.plan_mode,
@@ -243,18 +304,6 @@ pub fn decision_for(session: &str, tool_name: &str, arguments: &str) -> Decision
         return Decision::Allow;
     }
 
-    let rules = settings::permission_rules();
-    if let Some(rule) = rules
-        .deny
-        .iter()
-        .find(|rule| rule_matches(rule, tool_name, argument.as_deref()))
-    {
-        return Decision::Deny(format!(
-            "`{tool_name}` is denied by the permission rule `{rule}` in settings.toml. \
-             Do not retry it; work without this tool or ask the user to change \
-             the policy."
-        ));
-    }
     if rules
         .allow
         .iter()
@@ -418,6 +467,7 @@ mod tests {
             "skill",
             "task",
             "command_output",
+            "web_search",
         ] {
             assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
             assert_eq!(decision_for("t-ro", tool, "{}"), Decision::Allow, "{tool}");
@@ -437,6 +487,117 @@ mod tests {
             "remember",
             "mcp__server__anything",
             "totally_unknown_tool",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
+        }
+    }
+
+    #[test]
+    fn official_mcp_query_tools_are_read_only() {
+        let _guard = env_guard();
+        for tool in [
+            "mcp__sigit__list_issues",
+            "mcp__sigit__list_pull_requests",
+            "mcp__sigit__get_issue",
+            "mcp__sigit__get_pull_request",
+            "mcp__sigit__list_repositories",
+            "mcp__sigit__get_file_contents",
+            "mcp__sigit__search_code",
+            "mcp__sigit__web_search",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
+            // Read-only means it never prompts, whatever the policy layers say.
+            assert_eq!(
+                decision_for("t-official", tool, "{}"),
+                Decision::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn smbcloud_mcp_read_tools_are_read_only() {
+        let _guard = env_guard();
+        for tool in [
+            "mcp__smbcloud__me",
+            "mcp__smbcloud__deployments",
+            "mcp__smbcloud__project_list",
+            "mcp__smbcloud__project_show",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
+            assert_eq!(
+                decision_for("t-smbcloud", tool, "{}"),
+                Decision::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn smbcloud_mcp_mutating_and_unknown_tools_stay_gated() {
+        for tool in [
+            // smbcloud server, but not on the read allow-list
+            "mcp__smbcloud__project_create",
+            "mcp__smbcloud__project_update",
+            "mcp__smbcloud__project_delete",
+            "mcp__smbcloud__",
+            // allow-listed names on other servers get no exemption
+            "mcp__other__project_list",
+            "mcp__other__me",
+            // `smbcloud` must match the whole server name
+            "mcp__smbcloudx__project_list",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
+        }
+    }
+
+    #[test]
+    fn read_only_tool_still_honors_an_explicit_deny() {
+        let _guard = env_guard();
+        // A deny rule listing a read-only first-party query tool is enforced,
+        // even though the tool never prompts otherwise.
+        store_rules(&[], &["mcp__sigit__web_search"]);
+        assert!(matches!(
+            decision_for("t", "mcp__sigit__web_search", "{}"),
+            Decision::Deny(_)
+        ));
+        // A tool with no deny rule is unaffected.
+        assert_eq!(
+            decision_for("t", "mcp__sigit__list_issues", "{}"),
+            Decision::Allow
+        );
+
+        // An explicit per-tool `deny` mode also turns a read-only tool off,
+        // while the default mode never makes read-only tools prompt.
+        let mut settings = settings::load();
+        settings.permissions.rules.deny.clear();
+        settings.permissions.default = PermissionMode::Ask;
+        settings
+            .permissions
+            .tools
+            .insert("mcp__sigit__web_search".to_string(), PermissionMode::Deny);
+        settings::store(&settings).unwrap();
+        assert!(matches!(
+            decision_for("t", "mcp__sigit__web_search", "{}"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(decision_for("t", "read_file", "{}"), Decision::Allow);
+    }
+
+    #[test]
+    fn official_mcp_mutating_and_foreign_servers_stay_gated() {
+        for tool in [
+            // official server, but not a query tool
+            "mcp__sigit__create_issue",
+            "mcp__sigit__merge_pull_request",
+            "mcp__sigit__delete_repository",
+            "mcp__sigit__",
+            // query-shaped names on other servers get no exemption
+            "mcp__other__list_issues",
+            "mcp__other__get_issue",
+            "mcp__github__search_code",
+            // `sigit` must match the whole server name
+            "mcp__sigitx__list_issues",
         ] {
             assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
         }

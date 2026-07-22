@@ -246,7 +246,10 @@ pub(crate) fn tool_entry_lines(
 // Unix-only TUI consumes it at runtime, hence the non-Unix dead-code gates
 // (same pattern as `permissions::TUI_SESSION`).
 
-/// The three top-level TUI tabs, cycled with the Tab key.
+/// The top-level TUI tabs, cycled with the Tab key. `Repo` only exists when
+/// the session cwd's `origin` remote points at the sigit.si host (see
+/// [`parse_repo_remote`]); every method takes `repo_visible` so the hidden tab
+/// is skipped entirely and the bar renders exactly three tabs without it.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
@@ -254,29 +257,52 @@ pub(crate) enum Tab {
     Session,
     /// Saved sessions from the session store.
     History,
+    /// Issues and pull requests of the sigit.si-hosted repo (when detected).
+    Repo,
     /// siGit Code Cloud status and settings.
     Cloud,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
 impl Tab {
-    pub(crate) const TITLES: [&'static str; 3] = ["Session", "History", "Cloud"];
+    /// Tab-bar titles, in cycle order.
+    pub(crate) fn titles(repo_visible: bool) -> Vec<&'static str> {
+        if repo_visible {
+            vec!["Session", "History", "Repo", "Cloud"]
+        } else {
+            vec!["Session", "History", "Cloud"]
+        }
+    }
 
-    /// Session → History → Cloud → Session.
-    pub(crate) fn next(self) -> Self {
+    /// Session → History → (Repo →) Cloud → Session.
+    pub(crate) fn next(self, repo_visible: bool) -> Self {
         match self {
             Tab::Session => Tab::History,
-            Tab::History => Tab::Cloud,
+            Tab::History => {
+                if repo_visible {
+                    Tab::Repo
+                } else {
+                    Tab::Cloud
+                }
+            }
+            Tab::Repo => Tab::Cloud,
             Tab::Cloud => Tab::Session,
         }
     }
 
-    /// Position in [`Tab::TITLES`], for the ratatui `Tabs` widget.
-    pub(crate) fn index(self) -> usize {
+    /// Position in [`Tab::titles`], for the ratatui `Tabs` widget.
+    pub(crate) fn index(self, repo_visible: bool) -> usize {
         match self {
             Tab::Session => 0,
             Tab::History => 1,
-            Tab::Cloud => 2,
+            Tab::Repo => 2,
+            Tab::Cloud => {
+                if repo_visible {
+                    3
+                } else {
+                    2
+                }
+            }
         }
     }
 }
@@ -310,6 +336,161 @@ pub(crate) fn history_row(
     format!("{id}  ·  {when}  ·  {message_count} message(s)")
 }
 
+// ── Repo tab: remote detection and data parsing ───────────────────────────────
+//
+// Pure helpers for the Repo tab (issues / pull requests of a sigit.si-hosted
+// repo). Kept at the top level so they compile and test on every target; only
+// the Unix-only TUI consumes them at runtime.
+
+/// Host of the sigit.si instance this build talks to: the host of
+/// `SIGIT_API_URL` when set (same variable `account.rs` uses for the account
+/// API), else the production default.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn sigit_host() -> String {
+    host_from_api_url(std::env::var("SIGIT_API_URL").ok().as_deref())
+}
+
+/// Pure core of [`sigit_host`]: derive the host from an optional
+/// `SIGIT_API_URL` value, defaulting to `sigit.si`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn host_from_api_url(api_url: Option<&str>) -> String {
+    api_url
+        .and_then(url_host)
+        .unwrap_or_else(|| "sigit.si".to_string())
+}
+
+/// Extract the hostname (no scheme, userinfo, port, or path) from an http(s)
+/// URL. `None` for anything else.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn url_host(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Extract `owner/name` from a git remote URL *iff* it points at `host`.
+///
+/// Understands the two forms sigit.si issues:
+/// - ssh (scp-like): `git@sigit.si:owner/name.git` (and without `.git`)
+/// - https: `https://sigit.si/owner/name.git` (and without `.git`)
+///
+/// A different host, extra path segments, or anything unparsable → `None`,
+/// which hides the Repo tab.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn parse_repo_remote(remote: &str, host: &str) -> Option<String> {
+    let remote = remote.trim();
+
+    // ssh, scp-like: git@<host>:<owner>/<name>(.git)
+    if let Some(rest) = remote.strip_prefix("git@") {
+        let (remote_host, path) = rest.split_once(':')?;
+        if !remote_host.eq_ignore_ascii_case(host) {
+            return None;
+        }
+        return repo_owner_name(path);
+    }
+
+    // http(s)://<host>(:port)/<owner>/<name>(.git)
+    let rest = remote
+        .strip_prefix("https://")
+        .or_else(|| remote.strip_prefix("http://"))?;
+    let (authority, path) = rest.split_once('/')?;
+    let remote_host = authority.rsplit('@').next()?.split(':').next()?;
+    if !remote_host.eq_ignore_ascii_case(host) {
+        return None;
+    }
+    repo_owner_name(path)
+}
+
+/// Validate and normalize a remote path into `owner/name` (strips a trailing
+/// `.git` / `/`). Exactly two non-empty segments, or `None`.
+fn repo_owner_name(path: &str) -> Option<String> {
+    let path = path.trim().trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    if owner.is_empty() || name.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+/// One row of the Repo tab's Issues / Pull requests lists.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoItem {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+    pub(crate) state: String,
+}
+
+/// Parse the JSON text block a `list_issues` / `list_pull_requests` MCP tool
+/// returns into rows. Accepts a top-level array or an object wrapping one
+/// under `issues` / `pull_requests` / `items`; entries missing `number` or
+/// `title` are skipped. Unparsable input (e.g. an `Error: …` string from
+/// `mcp::call_tool`) comes back as `Err` with the original text so the tab can
+/// show it verbatim.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn parse_repo_items(text: &str) -> Result<Vec<RepoItem>, String> {
+    let trimmed = text.trim();
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|_| trimmed.to_string())?;
+    let entries = value
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            value.as_object().and_then(|object| {
+                ["issues", "pull_requests", "items"]
+                    .iter()
+                    .find_map(|key| object.get(*key).and_then(|v| v.as_array()).cloned())
+            })
+        })
+        .ok_or_else(|| trimmed.to_string())?;
+
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            Some(RepoItem {
+                number: entry.get("number")?.as_u64()?,
+                title: entry.get("title")?.as_str()?.to_string(),
+                state: entry
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect())
+}
+
+/// One list row: number, state, title.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn repo_row(item: &RepoItem) -> String {
+    if item.state.is_empty() {
+        format!("#{}  {}", item.number, item.title)
+    } else {
+        format!("#{}  [{}]  {}", item.number, item.state, item.title)
+    }
+}
+
+/// Render a `get_issue` / `get_pull_request` result for the detail view:
+/// pretty-print when it's JSON, pass anything else (e.g. error text) through.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn format_repo_detail(text: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(text.trim()) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_string()),
+        Err(_) => text.to_string(),
+    }
+}
+
 // ── Unix-only TUI ─────────────────────────────────────────────────────────────
 //
 // macOS + Linux only. Windows uses ACP mode instead.
@@ -325,7 +506,7 @@ mod tui {
     use futures::StreamExt;
     use onde::inference::{ChatEngine, SamplingConfig};
 
-    use super::Tab;
+    use super::{RepoItem, Tab};
     use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
     use crate::models::{
         InferenceKind, ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items,
@@ -467,6 +648,72 @@ mod tui {
         Error(String),
     }
 
+    // ── Repo tab types ────────────────────────────────────────────────────────
+
+    /// Which list the Repo tab is showing.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RepoSection {
+        Issues,
+        PullRequests,
+    }
+
+    impl RepoSection {
+        fn other(self) -> Self {
+            match self {
+                RepoSection::Issues => RepoSection::PullRequests,
+                RepoSection::PullRequests => RepoSection::Issues,
+            }
+        }
+    }
+
+    /// Lifecycle of one Repo-tab list. `Failed` carries the error text returned
+    /// by the MCP layer (signed out, MCP off, tool error, unparsable reply) so
+    /// the tab can show it verbatim plus a hint.
+    enum RepoData {
+        /// Nothing fetched yet — kicked off on first entry to the tab.
+        NotFetched,
+        Loading,
+        Ready(Vec<RepoItem>),
+        Failed(String),
+    }
+
+    impl RepoData {
+        fn len(&self) -> usize {
+            match self {
+                RepoData::Ready(items) => items.len(),
+                _ => 0,
+            }
+        }
+    }
+
+    /// Identifies which list row a detail fetch belongs to, so a slow reply
+    /// can be matched against the currently-open detail and dropped if the
+    /// user has since navigated elsewhere.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct RepoTarget {
+        section: RepoSection,
+        number: u64,
+    }
+
+    /// The full-tab detail view opened with Enter on a list row.
+    struct RepoDetail {
+        /// Which issue/PR this view is showing; matched against arriving
+        /// `RepoUpdate::Detail` replies so a stale fetch can't fill it.
+        target: RepoTarget,
+        title: String,
+        /// `None` while the `get_issue` / `get_pull_request` fetch runs.
+        text: Option<String>,
+        scroll: u16,
+    }
+
+    /// Results from the Repo tab's spawned fetch tasks, multiplexed into the
+    /// event loop alongside inference updates (same pattern as the Cloud tab).
+    enum RepoUpdate {
+        Issues(Result<Vec<RepoItem>, String>),
+        PullRequests(Result<Vec<RepoItem>, String>),
+        Detail { target: RepoTarget, text: String },
+    }
+
     // ── App state ─────────────────────────────────────────────────────────────
 
     struct App {
@@ -540,6 +787,22 @@ mod tui {
         /// `None` while a fetch is in flight (renders as "fetching…").
         cloud_lines: Option<Vec<String>>,
         cloud_rx: Option<oneshot::Receiver<Vec<String>>>,
+
+        // Repo tab: issues and pull requests of a sigit.si-hosted repo.
+        /// `owner/name` when the cwd's `origin` remote points at the sigit.si
+        /// host; `None` hides the Repo tab entirely.
+        repo: Option<String>,
+        repo_section: RepoSection,
+        repo_issues: RepoData,
+        repo_prs: RepoData,
+        repo_issue_index: usize,
+        repo_pr_index: usize,
+        /// Detail view over the list, opened with Enter, closed with Esc.
+        repo_detail: Option<RepoDetail>,
+        /// Sender cloned into the spawned fetch tasks; kept here so the
+        /// receiver never reads a spurious disconnect between fetches.
+        repo_tx: Option<mpsc::UnboundedSender<RepoUpdate>>,
+        repo_rx: Option<mpsc::UnboundedReceiver<RepoUpdate>>,
     }
 
     const BANNER_ART: &str = "\
@@ -630,6 +893,36 @@ mod tui {
                 history_notice: None,
                 cloud_lines: None,
                 cloud_rx: None,
+                repo: detect_sigit_repo(),
+                repo_section: RepoSection::Issues,
+                repo_issues: RepoData::NotFetched,
+                repo_prs: RepoData::NotFetched,
+                repo_issue_index: 0,
+                repo_pr_index: 0,
+                repo_detail: None,
+                repo_tx: None,
+                repo_rx: None,
+            }
+        }
+
+        /// Whether the Repo tab exists for this session.
+        fn repo_visible(&self) -> bool {
+            self.repo.is_some()
+        }
+
+        /// The data behind the Repo tab's active section.
+        fn repo_list(&self) -> &RepoData {
+            match self.repo_section {
+                RepoSection::Issues => &self.repo_issues,
+                RepoSection::PullRequests => &self.repo_prs,
+            }
+        }
+
+        /// Selection index of the Repo tab's active section.
+        fn repo_index_mut(&mut self) -> &mut usize {
+            match self.repo_section {
+                RepoSection::Issues => &mut self.repo_issue_index,
+                RepoSection::PullRequests => &mut self.repo_pr_index,
             }
         }
 
@@ -1086,7 +1379,8 @@ mod tui {
     // ── Tab bar (Session / History / Cloud) ───────────────────────────────────
 
     /// Switch to `tab`, refreshing the data it shows. Entering History rescans
-    /// the sessions dir; entering Cloud kicks off the async status fetch.
+    /// the sessions dir; entering Cloud kicks off the async status fetch;
+    /// entering Repo fetches the issue/PR lists on first visit.
     fn switch_tab(app: &mut App, tab: Tab, engine: &Arc<ChatEngine>) {
         app.active_tab = tab;
         match tab {
@@ -1094,6 +1388,12 @@ mod tui {
             Tab::History => {
                 app.refresh_history();
                 app.history_notice = None;
+            }
+            Tab::Repo => {
+                // Fetch once on first entry; `r` refreshes after that.
+                if matches!(app.repo_issues, RepoData::NotFetched) {
+                    refresh_repo(app);
+                }
             }
             Tab::Cloud => refresh_cloud(app, engine),
         }
@@ -1154,6 +1454,100 @@ mod tui {
             }
 
             let _ = tx.send(lines);
+        });
+    }
+
+    // ── Repo tab (issues / pull requests via the official MCP server) ─────────
+
+    /// `owner/name` when the current directory's `origin` remote lives on the
+    /// sigit.si host (per `SIGIT_API_URL`). Runs `git remote get-url origin`
+    /// once at startup; any failure (no git, no repo, no origin) → `None`.
+    fn detect_sigit_repo() -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let url = String::from_utf8_lossy(&output.stdout);
+        super::parse_repo_remote(url.trim(), &super::sigit_host())
+    }
+
+    /// Fetch both Repo-tab lists on spawned tasks feeding `repo_rx` — the same
+    /// spawned-fetch pattern as the Cloud tab, so the render loop never blocks
+    /// on the network. Replacing the channel drops any in-flight fetch's
+    /// updates on the floor, which is exactly what a refresh wants.
+    fn refresh_repo(app: &mut App) {
+        let Some(repo) = app.repo.clone() else {
+            return;
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.repo_tx = Some(tx.clone());
+        app.repo_rx = Some(rx);
+        app.repo_issues = RepoData::Loading;
+        app.repo_prs = RepoData::Loading;
+        // A stale detail view would outlive the list it was opened from.
+        app.repo_detail = None;
+
+        let args = serde_json::json!({ "repo": repo }).to_string();
+
+        let issues_tx = tx.clone();
+        let issues_args = args.clone();
+        tokio::spawn(async move {
+            let tool = crate::mcp::official_tool_name("list_issues");
+            let text = crate::mcp::call_tool(&tool, &issues_args).await;
+            let _ = issues_tx.send(RepoUpdate::Issues(super::parse_repo_items(&text)));
+        });
+
+        tokio::spawn(async move {
+            let tool = crate::mcp::official_tool_name("list_pull_requests");
+            let text = crate::mcp::call_tool(&tool, &args).await;
+            let _ = tx.send(RepoUpdate::PullRequests(super::parse_repo_items(&text)));
+        });
+    }
+
+    /// Open the detail view for the selected row and fetch its body
+    /// (`get_issue` / `get_pull_request`) on a spawned task.
+    fn open_repo_detail(app: &mut App) {
+        let Some(repo) = app.repo.clone() else {
+            return;
+        };
+        let (tool, label, index) = match app.repo_section {
+            RepoSection::Issues => ("get_issue", "Issue", app.repo_issue_index),
+            RepoSection::PullRequests => ("get_pull_request", "Pull request", app.repo_pr_index),
+        };
+        let RepoData::Ready(items) = app.repo_list() else {
+            return;
+        };
+        let Some(item) = items.get(index) else {
+            return;
+        };
+
+        let number = item.number;
+        let target = RepoTarget {
+            section: app.repo_section,
+            number,
+        };
+        app.repo_detail = Some(RepoDetail {
+            target,
+            title: format!("{label} #{number} — {}", item.title),
+            text: None,
+            scroll: 0,
+        });
+
+        let Some(tx) = app.repo_tx.clone() else {
+            return;
+        };
+        let tool = crate::mcp::official_tool_name(tool);
+        let args = serde_json::json!({ "repo": repo, "number": number }).to_string();
+        tokio::spawn(async move {
+            let text = crate::mcp::call_tool(&tool, &args).await;
+            let _ = tx.send(RepoUpdate::Detail {
+                target,
+                text: super::format_repo_detail(&text),
+            });
         });
     }
 
@@ -1222,6 +1616,49 @@ mod tui {
                 // Any other key cancels a pending delete confirmation.
                 _ => app.history_pending_delete = None,
             },
+            Tab::Repo => {
+                // Detail view open: Up/Down scroll it; Esc (handled in the
+                // event loop) closes it back to the list.
+                if app.repo_detail.is_some() {
+                    match key.code {
+                        KeyCode::Up => {
+                            if let Some(detail) = app.repo_detail.as_mut() {
+                                detail.scroll = detail.scroll.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(detail) = app.repo_detail.as_mut() {
+                                detail.scroll = detail.scroll.saturating_add(1);
+                            }
+                        }
+                        // "r refresh" (as the footer advertises) re-fetches the
+                        // item on screen, rather than closing the view back to
+                        // the list as refresh_repo would.
+                        KeyCode::Char('r') => open_repo_detail(app),
+                        _ => {}
+                    }
+                    return;
+                }
+                match key.code {
+                    KeyCode::Left | KeyCode::Right => {
+                        app.repo_section = app.repo_section.other();
+                    }
+                    KeyCode::Char('i') => app.repo_section = RepoSection::Issues,
+                    KeyCode::Char('p') => app.repo_section = RepoSection::PullRequests,
+                    KeyCode::Up => {
+                        let index = app.repo_index_mut();
+                        *index = index.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let max = app.repo_list().len().saturating_sub(1);
+                        let index = app.repo_index_mut();
+                        *index = (*index + 1).min(max);
+                    }
+                    KeyCode::Enter => open_repo_detail(app),
+                    KeyCode::Char('r') => refresh_repo(app),
+                    _ => {}
+                }
+            }
             Tab::Cloud => match key.code {
                 KeyCode::Char('l') => {
                     let enabled = !crate::settings::local_inference_enabled();
@@ -1241,8 +1678,12 @@ mod tui {
     }
 
     fn render_tab_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-        let tabs = Tabs::new(Tab::TITLES.map(Line::from).to_vec())
-            .select(app.active_tab.index())
+        let titles: Vec<Line> = Tab::titles(app.repo_visible())
+            .into_iter()
+            .map(Line::from)
+            .collect();
+        let tabs = Tabs::new(titles)
+            .select(app.active_tab.index(app.repo_visible()))
             .style(Style::default().fg(Color::DarkGray))
             .highlight_style(
                 Style::default()
@@ -1311,6 +1752,147 @@ mod tui {
         );
     }
 
+    fn render_repo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(format!(" {} ", app.repo.as_deref().unwrap_or("repo")));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Detail view: a full-tab scrollable paragraph; Esc goes back.
+        if let Some(ref detail) = app.repo_detail {
+            let mut lines: Vec<Line> = vec![
+                Line::from(Span::styled(
+                    format!("  {}", detail.title),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ];
+            match detail.text {
+                None => lines.push(Line::from(Span::styled(
+                    "  fetching…",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                Some(ref text) => {
+                    for text_line in text.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {text_line}"),
+                            Style::default().fg(Color::White),
+                        )));
+                    }
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((detail.scroll, 0)),
+                inner,
+            );
+            return;
+        }
+
+        // Section header: Issues ←→ Pull requests.
+        let selected_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        let idle_style = Style::default().fg(Color::DarkGray);
+        let issues_active = app.repo_section == RepoSection::Issues;
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    " Issues ",
+                    if issues_active {
+                        selected_style
+                    } else {
+                        idle_style
+                    },
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    " Pull requests ",
+                    if issues_active {
+                        idle_style
+                    } else {
+                        selected_style
+                    },
+                ),
+            ]),
+            Line::from(""),
+        ];
+        // Rows above the first list entry, for the keep-selection-visible math.
+        let header_rows = lines.len();
+
+        let (data, index) = match app.repo_section {
+            RepoSection::Issues => (&app.repo_issues, app.repo_issue_index),
+            RepoSection::PullRequests => (&app.repo_prs, app.repo_pr_index),
+        };
+
+        match data {
+            RepoData::NotFetched | RepoData::Loading => {
+                lines.push(Line::from(Span::styled(
+                    "  fetching…",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            RepoData::Failed(error) => {
+                for error_line in error.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {error_line}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  These lists come from the official sigit.si MCP server. Sign in \
+                     with /login, and make sure SIGIT_MCP / SIGIT_MCP_OFFICIAL are not \
+                     set to off. Press r to retry.",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            RepoData::Ready(items) if items.is_empty() => {
+                lines.push(Line::from(Span::styled(
+                    if issues_active {
+                        "  No issues."
+                    } else {
+                        "  No pull requests."
+                    },
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            RepoData::Ready(items) => {
+                for (row_index, item) in items.iter().enumerate() {
+                    let selected = row_index == index;
+                    let marker = if selected { "› " } else { "  " };
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{marker}{}", super::repo_row(item)),
+                        style,
+                    )));
+                }
+            }
+        }
+
+        // Keep the selection visible when the list outgrows the pane (same
+        // approach as the History tab, offset by the section header rows).
+        let inner_height = inner.height as usize;
+        let scroll = (index + header_rows).saturating_sub(inner_height.saturating_sub(1)) as u16;
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            inner,
+        );
+    }
+
     fn render_cloud_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1356,6 +1938,10 @@ mod tui {
         Local(Option<bool>),
         /// List discovered Agent Skills.
         Skills,
+        /// List configured subagent types (`.sigit/agents/*.md`) for `task`.
+        Agents,
+        /// List discovered user-defined commands (`.sigit/commands/*.md`).
+        Commands,
         /// List configured MCP servers and their tools.
         Mcp,
         /// explicitly load the selected (or default) on-device model
@@ -1383,7 +1969,10 @@ mod tui {
         /// turn with [`crate::instructions::INIT_PROMPT`] as the user text.
         Init,
         Exit,
-        Unknown(String),
+        /// An unrecognized command word, plus whatever followed it on the
+        /// line — a caller may still resolve it as a user-defined command
+        /// before falling back to "unknown command".
+        Unknown(String, Option<String>),
     }
 
     fn parse_slash(input: &str) -> Option<SlashCommand> {
@@ -1401,6 +1990,8 @@ mod tui {
             "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
             "/local" => SlashCommand::Local(parse_on_off(arg)),
             "/skills" => SlashCommand::Skills,
+            "/agents" => SlashCommand::Agents,
+            "/commands" => SlashCommand::Commands,
             "/mcp" => SlashCommand::Mcp,
             "/load" => SlashCommand::Load,
             "/login" => SlashCommand::Login(arg.map(str::to_string)),
@@ -1414,7 +2005,7 @@ mod tui {
             "/resume" => SlashCommand::Resume,
             "/init" => SlashCommand::Init,
             "/exit" | "/quit" | "/q" => SlashCommand::Exit,
-            other => SlashCommand::Unknown(other.to_string()),
+            other => SlashCommand::Unknown(other.to_string(), arg.map(str::to_string)),
         })
     }
 
@@ -1464,7 +2055,7 @@ mod tui {
                 render_footer(frame, app, zones[4]);
             }
             // No input pane on the non-chat tabs: the Tab key always cycles.
-            Tab::History | Tab::Cloud => {
+            Tab::History | Tab::Repo | Tab::Cloud => {
                 let zones = Layout::vertical([
                     Constraint::Length(1),
                     Constraint::Length(1),
@@ -1475,10 +2066,10 @@ mod tui {
 
                 render_tab_bar(frame, app, zones[0]);
                 render_title(frame, app, zones[1]);
-                if app.active_tab == Tab::History {
-                    render_history_tab(frame, app, zones[2]);
-                } else {
-                    render_cloud_tab(frame, app, zones[2]);
+                match app.active_tab {
+                    Tab::History => render_history_tab(frame, app, zones[2]),
+                    Tab::Repo => render_repo_tab(frame, app, zones[2]),
+                    _ => render_cloud_tab(frame, app, zones[2]),
                 }
                 render_footer(frame, app, zones[3]);
             }
@@ -1862,6 +2453,20 @@ mod tui {
                     (" Tab ", " next tab  "),
                     (" Esc ", " session"),
                 ],
+                Tab::Repo if app.repo_detail.is_some() => &[
+                    (" ↑/↓ ", " scroll  "),
+                    (" Esc ", " back  "),
+                    (" r ", " refresh  "),
+                    (" Tab ", " next tab"),
+                ],
+                Tab::Repo => &[
+                    (" ←/→ i/p ", " section  "),
+                    (" ↑/↓ ", " select  "),
+                    (" Enter ", " open  "),
+                    (" r ", " refresh  "),
+                    (" Tab ", " next tab  "),
+                    (" Esc ", " session"),
+                ],
                 _ => &[
                     (" l ", " toggle local inference  "),
                     (" r ", " refresh  "),
@@ -2120,6 +2725,8 @@ mod tui {
                      /models N      — switch to model N\n\
                      /local [on|off]— toggle on-device inference mode\n\
                      /skills        — list available Agent Skills\n\
+                     /agents        — list configured subagent types (.sigit/agents/*.md)\n\
+                     /commands      — list user-defined commands (.sigit/commands/*.md)\n\
                      /mcp           — list MCP servers and their tools\n\
                      /load          — load the selected on-device model\n\
                      /login E P     — sign in to siGit Code Cloud\n\
@@ -2236,6 +2843,15 @@ mod tui {
             SlashCommand::Skills => {
                 app.messages
                     .push(ChatMessage::system(crate::skills::format_skills_list()));
+            }
+            SlashCommand::Agents => {
+                app.messages.push(ChatMessage::system(
+                    crate::subagents::format_agent_types_list(),
+                ));
+            }
+            SlashCommand::Commands => {
+                app.messages
+                    .push(ChatMessage::system(crate::commands::format_commands_list()));
             }
             SlashCommand::Mcp => {
                 app.messages
@@ -2358,9 +2974,10 @@ mod tui {
             SlashCommand::Exit => {
                 app.quit = true;
             }
-            SlashCommand::Unknown(cmd) => {
-                app.messages
-                    .push(ChatMessage::system(format!("unknown command: {cmd}")));
+            SlashCommand::Unknown(cmd, _) => {
+                app.messages.push(ChatMessage::system(format!(
+                    "unknown command: {cmd}. Type /commands to list user-defined commands."
+                )));
             }
         }
     }
@@ -2403,8 +3020,21 @@ mod tui {
             specs.push(crate::tools::task_tool_spec());
         }
 
-        // Tools discovered from configured MCP servers (incl. the official one).
-        specs.extend(crate::mcp::tool_specs());
+        // `web_search` is a native wrapper around the official MCP server's
+        // `web_search` tool, offered only when that MCP tool was actually
+        // discovered (i.e. the user is signed in to siGit Code Cloud).
+        let web_search_offered = crate::tools::web_search_available();
+        if web_search_offered {
+            specs.push(crate::tools::web_search_tool_spec());
+        }
+
+        // Tools discovered from configured MCP servers (incl. the official
+        // one). Exclude the raw web_search delegate when the native wrapper
+        // above is already offered, so the model sees one clean option, not
+        // two names for the same tool.
+        specs.extend(crate::mcp::tool_specs().into_iter().filter(|spec| {
+            !(web_search_offered && crate::tools::is_web_search_delegate(&spec.name))
+        }));
 
         specs
     }
@@ -2880,6 +3510,49 @@ mod tui {
                     }));
                 }
 
+                // ── Repo tab fetches resolving ────────────────────────────────
+                update = async {
+                    match app.repo_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => pending().await,
+                    }
+                } => {
+                    match update {
+                        Some(RepoUpdate::Issues(result)) => {
+                            app.repo_issues = match result {
+                                Ok(items) => RepoData::Ready(items),
+                                Err(error) => RepoData::Failed(error),
+                            };
+                            app.repo_issue_index = app
+                                .repo_issue_index
+                                .min(app.repo_issues.len().saturating_sub(1));
+                        }
+                        Some(RepoUpdate::PullRequests(result)) => {
+                            app.repo_prs = match result {
+                                Ok(items) => RepoData::Ready(items),
+                                Err(error) => RepoData::Failed(error),
+                            };
+                            app.repo_pr_index = app
+                                .repo_pr_index
+                                .min(app.repo_prs.len().saturating_sub(1));
+                        }
+                        Some(RepoUpdate::Detail { target, text }) => {
+                            // Apply only to the matching open view: a reply for
+                            // a detail the user has since closed or navigated
+                            // away from is dropped, never shown under the wrong
+                            // title.
+                            if let Some(detail) = app.repo_detail.as_mut()
+                                && detail.target == target
+                            {
+                                detail.text = Some(text);
+                            }
+                        }
+                        // All senders gone (can't happen while app.repo_tx is
+                        // held) — stop polling this channel.
+                        None => app.repo_rx = None,
+                    }
+                }
+
                 // ── thinking / switching spinner tick (100ms) ────────────────
                 _ = async {
                     if app.thinking || app.switching_model {
@@ -2975,12 +3648,18 @@ mod tui {
                             if key.code == KeyCode::Tab
                                 && (app.active_tab != Tab::Session || app.input.is_empty())
                             {
-                                let next = app.active_tab.next();
+                                let next = app.active_tab.next(app.repo_visible());
                                 switch_tab(&mut app, next, &engine);
                                 continue;
                             }
                             if app.active_tab != Tab::Session && key.code == KeyCode::Esc {
-                                app.active_tab = Tab::Session;
+                                // On the Repo tab, Esc first closes an open
+                                // detail view (back to the list).
+                                if app.active_tab == Tab::Repo && app.repo_detail.is_some() {
+                                    app.repo_detail = None;
+                                } else {
+                                    app.active_tab = Tab::Session;
+                                }
                                 continue;
                             }
                         }
@@ -3027,11 +3706,34 @@ mod tui {
                             // `/init` runs a real agent turn: the transcript
                             // shows the command the user typed, but the model
                             // receives the canned AGENTS.md-generation prompt.
+                            // User-defined commands (`.sigit/commands/*.md`)
+                            // get the same treatment once `parse_slash`
+                            // reports the word unrecognized.
                             let mut inference_text = text.clone();
                             match parse_slash(&text) {
                                 Some(SlashCommand::Init) => {
                                     inference_text =
                                         crate::instructions::INIT_PROMPT.to_string();
+                                }
+                                Some(SlashCommand::Unknown(command, argument)) => {
+                                    match crate::commands::resolve_command(&command) {
+                                        Some(custom) => {
+                                            inference_text = crate::commands::render(
+                                                &custom.body,
+                                                argument.as_deref(),
+                                            );
+                                        }
+                                        None => {
+                                            exec_slash(
+                                                &mut app,
+                                                SlashCommand::Unknown(command, argument),
+                                                Arc::clone(&engine),
+                                                terminal,
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                    }
                                 }
                                 Some(cmd) => {
                                     exec_slash(&mut app, cmd, Arc::clone(&engine), terminal)
@@ -3124,9 +3826,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        TOOL_RESULT_PREVIEW_MAX, Tab, cap_output_preview, format_age, history_row,
-        parse_rich_text_segments, pretty_tool_arguments, streaming_think_tail, strip_think_blocks,
-        think_indicator, tool_entry_lines, tool_title,
+        RepoItem, TOOL_RESULT_PREVIEW_MAX, Tab, cap_output_preview, format_age, format_repo_detail,
+        history_row, host_from_api_url, parse_repo_items, parse_repo_remote,
+        parse_rich_text_segments, pretty_tool_arguments, repo_row, streaming_think_tail,
+        strip_think_blocks, think_indicator, tool_entry_lines, tool_title, url_host,
     };
 
     // ── tool_title ────────────────────────────────────────────────────────────
@@ -3293,19 +3996,201 @@ mod tests {
     // ── Tab / format_age / history_row ────────────────────────────────────────
 
     #[test]
-    fn tab_next_cycles_session_history_cloud() {
-        assert_eq!(Tab::Session.next(), Tab::History);
-        assert_eq!(Tab::History.next(), Tab::Cloud);
-        assert_eq!(Tab::Cloud.next(), Tab::Session);
-        // Three hops return to the start, matching the tab bar's order.
-        assert_eq!(Tab::Session.next().next().next(), Tab::Session);
+    fn tab_next_without_repo_cycles_three_tabs() {
+        assert_eq!(Tab::Session.next(false), Tab::History);
+        assert_eq!(Tab::History.next(false), Tab::Cloud);
+        assert_eq!(Tab::Cloud.next(false), Tab::Session);
+        // Three hops return to the start — exactly the base three-tab cycle.
+        assert_eq!(
+            Tab::Session.next(false).next(false).next(false),
+            Tab::Session
+        );
+    }
+
+    #[test]
+    fn tab_next_with_repo_cycles_four_tabs() {
+        assert_eq!(Tab::Session.next(true), Tab::History);
+        assert_eq!(Tab::History.next(true), Tab::Repo);
+        assert_eq!(Tab::Repo.next(true), Tab::Cloud);
+        assert_eq!(Tab::Cloud.next(true), Tab::Session);
     }
 
     #[test]
     fn tab_index_matches_titles_order() {
-        assert_eq!(Tab::TITLES[Tab::Session.index()], "Session");
-        assert_eq!(Tab::TITLES[Tab::History.index()], "History");
-        assert_eq!(Tab::TITLES[Tab::Cloud.index()], "Cloud");
+        for repo_visible in [false, true] {
+            let titles = Tab::titles(repo_visible);
+            assert_eq!(titles[Tab::Session.index(repo_visible)], "Session");
+            assert_eq!(titles[Tab::History.index(repo_visible)], "History");
+            assert_eq!(titles[Tab::Cloud.index(repo_visible)], "Cloud");
+        }
+        assert_eq!(Tab::titles(true)[Tab::Repo.index(true)], "Repo");
+    }
+
+    #[test]
+    fn tab_titles_hide_repo_when_undetected() {
+        assert_eq!(Tab::titles(false), vec!["Session", "History", "Cloud"]);
+        assert_eq!(
+            Tab::titles(true),
+            vec!["Session", "History", "Repo", "Cloud"]
+        );
+    }
+
+    // ── Repo remote detection ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_repo_remote_accepts_ssh_forms() {
+        assert_eq!(
+            parse_repo_remote("git@sigit.si:acme/demo.git", "sigit.si"),
+            Some("acme/demo".to_string())
+        );
+        // bare (no .git) works too
+        assert_eq!(
+            parse_repo_remote("git@sigit.si:acme/demo", "sigit.si"),
+            Some("acme/demo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_remote_accepts_https_forms() {
+        assert_eq!(
+            parse_repo_remote("https://sigit.si/acme/demo.git", "sigit.si"),
+            Some("acme/demo".to_string())
+        );
+        assert_eq!(
+            parse_repo_remote("https://sigit.si/acme/demo", "sigit.si"),
+            Some("acme/demo".to_string())
+        );
+        // trailing slash and http + port (dev instances) normalize too
+        assert_eq!(
+            parse_repo_remote("https://sigit.si/acme/demo/", "sigit.si"),
+            Some("acme/demo".to_string())
+        );
+        assert_eq!(
+            parse_repo_remote("http://127.0.0.1:8088/acme/demo.git", "127.0.0.1"),
+            Some("acme/demo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_remote_rejects_other_hosts() {
+        assert_eq!(
+            parse_repo_remote("git@github.com:acme/demo.git", "sigit.si"),
+            None
+        );
+        assert_eq!(
+            parse_repo_remote("https://github.com/acme/demo.git", "sigit.si"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_repo_remote_rejects_garbage_and_bad_paths() {
+        assert_eq!(parse_repo_remote("", "sigit.si"), None);
+        assert_eq!(parse_repo_remote("not a url at all", "sigit.si"), None);
+        assert_eq!(parse_repo_remote("/local/path/repo.git", "sigit.si"), None);
+        // wrong number of path segments
+        assert_eq!(
+            parse_repo_remote("https://sigit.si/demo.git", "sigit.si"),
+            None
+        );
+        assert_eq!(
+            parse_repo_remote("https://sigit.si/a/b/c.git", "sigit.si"),
+            None
+        );
+        assert_eq!(
+            parse_repo_remote("git@sigit.si:/demo.git", "sigit.si"),
+            None
+        );
+    }
+
+    #[test]
+    fn url_host_extracts_the_hostname() {
+        assert_eq!(url_host("https://sigit.si"), Some("sigit.si".to_string()));
+        assert_eq!(
+            url_host("http://localhost:8088/api/v1"),
+            Some("localhost".to_string())
+        );
+        assert_eq!(
+            url_host("https://SiGit.SI/path"),
+            Some("sigit.si".to_string())
+        );
+        assert_eq!(url_host("ftp://sigit.si"), None);
+        assert_eq!(url_host(""), None);
+    }
+
+    #[test]
+    fn host_from_api_url_defaults_to_production() {
+        assert_eq!(host_from_api_url(None), "sigit.si");
+        assert_eq!(host_from_api_url(Some("nonsense")), "sigit.si");
+        assert_eq!(
+            host_from_api_url(Some("http://127.0.0.1:8088")),
+            "127.0.0.1"
+        );
+    }
+
+    // ── Repo tab data parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_repo_items_reads_a_top_level_array() {
+        let text = r#"[
+            {"number": 12, "title": "Fix the flux capacitor", "state": "open"},
+            {"number": 7, "title": "Old bug", "state": "closed"}
+        ]"#;
+        let items = parse_repo_items(text).expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, 12);
+        assert_eq!(items[0].title, "Fix the flux capacitor");
+        assert_eq!(items[0].state, "open");
+    }
+
+    #[test]
+    fn parse_repo_items_reads_wrapped_arrays_and_skips_malformed_entries() {
+        let text = r#"{"issues": [
+            {"number": 1, "title": "ok", "state": "open"},
+            {"title": "no number"},
+            {"number": 2, "title": "stateless"}
+        ]}"#;
+        let items = parse_repo_items(text).expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].state, "");
+    }
+
+    #[test]
+    fn parse_repo_items_passes_error_text_through() {
+        // `mcp::call_tool` returns error strings, not JSON — the tab shows them.
+        let err = parse_repo_items("Error: MCP is not initialized.").unwrap_err();
+        assert_eq!(err, "Error: MCP is not initialized.");
+        // JSON that isn't a list shape is surfaced verbatim too.
+        assert!(parse_repo_items("\"unexpected\"").is_err());
+    }
+
+    #[test]
+    fn repo_row_formats_number_state_title() {
+        let item = RepoItem {
+            number: 12,
+            title: "Fix the flux capacitor".to_string(),
+            state: "open".to_string(),
+        };
+        assert_eq!(repo_row(&item), "#12  [open]  Fix the flux capacitor");
+        let stateless = RepoItem {
+            number: 3,
+            title: "t".to_string(),
+            state: String::new(),
+        };
+        assert_eq!(repo_row(&stateless), "#3  t");
+    }
+
+    #[test]
+    fn format_repo_detail_pretty_prints_json_and_passes_text_through() {
+        let pretty = format_repo_detail(r#"{"number":1,"title":"x"}"#);
+        assert!(
+            pretty.contains("\n"),
+            "expected pretty-printed JSON: {pretty}"
+        );
+        assert_eq!(
+            format_repo_detail("Error: server 'sigit' returned 401"),
+            "Error: server 'sigit' returned 401"
+        );
     }
 
     #[test]

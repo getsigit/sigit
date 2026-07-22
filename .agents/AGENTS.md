@@ -110,7 +110,23 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
   `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
-  unless the commit already exists on a remote, which is never rewritten.
+  unless the commit already exists on a remote, which is never rewritten. Also owns the `task`
+  tool: a nested agent loop in a fresh conversation, offered only when `subagent_available()`
+  (a subagent factory is registered — see `register_subagent_factory_for` in `main.rs`; on-device
+  registers a `None`-returning factory since onde has a single shared history). A subagent's
+  toolset is a hard-gated read-only allow-list (`SUBAGENT_TOOL_NAMES`) that is never expanded by a
+  configurable subagent type (see `src/subagents.rs`) — only ever narrowed — so a `.sigit/agents/*.md`
+  file can't grant itself `edit_file`/`run_command` and bypass the permission system. Also owns
+  `web_search`: a thin native wrapper around the official MCP server's Brave-Search-backed
+  `web_search` tool (`mcp__sigit__web_search`, implemented server-side in `sigit-si`'s
+  `WebSearchService` + `Mcp::Tools::WebSearch`), offered only when that MCP tool was actually
+  discovered (i.e. the user is signed in to siGit Code Cloud — see `web_search_available`).
+  Wrapping it natively rather than leaving it as a raw `mcp__*` tool matters for two reasons:
+  `permissions::classify` treats every `mcp__*` tool as mutating (an "ask" prompt on every call),
+  while `web_search` is read-only like `read_website`; and the raw delegate name is filtered out
+  of the assembled tool list (`is_web_search_delegate`) so the model sees one clean option, not
+  two names for the same tool. Execution still forwards verbatim to `mcp::call_tool` — no second
+  HTTP/JSON-RPC implementation.
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
   instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,
@@ -119,6 +135,31 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
   `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
   and only when at least one skill exists.
+- **`src/commands.rs`** — user-defined slash commands. Discovers Markdown files (each an
+  optional YAML frontmatter block — `description`, `argument-hint` — followed by a prompt-template
+  body) from `.sigit/commands/` and `.claude/commands/` in the cwd, `$SIGIT_CONFIG_DIR/commands/`,
+  and `~/.claude/commands/`. A subdirectory namespaces the command with `:`
+  (`.sigit/commands/git/commit.md` → `/git:commit`). Unlike skills there's no tool-call
+  indirection: invoking one works exactly like the built-in `/init` — `commands::render`
+  substitutes `$ARGUMENTS`/`$1..$9` in the body against whatever followed the command on the
+  input line, and the result is fed to the model as a normal turn through the ordinary tools and
+  permission checks. Resolution happens where each surface (`main.rs`/`chat.rs`) already
+  special-cases `/init`: an unrecognized slash command is tried against `commands::resolve_command`
+  before falling back to "unknown command". A custom command sharing a name with a built-in is
+  unreachable (built-ins match first in `parse_slash`) and is skipped when advertised to ACP
+  clients, with a warning logged.
+- **`src/subagents.rs`** — configurable subagent types for the `task` tool. Discovers Markdown
+  files (YAML frontmatter `name` + `description`, optional comma-separated `tools:` allow-list,
+  then a Markdown body that becomes the subagent's system prompt) from `.sigit/agents/` and
+  `.claude/agents/` in the cwd, `$SIGIT_CONFIG_DIR/agents/`, and `~/.claude/agents/`. Passing a
+  type's `name` as `task`'s `subagent_type` argument swaps in that system prompt and, if `tools:`
+  is set, narrows the offered toolset to its *intersection* with `SUBAGENT_TOOL_NAMES` — the
+  security-relevant narrowing logic lives in `tools.rs` next to that constant, not here; this
+  module only discovers and parses files. `SubagentFactory` (in `tools.rs`) takes the resolved
+  system prompt per call rather than baking one in at registration, so a single registered
+  factory serves both the default research subagent and every configured type.
+- **`src/frontmatter.rs`** — shared "YAML frontmatter + Markdown body" parsing used by both
+  `src/skills.rs` (`SKILL.md`) and `src/commands.rs` (`.sigit/commands/*.md`).
 - **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Two
   transports: **Streamable HTTP** (one JSON-RPC POST endpoint, `url` in `mcp.toml`; replies are
   `application/json` or SSE) and **stdio** (`command` + optional `args`/`[server.env]` in
@@ -131,12 +172,20 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   both read it; `/reload` does *not* re-run it, so config changes need a restart. stdio children
   live for the process; a dead child fails calls with an in-band error string (no auto-restart).
   Tools are namespaced `mcp__<server>__<tool>`, appended in the `*_as_specs`/`build_tool_specs`
-  layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. The official server
-  (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`) is baked in (always HTTP) and authed
-  with the cloud session token; extra servers live in `mcp.toml` (global
+  layer and routed in `tools::execute_tool` via `mcp::is_mcp_tool`. Two servers are baked in:
+  the official server (`<cloud>/mcp`, default `https://sigit.si/api/v1/mcp`, always HTTP, authed
+  with the cloud session token) and the smbCloud CLI server (`smb --mcp`, stdio, added only when
+  the `smb` binary is on `PATH`; opt out with `smbcloud = false` in `mcp.toml` or
+  `SIGIT_MCP_SMBCLOUD=off`). A user-defined entry named `sigit` or `smbcloud` overrides the
+  corresponding baked-in one. Extra servers live in `mcp.toml` (global
   `$SIGIT_CONFIG_DIR/mcp.toml` and project-local `.sigit/mcp.toml`). The stdio path is covered by
   `tests/mcp_stdio.rs`, driven by the test-only `src/bin/mcp_stdio_stub.rs` helper binary
-  (excluded from the published crate via `exclude` in `Cargo.toml`).
+  (excluded from the published crate via `exclude` in `Cargo.toml`). The baked-in official
+  server is *also* listed in the public MCP Registry as `si.sigit/sigit` — a **remote**
+  Streamable-HTTP listing (`server.json` at the repo root, published by
+  `release-mcp-registry.yml`). Because it's a remote server, the registry's URL-match rule
+  forces a domain namespace (`si.sigit` ↔ `sigit.si`) verified by a DNS TXT record, not the
+  GitHub-OIDC scheme `smbcloud-cli` uses for its package listing.
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
@@ -165,12 +214,14 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
-Slash commands (`/help`, `/models`, `/skills`, `/mcp`, `/login`, `/logout`, `/whoami`, `/reload`,
-`/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via `advertise_commands` in
-`main.rs` and handled in both the TUI and ACP sessions. `/init` is special: instead of replying
-directly it substitutes `instructions::INIT_PROMPT` for the user text and runs a normal agent
-turn that explores the repo and writes (or improves) `AGENTS.md` through the ordinary tools and
-permission checks.
+Slash commands (`/help`, `/models`, `/skills`, `/agents`, `/commands`, `/mcp`, `/login`, `/logout`,
+`/whoami`, `/reload`, `/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via
+`advertise_commands` in `main.rs` and handled in both the TUI and ACP sessions. `/init` is
+special: instead of replying directly it substitutes `instructions::INIT_PROMPT` for the user
+text and runs a normal agent turn that explores the repo and writes (or improves) `AGENTS.md`
+through the ordinary tools and permission checks. User-defined commands (see `src/commands.rs`)
+get the same treatment via the `SlashCommand::Unknown` fallback path, so anyone can add their own
+`/name` commands without touching the built-in command list.
 
 ## Model cache (macOS)
 
@@ -190,7 +241,8 @@ verbosity with `RUST_LOG`.
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
+`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
+smbCloud CLI server), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
 server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),
 `HF_HOME` / `HF_HUB_CACHE`, `RUST_LOG`.

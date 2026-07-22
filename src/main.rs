@@ -31,8 +31,11 @@
 mod account;
 mod backend;
 mod chat;
+mod commands;
 mod credentials;
+mod frontmatter;
 mod headless;
+mod hooks;
 mod instructions;
 mod mcp;
 mod models;
@@ -42,11 +45,14 @@ mod session_store;
 mod settings;
 mod setup;
 mod skills;
+mod subagents;
 mod tools;
 
-/// Serializes tests that mutate process-global env vars (`SIGIT_CONFIG_DIR`
-/// etc.). `cargo test` runs tests in parallel within a binary, so without this
-/// the credentials and settings round-trip tests clobber each other's env.
+/// Serializes tests that mutate process-global state: env vars
+/// (`SIGIT_CONFIG_DIR` etc.) and the current directory. `cargo test` runs
+/// tests in parallel within a binary, so without this the credentials and
+/// settings round-trip tests clobber each other's env, and the discovery
+/// tests (skills/commands/subagents) yank the cwd out from under each other.
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -148,6 +154,12 @@ Git operations — always use run_command:
   — GitHub reads that exact format and credits siGit as co-author. If a commit \
   lands without it, siGit Code amends the trailer in automatically and the tool \
   output says so; do not amend again yourself.
+
+For repositories hosted on sigit.si, issue and pull request workflows go \
+through the official MCP tools: mcp__sigit__list_issues, mcp__sigit__get_issue, \
+mcp__sigit__create_issue, mcp__sigit__list_pull_requests, and \
+mcp__sigit__get_pull_request. Prefer these tools over shelling out to git (or \
+fetching web pages) for issue and PR queries on sigit.si repos.
 
 Never introduce yourself unless asked. Jump straight into the answer. \
 Keep answers short. Write idiomatic code. \
@@ -255,7 +267,7 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
         "delete_file" => ToolKind::Delete,
         "run_command" | "kill_command" => ToolKind::Execute,
         "read_file" | "list_directory" | "command_output" => ToolKind::Read,
-        "search_files" | "glob" => ToolKind::Search,
+        "search_files" | "glob" | "web_search" => ToolKind::Search,
         "read_website" => ToolKind::Fetch,
         "write_todos" => ToolKind::Think,
         _ => ToolKind::Other,
@@ -314,27 +326,45 @@ fn agent_tools_as_specs() -> Vec<ToolSpec> {
         specs.push(tools::task_tool_spec());
     }
 
+    // `web_search` is a native wrapper around the official MCP server's
+    // `web_search` tool (see the module doc in tools.rs), offered only when
+    // that MCP tool was actually discovered (i.e. the user is signed in to
+    // siGit Code Cloud).
+    let web_search_offered = tools::web_search_available();
+    if web_search_offered {
+        specs.push(tools::web_search_tool_spec());
+    }
+
     // Tools discovered from configured MCP servers (incl. the official one).
-    specs.extend(mcp::tool_specs());
+    // Exclude the raw web_search delegate when the native wrapper above is
+    // already offered, so the model sees one clean option, not two names for
+    // the same tool.
+    specs.extend(
+        mcp::tool_specs()
+            .into_iter()
+            .filter(|spec| !(web_search_offered && tools::is_web_search_delegate(&spec.name))),
+    );
 
     specs
 }
 
 /// Register the `task` tool's subagent factory for an OpenAI-compatible
 /// provider: each subagent run gets a FRESH `OpenAiBackend` against the same
-/// endpoint (its own conversation history), seeded with the subagent system
-/// prompt. The provider config is captured by clone. Called once at startup by
-/// whichever surface resolved the provider; on-device paths register a factory
-/// that returns `None` instead (onde has a single shared history, so a second
-/// concurrent context is not possible yet).
+/// endpoint (its own conversation history), seeded with whichever system
+/// prompt the caller resolved (the default subagent prompt, or a configured
+/// subagent type's prompt — see `tools::exec_task_with`). The provider config
+/// is captured by clone. Called once at startup by whichever surface resolved
+/// the provider; on-device paths register a factory that returns `None`
+/// instead (onde has a single shared history, so a second concurrent context
+/// is not possible yet).
 fn register_subagent_factory_for(cfg: &provider::ProviderConfig) {
     let cfg = cfg.clone();
-    tools::set_subagent_factory(Box::new(move || {
+    tools::set_subagent_factory(Box::new(move |system_prompt: &str| {
         Some(Arc::new(OpenAiBackend::new(
             cfg.base_url.clone(),
             cfg.api_key.clone(),
             cfg.model.clone(),
-            Some(tools::SUBAGENT_SYSTEM_PROMPT.to_string()),
+            Some(system_prompt.to_string()),
         )) as Arc<dyn InferenceBackend>)
     }));
 }
@@ -772,7 +802,7 @@ impl SiGitAgent {
                 UnstructuredCommandInput::new(hint),
             ))
         };
-        let commands = vec![
+        let mut commands = vec![
             AvailableCommand::new("help", "Show available commands"),
             AvailableCommand::new("models", "List available models").input(
                 AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
@@ -785,6 +815,14 @@ impl SiGitAgent {
                 "on|off (optional)",
             ),
             AvailableCommand::new("skills", "List available Agent Skills"),
+            AvailableCommand::new(
+                "agents",
+                "List configured subagent types (.sigit/agents/*.md) for task",
+            ),
+            AvailableCommand::new(
+                "commands",
+                "List user-defined commands (.sigit/commands/*.md)",
+            ),
             AvailableCommand::new("mcp", "List MCP servers and their tools"),
             AvailableCommand::new("load", "Load the selected on-device model"),
             with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
@@ -802,6 +840,32 @@ impl SiGitAgent {
             AvailableCommand::new("clear", "Wipe the conversation history"),
             AvailableCommand::new("status", "Show engine status"),
         ];
+
+        // User-defined commands (.sigit/commands/*.md etc.) are appended so
+        // clients that only forward advertised commands (Zed) can actually
+        // send them. A custom command sharing a name with a built-in is
+        // unreachable — parse_slash always matches built-ins first — so skip
+        // advertising the shadowed duplicate rather than confuse the client.
+        let built_in_names: Vec<String> = commands.iter().map(|c| c.name.to_string()).collect();
+        for command in commands::discover_commands() {
+            if built_in_names.contains(&command.name) {
+                log::warn!(
+                    "custom command \"{}\" at {} is shadowed by a built-in command of the same name",
+                    command.name,
+                    command.path.display()
+                );
+                continue;
+            }
+            let description = command
+                .description
+                .clone()
+                .unwrap_or_else(|| "User-defined command".to_string());
+            commands.push(match &command.argument_hint {
+                Some(hint) => with_hint(&command.name, &description, hint),
+                None => AvailableCommand::new(&command.name, &description),
+            });
+        }
+
         self.send_tool_call_update(
             cx,
             session_id,
@@ -1024,6 +1088,12 @@ impl SiGitAgent {
 
         self.advertise_commands(cx, args.session_id.clone());
 
+        // Run SessionStart hooks
+        let hook_settings = settings::load().hooks;
+        if hook_settings.has_hooks() {
+            hooks::run_session_start_hooks(&hook_settings, &args.cwd, &args.session_id.to_string());
+        }
+
         Ok(LoadSessionResponse::new().config_options(config_options))
     }
 
@@ -1074,6 +1144,12 @@ impl SiGitAgent {
 
         self.advertise_commands(cx, new_id.clone());
 
+        // Run SessionStart hooks
+        let hook_settings = settings::load().hooks;
+        if hook_settings.has_hooks() {
+            hooks::run_session_start_hooks(&hook_settings, &args.cwd, &new_id.to_string());
+        }
+
         Ok(ForkSessionResponse::new(new_id).config_options(config_options))
     }
 
@@ -1121,6 +1197,12 @@ impl SiGitAgent {
         };
 
         self.advertise_commands(cx, session_id.clone());
+
+        // Run SessionStart hooks
+        let hook_settings = settings::load().hooks;
+        if hook_settings.has_hooks() {
+            hooks::run_session_start_hooks(&hook_settings, &args.cwd, &session_id.to_string());
+        }
 
         Ok(NewSessionResponse::new(session_id).config_options(config_options))
     }
@@ -1275,6 +1357,24 @@ impl SiGitAgent {
             // exploration and file write go through the ordinary tools and
             // permission checks.
             Some(SlashCommand::Init) => instructions::INIT_PROMPT.to_string(),
+            // A word `parse_slash` didn't recognize might be a user-defined
+            // command (`.sigit/commands/*.md`) — same substitute-and-run-a-
+            // real-turn treatment as `/init`. Only fall back to "unknown
+            // command" once that lookup also misses.
+            Some(SlashCommand::Unknown(command, argument)) => {
+                match commands::resolve_command(&command) {
+                    Some(custom) => commands::render(&custom.body, argument.as_deref()),
+                    None => {
+                        return exec_slash_acp(
+                            self,
+                            cx,
+                            session_id,
+                            SlashCommand::Unknown(command, argument),
+                        )
+                        .await;
+                    }
+                }
+            }
             Some(command) => return exec_slash_acp(self, cx, session_id, command).await,
             None => user_text,
         };
@@ -2224,6 +2324,10 @@ enum SlashCommand {
     Local(Option<bool>),
     /// List discovered Agent Skills.
     Skills,
+    /// List configured subagent types (`.sigit/agents/*.md`) for `task`.
+    Agents,
+    /// List discovered user-defined commands (`.sigit/commands/*.md`).
+    Commands,
     /// List configured MCP servers and their tools.
     Mcp,
     /// Explicitly load the selected (or default) on-device model.
@@ -2245,7 +2349,10 @@ enum SlashCommand {
     /// with [`instructions::INIT_PROMPT`] as the user text.
     Init,
     Exit,
-    Unknown(String),
+    /// An unrecognized command word, plus whatever followed it on the line
+    /// (untouched — a caller may still resolve it as a user-defined command
+    /// before falling back to "unknown command").
+    Unknown(String, Option<String>),
 }
 
 fn parse_slash(input: &str) -> Option<SlashCommand> {
@@ -2263,6 +2370,8 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/models" => SlashCommand::Models(argument.and_then(|v| v.parse::<usize>().ok())),
         "/local" => SlashCommand::Local(parse_on_off(argument)),
         "/skills" => SlashCommand::Skills,
+        "/agents" => SlashCommand::Agents,
+        "/commands" => SlashCommand::Commands,
         "/mcp" => SlashCommand::Mcp,
         "/load" => SlashCommand::Load,
         "/login" => SlashCommand::Login(argument.map(str::to_string)),
@@ -2274,7 +2383,7 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/compact" => SlashCommand::Compact,
         "/init" => SlashCommand::Init,
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
-        other => SlashCommand::Unknown(other.to_string()),
+        other => SlashCommand::Unknown(other.to_string(), argument.map(str::to_string)),
     })
 }
 
@@ -2375,6 +2484,8 @@ async fn exec_slash_acp(
                      /models N      - switch to model N\n\
                      /local [on|off]- toggle on-device inference mode\n\
                      /skills        - list available Agent Skills\n\
+                     /agents        - list configured subagent types (.sigit/agents/*.md)\n\
+                     /commands      - list user-defined commands (.sigit/commands/*.md)\n\
                      /mcp           - list MCP servers and their tools\n\
                      /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
@@ -2462,6 +2573,16 @@ async fn exec_slash_acp(
         SlashCommand::Skills => {
             agent
                 .send_assistant_message(cx, session_id, skills::format_skills_list())
+                .ok();
+        }
+        SlashCommand::Agents => {
+            agent
+                .send_assistant_message(cx, session_id, subagents::format_agent_types_list())
+                .ok();
+        }
+        SlashCommand::Commands => {
+            agent
+                .send_assistant_message(cx, session_id, commands::format_commands_list())
                 .ok();
         }
         SlashCommand::Mcp => {
@@ -2661,9 +2782,15 @@ async fn exec_slash_acp(
                 .send_assistant_message(cx, session_id, "Send /init as a prompt to run it.")
                 .ok();
         }
-        SlashCommand::Unknown(command) => {
+        SlashCommand::Unknown(command, _) => {
             agent
-                .send_assistant_message(cx, session_id, format!("unknown command: {command}"))
+                .send_assistant_message(
+                    cx,
+                    session_id,
+                    format!(
+                        "unknown command: {command}. Type /commands to list user-defined commands."
+                    ),
+                )
                 .ok();
         }
     }
@@ -2868,7 +2995,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                         let _ = load_tx.send(Ok(()));
                         // On-device inference has a single shared history; no
                         // subagent context is possible yet.
-                        tools::set_subagent_factory(Box::new(|| None));
+                        tools::set_subagent_factory(Box::new(|_system_prompt: &str| None));
                         let backend = Arc::new(LocalBackend::new(Arc::clone(&engine)))
                             as Arc<dyn InferenceBackend>;
                         (backend, startup_model_name)
@@ -3002,7 +3129,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
     } else {
         // On-device inference has a single shared conversation history, so a
         // second concurrent subagent context is not possible yet.
-        tools::set_subagent_factory(Box::new(|| None));
+        tools::set_subagent_factory(Box::new(|_system_prompt: &str| None));
     }
 
     let stdin = tokio::io::stdin().compat();
@@ -3247,6 +3374,25 @@ mod tests {
         assert!(matches!(parse_slash("/init"), Some(SlashCommand::Init)));
         // Trailing whitespace comes from editors that submit the raw line.
         assert!(matches!(parse_slash(" /init "), Some(SlashCommand::Init)));
+    }
+
+    #[test]
+    fn system_prompt_points_issue_and_pr_work_at_the_official_mcp_tools() {
+        // The guidance must reference the exact namespaced names the official
+        // server's tools get (see mcp::official_tool_name), or the model will
+        // call tools that don't exist.
+        for tool in [
+            "list_issues",
+            "get_issue",
+            "create_issue",
+            "list_pull_requests",
+            "get_pull_request",
+        ] {
+            assert!(
+                SYSTEM_PROMPT.contains(&mcp::official_tool_name(tool)),
+                "SYSTEM_PROMPT must mention mcp__sigit__{tool}"
+            );
+        }
     }
 
     #[test]

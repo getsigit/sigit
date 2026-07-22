@@ -1,0 +1,49 @@
+# Example siGit Code settings with hooks configured
+# Place this at ~/.config/sigit/settings.toml
+
+# Whether to use on-device inference (true) or cloud (false)
+local_inference = true
+
+# Tool permission policy
+[permissions]
+# Default permission mode: allow, ask, or deny
+default = "ask"
+
+# Per-tool overrides
+[permissions.tools]
+edit_file = "ask"
+run_command = "ask"
+
+# Argument-level allow/deny rules
+[permissions.rules]
+allow = ["run_command(cargo *)"]
+deny = ["run_command(rm -rf *)"]
+
+# Extensibility hooks for session and tool lifecycle
+[hooks]
+
+# SessionStart hooks run when a session begins (new/load/fork)
+# Available variables: {cwd}, {session_id}
+session_start = [
+    "echo 'Starting siGit session in {cwd}'",
+    # Uncomment to build on session start:
+    # "cd {cwd} && cargo build",
+]
+
+# PreToolUse hooks run before a tool is executed
+# Available variables: {tool_name}, {tool_args_len}, {cwd}
+pre_tool_use = [
+    # Log tool usage
+    "echo '[TOOL] {tool_name}' >> /tmp/sigit-tool-log.txt",
+    # Uncomment to show which tools run:
+    # "echo 'About to run: {tool_name} ({tool_args_len} bytes of args)'",
+]
+
+# PostToolUse hooks run after a tool is executed
+# Available variables: {tool_name}, {tool_result_len}, {cwd}
+post_tool_use = [
+    # Log result size
+    "echo '[RESULT] {tool_name}: {tool_result_len} bytes' >> /tmp/sigit-tool-log.txt",
+    # Uncomment to track metrics:
+    # "echo {tool_result_len} >> /tmp/sigit-result-sizes.log",
+]

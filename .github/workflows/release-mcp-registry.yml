@@ -1,0 +1,79 @@
+name: MCP Registry Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override the version in server.json (e.g. 0.2.0); leave blank to publish as-is"
+        required: false
+
+# A remote server proves namespace ownership through domain (DNS) verification,
+# not GitHub OIDC: the registry checks a v=MCPv1 TXT record on sigit.si against
+# a request signed with the matching Ed25519 private key. See the MCP Registry
+# doc in the sigit-si repo for the one-time key/DNS setup.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish server.json to the MCP Registry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Optionally override the version in server.json
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.version }}"
+          if [ -n "${version}" ]; then
+            jq --arg v "${version}" '.version = $v' server.json > server.tmp
+            mv server.tmp server.json
+          fi
+          cat server.json
+
+      - name: Check the remote URL matches the namespace domain
+        shell: bash
+        run: |
+          # The registry rejects a remote server whose URL isn't under the
+          # namespace's domain. si.sigit -> sigit.si, so every listed remote
+          # must live on sigit.si (or a subdomain).
+          server_name="$(jq -r '.name' server.json)"
+          domain="$(echo "${server_name%%/*}" | awk -F. '{ for (i=NF; i>=1; i--) printf "%s%s", $i, (i>1 ? "." : "") }')"
+          echo "Server: ${server_name}  Domain: ${domain}"
+
+          bad="$(jq -r --arg d "${domain}" '
+            .remotes // []
+            | map(.url | sub("^[a-z]+://"; "") | sub("/.*$"; ""))
+            | map(select(. != $d and (endswith("." + $d) | not)))
+            | .[]' server.json)"
+          if [ -n "${bad}" ]; then
+            echo "Remote URL host(s) not under ${domain}: ${bad}" >&2
+            exit 1
+          fi
+
+      - name: Install mcp-publisher
+        shell: bash
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to the MCP Registry
+        shell: bash
+        env:
+          MCP_REGISTRY_DNS_PRIVATE_KEY: ${{ secrets.MCP_REGISTRY_DNS_PRIVATE_KEY }}
+        run: |
+          if [ -z "${MCP_REGISTRY_DNS_PRIVATE_KEY}" ]; then
+            echo "MCP_REGISTRY_DNS_PRIVATE_KEY secret is not set. See the MCP Registry doc in the sigit-si repo." >&2
+            exit 1
+          fi
+          ./mcp-publisher login dns --domain=sigit.si --private-key="${MCP_REGISTRY_DNS_PRIVATE_KEY}"
+
+      - name: Publish
+        shell: bash
+        run: ./mcp-publisher publish
+
+      - name: Verify the server is listed
+        shell: bash
+        run: |
+          server_name="$(jq -r '.name' server.json)"
+          curl -fsSL "https://registry.modelcontextprotocol.io/v0.1/servers?search=${server_name}" | jq .

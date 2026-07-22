@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.5.0
+
+Opens the agent up to user extension: lifecycle hooks, custom slash commands,
+and configurable subagent types. Also adds web search, a Repo tab in the TUI,
+and a baked-in smbCloud MCP server.
+
+### What changed
+
+- Hooks let you run shell commands at three points in the agent's lifecycle:
+  `session_start`, `pre_tool_use`, and `post_tool_use`, configured under
+  `[hooks]` in `settings.toml`. Commands get context through variable
+  substitution (`{cwd}`, `{tool_name}`, `{tool_result_len}`) and run in the
+  session working directory. A hook that fails is logged and the session
+  continues; a hook that hangs is killed on a timeout, along with its whole
+  process group
+- User-defined slash commands: drop a Markdown file in `.sigit/commands/` or
+  `.claude/commands/` (or the personal `$SIGIT_CONFIG_DIR/commands/` and
+  `~/.claude/commands/`) with optional `description` and `argument-hint`
+  frontmatter, and the body becomes a prompt template. `$ARGUMENTS` takes the
+  whole argument string and `$1`..`$9` the positional words. A subdirectory
+  namespaces the command with `:`, so `.sigit/commands/git/commit.md` becomes
+  `/git:commit`. They run as ordinary agent turns through the usual tools and
+  permission checks, and are advertised to ACP clients like Zed. `/commands`
+  lists what was discovered
+- Configurable subagent types for the `task` tool: a Markdown file in
+  `.sigit/agents/` or `.claude/agents/` with `name`, `description`, and an
+  optional `tools:` allow-list, whose body becomes that subagent's system
+  prompt. Pass its name as `subagent_type` to swap the prompt in. The
+  `tools:` list can only narrow the subagent's read-only ceiling, never widen
+  it, so a config file cannot grant itself `edit_file` or `run_command` and
+  route around the permission system. `/agents` lists the discovered types
+- New `web_search` tool, backed by the Brave-Search-backed search on siGit
+  Code Cloud's MCP server. It is offered only when you are signed in, and it
+  is classified read-only, so searching never triggers a permission prompt
+- The TUI gains a Repo tab, shown when the session's `origin` remote points at
+  the sigit.si host. It lists issues and pull requests fetched through the
+  official MCP server: Up and Down select, Enter opens a scrollable detail,
+  `i`, `p`, Left and Right switch sections, `r` refreshes. The tab is hidden
+  and skipped in the cycle for any other remote
+- The smbCloud CLI's stdio MCP server (`smb --mcp`) is now baked in, so
+  smbCloud project and deployment tools work with no `mcp.toml` setup. It is
+  added only when the `smb` binary is on `PATH`, its read-only tools (`me`,
+  `deployments`, `project_list`, `project_show`) skip permission prompts, and
+  you can opt out with `smbcloud = false` in `mcp.toml` or
+  `SIGIT_MCP_SMBCLOUD=off`
+- siGit Code Cloud's MCP server is now listed in the public MCP Registry as
+  `si.sigit/sigit`, published from `server.json` at the repository root
+
+### Fixes
+
+- An explicit `deny` rule now applies to read-only first-party tools instead
+  of being skipped
+- A subagent type whose `tools:` list resolves to an empty set is rejected
+  rather than producing a subagent with no tools
+- Command templates render in a single substitution pass, so an argument that
+  contains something like `$1` is no longer re-substituted
+- Frontmatter is stripped with the same leniency it is parsed with
+- The Repo tab's detail view no longer shows stale data after a refresh
+
 ## 1.4.1
 
 Two small fixes: correct co-author attribution and a Homebrew tap fix.
