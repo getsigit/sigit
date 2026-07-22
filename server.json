@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "si.sigit/sigit",
+  "title": "siGit Si",
+  "description": "siGit tools: browse repos, read files, search code, manage pull requests and issues, and web search.",
+  "version": "0.1.0",
+  "websiteUrl": "https://sigit.si",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://sigit.si/api/v1/mcp"
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "categories": ["developer-tools", "version-control"],
+      "keywords": [
+        "git",
+        "code search",
+        "pull requests",
+        "issues",
+        "repositories",
+        "web search",
+        "coding agent"
+      ]
+    }
+  }
+}
