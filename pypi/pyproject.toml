@@ -9,7 +9,11 @@ readme = "README.md"
 requires-python = ">=3.8"
 dynamic = ["version"]
 license = { text = "Apache-2.0" }
-authors = [{ name = "Seto Elkahfi", email = "seto@ondeinference.com" }]
+authors = [
+    { name = "Seto Elkahfi", email = "seto@sigit.si" },
+    { name = "paydii", email = "193906237+paydii@users.noreply.github.com" },
+    { name = "keypair34", email = "216233964+keypair34@users.noreply.github.com" }
+]
 keywords = ["sigit", "cli", "ai", "coding-agent", "llm", "on-device"]
 classifiers = [
     "Development Status :: 4 - Beta",
