@@ -115,6 +115,10 @@ Terminal mode currently needs Unix terminal behavior, so it works on macOS and L
 
 [Apache 2.0](https://github.com/getsigit/sigit/blob/main/LICENSE)
 
+## Distribution
+
+[Splitfire AB](https://5mb.app).
+
 ## Copyright
 
-© 2026 [Splitfire AB](https://5mb.app) ([siGit Code & Deploy](https://sigit.si)).
+© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)).
