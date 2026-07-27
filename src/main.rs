@@ -433,6 +433,9 @@ struct SiGitAgent {
     model_load_error: Arc<std::sync::Mutex<Option<String>>>,
     /// true when the startup model isn't cached yet
     startup_needs_download: bool,
+    /// Xcode launches custom agents with `--acp`; that mode should be ready to
+    /// answer the first prompt without requiring an editor slash command.
+    auto_load_local_model: bool,
     /// for progress UI
     startup_model_name: String,
     /// for download-progress polling
@@ -453,6 +456,7 @@ impl SiGitAgent {
         startup_model_load_started: Arc<AtomicBool>,
         model_load_error: Arc<std::sync::Mutex<Option<String>>>,
         startup_needs_download: bool,
+        auto_load_local_model: bool,
     ) -> Self {
         let startup_model_name = initial_model.display_name.clone();
         let startup_model_id = initial_model.model_id.clone();
@@ -466,6 +470,7 @@ impl SiGitAgent {
             startup_model_load_started,
             model_load_error,
             startup_needs_download,
+            auto_load_local_model,
             startup_model_name,
             startup_model_id,
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1390,21 +1395,25 @@ impl SiGitAgent {
         let backend = self.backend.lock().await.clone();
 
         // Only on-device inference needs a local model in memory. Cloud tiers run
-        // over the network, so they never need a local model. We never load the
-        // on-device model implicitly: the user loads it explicitly with `/load`
-        // (or by picking one in `/models`). If a prompt arrives before that, guide
-        // them rather than blocking on a multi-minute download/load.
+        // over the network, so they never need a local model. Xcode's explicit
+        // `--acp` mode loads lazily on the first prompt because its custom-agent
+        // UI has no reliable equivalent of siGit's `/load` command.
         if !backend.is_remote()
             && self.engine.info().await.status == onde::inference::EngineStatus::Unloaded
         {
-            self.send_assistant_message(
-                cx,
-                session_id,
-                "No on-device model is loaded. Run `/load` to load the selected model, \
-                 or `/models` to choose one.",
-            )
-            .ok();
-            return Ok(PromptResponse::new(StopReason::EndTurn));
+            if self.auto_load_local_model {
+                self.start_startup_model_load_if_needed();
+                self.await_model_ready(cx, &session_id).await?;
+            } else {
+                self.send_assistant_message(
+                    cx,
+                    session_id,
+                    "No on-device model is loaded. Run `/load` to load the selected model, \
+                     or `/models` to choose one.",
+                )
+                .ok();
+                return Ok(PromptResponse::new(StopReason::EndTurn));
+            }
         }
 
         // ── tool-calling loop ────────────────────────────────────────────
@@ -1422,6 +1431,7 @@ impl SiGitAgent {
         let mut assembled = String::new();
         let mut sent = String::new();
         let mut streamed_any = false;
+        let mut repeated_tool_calls = std::collections::HashMap::<String, usize>::new();
 
         let mut result = self
             .drain_turn(
@@ -1470,6 +1480,7 @@ impl SiGitAgent {
             }
 
             let mut tool_results = Vec::new();
+            let mut force_text = false;
 
             for (call_index, tc) in result.tool_calls.iter().enumerate() {
                 log::info!(
@@ -1478,52 +1489,79 @@ impl SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
+                let signature = format!("{}\n{}", tc.name, tc.arguments);
+                let repeat_count = repeated_tool_calls
+                    .entry(signature)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                let repeated = *repeat_count >= 3;
+                if repeated {
+                    force_text = true;
+                    log::warn!(
+                        "prompt({}) stopping repeated tool call `{}` after {} attempts",
+                        session_id,
+                        tc.name,
+                        repeat_count
+                    );
+                }
+
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may ask the client.
-                let output = match permissions::decision_for(
-                    &session_id.to_string(),
-                    &tc.name,
-                    &tc.arguments,
-                ) {
-                    permissions::Decision::Allow => {
-                        tools::execute_tool(&tc.name, &tc.arguments).await
-                    }
-                    permissions::Decision::Deny(reason) => {
-                        log::info!("  ✗ {} denied by policy", tc.name);
-                        reason
-                    }
-                    permissions::Decision::Ask => {
-                        match self
-                            .request_tool_permission(cx, &session_id, &tc.name, &tc.arguments)
-                            .await
-                        {
-                            PermissionVerdict::Approved => {
-                                tools::execute_tool(&tc.name, &tc.arguments).await
-                            }
-                            PermissionVerdict::Denied(reason) => {
-                                log::info!("  ✗ {} denied by user", tc.name);
-                                reason
-                            }
-                            PermissionVerdict::TurnCancelled => {
-                                log::info!("prompt({}) cancelled at permission gate", session_id);
-                                // The assistant message carrying these tool
-                                // calls is already in the backend history;
-                                // leaving any of them unanswered makes strict
-                                // OpenAI-compatible endpoints reject every
-                                // later request in the session. Close out this
-                                // call and the ones this round never reached.
-                                for pending in &result.tool_calls[call_index..] {
-                                    tool_results.push(BackendToolResult {
-                                        tool_call_id: pending.id.clone(),
-                                        content: format!(
-                                            "`{}` was not executed: the user cancelled the turn \
-                                             at the permission prompt.",
-                                            pending.name
-                                        ),
-                                    });
+                let output = if repeated {
+                    format!(
+                        "The tool `{}` was not executed again because the model repeated \
+                         the same call three times. Continue without this tool.",
+                        tc.name
+                    )
+                } else {
+                    match permissions::decision_for(
+                        &session_id.to_string(),
+                        &tc.name,
+                        &tc.arguments,
+                    ) {
+                        permissions::Decision::Allow => {
+                            tools::execute_tool(&tc.name, &tc.arguments).await
+                        }
+                        permissions::Decision::Deny(reason) => {
+                            log::info!("  ✗ {} denied by policy", tc.name);
+                            reason
+                        }
+                        permissions::Decision::Ask => {
+                            match self
+                                .request_tool_permission(cx, &session_id, &tc.name, &tc.arguments)
+                                .await
+                            {
+                                PermissionVerdict::Approved => {
+                                    tools::execute_tool(&tc.name, &tc.arguments).await
                                 }
-                                backend.record_cancelled_tool_results(tool_results).await;
-                                return Ok(PromptResponse::new(StopReason::Cancelled));
+                                PermissionVerdict::Denied(reason) => {
+                                    log::info!("  ✗ {} denied by user", tc.name);
+                                    reason
+                                }
+                                PermissionVerdict::TurnCancelled => {
+                                    log::info!(
+                                        "prompt({}) cancelled at permission gate",
+                                        session_id
+                                    );
+                                    // The assistant message carrying these tool
+                                    // calls is already in the backend history;
+                                    // leaving any of them unanswered makes strict
+                                    // OpenAI-compatible endpoints reject every
+                                    // later request in the session. Close out this
+                                    // call and the ones this round never reached.
+                                    for pending in &result.tool_calls[call_index..] {
+                                        tool_results.push(BackendToolResult {
+                                            tool_call_id: pending.id.clone(),
+                                            content: format!(
+                                                "`{}` was not executed: the user cancelled the turn \
+                                                 at the permission prompt.",
+                                                pending.name
+                                            ),
+                                        });
+                                    }
+                                    backend.record_cancelled_tool_results(tool_results).await;
+                                    return Ok(PromptResponse::new(StopReason::Cancelled));
+                                }
                             }
                         }
                     }
@@ -1537,7 +1575,7 @@ impl SiGitAgent {
                 });
             }
 
-            let next_tools = if round < MAX_TOOL_ROUNDS {
+            let next_tools = if round < MAX_TOOL_ROUNDS && !force_text {
                 Some(tools.as_slice())
             } else {
                 None // last round: force text
@@ -3064,7 +3102,17 @@ fn default_local_model_config() -> GgufModelConfig {
         .unwrap_or_else(GgufModelConfig::qwen25_3b)
 }
 
-async fn run_acp_server() -> anyhow::Result<()> {
+fn parse_explicit_acp(args: &[String]) -> Result<bool, String> {
+    if !args.iter().any(|arg| arg == "--acp") {
+        return Ok(false);
+    }
+    if args.iter().any(|arg| arg != "--acp") {
+        return Err("--acp does not accept additional arguments".to_string());
+    }
+    Ok(true)
+}
+
+async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
     log::info!("ACP mode — starting agent server");
 
     let config = default_local_model_config();
@@ -3102,6 +3150,7 @@ async fn run_acp_server() -> anyhow::Result<()> {
         startup_model_load_started,
         model_load_error,
         needs_download,
+        auto_load_local_model,
     ));
 
     // Honor the explicit provider override (OPENAI_BASE_URL/OPENAI_API_KEY or
@@ -3294,6 +3343,25 @@ async fn main() -> anyhow::Result<()> {
     // is dispatched here, before the TTY/ACP split, like the account
     // subcommands above.
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    // Xcode's custom-agent UI launches ACP agents with an explicit `--acp`
+    // argument. Honor it even when Xcode gives the child a terminal-like stdin.
+    match parse_explicit_acp(&cli_args) {
+        Err(error) => {
+            eprintln!("sigit: {error}");
+            std::process::exit(2);
+        }
+        Ok(true) => {
+            init_logging(false);
+            setup::setup_shared_model_cache();
+            mcp::init().await;
+            log::info!(
+                "siGit v{} starting (explicit ACP mode)",
+                env!("CARGO_PKG_VERSION")
+            );
+            return run_acp_server(true).await;
+        }
+        Ok(false) => {}
+    }
     match headless::parse_args(&cli_args) {
         Ok(None) => {}
         Ok(Some(config)) => {
@@ -3350,13 +3418,20 @@ async fn main() -> anyhow::Result<()> {
         // Best-effort MCP discovery (incl. the official server) before serving.
         mcp::init().await;
         log::info!("siGit v{} starting (ACP mode)", env!("CARGO_PKG_VERSION"));
-        run_acp_server().await
+        run_acp_server(false).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_acp_flag_is_accepted_without_other_arguments() {
+        assert_eq!(parse_explicit_acp(&["--acp".to_string()]), Ok(true));
+        assert_eq!(parse_explicit_acp(&[]), Ok(false));
+        assert!(parse_explicit_acp(&["--acp".to_string(), "--quiet".to_string()]).is_err());
+    }
 
     #[test]
     fn system_prompt_advertises_the_commit_co_author_trailer() {
