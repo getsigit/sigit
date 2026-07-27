@@ -127,9 +127,12 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// sum.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Overall request timeout for an individual `tools/call`. Generous, since an
-/// MCP tool may do real work server-side.
+/// Overall request timeout for an individual `tools/call`. Generous for build
+/// and test tools, while the Xcode bridge gets a shorter bound below because
+/// it otherwise leaves an ACP prompt looking permanently busy when Xcode
+/// cannot service the request.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const XCODE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cap on the characters returned from a single tool call, so a chatty server
 /// can't blow up the model's context. Matches the spirit of the file-read cap.
@@ -818,7 +821,12 @@ impl Mcp {
         let result = match &server.transport {
             None => return Err(format!("server '{}' is not connected", server.name)),
             Some(Transport::Stdio(stdio)) => {
-                stdio.request("tools/call", params, CALL_TIMEOUT).await?
+                let timeout = if server.name == "xcode" {
+                    XCODE_CALL_TIMEOUT
+                } else {
+                    CALL_TIMEOUT
+                };
+                stdio.request("tools/call", params, timeout).await?
             }
             Some(Transport::Http(http_conn)) => {
                 let body = json!({
@@ -827,14 +835,19 @@ impl Mcp {
                     "method": "tools/call",
                     "params": params
                 });
-                match post_rpc(&self.http, &server.name, http_conn, &body, CALL_TIMEOUT).await {
+                let timeout = if server.name == "xcode" {
+                    XCODE_CALL_TIMEOUT
+                } else {
+                    CALL_TIMEOUT
+                };
+                match post_rpc(&self.http, &server.name, http_conn, &body, timeout).await {
                     Ok(result) => result,
                     Err(error) if error.contains("returned 404") => {
                         // Session expired — drop it, re-handshake, and retry once.
                         *http_conn.session_id.lock().await = None;
                         initialize(&self.http, server).await?;
                         notify_initialized(&self.http, server).await?;
-                        post_rpc(&self.http, &server.name, http_conn, &body, CALL_TIMEOUT).await?
+                        post_rpc(&self.http, &server.name, http_conn, &body, timeout).await?
                     }
                     Err(error) => return Err(error),
                 }
@@ -1027,7 +1040,10 @@ async fn stdio_reader(mut stdout: BufReader<ChildStdout>, shared: Arc<StdioShare
             );
             continue;
         }
-        let Some(id) = message.get("id").and_then(Value::as_i64) else {
+        let Some(id) = message
+            .get("id")
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+        else {
             log::warn!(
                 "mcp: '{}' sent a response without a usable id; ignoring",
                 shared.name
