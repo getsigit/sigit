@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.5.1
+
+Makes siGit Code work as an Xcode custom agent, and updates the Onde SDK.
+
+### What changed
+
+- Xcode can now run siGit Code as a custom agent. Point it at the binary with
+  `--acp` as the argument, and that explicit mode loads the selected on-device
+  model on the first prompt, since Xcode's chat has no equivalent of `/load`.
+  The README covers the setup, including wiring up `xcrun mcpbridge` in
+  `mcp.toml` so the agent can use Xcode's build, test, and project tools
+- MCP calls to the `xcode` server time out after 30 seconds instead of 120, so
+  a request Xcode cannot service no longer leaves the prompt looking busy for
+  two minutes. String JSON-RPC ids from the bridge are handled too
+- The agent stops repeating itself: a tool call made three times with identical
+  arguments now forces a text reply instead of looping
+- Onde SDK bumped to 1.2.2
+- The registry listing in `server.json` matches what sigit.si publishes
+
 ## 1.5.0
 
 Opens the agent up to user extension: lifecycle hooks, custom slash commands,
