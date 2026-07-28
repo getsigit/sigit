@@ -37,6 +37,7 @@ cargo install sigit
 | pip | `pip install sigit-code` |
 | uv | `uvx --from sigit-code sigit` |
 | npm | `npm install -g @smbcloud/sigit` |
+| NuGet | `dotnet tool install --global SiGit.Code` |
 
 ## First run
 

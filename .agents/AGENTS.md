@@ -249,6 +249,22 @@ mutating tools; the escape hatch for clients without permission-request support)
 
 ## Releasing
 
-Version lives in `Cargo.toml`. The binary is published to five registries via separate workflows
-(`release-crates`, `release-github`, `release-homebrew`, `release-npm`, `release-pypi`); the
-`npm/` and `pypi/` dirs hold the wrapper-package templates. Update `CHANGELOG.md` for releases.
+Version lives in `Cargo.toml`. The binary is published to six registries via separate workflows
+(`release-crates`, `release-github`, `release-homebrew`, `release-npm`, `release-nuget`,
+`release-pypi`); the `npm/`, `nuget/`, and `pypi/` dirs hold the wrapper-package templates. Update
+`CHANGELOG.md` for releases.
+
+`[profile.release]` sets `strip = "symbols"` because binary size is a distribution constraint, not
+just a nicety — see the NuGet note below.
+
+The NuGet package (`SiGit.Code`, installed with `dotnet tool install --global SiGit.Code`) is the
+odd one out: npm and PyPI publish one artifact per platform, but a .NET tool is a single package,
+so `nuget/sigit/` bundles all six binaries under `native/<os>-<arch>/` and a small managed shim
+(`Program.cs`) execs the right one. That shim leaves stdin/stdout/stderr unredirected on purpose,
+since siGit Code chooses TUI or ACP mode by testing whether stdin is a TTY.
+
+Bundling every target means the package is large, so `release-nuget.yml` fails the pack job if the
+`.nupkg` crosses nuget.org's 250 MB limit. At v1.5.1 it lands around 160 MB. If a future release
+trips that check, the fix is not to drop targets but to split into RID-specific tool packages
+(.NET 10's `DotnetToolRidPackage`), which ship one binary per platform the way npm already does —
+that also needs a fallback package for pre-.NET-10 SDKs.
