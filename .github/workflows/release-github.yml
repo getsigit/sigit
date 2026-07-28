@@ -119,6 +119,54 @@ jobs:
           echo "Archive: ${ARCHIVE_NAME}"
           echo "SHA256:  $(cat "${ARCHIVE_NAME}.sha256")"
 
+      # Debian and RPM packages are built from the binary staged above rather
+      # than by re-invoking cargo, so each Linux target compiles once and gets
+      # packaged twice.
+      - name: Build Linux packages
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        env:
+          NFPM_VERSION: "2.43.0"
+        run: |
+          case "$(uname -m)" in
+            x86_64)  nfpm_arch="x86_64"; export PKG_ARCH="amd64" ;;
+            aarch64) nfpm_arch="arm64";  export PKG_ARCH="arm64" ;;
+            *) echo "Unsupported Linux build host $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          curl -sSfL \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${nfpm_arch}.tar.gz" \
+            | tar -xz -C /tmp nfpm
+
+          export PKG_VERSION="${RELEASE_VERSION}"
+          export PKG_BINARY="./release/${PROJECT_NAME}-${{ matrix.name }}"
+
+          /tmp/nfpm package --config packaging/nfpm.yaml --packager deb --target ./release/
+          /tmp/nfpm package --config packaging/nfpm.yaml --packager rpm --target ./release/
+
+          ls -la ./release/
+
+      # Homebrew has always had a checksum because the tap needs one. Scoop,
+      # winget, and the AUR PKGBUILD each need one too, and they consume the
+      # raw binaries rather than the macOS tarball, so every asset gets a
+      # sidecar. Windows runners use bash from Git for Windows, which has
+      # sha256sum; macOS only has shasum.
+      - name: Checksum release assets
+        shell: bash
+        run: |
+          cd release
+          for asset in *; do
+            case "${asset}" in *.sha256) continue ;; esac
+
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${asset}" | awk '{print $1}' > "${asset}.sha256"
+            else
+              shasum -a 256 "${asset}" | awk '{print $1}' > "${asset}.sha256"
+            fi
+
+            echo "${asset}: $(cat "${asset}.sha256")"
+          done
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
@@ -171,17 +219,36 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           files: release/*
 
-      - name: Trigger Homebrew release
+      # These channels all publish somewhere outside this repo (a tap, a Scoop
+      # bucket, microsoft/winget-pkgs, the AUR) and every one of them reads
+      # checksums off the release created above, so they hang off this job
+      # rather than firing on the tag directly.
+      - name: Trigger OS package manager releases
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'release-homebrew.yml',
-              ref: 'main',
-              inputs: {
-                tag: '${{ steps.tag.outputs.tag }}'
+            const tag = '${{ steps.tag.outputs.tag }}'
+            const workflows = [
+              'release-homebrew.yml',
+              'release-scoop.yml',
+              'release-winget.yml',
+              'release-aur.yml',
+            ]
+
+            for (const workflow_id of workflows) {
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id,
+                  ref: 'main',
+                  inputs: { tag },
+                })
+                console.log(`Dispatched ${workflow_id} for tag ${tag}`)
+              } catch (error) {
+                // One packaging channel being unconfigured (a missing secret,
+                // a bucket repo that does not exist yet) should not take the
+                // rest of the fan-out down with it.
+                core.warning(`Failed to dispatch ${workflow_id}: ${error.message}`)
               }
-            })
-            console.log('Dispatched release-homebrew.yml for tag ${{ steps.tag.outputs.tag }}')
+            }

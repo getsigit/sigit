@@ -1,0 +1,140 @@
+name: Scoop Release
+
+# Dispatched by release-github.yml once the release and its checksums exist.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.5.2)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  REPO: getsigit/sigit
+
+jobs:
+  update-scoop-bucket:
+    name: Update Scoop bucket
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve tag and version
+        id: release
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Read SHA256 checksums from release
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p artifacts
+
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo "${{ env.REPO }}" \
+            --pattern "sigit-win-*.exe.sha256" \
+            --dir artifacts/
+
+          AMD64_SHA=$(cat artifacts/sigit-win-amd64.exe.sha256)
+          ARM64_SHA=$(cat artifacts/sigit-win-arm64.exe.sha256)
+
+          echo "amd64=${AMD64_SHA}" >> "$GITHUB_OUTPUT"
+          echo "arm64=${ARM64_SHA}" >> "$GITHUB_OUTPUT"
+
+          echo "AMD64 SHA256: ${AMD64_SHA}"
+          echo "ARM64 SHA256: ${ARM64_SHA}"
+
+      - name: Checkout Scoop bucket
+        uses: actions/checkout@v6
+        with:
+          repository: getsigit/scoop-bucket
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: scoop-bucket
+
+      - name: Generate manifest
+        shell: bash
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          TAG="${{ steps.release.outputs.tag }}"
+          AMD64_SHA="${{ steps.sha.outputs.amd64 }}"
+          ARM64_SHA="${{ steps.sha.outputs.arm64 }}"
+
+          mkdir -p scoop-bucket/bucket
+
+          # The `#/sigit.exe` URL fragment is Scoop's rename-on-download
+          # syntax: the release asset is sigit-win-amd64.exe, but the shim has
+          # to end up as sigit.exe for `sigit` to work on PATH.
+          cat > scoop-bucket/bucket/sigit.json <<MANIFEST
+          {
+              "version": "${VERSION}",
+              "description": "siGit Code, an AI coding agent that runs on your machine.",
+              "homepage": "https://sigit.si",
+              "license": "Apache-2.0",
+              "architecture": {
+                  "64bit": {
+                      "url": "https://github.com/${REPO}/releases/download/${TAG}/sigit-win-amd64.exe#/sigit.exe",
+                      "hash": "${AMD64_SHA}"
+                  },
+                  "arm64": {
+                      "url": "https://github.com/${REPO}/releases/download/${TAG}/sigit-win-arm64.exe#/sigit.exe",
+                      "hash": "${ARM64_SHA}"
+                  }
+              },
+              "bin": "sigit.exe",
+              "checkver": {
+                  "github": "https://github.com/${REPO}"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/${REPO}/releases/download/v\$version/sigit-win-amd64.exe#/sigit.exe"
+                      },
+                      "arm64": {
+                          "url": "https://github.com/${REPO}/releases/download/v\$version/sigit-win-arm64.exe#/sigit.exe"
+                      }
+                  },
+                  "hash": {
+                      "url": "\$url.sha256"
+                  }
+              }
+          }
+          MANIFEST
+
+          echo "Generated manifest:"
+          cat scoop-bucket/bucket/sigit.json
+
+      - name: Validate manifest JSON
+        shell: bash
+        run: |
+          if ! jq empty scoop-bucket/bucket/sigit.json; then
+            echo "::error::Generated Scoop manifest is not valid JSON" >&2
+            exit 1
+          fi
+
+          for field in version bin architecture; do
+            if [ "$(jq -r "has(\"${field}\")" scoop-bucket/bucket/sigit.json)" != "true" ]; then
+              echo "::error::Scoop manifest is missing the '${field}' field" >&2
+              exit 1
+            fi
+          done
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+
+          cd scoop-bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bucket/sigit.json
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update sigit to ${VERSION}"
+          git push
