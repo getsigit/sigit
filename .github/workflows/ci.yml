@@ -9,6 +9,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
