@@ -1873,13 +1873,13 @@ impl SiGitAgent {
 
         // ── Local Inference toggle ──────────────────────────────────────────
         if args.config_id.0.as_ref() == LOCAL_INFERENCE_CONFIG_ID {
-            let enabled = match args.value.0.as_ref() {
-                LOCAL_INFERENCE_ON => true,
-                LOCAL_INFERENCE_OFF => false,
+            let enabled = match args.value.as_value_id().map(|v| v.0.as_ref()) {
+                Some(LOCAL_INFERENCE_ON) => true,
+                Some(LOCAL_INFERENCE_OFF) => false,
                 other => {
                     return Err(agent_client_protocol::Error::new(
                         -32602,
-                        format!("unknown Local Inference value: {other}"),
+                        format!("unknown Local Inference value: {other:?}"),
                     ));
                 }
             };
@@ -1909,7 +1909,15 @@ impl SiGitAgent {
             ));
         }
 
-        let model_id = args.value.0.as_ref();
+        let Some(model_id) = args.value.as_value_id().map(|v| v.0.as_ref()) else {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!(
+                    "expected a value-id for {MODEL_CONFIG_ID}, got {:?}",
+                    args.value
+                ),
+            ));
+        };
 
         // can't switch while the startup model is still loading — the old
         // weights are in GPU memory and the new load gets "does not fit"
