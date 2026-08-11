@@ -2,12 +2,15 @@
 
 ## 1.5.2
 
-Adds the new siGit Code Cloud model tiers and updates the ACP SDK.
+Brings the latest siGit Code Cloud tiers to the picker and aligns the MCP
+registry metadata with the server release.
 
 ### What changed
 
-- siGit Code Cloud now offers the `onde-mini`, `onde-air`, and `onde-pro`
-  model tiers in the model picker
+- `/models` now lists the Pro, Air, and Mini siGit Code Cloud tiers alongside
+  Fast, Balanced, and Large
+- Updated the MCP registry manifest to version 1.2.5, matching the siGit Code
+  Cloud server release
 - Updated the Agent Client Protocol SDK to the latest v1 release
 
 ## 1.5.1
