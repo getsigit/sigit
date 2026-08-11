@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.2
+
+Adds the new siGit Code Cloud model tiers and updates the ACP SDK.
+
+### What changed
+
+- siGit Code Cloud now offers the `onde-mini`, `onde-air`, and `onde-pro`
+  model tiers in the model picker
+- Updated the Agent Client Protocol SDK to the latest v1 release
+
 ## 1.5.1
 
 Makes siGit Code work as an Xcode custom agent, and updates the Onde SDK.
