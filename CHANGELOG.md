@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.2
+
+Brings the latest siGit Code Cloud tiers to the picker and aligns the MCP
+registry metadata with the server release.
+
+### What changed
+
+- `/models` now lists the Pro, Air, and Mini siGit Code Cloud tiers alongside
+  Fast, Balanced, and Large
+- Updated the MCP registry manifest to version 1.2.5, matching the siGit Code
+  Cloud server release
+- Updated the Agent Client Protocol SDK to the latest v1 release
+
 ## 1.5.1
 
 Makes siGit Code work as an Xcode custom agent, and updates the Onde SDK.

@@ -6,11 +6,12 @@ name: CI
 
 on:
   push:
+    branches: [main, development]
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: ci
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
