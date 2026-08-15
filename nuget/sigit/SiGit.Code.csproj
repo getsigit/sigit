@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      Targeting net8.0 keeps the tool installable on older SDKs, but a
+      framework-dependent app only rolls forward across patch versions by
+      default. Without this, `dotnet tool install` on a machine carrying just
+      the .NET 10 runtime installs a tool that refuses to start with "You must
+      install or update .NET to run this application". The shim does nothing
+      version-sensitive, so rolling forward across majors is safe.
+    -->
+    <RollForward>Major</RollForward>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>sigit</ToolCommandName>
+    <PackageId>SiGit.Code</PackageId>
+    <PackageVersion>0.0.0-local</PackageVersion>
+    <Version>$(PackageVersion)</Version>
+    <Authors>Seto Elkahfi</Authors>
+    <Description>siGit Code — ACP-compatible AI coding agent. Sí, git.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://sigit.si</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/getsigit/sigit</RepositoryUrl>
+    <PackageTags>cli;sigit;ai;coding-agent;llm;acp;developer-tools;dotnet-tool</PackageTags>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="" />
+    <!--
+      `native/` is populated by release-nuget.yml from the six per-target build
+      jobs; it is gitignored and empty in a source checkout. Pack="false" keeps
+      MSBuild from adding the binaries twice: they reach the package through the
+      tool's publish output, which is what `dotnet tool install` unpacks.
+    -->
+    <Content Include="native/**/*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" Visible="false" />
+  </ItemGroup>
+</Project>
