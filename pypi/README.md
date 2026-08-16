@@ -84,4 +84,4 @@ This package ships a prebuilt binary. The source code lives at [github.com/getsi
 
 ## Copyright
 
-© 2026 [Splitfire AB](https://5mb.app) ([siGit Code & Deploy](https://sigit.si)).
+© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)), distributed by [Splitfire AB](https://5mb.app).
