@@ -25,9 +25,15 @@ use serde::Deserialize;
 /// `SIGIT_CLOUD_URL` (dev: `http://localhost:8088/api/v1`).
 const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 
-/// The cloud quality tiers, in display order. Always offered in `/models`;
-/// selecting one requires a signed-in account.
-pub const CLOUD_TIERS: &[&str] = &["fast", "balanced", "large"];
+/// The cloud quality tiers, in display order (each line ordered smallest to
+/// largest). Always offered in `/models`; selecting one requires a signed-in
+/// account.
+///
+/// There are two lines because the cloud serves two independent families, and a
+/// tier is only routable when the cloud has that family configured. Which family
+/// is which, and what runs behind either, is deliberately not represented here:
+/// the client knows tier names and nothing else.
+pub const CLOUD_TIERS: &[&str] = &["fast", "balanced", "large", "mini", "air", "pro"];
 
 /// Base URL of the siGit Code Cloud inference endpoint. Override with
 /// `SIGIT_CLOUD_URL` (dev: `http://localhost:8090/v1`).
@@ -60,6 +66,9 @@ fn tier_to_model(tier: &str) -> String {
         "fast" => "onde-fast",
         "balanced" => "onde-balanced",
         "large" => "onde-large",
+        "mini" => "onde-mini",
+        "air" => "onde-air",
+        "pro" => "onde-pro",
         other => other,
     }
     .to_string()
