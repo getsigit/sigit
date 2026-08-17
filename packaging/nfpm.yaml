@@ -1,0 +1,37 @@
+# nfpm builds the .deb and .rpm attached to each GitHub release.
+#
+# One config covers both formats. nfpm takes an already-built binary rather
+# than invoking cargo, so the release matrix compiles each Linux target once
+# and packages it twice. `arch` is a Go arch name (amd64/arm64) that nfpm
+# translates per format, so the rpm comes out tagged x86_64 without a second
+# config.
+#
+# PKG_ARCH and PKG_VERSION are set by release-github.yml; PKG_BINARY points at
+# the renamed binary already staged in release/.
+name: sigit
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: devel
+priority: optional
+maintainer: smbCloud <seto@sigit.si>
+vendor: PT Sigit Mitra Bangun
+homepage: https://sigit.si
+license: Apache-2.0
+description: |
+  siGit Code, an AI coding agent that runs on your machine.
+  Speaks the Agent Client Protocol for editor integration, and runs inference
+  either on-device or against a hosted endpoint.
+contents:
+  - src: ${PKG_BINARY}
+    dst: /usr/bin/sigit
+    file_info:
+      mode: 0755
+  - src: ./LICENSE
+    dst: /usr/share/doc/sigit/LICENSE
+    file_info:
+      mode: 0644
+  - src: ./README.md
+    dst: /usr/share/doc/sigit/README.md
+    file_info:
+      mode: 0644

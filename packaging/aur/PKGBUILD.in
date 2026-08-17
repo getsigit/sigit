@@ -1,0 +1,31 @@
+# Maintainer: smbCloud <seto@sigit.si>
+#
+# Template for the sigit-bin AUR package. release-aur.yml substitutes the
+# at-sign-delimited placeholders below and pushes the result. The
+# $pkgver/${CARCH} references are makepkg's own and must survive substitution
+# untouched, which is why this lives in a file rather than a heredoc in the
+# workflow. Keep placeholder-shaped text out of the comments: the workflow
+# greps for leftovers and treats any hit as an unsubstituted value.
+
+pkgname=sigit-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="siGit Code, an AI coding agent that runs on your machine"
+arch=('x86_64' 'aarch64')
+url="https://github.com/getsigit/sigit"
+license=('Apache-2.0')
+depends=('glibc' 'gcc-libs')
+provides=('sigit')
+conflicts=('sigit')
+# The released binary is already stripped by the release profile, and makepkg
+# should not rewrite a vendor binary it did not build.
+options=(!strip !debug)
+
+source_x86_64=("sigit-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/sigit-linux-amd64")
+source_aarch64=("sigit-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/sigit-linux-arm64")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  install -Dm755 "${srcdir}/sigit-${pkgver}-${CARCH}" "${pkgdir}/usr/bin/sigit"
+}
