@@ -1934,13 +1934,12 @@ fn spawn_shell(command_str: &str, cwd_path: &Path) -> std::io::Result<std::proce
 /// Trailer identifying siGit Code as the co-author of commits it creates.
 /// GitHub detects `Co-authored-by:` trailers on the last lines of a commit
 /// message (separated from the body by a blank line) and lists the agent
-/// alongside the human author; `297239231+sigitc@users.noreply.github.com`
+/// alongside the human author; `noreply@sigit.si`
 /// is the noreply address for the <https://github.com/sigitc> account
 /// ("siGit Code"), so the co-author is rendered with that account's avatar
 /// and profile link. The system prompt asks the model to add this itself;
 /// [`ensure_commit_co_author`] is the safety net when it forgets.
-pub const COMMIT_CO_AUTHOR_TRAILER: &str =
-    "Co-Authored-By: siGit Code <297239231+sigitc@users.noreply.github.com>";
+pub const COMMIT_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: siGit Code <noreply@sigit.si>";
 
 /// Run `git <args>` in `cwd`, returning trimmed stdout on success.
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
