@@ -1946,7 +1946,8 @@ mod tui {
         Mcp,
         /// explicitly load the selected (or default) on-device model
         Load,
-        /// `/login <email> <password>` — the raw argument, parsed when executed.
+        /// `/login` (browser) or `/login <email> <password>` — the raw argument,
+        /// parsed when executed.
         Login(Option<String>),
         Logout,
         Whoami,
@@ -2551,7 +2552,7 @@ mod tui {
                 if app.input.trim().is_empty() {
                     return None;
                 }
-                let text = app.input.drain(..).collect::<String>();
+                let text = std::mem::take(&mut app.input);
                 app.cursor = 0;
                 Some(text)
             }
@@ -2729,7 +2730,8 @@ mod tui {
                      /commands      — list user-defined commands (.sigit/commands/*.md)\n\
                      /mcp           — list MCP servers and their tools\n\
                      /load          — load the selected on-device model\n\
-                     /login E P     — sign in to siGit Code Cloud\n\
+                     /login         — sign in via your browser\n\
+                     /login E P     — sign in with an email and password\n\
                      /logout        — sign out\n\
                      /whoami        — show the signed-in account\n\
                      /plan [on|off] — plan mode: research only, no edits or commands\n\
@@ -2953,7 +2955,14 @@ mod tui {
                             Err(error) => format!("Login failed: {error}"),
                         }
                     }
-                    None => "usage: /login <email> <password>".to_string(),
+                    // A bare `/login` opens the browser instead of asking for
+                    // a password in the chat box.
+                    None => {
+                        app.messages.push(ChatMessage::system(
+                            "Opening your browser to sign in to siGit Code Cloud...",
+                        ));
+                        crate::browser_login_message().await
+                    }
                 };
                 app.messages.push(ChatMessage::system(message));
             }

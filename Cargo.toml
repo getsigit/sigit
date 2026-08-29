@@ -54,6 +54,11 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 uuid = { version = "1", features = ["v4"] }
 rpassword = "7"
+# Browser sign-in: PKCE needs a SHA-256 and base64url, the verifier and state
+# need a CSPRNG. All three already came in through the dependency graph.
+base64 = "0.22"
+rand = "0.9"
+sha2 = "0.10"
 
 # Release binaries ship to five registries, and the NuGet package bundles all
 # six targets in a single archive, so binary size is a distribution constraint
