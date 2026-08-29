@@ -211,6 +211,18 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   those read env vars once at init.
 - **`src/account.rs`** — siGit Code Cloud auth (`/login`, `/logout`, `/whoami`); authenticates
   against the account API and stores a session token. Performs no console I/O.
+- **`src/browser_auth.rs`** — browser sign-in, the path the editor's "Sign in to siGit Code"
+  button takes. sigit is a public OAuth client (client id `sigit-code-cli`, no secret, PKCE
+  S256) against the authorization server at `$SIGIT_API_URL/oauth`. Two ways the code gets
+  back: a loopback listener on `127.0.0.1:0` (the registration lists `http://127.0.0.1/callback`
+  with no port, and RFC 8252 §7.3 matching ignores the port, so one registration covers every
+  run), or the out-of-band URN, where the server renders the code and the user pastes it. The
+  resulting token goes into `credentials` like any other, and is served by `/api/v1/user` rather
+  than the deprecated `/api/v1/me` — OAuth tokens are rejected there. The scopes requested are
+  `user:read code:agent`; `code:agent` is what reaches `chat/completions` and the official MCP
+  server. Surfaces: ACP `authenticate` (loopback only — nowhere to show a code), a bare `/login`
+  in either chat surface, and `sigit login` (which adds the paste fallback, plus `--paste` to
+  force it and `--password` for the old email/password prompt).
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
