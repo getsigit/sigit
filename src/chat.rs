@@ -2552,7 +2552,7 @@ mod tui {
                 if app.input.trim().is_empty() {
                     return None;
                 }
-                let text = app.input.drain(..).collect::<String>();
+                let text = std::mem::take(&mut app.input);
                 app.cursor = 0;
                 Some(text)
             }
