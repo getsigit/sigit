@@ -78,7 +78,7 @@ jobs:
           key: clippy-${{ matrix.target }}
 
       - name: Clippy
-        run: cargo clippy --tests --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --locked --tests --target ${{ matrix.target }} -- -D warnings
 
   test:
     name: Test — ${{ matrix.name }}

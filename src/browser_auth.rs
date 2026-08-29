@@ -205,7 +205,7 @@ fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, 
         .set_nonblocking(true)
         .map_err(|error| format!("could not watch for the browser: {error}"))?;
 
-    loop {
+    'connections: loop {
         if std::time::Instant::now() >= deadline {
             return Err("timed out waiting for the browser".to_string());
         }
@@ -218,12 +218,37 @@ fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, 
             }
             Err(error) => return Err(format!("could not accept the browser: {error}")),
         };
-        stream.set_nonblocking(false).ok();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out waiting for the browser".to_string());
+        }
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| format!("could not read the browser callback: {error}"))?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        stream
+            .set_read_timeout(Some(remaining.min(Duration::from_secs(5))))
+            .map_err(|error| format!("could not read the browser callback: {error}"))?;
 
-        // The request line is all we need, and it arrives in the first packet.
+        // Read through the end of the request line; a TCP read may return a
+        // partial line when the request spans multiple packets.
         let mut buffer = [0_u8; 4096];
-        let read = stream.read(&mut buffer).unwrap_or(0);
+        let mut read = 0;
+        while read < buffer.len() {
+            match stream.read(&mut buffer[read..]) {
+                Ok(0) => break,
+                Ok(count) => {
+                    read += count;
+                    if buffer[..read].windows(2).any(|window| window == b"\r\n") {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    respond(&mut stream, "Could not read the sign-in callback.");
+                    log::debug!("could not read browser callback: {error}");
+                    continue 'connections;
+                }
+            }
+        }
         let request = String::from_utf8_lossy(&buffer[..read]);
         let Some(target) = request
             .lines()
@@ -328,20 +353,14 @@ async fn exchange(code: &str, verifier: &str, redirect_uri: &str) -> Result<Stri
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| "siGit Code Cloud returned no access token".to_string())?;
 
-    // Store before the profile lookup: the token is the thing worth keeping,
-    // and the email is only there to label it.
+    // The token is the thing worth keeping, and the email is only there to
+    // label it. Store once so a profile lookup failure does not leave partial
+    // state on disk.
+    let email = fetch_email(token).await;
     credentials::store(&Credentials {
         access_token: token.to_string(),
-        email: None,
+        email: email.clone(),
     })?;
-
-    let email = fetch_email(token).await;
-    if email.is_some() {
-        credentials::store(&Credentials {
-            access_token: token.to_string(),
-            email: email.clone(),
-        })?;
-    }
 
     Ok(email.unwrap_or_else(|| "(unknown)".to_string()))
 }
@@ -415,7 +434,7 @@ fn percent_decode(value: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
+            b'%' if index + 3 <= bytes.len() => {
                 let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
                 match u8::from_str_radix(hex, 16) {
                     Ok(byte) => {
@@ -493,5 +512,10 @@ mod tests {
         let pairs = parse_query("code=abc%2Fdef&state=x+y");
         assert_eq!(pairs[0], ("code".to_string(), "abc/def".to_string()));
         assert_eq!(pairs[1], ("state".to_string(), "x y".to_string()));
+    }
+
+    #[test]
+    fn percent_decode_handles_escape_at_end() {
+        assert_eq!(percent_decode("code%2F"), "code/");
     }
 }
