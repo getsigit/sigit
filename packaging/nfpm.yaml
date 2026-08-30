@@ -7,7 +7,9 @@
 # config.
 #
 # PKG_ARCH and PKG_VERSION are set by release-github.yml; PKG_BINARY points at
-# the renamed binary already staged in release/.
+# the renamed binary already staged in release/. nfpm does not expand env vars
+# in contents.src, so release-github.yml renders this file with envsubst before
+# invoking nfpm.
 name: sigit
 arch: ${PKG_ARCH}
 platform: linux
