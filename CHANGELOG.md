@@ -40,6 +40,13 @@ fixes the co-authored-by trailer email.
 - **Co-authored-by trailer fix:** the `Co-Authored-By` trailer email was
   updated to `noreply@sigit.si` (platform-neutral); the commit attribution
   check was tightened to use idiomatic ownership
+- **NuGet trusted publishing:** the NuGet release workflow now exchanges a
+  GitHub OIDC token for a short-lived NuGet API key (via `NuGet/login`) instead
+  of relying on a long-lived `NUGET_API_KEY` secret, so there is no stored
+  credential to rotate or leak
+- **AUR dispatch temporarily disabled:** the AUR release workflow is no longer
+  dispatched from `release-github` while new AUR account registration is
+  closed; the `sigit-bin` channel returns once registration reopens
 - Legal and branding copy updated
 
 ## 1.5.2
