@@ -33,7 +33,7 @@ const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 /// tier is only routable when the cloud has that family configured. Which family
 /// is which, and what runs behind either, is deliberately not represented here:
 /// the client knows tier names and nothing else.
-pub const CLOUD_TIERS: &[&str] = &["fast", "balanced", "large", "mini", "air", "pro"];
+pub const CLOUD_TIERS: &[&str] = &["fast", "balanced", "large", "mini", "air", "pro", "oke"];
 
 /// Base URL of the siGit Code Cloud inference endpoint. Override with
 /// `SIGIT_CLOUD_URL` (dev: `http://localhost:8090/v1`).
@@ -69,6 +69,7 @@ fn tier_to_model(tier: &str) -> String {
         "mini" => "onde-mini",
         "air" => "onde-air",
         "pro" => "onde-pro",
+        "oke" => "onde-kkk",
         other => other,
     }
     .to_string()
