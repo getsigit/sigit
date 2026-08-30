@@ -141,8 +141,41 @@ jobs:
           export PKG_VERSION="${RELEASE_VERSION}"
           export PKG_BINARY="./release/${PROJECT_NAME}-${{ matrix.name }}"
 
-          /tmp/nfpm package --config packaging/nfpm.yaml --packager deb --target ./release/
-          /tmp/nfpm package --config packaging/nfpm.yaml --packager rpm --target ./release/
+          # An empty version is worse than a hard failure here: nfpm accepts it
+          # and silently emits a "0.0.0~rc0" package that would be attached to
+          # the release. Same for a missing binary, which only surfaces as an
+          # opaque glob error. Fail loudly instead.
+          if [ -z "${PKG_VERSION}" ]; then
+            echo "RELEASE_VERSION is empty; refusing to build packages" >&2
+            exit 1
+          fi
+          if [ ! -f "${PKG_BINARY}" ]; then
+            echo "Staged binary ${PKG_BINARY} not found" >&2
+            exit 1
+          fi
+
+          # nfpm expands ${VAR} in most fields but NOT in contents.src, so the
+          # config is rendered up front and nfpm only ever sees literal values.
+          # envsubst comes from gettext-base, preinstalled on the Ubuntu runner
+          # images. The explicit variable list keeps it from clobbering any
+          # other shell-looking text added to the config later.
+          if ! command -v envsubst >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y gettext-base
+          fi
+
+          envsubst '${PKG_ARCH} ${PKG_VERSION} ${PKG_BINARY}' \
+            < packaging/nfpm.yaml > /tmp/nfpm.rendered.yaml
+
+          /tmp/nfpm package --config /tmp/nfpm.rendered.yaml --packager deb --target ./release/
+          /tmp/nfpm package --config /tmp/nfpm.rendered.yaml --packager rpm --target ./release/
+
+          # Guard against a packager silently producing nothing.
+          for ext in deb rpm; do
+            if ! compgen -G "./release/*.${ext}" >/dev/null; then
+              echo "No .${ext} produced" >&2
+              exit 1
+            fi
+          done
 
           ls -la ./release/
 
