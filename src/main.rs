@@ -1523,7 +1523,10 @@ impl SiGitAgent {
                 // leaving an otherwise working tool round visually indistinct
                 // from a stalled response.
                 let raw_input: serde_json::Value = serde_json::from_str(&tc.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::String(tc.arguments.clone()));
+                    .unwrap_or_else(|e| {
+                        log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
+                        serde_json::Value::String(tc.arguments.clone())
+                    });
                 self.send_tool_call_update(
                     cx,
                     session_id.clone(),
@@ -1734,8 +1737,10 @@ impl SiGitAgent {
         } else {
             format!("{tool_name}({args_preview})")
         };
-        let raw_input: serde_json::Value = serde_json::from_str(arguments)
-            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()));
+        let raw_input: serde_json::Value = serde_json::from_str(arguments).unwrap_or_else(|e| {
+            log::warn!("malformed JSON in tool arguments for '{}': {e}", tool_name);
+            serde_json::Value::String(arguments.to_string())
+        });
 
         let request = RequestPermissionRequest::new(
             session_id.clone(),
