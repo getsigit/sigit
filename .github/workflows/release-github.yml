@@ -232,7 +232,8 @@ jobs:
               'release-homebrew.yml',
               'release-scoop.yml',
               'release-winget.yml',
-              'release-aur.yml',
+              // New AUR account registration is temporarily closed
+              //'release-aur.yml',
             ]
 
             for (const workflow_id of workflows) {
