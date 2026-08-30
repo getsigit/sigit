@@ -22,7 +22,7 @@ function getExePath() {
   try {
     // Since the binary will be located inside node_modules, we can simply call require.resolve
     return require.resolve(
-      `@smbcloud/sigit-${os}-${arch}/bin/sigit${extension}`,
+      `@getsigit/sigit-${os}-${arch}/bin/sigit${extension}`,
     );
   } catch (e) {
     throw new Error(
