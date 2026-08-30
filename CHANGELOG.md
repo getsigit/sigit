@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.5.3
+
+Adds browser-based sign-in, expands distribution channels to Windows (winget,
+Scoop), Linux (AUR, deb, rpm), and .NET (NuGet), gives ACP clients live
+visibility into tool activity, adds the KKK and Moonshot AI cloud tiers, and
+fixes the co-authored-by trailer email.
+
+### What changed
+
+- **Browser sign-in:** `sigit login` now opens a browser OAuth flow (PKCE S256
+  against the siGit Code Cloud authorization server) so you can sign in without
+  a password. A loopback listener catches the redirect automatically; a
+  paste-back fallback handles environments where a loopback isn't reachable.
+  `--paste` forces the paste path, `--password` keeps the old email/password
+  prompt. Zed's "Sign in to siGit Code" button uses the loopback path via ACP
+  `authenticate`
+- **New release channels:** siGit Code is now published to winget
+  (`getsigit.siGitCode`), Scoop (`getsigit/scoop-bucket`), the AUR
+  (`sigit-bin`), and as `.deb`/`.rpm` packages alongside the existing
+  Homebrew, npm, PyPI, crates.io, and NuGet channels
+- **NuGet .NET tool:** `dotnet tool install --global SiGit.Code` now works on
+  Windows, macOS, and Linux — the package bundles all six platform binaries and
+  a managed shim that execs the right one, leaving stdin/stdout/stderr
+  unredirected so TUI vs ACP mode detection still works
+- **New cloud tiers:** the model picker (`/models` in the TUI, the config
+  panel in Zed) now offers the `onde-kkk` (KKK) and Moonshot AI (`oke`) tiers
+  alongside the existing Fast, Balanced, Large, Mini, Air, and Pro options
+- **ACP tool visibility:** the agent loop now emits `ToolCall(InProgress)`
+  before each tool runs and `ToolCallUpdate(Completed/Failed)` after it
+  returns, so clients like Zed gain live visibility into tool activity between
+  inference rounds. `tool_choice: "auto"` is also sent explicitly whenever
+  tools are present, fixing models that describe actions in prose rather than
+  issuing a tool call when the field is absent
+- **Malformed tool argument logging:** invalid tool argument JSON is now logged
+  at three sites (TUI pretty-printer, ACP tool-call event, permission request)
+  instead of silently falling back to a string value, making malformed payloads
+  visible in logs while preserving backward-compatible behaviour
+- **Co-authored-by trailer fix:** the `Co-Authored-By` trailer email was
+  updated to `noreply@sigit.si` (platform-neutral); the commit attribution
+  check was tightened to use idiomatic ownership
+- **NuGet trusted publishing:** the NuGet release workflow now exchanges a
+  GitHub OIDC token for a short-lived NuGet API key (via `NuGet/login`) instead
+  of relying on a long-lived `NUGET_API_KEY` secret, so there is no stored
+  credential to rotate or leak
+- **AUR dispatch temporarily disabled:** the AUR release workflow is no longer
+  dispatched from `release-github` while new AUR account registration is
+  closed; the `sigit-bin` channel returns once registration reopens
+- Legal and branding copy updated
+
 ## 1.5.2
 
 Brings the latest siGit Code Cloud tiers to the picker and aligns the MCP
