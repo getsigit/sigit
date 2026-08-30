@@ -186,13 +186,19 @@ pub(crate) fn tool_title(name: &str, arguments_json: &str) -> String {
 }
 
 /// Pretty-print a tool call's JSON arguments for the expanded view; malformed
-/// JSON is shown raw.
+/// JSON is logged and shown raw.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn pretty_tool_arguments(arguments_json: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(arguments_json)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or_else(|| arguments_json.to_string())
+    match serde_json::from_str::<serde_json::Value>(arguments_json) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|e| {
+            log::warn!("failed to pretty-print tool arguments: {e}");
+            arguments_json.to_string()
+        }),
+        Err(e) => {
+            log::warn!("malformed JSON in tool arguments: {e}");
+            arguments_json.to_string()
+        }
+    }
 }
 
 /// The tail of a tool's output for display under an expanded tool entry,

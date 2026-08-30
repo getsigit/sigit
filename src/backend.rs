@@ -459,6 +459,12 @@ impl OpenAiBackend {
             && !tools.is_empty()
         {
             body["tools"] = serde_json::Value::Array(Self::tools_json(tools));
+            // OpenAI specifies `auto` as the default when tools are present,
+            // but not every OpenAI-compatible gateway implements that default.
+            // Sending it explicitly is important for the cloud path: otherwise
+            // a model can describe the action it intends to take as text and
+            // end the turn without returning a tool call at all.
+            body["tool_choice"] = serde_json::Value::String("auto".to_string());
         }
 
         let response = self

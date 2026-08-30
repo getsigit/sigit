@@ -316,6 +316,12 @@ fn permission_round_trip_cancel_then_allow() {
     let requests = endpoint.requests.lock().unwrap();
     assert_eq!(requests.len(), 3, "expected exactly three completions");
 
+    // The client explicitly requests automatic tool selection. Some
+    // OpenAI-compatible gateways do not honour OpenAI's implicit `auto`
+    // default, which otherwise lets the model describe a tool action in prose
+    // and end the turn without a tool call.
+    assert_eq!(requests[0]["tool_choice"], "auto");
+
     // Request 2 replays the full history: the cancelled round's tool call
     // must be answered by a `role: "tool"` message, not left dangling.
     let messages = requests[1]["messages"].as_array().expect("messages");

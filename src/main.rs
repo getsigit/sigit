@@ -1515,6 +1515,30 @@ impl SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
+                // Model tool calls are agent actions in ACP too, not merely an
+                // implementation detail of the completion loop. Announce each
+                // one before it runs and close it afterwards so clients such as
+                // Zed can render activity while the next inference round is in
+                // flight. Previously only model loading emitted ToolCall events,
+                // leaving an otherwise working tool round visually indistinct
+                // from a stalled response.
+                let raw_input: serde_json::Value = serde_json::from_str(&tc.arguments)
+                    .unwrap_or_else(|e| {
+                        log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
+                        serde_json::Value::String(tc.arguments.clone())
+                    });
+                self.send_tool_call_update(
+                    cx,
+                    session_id.clone(),
+                    SessionUpdate::ToolCall(
+                        ToolCall::new(tc.id.clone(), tc.name.clone())
+                            .kind(tool_kind_for(&tc.name))
+                            .status(ToolCallStatus::InProgress)
+                            .raw_input(raw_input),
+                    ),
+                )
+                .ok();
+
                 let signature = format!("{}\n{}", tc.name, tc.arguments);
                 let repeat_count = repeated_tool_calls
                     .entry(signature)
@@ -1585,6 +1609,20 @@ impl SiGitAgent {
                                             ),
                                         });
                                     }
+                                    self.send_tool_call_update(
+                                        cx,
+                                        session_id.clone(),
+                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                            tc.id.clone(),
+                                            ToolCallUpdateFields::new()
+                                                .status(ToolCallStatus::Failed)
+                                                .raw_output(serde_json::Value::String(
+                                                    "Not executed: the user cancelled the turn at the permission prompt."
+                                                        .to_string(),
+                                                )),
+                                        )),
+                                    )
+                                    .ok();
                                     backend.record_cancelled_tool_results(tool_results).await;
                                     return Ok(PromptResponse::new(StopReason::Cancelled));
                                 }
@@ -1594,6 +1632,18 @@ impl SiGitAgent {
                 };
 
                 log::info!("  ← {} chars", output.len());
+
+                self.send_tool_call_update(
+                    cx,
+                    session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        tc.id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(ToolCallStatus::Completed)
+                            .raw_output(serde_json::Value::String(output.clone())),
+                    )),
+                )
+                .ok();
 
                 tool_results.push(BackendToolResult {
                     tool_call_id: tc.id.clone(),
@@ -1687,8 +1737,10 @@ impl SiGitAgent {
         } else {
             format!("{tool_name}({args_preview})")
         };
-        let raw_input: serde_json::Value = serde_json::from_str(arguments)
-            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()));
+        let raw_input: serde_json::Value = serde_json::from_str(arguments).unwrap_or_else(|e| {
+            log::warn!("malformed JSON in tool arguments for '{}': {e}", tool_name);
+            serde_json::Value::String(arguments.to_string())
+        });
 
         let request = RequestPermissionRequest::new(
             session_id.clone(),
