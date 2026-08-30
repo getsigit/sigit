@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.4
+
+- **CI**: nfpm config expanded to include package version and binary path
+
 ## 1.5.3
 
 Adds browser-based sign-in, expands distribution channels to Windows (winget,
