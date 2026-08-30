@@ -1,0 +1,315 @@
+name: NuGet Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.5.2)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DOTNET_VERSION: 8.0.x
+  NUGET_PACKAGE_ID: SiGit.Code
+
+jobs:
+  build-native-binaries:
+    name: Build native binary (${{ matrix.build.NAME }})
+    runs-on: ${{ matrix.build.OS }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - {
+              NAME: linux-x64,
+              OS: ubuntu-latest,
+              TARGET: x86_64-unknown-linux-gnu,
+            }
+          - {
+              NAME: linux-arm64,
+              OS: ubuntu-24.04-arm,
+              TARGET: aarch64-unknown-linux-gnu,
+            }
+          - {
+              NAME: windows-x64,
+              OS: windows-2022,
+              TARGET: x86_64-pc-windows-msvc,
+            }
+          - {
+              NAME: windows-arm64,
+              OS: windows-2022,
+              TARGET: aarch64-pc-windows-msvc,
+            }
+          - { NAME: darwin-x64, OS: macos-26, TARGET: x86_64-apple-darwin }
+          - { NAME: darwin-arm64, OS: macos-26, TARGET: aarch64-apple-darwin }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Read Rust toolchain
+        shell: bash
+        run: |
+          rust_toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -n 1)"
+          if [ -z "$rust_toolchain" ]; then
+            echo "Failed to read Rust toolchain from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "RUST_TOOLCHAIN=${rust_toolchain}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.build.TARGET }} --toolchain ${{ env.RUST_TOOLCHAIN }}
+          rustup target list --installed
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: nuget-${{ matrix.build.TARGET }}
+
+      - name: Build binary
+        shell: bash
+        run: cargo build --locked --release --target ${{ matrix.build.TARGET }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          executable_name="sigit"
+          if [[ "${{ matrix.build.OS }}" == "windows-2022" ]]; then
+            executable_name="sigit.exe"
+          fi
+
+          mkdir -p "nuget-artifacts/native/${{ matrix.build.NAME }}"
+          cp "target/${{ matrix.build.TARGET }}/release/${executable_name}" \
+            "nuget-artifacts/native/${{ matrix.build.NAME }}/${executable_name}"
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-native-${{ matrix.build.NAME }}
+          path: nuget-artifacts/native
+
+  pack-nuget:
+    name: Pack NuGet .NET tool
+    runs-on: ubuntu-latest
+    needs: build-native-binaries
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nuget-native-*
+          path: nuget/sigit/native
+          merge-multiple: true
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Pack .NET tool
+        shell: bash
+        run: |
+          dotnet pack nuget/sigit/SiGit.Code.csproj \
+            --configuration Release \
+            --output nuget/dist \
+            -p:PackageVersion=${RELEASE_VERSION}
+
+      # All six binaries ship in one package, so this sits closer to nuget.org's
+      # 250 MB ceiling than the single-platform npm and PyPI artifacts do. Fail
+      # here with a clear message rather than at `dotnet nuget push`, where the
+      # error is just "the package file exceeds the size limit".
+      - name: Check package size against the NuGet limit
+        shell: bash
+        run: |
+          package="$(ls nuget/dist/*.nupkg | head -n 1)"
+          size_bytes="$(wc -c < "${package}")"
+          limit_bytes=$((250 * 1024 * 1024))
+
+          echo "Package: ${package}"
+          echo "Size:    $((size_bytes / 1024 / 1024)) MiB"
+
+          if [ "${size_bytes}" -gt "${limit_bytes}" ]; then
+            echo "::error::${package} is over nuget.org's 250 MB package limit. Split the tool into RID-specific packages (.NET 10 DotnetToolRidPackage) instead of bundling every target." >&2
+            exit 1
+          fi
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-package
+          path: nuget/dist/*.nupkg
+
+  smoke-test:
+    name: Smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: pack-nuget
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-2022
+          - macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-package
+          path: nuget/dist
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install tool from local package
+        shell: pwsh
+        run: |
+          $packageSource = (Resolve-Path "nuget/dist").Path
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$packageSource" />
+            </packageSources>
+          </configuration>
+          "@ | Set-Content -Path "nuget/NuGet.Config"
+
+          dotnet tool install `
+            --tool-path ".tool" `
+            --configfile "nuget/NuGet.Config" `
+            --version "$env:RELEASE_VERSION" `
+            "$env:NUGET_PACKAGE_ID"
+
+      - name: Verify bundled native binary
+        shell: pwsh
+        run: |
+          $runtimeIdentifier = if ($IsWindows) {
+            if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { "windows-arm64" } else { "windows-x64" }
+          } elseif ($IsMacOS) {
+            if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { "darwin-arm64" } else { "darwin-x64" }
+          } else {
+            if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { "linux-arm64" } else { "linux-x64" }
+          }
+
+          $binaryName = if ($IsWindows) { "sigit.exe" } else { "sigit" }
+          $nativeBinary = Get-ChildItem ".tool/.store" -Recurse -File | Where-Object {
+            $_.FullName -like "*native*${runtimeIdentifier}*${binaryName}"
+          } | Select-Object -First 1
+
+          if (-not $nativeBinary) {
+            Write-Error "The sigit native binary for ${runtimeIdentifier} was not bundled in the installed .NET tool package."
+          }
+
+          Write-Host "Found bundled native binary at $($nativeBinary.FullName)"
+
+  publish-nuget:
+    name: Publish to NuGet
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    # Trusted Publishing exchanges a GitHub OIDC token for a short-lived NuGet
+    # API key, so no long-lived NUGET_API_KEY secret is stored. Requires the
+    # `sigit-nuget` trusted publisher policy on nuget.org (owner getsigit, repo
+    # sigit, workflow release-nuget.yml).
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set the release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_version="${GITHUB_REF_NAME#v}"
+          else
+            release_version="${{ github.event.inputs.tag }}"
+            release_version="${release_version#v}"
+          fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-package
+          path: nuget/dist
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Check whether release already exists on NuGet
+        id: nuget-check
+        shell: bash
+        run: |
+          package_index_url="https://api.nuget.org/v3-flatcontainer/sigit.code/index.json"
+          if curl -fsS "${package_index_url}" | grep -F "\"${RELEASE_VERSION}\"" >/dev/null; then
+            echo "${NUGET_PACKAGE_ID} ${RELEASE_VERSION} already exists on NuGet, skipping publish"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Exchange the workflow's OIDC token for a short-lived NuGet API key. The
+      # key is written to the environment for the subsequent `dotnet nuget push`
+      # via the NUGET_API_KEY variable this action sets.
+      - name: NuGet trusted-publishing login
+        if: steps.nuget-check.outputs.exists != 'true'
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: setoelkahfi
+
+      - name: Publish package
+        if: steps.nuget-check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          dotnet nuget push nuget/dist/*.nupkg \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate

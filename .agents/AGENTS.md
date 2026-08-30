@@ -211,6 +211,18 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   those read env vars once at init.
 - **`src/account.rs`** — siGit Code Cloud auth (`/login`, `/logout`, `/whoami`); authenticates
   against the account API and stores a session token. Performs no console I/O.
+- **`src/browser_auth.rs`** — browser sign-in, the path the editor's "Sign in to siGit Code"
+  button takes. sigit is a public OAuth client (client id `sigit-code-cli`, no secret, PKCE
+  S256) against the authorization server at `$SIGIT_API_URL/oauth`. Two ways the code gets
+  back: a loopback listener on `127.0.0.1:0` (the registration lists `http://127.0.0.1/callback`
+  with no port, and RFC 8252 §7.3 matching ignores the port, so one registration covers every
+  run), or the out-of-band URN, where the server renders the code and the user pastes it. The
+  resulting token goes into `credentials` like any other, and is served by `/api/v1/user` rather
+  than the deprecated `/api/v1/me` — OAuth tokens are rejected there. The scopes requested are
+  `user:read code:agent`; `code:agent` is what reaches `chat/completions` and the official MCP
+  server. Surfaces: ACP `authenticate` (loopback only — nowhere to show a code), a bare `/login`
+  in either chat surface, and `sigit login` (which adds the paste fallback, plus `--paste` to
+  force it and `--password` for the old email/password prompt).
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
 - **`src/models.rs`** — model-picker types shared across platforms.
 
@@ -249,6 +261,47 @@ mutating tools; the escape hatch for clients without permission-request support)
 
 ## Releasing
 
-Version lives in `Cargo.toml`. The binary is published to five registries via separate workflows
-(`release-crates`, `release-github`, `release-homebrew`, `release-npm`, `release-pypi`); the
-`npm/` and `pypi/` dirs hold the wrapper-package templates. Update `CHANGELOG.md` for releases.
+Version lives in `Cargo.toml`. Update `CHANGELOG.md` for releases.
+
+Publishing splits into two groups. **Language registries** each get their own tag-triggered
+workflow: `release-crates`, `release-npm`, `release-nuget`, `release-pypi`. The `npm/`, `nuget/`,
+and `pypi/` dirs hold their wrapper-package templates.
+
+**OS package managers** all publish somewhere outside this repo and all need checksums from the
+GitHub release, so `release-github` builds the binaries, attaches the assets, and then dispatches
+`release-homebrew`, `release-scoop`, `release-winget`, and `release-aur`. A dispatch failure in one
+is logged as a warning rather than failing the others, so an unconfigured channel does not block a
+release. Their inputs live in `packaging/`.
+
+Every release asset now carries a `.sha256` sidecar, not just the macOS Homebrew tarball. Scoop,
+winget, and the AUR PKGBUILD each need one, and they consume the raw binaries rather than the
+tarball. `release-github` also builds a `.deb` and `.rpm` per Linux target with nfpm
+(`packaging/nfpm.yaml`), packaging the already-built binary rather than re-invoking cargo.
+
+Three of these need credentials or a one-time manual step before they work:
+
+- Scoop needs a `getsigit/scoop-bucket` repo and a `SCOOP_BUCKET_TOKEN` secret, mirroring the
+  Homebrew tap setup.
+- winget needs a `WINGET_TOKEN` (PAT with `public_repo`) so `wingetcreate` can fork
+  `microsoft/winget-pkgs`. The workflow only handles *updates*; the first submission has to be made
+  by hand with `wingetcreate new`, since a package must exist before it can be updated.
+- The AUR needs `AUR_USERNAME`, `AUR_EMAIL`, and `AUR_SSH_PRIVATE_KEY`. It publishes `sigit-bin`
+  (a prebuilt binary) so Arch users are not compiling the on-device inference stack to install a
+  CLI.
+
+`[profile.release]` sets `strip = "symbols"` because binary size is a distribution constraint, not
+just a nicety. See the NuGet note below.
+
+The NuGet package (`SiGit.Code`, installed with `dotnet tool install --global SiGit.Code`) is the
+odd one out among the language registries: npm and PyPI publish one artifact per platform, but a
+.NET tool is a single package, so `nuget/sigit/` bundles all six binaries under
+`native/<os>-<arch>/` and a small managed shim (`Program.cs`) execs the right one. That shim leaves
+stdin/stdout/stderr unredirected on purpose, since siGit Code chooses TUI or ACP mode by testing
+whether stdin is a TTY. It also sets `RollForward=Major`: it targets `net8.0`, and without that a
+machine carrying only the .NET 10 runtime installs a tool that refuses to start.
+
+Bundling every target means the package is large, so `release-nuget.yml` fails the pack job if the
+`.nupkg` crosses nuget.org's 250 MB limit. At v1.5.1 it lands around 160 MB. If a future release
+trips that check, the fix is not to drop targets but to split into RID-specific tool packages
+(.NET 10's `DotnetToolRidPackage`), which ship one binary per platform the way npm already does.
+That also needs a fallback package for pre-.NET-10 SDKs.

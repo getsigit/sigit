@@ -30,6 +30,7 @@
 
 mod account;
 mod backend;
+mod browser_auth;
 mod chat;
 mod commands;
 mod credentials;
@@ -150,7 +151,7 @@ Git operations — always use run_command:
 - if a clone or init fails, check the error, fix the cause (wrong path, missing \
   directory, permissions), and retry
 - when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: Co-Authored-By: siGit Code <297239231+sigitc@users.noreply.github.com> \
+  then this trailer on its own line: Co-Authored-By: siGit Code <noreply@sigit.si> \
   — GitHub reads that exact format and credits siGit as co-author. If a commit \
   lands without it, siGit Code amends the trailer in automatically and the tool \
   output says so; do not amend again yourself.
@@ -830,7 +831,11 @@ impl SiGitAgent {
             ),
             AvailableCommand::new("mcp", "List MCP servers and their tools"),
             AvailableCommand::new("load", "Load the selected on-device model"),
-            with_hint("login", "Sign in to siGit Code Cloud", "<email> <password>"),
+            with_hint(
+                "login",
+                "Sign in to siGit Code Cloud (opens your browser)",
+                "[email] [password]",
+            ),
             AvailableCommand::new("logout", "Sign out of siGit Code Cloud"),
             AvailableCommand::new("whoami", "Show the signed-in account"),
             AvailableCommand::new("reload", "Re-sync sign-in and model state"),
@@ -980,12 +985,11 @@ impl SiGitAgent {
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
         // like Zed advertise terminal-auth capability but don't actually spawn the
         // login terminal for *custom* ACP agents, so the button is a silent no-op.
-        // With an Agent method, clicking calls `authenticate`, which returns either
-        // confirmation (already signed in via `/login`) or a message telling the
-        // user to run `/login <email> <password>` — so the button does something.
+        // With an Agent method, clicking calls `authenticate`, which opens the
+        // browser and finishes the sign-in itself.
         let auth_methods = vec![AuthMethod::Agent(
             AuthMethodAgent::new("sigit", "Sign in to siGit Code")
-                .description("Sign in with `/login <email> <password>` in the message box."),
+                .description("Opens sigit.si in your browser to authorize this device."),
         )];
 
         Ok(InitializeResponse::new(ProtocolVersion::V1)
@@ -1010,20 +1014,42 @@ impl SiGitAgent {
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
         log::info!("authenticate: method={}", req.method_id.0);
 
-        // Confirm the stored token works. The button can't collect a password,
-        // so an unsigned-in user is pointed at the `/login` slash command; a user
-        // already signed in via `/login` gets the gate cleared.
-        match account::verify_session().await {
+        // An existing session clears the gate without sending anyone to a
+        // browser they didn't ask for.
+        if let Ok(email) = account::verify_session().await {
+            log::info!("authenticate: verified existing session for {email}");
+            return Ok(AuthenticateResponse::default());
+        }
+
+        // Otherwise run the browser flow. There is no way to collect a password
+        // here (the method has no UI of its own) and no way to show a code to
+        // paste, so this is the loopback variant or nothing: the editor gets an
+        // error naming the terminal command that does work without a listener.
+        let flow = browser_auth::begin();
+        if !flow.is_loopback() {
+            return Err(agent_client_protocol::Error::new(
+                -32000,
+                "Could not open a local port to receive the sign-in. \
+                 Run `sigit login` in a terminal instead."
+                    .to_string(),
+            ));
+        }
+
+        log::info!("authenticate: opening browser at {}", flow.authorize_url());
+        if !browser_auth::open_browser(flow.authorize_url()) {
+            log::warn!("authenticate: no browser could be launched");
+        }
+
+        match browser_auth::complete_loopback(flow).await {
             Ok(email) => {
-                log::info!("authenticate: verified session for {email}");
+                log::info!("authenticate: signed in as {email}");
                 Ok(AuthenticateResponse::default())
             }
             Err(reason) => Err(agent_client_protocol::Error::new(
                 -32000,
                 format!(
-                    "Not signed in to siGit Code Cloud ({reason}). \
-                     Sign in with `/login <email> <password>` in the message box, \
-                     or create an account at https://sigit.si."
+                    "Sign-in did not complete ({reason}). \
+                     Try again, or create an account at https://sigit.si."
                 ),
             )),
         }
@@ -1489,6 +1515,30 @@ impl SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
+                // Model tool calls are agent actions in ACP too, not merely an
+                // implementation detail of the completion loop. Announce each
+                // one before it runs and close it afterwards so clients such as
+                // Zed can render activity while the next inference round is in
+                // flight. Previously only model loading emitted ToolCall events,
+                // leaving an otherwise working tool round visually indistinct
+                // from a stalled response.
+                let raw_input: serde_json::Value = serde_json::from_str(&tc.arguments)
+                    .unwrap_or_else(|e| {
+                        log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
+                        serde_json::Value::String(tc.arguments.clone())
+                    });
+                self.send_tool_call_update(
+                    cx,
+                    session_id.clone(),
+                    SessionUpdate::ToolCall(
+                        ToolCall::new(tc.id.clone(), tc.name.clone())
+                            .kind(tool_kind_for(&tc.name))
+                            .status(ToolCallStatus::InProgress)
+                            .raw_input(raw_input),
+                    ),
+                )
+                .ok();
+
                 let signature = format!("{}\n{}", tc.name, tc.arguments);
                 let repeat_count = repeated_tool_calls
                     .entry(signature)
@@ -1559,6 +1609,20 @@ impl SiGitAgent {
                                             ),
                                         });
                                     }
+                                    self.send_tool_call_update(
+                                        cx,
+                                        session_id.clone(),
+                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                            tc.id.clone(),
+                                            ToolCallUpdateFields::new()
+                                                .status(ToolCallStatus::Failed)
+                                                .raw_output(serde_json::Value::String(
+                                                    "Not executed: the user cancelled the turn at the permission prompt."
+                                                        .to_string(),
+                                                )),
+                                        )),
+                                    )
+                                    .ok();
                                     backend.record_cancelled_tool_results(tool_results).await;
                                     return Ok(PromptResponse::new(StopReason::Cancelled));
                                 }
@@ -1568,6 +1632,18 @@ impl SiGitAgent {
                 };
 
                 log::info!("  ← {} chars", output.len());
+
+                self.send_tool_call_update(
+                    cx,
+                    session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        tc.id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(ToolCallStatus::Completed)
+                            .raw_output(serde_json::Value::String(output.clone())),
+                    )),
+                )
+                .ok();
 
                 tool_results.push(BackendToolResult {
                     tool_call_id: tc.id.clone(),
@@ -1661,8 +1737,10 @@ impl SiGitAgent {
         } else {
             format!("{tool_name}({args_preview})")
         };
-        let raw_input: serde_json::Value = serde_json::from_str(arguments)
-            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()));
+        let raw_input: serde_json::Value = serde_json::from_str(arguments).unwrap_or_else(|e| {
+            log::warn!("malformed JSON in tool arguments for '{}': {e}", tool_name);
+            serde_json::Value::String(arguments.to_string())
+        });
 
         let request = RequestPermissionRequest::new(
             session_id.clone(),
@@ -2789,7 +2867,9 @@ async fn exec_slash_acp(
                     ),
                     Err(error) => format!("Login failed: {error}"),
                 },
-                None => "usage: /login <email> <password>".to_string(),
+                // A bare `/login` takes the browser route, same as the editor's
+                // sign-in button.
+                None => browser_login_message().await,
             };
             agent.send_assistant_message(cx, session_id, message).ok();
         }
@@ -3310,6 +3390,70 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run the browser sign-in from a chat surface and describe how it went.
+///
+/// Both the TUI and an ACP session reach this from a bare `/login`. Neither can
+/// prompt for a pasted code mid-command, so a box with no bindable port is told
+/// to use `sigit login`, which can.
+pub(crate) async fn browser_login_message() -> String {
+    let flow = browser_auth::begin();
+    if !flow.is_loopback() {
+        return "Could not open a local port to receive the sign-in. \
+                Run `sigit login` in a terminal instead."
+            .to_string();
+    }
+
+    browser_auth::open_browser(flow.authorize_url());
+    let url = flow.authorize_url().to_string();
+
+    match browser_auth::complete_loopback(flow).await {
+        Ok(email) => format!("Signed in as {email}. Pick a siGit Code Cloud tier in /models."),
+        Err(error) => format!("Login failed: {error}\nYou can also open {url} by hand."),
+    }
+}
+
+/// `sigit login` from a shell: open the browser and wait for the code.
+///
+/// Unlike the ACP button this has a terminal to fall back on, so when no local
+/// port can be bound the flow switches to the paste variant and reads the code
+/// from stdin. That is the path an ssh session takes.
+async fn terminal_browser_login() -> Result<String, String> {
+    use std::io::{Write, stdin, stdout};
+
+    // `--paste` forces the code-in-hand variant. Binding a port succeeds on a
+    // remote box, but nothing there can reach it if the browser is running on
+    // the laptop in front of you, so the choice can't be made by probing.
+    let paste = std::env::args().any(|arg| arg == "--paste");
+    let flow = if paste {
+        browser_auth::begin_paste()
+    } else {
+        browser_auth::begin()
+    };
+    let opened = browser_auth::open_browser(flow.authorize_url());
+
+    if flow.is_loopback() {
+        if opened {
+            println!("Opened your browser to finish signing in.");
+        } else {
+            println!("Open this URL to finish signing in:");
+        }
+        println!("  {}", flow.authorize_url());
+        println!("Waiting...");
+        return browser_auth::complete_loopback(flow).await;
+    }
+
+    println!("Open this URL to finish signing in:");
+    println!("  {}", flow.authorize_url());
+    print!("Then paste the code shown there: ");
+    stdout().flush().ok();
+    let mut code = String::new();
+    stdin()
+        .read_line(&mut code)
+        .map_err(|error| format!("could not read the code: {error}"))?;
+
+    browser_auth::complete_paste(&flow, &code).await
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -3321,7 +3465,15 @@ async fn main() -> anyhow::Result<()> {
         match verb.as_str() {
             "login" => {
                 init_logging(true);
-                match account::interactive_login().await {
+                // `--password` keeps the old email/password prompt for anyone
+                // who wants it (scripts, a box with no browser at all).
+                let by_password = std::env::args().any(|arg| arg == "--password");
+                let result = if by_password {
+                    account::interactive_login().await
+                } else {
+                    terminal_browser_login().await
+                };
+                match result {
                     Ok(email) => {
                         println!("Signed in to siGit Code Cloud as {email}.");
                         return Ok(());

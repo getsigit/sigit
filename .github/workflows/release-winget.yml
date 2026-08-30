@@ -1,0 +1,71 @@
+name: winget Release
+
+# Dispatched by release-github.yml once the release and its checksums exist.
+#
+# This workflow only handles *updates*. winget manifests live in
+# microsoft/winget-pkgs, and a package has to exist there before it can be
+# updated, so the very first submission is a one-time manual step:
+#
+#   wingetcreate new https://github.com/getsigit/sigit/releases/download/vX.Y.Z/sigit-win-amd64.exe
+#
+# answering `portable` for the installer type and `smbCloud.siGitCode` for the
+# package identifier. Every release after that is automated here.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.5.2)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  REPO: getsigit/sigit
+  PACKAGE_IDENTIFIER: smbCloud.siGitCode
+
+jobs:
+  submit-winget-manifest:
+    name: Submit winget manifest
+    # wingetcreate is a Windows-only tool.
+    runs-on: windows-latest
+
+    steps:
+      - name: Resolve tag and version
+        id: release
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Submit manifest update
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+          }
+
+          $tag = "${{ steps.release.outputs.tag }}"
+          $version = "${{ steps.release.outputs.version }}"
+          $base = "https://github.com/${env:REPO}/releases/download/$tag"
+
+          Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
+
+          # The trailing |x64 and |arm64 tell wingetcreate which installer
+          # entry each URL replaces. Without them it guesses from the file
+          # name, and "sigit-win-amd64.exe" is not a spelling it recognises.
+          .\wingetcreate.exe update $env:PACKAGE_IDENTIFIER `
+            --version $version `
+            --urls "$base/sigit-win-amd64.exe|x64" "$base/sigit-win-arm64.exe|arm64" `
+            --release-notes-url "https://github.com/${env:REPO}/releases/tag/$tag" `
+            --submit `
+            --token $env:WINGET_TOKEN
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "wingetcreate failed with exit code $LASTEXITCODE"
+          }

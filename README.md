@@ -37,6 +37,12 @@ cargo install sigit
 | pip | `pip install sigit-code` |
 | uv | `uvx --from sigit-code sigit` |
 | npm | `npm install -g @smbcloud/sigit` |
+| NuGet | `dotnet tool install --global SiGit.Code` |
+| winget | `winget install smbCloud.siGitCode` |
+| Scoop | `scoop bucket add getsigit https://github.com/getsigit/scoop-bucket && scoop install sigit` |
+| AUR | `yay -S sigit-bin` |
+| Debian/Ubuntu | download the `.deb` from [releases](https://github.com/getsigit/sigit/releases), then `sudo dpkg -i sigit_*.deb` |
+| Fedora/RHEL | download the `.rpm` from [releases](https://github.com/getsigit/sigit/releases), then `sudo rpm -i sigit-*.rpm` |
 
 ## First run
 

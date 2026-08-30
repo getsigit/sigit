@@ -1,0 +1,99 @@
+name: AUR Release
+
+# Dispatched by release-github.yml once the release and its checksums exist.
+#
+# Publishes the `sigit-bin` package: a prebuilt binary rather than a source
+# build, so Arch users are not compiling the whole dependency tree (and the
+# on-device inference stack in particular) to install a CLI.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.5.2)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  REPO: getsigit/sigit
+
+jobs:
+  publish-aur-package:
+    name: Publish sigit-bin to the AUR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Resolve tag and version
+        id: release
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Read SHA256 checksums from release
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p artifacts
+
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo "${{ env.REPO }}" \
+            --pattern "sigit-linux-*.sha256" \
+            --dir artifacts/
+
+          X86_64_SHA=$(cat artifacts/sigit-linux-amd64.sha256)
+          AARCH64_SHA=$(cat artifacts/sigit-linux-arm64.sha256)
+
+          echo "x86_64=${X86_64_SHA}" >> "$GITHUB_OUTPUT"
+          echo "aarch64=${AARCH64_SHA}" >> "$GITHUB_OUTPUT"
+
+          echo "x86_64 SHA256:  ${X86_64_SHA}"
+          echo "aarch64 SHA256: ${AARCH64_SHA}"
+
+      - name: Render PKGBUILD
+        shell: bash
+        run: |
+          mkdir -p aur-build
+
+          sed \
+            -e "s/@VERSION@/${{ steps.release.outputs.version }}/g" \
+            -e "s/@SHA256_X86_64@/${{ steps.sha.outputs.x86_64 }}/g" \
+            -e "s/@SHA256_AARCH64@/${{ steps.sha.outputs.aarch64 }}/g" \
+            packaging/aur/PKGBUILD.in > aur-build/PKGBUILD
+
+          if grep -q '@[A-Z0-9_]*@' aur-build/PKGBUILD; then
+            echo "::error::PKGBUILD still contains unsubstituted placeholders" >&2
+            grep -n '@[A-Z0-9_]*@' aur-build/PKGBUILD >&2
+            exit 1
+          fi
+
+          # Catches an unbalanced quote or paren before it reaches the AUR.
+          bash -n aur-build/PKGBUILD
+
+          echo "Rendered PKGBUILD:"
+          cat aur-build/PKGBUILD
+
+      # The action runs makepkg in an Arch container to generate .SRCINFO and
+      # pushes over SSH. Generating .SRCINFO by hand is possible but drifts
+      # from the PKGBUILD the moment a field is added.
+      - name: Publish to the AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3
+        with:
+          pkgname: sigit-bin
+          pkgbuild: aur-build/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update sigit-bin to ${{ steps.release.outputs.version }}"
+          updpkgsums: false
