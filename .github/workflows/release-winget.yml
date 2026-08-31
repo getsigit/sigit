@@ -2,14 +2,17 @@ name: winget Release
 
 # Dispatched by release-github.yml once the release and its checksums exist.
 #
-# This workflow only handles *updates*. winget manifests live in
-# microsoft/winget-pkgs, and a package has to exist there before it can be
-# updated, so the very first submission is a one-time manual step:
+# winget manifests live in microsoft/winget-pkgs, and `wingetcreate update`
+# only works on a package that is already there. So this workflow branches:
 #
-#   wingetcreate new https://github.com/getsigit/sigit/releases/download/vX.Y.Z/sigit-win-amd64.exe
+#   - package already in winget-pkgs -> `wingetcreate update`, which rewrites
+#     the URLs and re-hashes the installers for us.
+#   - package not there yet -> render the manifests in packaging/winget/ and
+#     `wingetcreate submit` them as a new package.
 #
-# answering `portable` for the installer type and `smbCloud.siGitCode` for the
-# package identifier. Every release after that is automated here.
+# The second path only runs once, but keeping it here means a first release
+# does not need someone to sit at a Windows box running `wingetcreate new`
+# interactively.
 on:
   workflow_dispatch:
     inputs:
@@ -22,7 +25,7 @@ permissions:
 
 env:
   REPO: getsigit/sigit
-  PACKAGE_IDENTIFIER: smbCloud.siGitCode
+  PACKAGE_IDENTIFIER: getSigit.siGitCode
 
 jobs:
   submit-winget-manifest:
@@ -31,30 +34,124 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Resolve tag and version
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Resolve tag, version and release date
         id: release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.event.inputs.tag }}"
           VERSION="${TAG#v}"
+          # wingetcreate wants ReleaseDate as YYYY-MM-DD.
+          DATE=$(gh release view "$TAG" --repo "$REPO" --json publishedAt --jq '.publishedAt[0:10]')
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
 
-      - name: Submit manifest update
+      - name: Check whether the package is already in winget-pkgs
+        id: exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # manifests are filed under the lowercased first letter of the
+          # publisher, e.g. manifests/g/getSigit/siGitCode.
+          PUBLISHER="${PACKAGE_IDENTIFIER%%.*}"
+          NAME="${PACKAGE_IDENTIFIER#*.}"
+          FIRST=$(echo "${PUBLISHER:0:1}" | tr '[:upper:]' '[:lower:]')
+          PATH_IN_REPO="manifests/${FIRST}/${PUBLISHER}/${NAME}"
+
+          if gh api "repos/microsoft/winget-pkgs/contents/${PATH_IN_REPO}" >/dev/null 2>&1; then
+            echo "Found ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting an update."
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting it as a new package."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Render manifests for a first submission
+        if: steps.exists.outputs.found == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          VERSION="${{ steps.release.outputs.version }}"
+
+          mkdir -p artifacts manifests
+
+          gh release download "$TAG" \
+            --repo "$REPO" \
+            --pattern "sigit-win-*.exe.sha256" \
+            --dir artifacts/
+
+          # The schema wants 64 hex characters; the community validation
+          # pipeline writes them uppercase, so match that.
+          SHA_AMD64=$(tr -d '[:space:]' < artifacts/sigit-win-amd64.exe.sha256 | tr '[:lower:]' '[:upper:]')
+          SHA_ARM64=$(tr -d '[:space:]' < artifacts/sigit-win-arm64.exe.sha256 | tr '[:lower:]' '[:upper:]')
+
+          RELEASE_DATE="${{ steps.release.outputs.date }}"
+
+          for template in packaging/winget/*.yaml.in; do
+            out="manifests/$(basename "$template" .in)"
+            sed \
+              -e "s|@VERSION@|${VERSION}|g" \
+              -e "s|@TAG@|${TAG}|g" \
+              -e "s|@REPO@|${REPO}|g" \
+              -e "s|@SHA_AMD64@|${SHA_AMD64}|g" \
+              -e "s|@SHA_ARM64@|${SHA_ARM64}|g" \
+              -e "s|@RELEASE_DATE@|${RELEASE_DATE}|g" \
+              "$template" > "$out"
+
+            echo "--- ${out} ---"
+            cat "$out"
+          done
+
+      - name: Download wingetcreate
+        shell: pwsh
+        run: Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
+
+      - name: Submit new package
+        if: steps.exists.outputs.found == 'false'
         shell: pwsh
         env:
-          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          # wingetcreate reads the token from this variable. Passing it as
+          # --token instead makes the tool warn that the token can end up in
+          # logs, which on a shared runner is not a warning worth ignoring.
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
-          if (-not $env:WINGET_TOKEN) {
+          if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
+            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+          }
+
+          $version = "${{ steps.release.outputs.version }}"
+
+          # --no-open because the runner has no browser to open the PR in.
+          .\wingetcreate.exe submit manifests `
+            --prtitle "New package: $env:PACKAGE_IDENTIFIER version $version" `
+            --no-open
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "wingetcreate submit failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Submit manifest update
+        if: steps.exists.outputs.found == 'true'
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
             Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
           }
 
           $tag = "${{ steps.release.outputs.tag }}"
           $version = "${{ steps.release.outputs.version }}"
           $base = "https://github.com/${env:REPO}/releases/download/$tag"
-
-          Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
 
           # The trailing |x64 and |arm64 tell wingetcreate which installer
           # entry each URL replaces. Without them it guesses from the file
@@ -63,8 +160,10 @@ jobs:
             --version $version `
             --urls "$base/sigit-win-amd64.exe|x64" "$base/sigit-win-arm64.exe|arm64" `
             --release-notes-url "https://github.com/${env:REPO}/releases/tag/$tag" `
+            --release-date "${{ steps.release.outputs.date }}" `
+            --prtitle "Update $env:PACKAGE_IDENTIFIER to version $version" `
             --submit `
-            --token $env:WINGET_TOKEN
+            --no-open
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "wingetcreate failed with exit code $LASTEXITCODE"

@@ -101,9 +101,16 @@ jobs:
           node-version-file: .nvmrc
           registry-url: "https://registry.npmjs.org"
 
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1. .nvmrc pins the Node
+      # version (>= 22.14.0, also an OIDC requirement); npm still needs
+      # upgrading past whatever ships with it.
+      - name: Upgrade npm for Trusted Publishing
+        shell: bash
+        run: npm install -g npm@latest
+
+      # Authentication is OIDC: each @getsigit/* package has a Trusted
+      # Publisher pointing at this workflow, so there is no token to leak.
       - name: Publish platform package to NPM
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           cd npm
@@ -150,16 +157,16 @@ jobs:
 
           cd "${node_pkg}"
 
-          npm_package_name="@smbcloud/${node_pkg}"
+          npm_package_name="@getsigit/${node_pkg}"
           if npm view "${npm_package_name}@${node_version}" version >/dev/null 2>&1; then
             echo "${npm_package_name}@${node_version} already exists on npm, skipping publish"
             exit 0
           fi
 
-          npm publish --access public --provenance
+          npm publish --access public
 
   publish-npm-base:
-    name: Publish base NPM package (@smbcloud/sigit)
+    name: Publish base NPM package (@getsigit/sigit)
     needs: publish-npm-binaries
     runs-on: ubuntu-latest
 
@@ -186,9 +193,14 @@ jobs:
           node-version-file: .nvmrc
           registry-url: "https://registry.npmjs.org"
 
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1. .nvmrc pins the Node
+      # version (>= 22.14.0, also an OIDC requirement); npm still needs
+      # upgrading past whatever ships with it.
+      - name: Upgrade npm for Trusted Publishing
+        shell: bash
+        run: npm install -g npm@latest
+
       - name: Publish base package to NPM
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           cd npm/sigit
@@ -199,7 +211,7 @@ jobs:
             "./package.json" \
             "${{ env.RELEASE_VERSION }}"
 
-          npm_package_name="@smbcloud/sigit"
+          npm_package_name="@getsigit/sigit"
           npm_package_version="${{ env.RELEASE_VERSION }}"
 
           if npm view "${npm_package_name}@${npm_package_version}" version >/dev/null 2>&1; then
@@ -209,4 +221,4 @@ jobs:
 
           npm install
           npm run build
-          npm publish --access public --provenance
+          npm publish --access public

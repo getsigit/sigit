@@ -1,5 +1,5 @@
 {
-  "name": "@smbcloud/sigit",
+  "name": "@getsigit/sigit",
   "version": "0.0.0-dev",
   "keywords": [
     "sigit",
@@ -34,11 +34,11 @@
     "typescript": "^5.0.0"
   },
   "optionalDependencies": {
-    "@smbcloud/sigit-darwin-arm64": "0.0.0-dev",
-    "@smbcloud/sigit-darwin-x64": "0.0.0-dev",
-    "@smbcloud/sigit-linux-arm64": "0.0.0-dev",
-    "@smbcloud/sigit-linux-x64": "0.0.0-dev",
-    "@smbcloud/sigit-windows-arm64": "0.0.0-dev",
-    "@smbcloud/sigit-windows-x64": "0.0.0-dev"
+    "@getsigit/sigit-darwin-arm64": "0.0.0-dev",
+    "@getsigit/sigit-darwin-x64": "0.0.0-dev",
+    "@getsigit/sigit-linux-arm64": "0.0.0-dev",
+    "@getsigit/sigit-linux-x64": "0.0.0-dev",
+    "@getsigit/sigit-windows-arm64": "0.0.0-dev",
+    "@getsigit/sigit-windows-x64": "0.0.0-dev"
   }
 }

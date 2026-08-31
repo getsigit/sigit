@@ -14,7 +14,7 @@ The short version:
 - **Product / brand name:** `siGit Code`
 - **CLI command:** `sigit`
 - **Rust crate:** `sigit`
-- **npm package:** `@smbcloud/sigit`
+- **npm package:** `@getsigit/sigit`
 - **PyPI package:** `sigit-code`
 - **Company name:** `smbCloud`
 - **LLM backend name:** `Onde Inference`
@@ -38,7 +38,7 @@ These names are case-sensitive.
 - **CLI command:** `sigit`
 - **Rust crate:** `sigit`
 - **Repository slug:** `getsigit/sigit`
-- **npm package:** `@smbcloud/sigit`
+- **npm package:** `@getsigit/sigit`
 - **PyPI package:** `sigit-code`
 - **Company:** `smbCloud`
 - **LLM backend in prose:** `Onde Inference`
@@ -73,7 +73,7 @@ When you mean something users type, install, import, or clone, use the literal l
 That means:
 
 - `sigit` for the command, crate, and repo slug
-- `@smbcloud/sigit` for npm
+- `@getsigit/sigit` for npm
 - `sigit-code` for PyPI
 - `onde` for the Rust crate
 
@@ -81,7 +81,7 @@ Examples:
 
 - Run `sigit` in a terminal.
 - Install with `cargo install sigit`.
-- Install with `npm install -g @smbcloud/sigit`.
+- Install with `npm install -g @getsigit/sigit`.
 - Install with `pip install sigit-code`.
 - The repository is `getsigit/sigit`.
 
@@ -169,7 +169,7 @@ That includes:
 - `Onde Inference`
 - `ACP`
 - `sigit`
-- `@smbcloud/sigit`
+- `@getsigit/sigit`
 - `sigit-code`
 - `onde`
 
@@ -181,7 +181,7 @@ Before you finish any doc or release-note edit, check these:
 
 1. Did you use `siGit Code` when referring to the product?
 2. Did you keep `sigit` lowercase for commands, crates, and repo references?
-3. Did you keep `@smbcloud/sigit` and `sigit-code` exact?
+3. Did you keep `@getsigit/sigit` and `sigit-code` exact?
 4. Did you keep `smbCloud` and `Onde Inference` cased correctly?
 5. In setup examples, does the visible editor label say `siGit Code` while the command stays `sigit`?
 
