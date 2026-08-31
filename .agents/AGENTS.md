@@ -283,8 +283,12 @@ Three of these need credentials or a one-time manual step before they work:
 - Scoop needs a `getsigit/scoop-bucket` repo and a `SCOOP_BUCKET_TOKEN` secret, mirroring the
   Homebrew tap setup.
 - winget needs a `WINGET_TOKEN` (PAT with `public_repo`) so `wingetcreate` can fork
-  `microsoft/winget-pkgs`. The workflow only handles *updates*; the first submission has to be made
-  by hand with `wingetcreate new`, since a package must exist before it can be updated.
+  `microsoft/winget-pkgs`. It is passed as `WINGET_CREATE_GITHUB_TOKEN` rather than `--token`,
+  which wingetcreate warns can leak the token into logs. `wingetcreate update` only works on a
+  package that already exists in `microsoft/winget-pkgs`, so the workflow checks the
+  `manifests/g/getSigit/siGitCode` path first and falls back to rendering
+  `packaging/winget/*.yaml.in` and running `wingetcreate submit` for a first submission. That
+  fallback runs once, then every later release takes the `update` path.
 - The AUR needs `AUR_USERNAME`, `AUR_EMAIL`, and `AUR_SSH_PRIVATE_KEY`. It publishes `sigit-bin`
   (a prebuilt binary) so Arch users are not compiling the on-device inference stack to install a
   CLI.
