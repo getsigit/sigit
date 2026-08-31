@@ -267,6 +267,12 @@ Publishing splits into two groups. **Language registries** each get their own ta
 workflow: `release-crates`, `release-npm`, `release-nuget`, `release-pypi`. The `npm/`, `nuget/`,
 and `pypi/` dirs hold their wrapper-package templates.
 
+npm and NuGet authenticate with OIDC (Trusted Publishing), so neither needs a stored token. On
+npm that is configured per package, not per org: all seven `@getsigit/*` names carry a trusted
+publisher pointing at `release-npm.yml`, and a package added later needs the same setup or its
+publish step will fail. OIDC also requires npm >= 11.5.1 and Node >= 22.14.0, which is why the
+workflow upgrades npm and why `.nvmrc` cannot drop below 22.
+
 **OS package managers** all publish somewhere outside this repo and all need checksums from the
 GitHub release, so `release-github` builds the binaries, attaches the assets, and then dispatches
 `release-homebrew`, `release-scoop`, `release-winget`, and `release-aur`. A dispatch failure in one

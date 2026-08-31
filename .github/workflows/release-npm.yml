@@ -101,20 +101,16 @@ jobs:
           node-version-file: .nvmrc
           registry-url: "https://registry.npmjs.org"
 
-      # Trusted Publishing (OIDC) needs npm >= 11.5.1; the version bundled with
-      # Node 20 is older, so upgrade before publishing.
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1. .nvmrc pins the Node
+      # version (>= 22.14.0, also an OIDC requirement); npm still needs
+      # upgrading past whatever ships with it.
       - name: Upgrade npm for Trusted Publishing
         shell: bash
         run: npm install -g npm@latest
 
-      # BOOTSTRAP: the @getsigit/* packages don't exist yet, and npm can't
-      # configure a Trusted Publisher for a package that has never been
-      # published. So the first scope-cutover release authenticates with a
-      # token. Once the packages exist, configure Trusted Publishing on npmjs.com
-      # for each package and delete this env block to go fully tokenless.
+      # Authentication is OIDC: each @getsigit/* package has a Trusted
+      # Publisher pointing at this workflow, so there is no token to leak.
       - name: Publish platform package to NPM
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           cd npm
@@ -167,7 +163,7 @@ jobs:
             exit 0
           fi
 
-          npm publish --access public --provenance
+          npm publish --access public
 
   publish-npm-base:
     name: Publish base NPM package (@getsigit/sigit)
@@ -197,17 +193,14 @@ jobs:
           node-version-file: .nvmrc
           registry-url: "https://registry.npmjs.org"
 
-      # Trusted Publishing (OIDC) needs npm >= 11.5.1; the version bundled with
-      # Node 20 is older, so upgrade before publishing.
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1. .nvmrc pins the Node
+      # version (>= 22.14.0, also an OIDC requirement); npm still needs
+      # upgrading past whatever ships with it.
       - name: Upgrade npm for Trusted Publishing
         shell: bash
         run: npm install -g npm@latest
 
-      # BOOTSTRAP: token auth for the first @getsigit release (see the platform
-      # job above). Drop this env block once Trusted Publishing is configured.
       - name: Publish base package to NPM
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           cd npm/sigit
@@ -228,4 +221,4 @@ jobs:
 
           npm install
           npm run build
-          npm publish --access public --provenance
+          npm publish --access public
