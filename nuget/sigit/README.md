@@ -45,7 +45,7 @@ npm, and PyPI packages each download only the binary for your platform.
 ## Other installation methods
 
 - Cargo: `cargo install sigit`
-- npm: `npm install -g @smbcloud/sigit`
+- npm: `npm install -g @getsigit/sigit`
 - pip: `pip install sigit-code`
 - Homebrew: `brew tap getsigit/tap && brew trust --tap getsigit/tap && brew install sigit`
 - GitHub Releases: <https://github.com/getsigit/sigit/releases>

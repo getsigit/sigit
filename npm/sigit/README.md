@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@smbcloud/sigit"><img src="https://img.shields.io/npm/v/@smbcloud/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/@getsigit/sigit"><img src="https://img.shields.io/npm/v/@getsigit/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
   <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Crates.io"></a>
   <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/v/sigit-code?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
   <a href="https://smbcloud.xyz"><img src="https://img.shields.io/badge/smbcloud.xyz-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
@@ -16,7 +16,7 @@
 ## Install
 
 ```sh
-npm install -g @smbcloud/sigit
+npm install -g @getsigit/sigit
 ```
 
 npm pulls in the right binary for your platform automatically.
@@ -81,12 +81,12 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 
 | Platform | Architecture | Package |
 |---|---|---|
-| macOS | Apple Silicon (arm64) | [`@smbcloud/sigit-darwin-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-darwin-arm64) |
-| macOS | Intel (x64) | [`@smbcloud/sigit-darwin-x64`](https://www.npmjs.com/package/@smbcloud/sigit-darwin-x64) |
-| Linux | x64 | [`@smbcloud/sigit-linux-x64`](https://www.npmjs.com/package/@smbcloud/sigit-linux-x64) |
-| Linux | arm64 | [`@smbcloud/sigit-linux-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-linux-arm64) |
-| Windows | x64 | [`@smbcloud/sigit-windows-x64`](https://www.npmjs.com/package/@smbcloud/sigit-windows-x64) |
-| Windows | arm64 | [`@smbcloud/sigit-windows-arm64`](https://www.npmjs.com/package/@smbcloud/sigit-windows-arm64) |
+| macOS | Apple Silicon (arm64) | [`@getsigit/sigit-darwin-arm64`](https://www.npmjs.com/package/@getsigit/sigit-darwin-arm64) |
+| macOS | Intel (x64) | [`@getsigit/sigit-darwin-x64`](https://www.npmjs.com/package/@getsigit/sigit-darwin-x64) |
+| Linux | x64 | [`@getsigit/sigit-linux-x64`](https://www.npmjs.com/package/@getsigit/sigit-linux-x64) |
+| Linux | arm64 | [`@getsigit/sigit-linux-arm64`](https://www.npmjs.com/package/@getsigit/sigit-linux-arm64) |
+| Windows | x64 | [`@getsigit/sigit-windows-x64`](https://www.npmjs.com/package/@getsigit/sigit-windows-x64) |
+| Windows | arm64 | [`@getsigit/sigit-windows-arm64`](https://www.npmjs.com/package/@getsigit/sigit-windows-arm64) |
 
 ## Links
 
