@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.5
+
+A distribution release. siGit Code itself is unchanged. What moved is how it
+reaches you on npm and on Windows.
+
+### What changed
+
+- **The npm package is now `@getsigit/sigit`.** The six platform packages moved
+  with it. `@smbcloud/sigit` stays on the registry but stops receiving updates,
+  so upgrading means switching names:
+  `npm uninstall -g @smbcloud/sigit && npm install -g @getsigit/sigit`. The old
+  package had been stuck at 1.5.2, so this picks up 1.5.3 and 1.5.4 as well.
+- **npm publishes over OIDC.** Every `@getsigit/*` package has a trusted
+  publisher pointing at the release workflow, so no npm token is stored in the
+  repository. The release workflow moves to Node 22, which trusted publishing
+  requires.
+- **winget releases actually go out.** The workflow could only update a package
+  already present in `microsoft/winget-pkgs`, and siGit Code had never been
+  submitted there, so every dispatch failed. It now submits the package the
+  first time and updates it on later releases. The identifier is
+  `getSigit.siGitCode`.
+
 ## 1.5.4
 
 - **CI**: nfpm config expanded to include package version and binary path
