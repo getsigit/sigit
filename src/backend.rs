@@ -880,6 +880,89 @@ struct StreamFunctionDelta {
     arguments: Option<String>,
 }
 
+// ── Carrying a conversation across a model switch ────────────────────────────
+
+/// The part of a history snapshot that survives a model switch: every
+/// non-system message, with half-finished tool plumbing repaired.
+///
+/// System messages are dropped because the backend being switched *to* seeds
+/// its own — a different model's prompt, or a freshly pushed session-context
+/// message. A switch can land mid-turn, after the assistant asked for a tool
+/// but before the results came back; a tool call with no matching result (or a
+/// result with no matching call) makes strict OpenAI-compatible endpoints
+/// reject every later request in the session, so those halves are stripped
+/// instead of carried.
+pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let answered: std::collections::HashSet<String> = snapshot
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["tool_call_id"].as_str().map(str::to_string))
+        .collect();
+
+    let mut carried: Vec<serde_json::Value> = Vec::with_capacity(snapshot.len());
+    let mut called: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for mut message in snapshot {
+        match message["role"].as_str().unwrap_or_default() {
+            "system" => continue,
+            "assistant" => {
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    let kept: Vec<serde_json::Value> = calls
+                        .iter()
+                        .filter(|call| call["id"].as_str().is_some_and(|id| answered.contains(id)))
+                        .cloned()
+                        .collect();
+                    if kept.is_empty() {
+                        // Only unanswered requests: keep whatever text came
+                        // with them, drop the message if there was none.
+                        if let Some(object) = message.as_object_mut() {
+                            object.remove("tool_calls");
+                        }
+                        if message["content"].as_str().unwrap_or_default().is_empty() {
+                            continue;
+                        }
+                    } else {
+                        for call in &kept {
+                            called.insert(call["id"].as_str().unwrap_or_default().to_string());
+                        }
+                        message["tool_calls"] = serde_json::Value::Array(kept);
+                    }
+                }
+                carried.push(message);
+            }
+            "tool" => {
+                let answers_a_kept_call = message["tool_call_id"]
+                    .as_str()
+                    .is_some_and(|id| called.contains(id));
+                if answers_a_kept_call {
+                    carried.push(message);
+                }
+            }
+            _ => carried.push(message),
+        }
+    }
+
+    carried
+}
+
+/// Replay `carried` (from [`carryover_history`]) into `backend`, on top of the
+/// system messages `backend` seeded for itself. Used when a model switch
+/// installs a new backend — or reloads the on-device engine, which wipes its
+/// history — so the thread continues under the new model instead of restarting.
+pub async fn adopt_carryover(backend: &dyn InferenceBackend, carried: Vec<serde_json::Value>) {
+    if carried.is_empty() {
+        return;
+    }
+    let mut rebuilt: Vec<serde_json::Value> = backend
+        .history_snapshot()
+        .await
+        .into_iter()
+        .take_while(|message| message["role"] == "system")
+        .collect();
+    rebuilt.extend(carried);
+    backend.restore_history(rebuilt).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1049,125 @@ mod tests {
         assert_eq!(last["role"], "tool");
         assert_eq!(last["tool_call_id"], "call_9");
         assert_eq!(last["content"], "cancelled by the user");
+    }
+
+    #[test]
+    fn carryover_drops_system_messages_and_keeps_the_turns() {
+        let snapshot = vec![
+            serde_json::json!({ "role": "system", "content": "old prompt" }),
+            serde_json::json!({ "role": "user", "content": "hello" }),
+            serde_json::json!({ "role": "assistant", "content": "hi" }),
+        ];
+
+        let carried = carryover_history(snapshot);
+
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0]["role"], "user");
+        assert_eq!(carried[1]["content"], "hi");
+    }
+
+    #[test]
+    fn carryover_strips_a_tool_call_that_never_got_a_result() {
+        // Switching mid-turn: the assistant asked for a tool, nothing answered.
+        let snapshot = vec![
+            serde_json::json!({ "role": "user", "content": "read a.rs" }),
+            streamed_assistant_history(
+                "on it",
+                &[ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            ),
+        ];
+
+        let carried = carryover_history(snapshot);
+
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[1]["content"], "on it");
+        assert!(
+            carried[1].get("tool_calls").is_none(),
+            "an unanswered tool call must not survive the switch"
+        );
+    }
+
+    #[test]
+    fn carryover_drops_a_textless_unanswered_tool_call_and_its_late_result() {
+        let snapshot = vec![
+            streamed_assistant_history(
+                "",
+                &[ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            ),
+            // An orphan: its assistant message is gone with the line above.
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_other",
+                "content": "file contents",
+            }),
+        ];
+
+        assert!(carryover_history(snapshot).is_empty());
+    }
+
+    #[test]
+    fn carryover_keeps_an_answered_tool_call_paired_with_its_result() {
+        let snapshot = vec![
+            streamed_assistant_history(
+                "",
+                &[ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            ),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "file contents",
+            }),
+        ];
+
+        let carried = carryover_history(snapshot);
+
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(carried[1]["tool_call_id"], "call_1");
+    }
+
+    #[tokio::test]
+    async fn adopt_carryover_replays_the_thread_under_the_new_system_prompt() {
+        let new_backend =
+            OpenAiBackend::new("http://localhost", "", "m", Some("new prompt".into()));
+
+        let carried = carryover_history(vec![
+            serde_json::json!({ "role": "system", "content": "old prompt" }),
+            serde_json::json!({ "role": "user", "content": "hello" }),
+            serde_json::json!({ "role": "assistant", "content": "hi" }),
+        ]);
+        adopt_carryover(&new_backend, carried).await;
+
+        let history = new_backend.history_snapshot().await;
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0]["role"], "system");
+        assert_eq!(history[0]["content"], "new prompt");
+        assert_eq!(history[1]["content"], "hello");
+        assert_eq!(history[2]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn adopt_carryover_leaves_a_fresh_backend_alone() {
+        let new_backend =
+            OpenAiBackend::new("http://localhost", "", "m", Some("new prompt".into()));
+
+        adopt_carryover(&new_backend, Vec::new()).await;
+
+        let history = new_backend.history_snapshot().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["content"], "new prompt");
     }
 
     #[test]

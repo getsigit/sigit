@@ -901,6 +901,17 @@ impl SiGitAgent {
             new_config.display_name
         );
 
+        // Loading weights resets the engine's history, which would restart the
+        // conversation under the new model. Keep the turns so far and replay
+        // them below, once the new prompt and session context are seeded.
+        let carried = self
+            .engine
+            .history()
+            .await
+            .into_iter()
+            .filter(|message| message.role != onde::inference::ChatRole::System)
+            .collect::<Vec<_>>();
+
         let sampling = SamplingConfig {
             max_tokens: Some(max_tokens),
             ..SamplingConfig::default()
@@ -967,6 +978,10 @@ impl SiGitAgent {
                     session_context_message(&cwd),
                 ))
                 .await;
+        }
+
+        for message in carried {
+            self.engine.push_history(message).await;
         }
 
         Ok(new_config)
@@ -1820,6 +1835,10 @@ impl SiGitAgent {
             cfg.model,
             Some(system_prompt),
         ));
+        // Continue the thread on the new backend instead of starting over.
+        let carried =
+            backend::carryover_history(self.backend.lock().await.history_snapshot().await);
+        backend::adopt_carryover(cloud_backend.as_ref(), carried).await;
         *self.backend.lock().await = cloud_backend;
 
         let cloud_config = GgufModelConfig {
@@ -1862,11 +1881,26 @@ impl SiGitAgent {
     }
 
     /// Route inference back on-device. Used after leaving a cloud tier for a
-    /// local model. The `LocalBackend` reads the live `engine`, so this just
-    /// repoints the active backend.
+    /// local model. The `LocalBackend` reads the live `engine`, so this repoints
+    /// the active backend and moves the conversation onto the engine with it.
     async fn reset_to_local_backend(&self) {
+        // Coming back from a cloud tier, the turns since the switch live in the
+        // cloud backend's history, not the engine's — carry them over so the
+        // on-device model picks the thread up where the cloud one left it. A
+        // local-to-local switch needs nothing: `switch_model_by_id` has already
+        // replayed the engine's own history past the reload.
+        let carried = {
+            let current = self.backend.lock().await;
+            if current.is_remote() {
+                backend::carryover_history(current.history_snapshot().await)
+            } else {
+                Vec::new()
+            }
+        };
+
         let local_backend: Arc<dyn InferenceBackend> =
             Arc::new(LocalBackend::new(Arc::clone(&self.engine)));
+        backend::adopt_carryover(local_backend.as_ref(), carried).await;
         *self.backend.lock().await = local_backend;
     }
 
@@ -2764,7 +2798,6 @@ async fn exec_slash_acp(
                             Ok(new_config) => {
                                 agent.reset_to_local_backend().await;
                                 let _ = settings::set_local_inference(true);
-                                agent.engine.clear_history().await;
                                 agent
                                     .send_assistant_message(
                                         cx,
@@ -2798,7 +2831,6 @@ async fn exec_slash_acp(
                         let switched = agent.switch_model_by_id(&model.config.model_id).await?;
                         agent.reset_to_local_backend().await;
                         let _ = settings::set_local_inference(true);
-                        agent.engine.clear_history().await;
 
                         agent
                             .send_assistant_message(
