@@ -226,8 +226,16 @@ impl AgentUnderTest {
     }
 
     /// The first `session/update` whose payload satisfies `matches`.
+    ///
+    /// Only used by tests that run with the permission gate off, so a
+    /// `session/request_permission` means the run is misconfigured — say that
+    /// rather than waiting out the timeout on a request nobody will answer.
     fn wait_for_update(&mut self, what: &str, matches: impl Fn(&Value) -> bool) -> Value {
         let message = self.wait_for(what, |message| {
+            assert!(
+                message["method"] != "session/request_permission",
+                "unexpected permission request while waiting for {what}: {message}"
+            );
             message["method"] == "session/update" && matches(&message["params"]["update"])
         });
         message["params"]["update"].clone()
@@ -385,18 +393,32 @@ fn permission_round_trip_cancel_then_allow() {
 
 #[test]
 fn a_slow_commands_progress_reaches_the_client_while_it_runs() {
-    // `SIGIT_PERMISSIONS=allow` skips the gate, so the only thing between the
-    // two updates below is the command itself.
-    let endpoint = start_fake_endpoint(vec![
-        sse_tool_call("call_1", "run_command", r#"{"command":"sleep 2"}"#),
-        sse_text("done"),
-    ]);
-
     let scratch = std::env::temp_dir().join(format!("sigit_acp_progress_{}", std::process::id()));
     let config_dir = scratch.join("config");
     let cwd = scratch.join("cwd");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
+
+    // The command has to take a couple of seconds through `sh -c` / `cmd /C`.
+    // `sleep` is neither a cmd builtin nor on a Windows runner's PATH (Git's
+    // usr\bin, which carries the MSYS coreutils, is deliberately left off it),
+    // and the Windows job hung on it rather than failing fast. `ping` ships in
+    // System32, waits a second between echoes, and never reads stdin.
+    #[cfg(unix)]
+    let command = "sleep 2";
+    #[cfg(windows)]
+    let command = "ping -n 3 127.0.0.1";
+
+    // `SIGIT_PERMISSIONS=allow` skips the gate, so the only thing between the
+    // two updates below is the command itself.
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_1",
+            "run_command",
+            &json!({"command": command, "cwd": cwd}).to_string(),
+        ),
+        sse_text("done"),
+    ]);
 
     let mut agent = spawn_agent_with_permissions(endpoint.port, &config_dir, Some("allow"));
 
@@ -429,20 +451,21 @@ fn a_slow_commands_progress_reaches_the_client_while_it_runs() {
         "a running tool call must be announced as in_progress: {started}"
     );
 
-    agent.wait_for_update("the tool call finishing", |update| {
+    let finished = agent.wait_for_update("the tool call finishing", |update| {
         update["sessionUpdate"] == "tool_call_update"
             && update["toolCallId"] == "call_1"
             && update["status"] == "completed"
     });
 
-    // `sleep 2` runs between the two updates. If the turn blocked the
-    // connection's actors, both would only reach the client once the command
-    // had already finished, and the editor would never draw a spinner.
+    // The command runs between the two updates. If the turn blocked the
+    // connection's actors, both would only reach the client once it had
+    // already finished, and the editor would never draw a spinner.
     assert!(
         in_progress_at.elapsed() >= Duration::from_millis(1_000),
         "in_progress arrived only {:?} before completed — the client had no \
-         window to show progress in",
-        in_progress_at.elapsed()
+         window to show progress in. `{command}` said: {}",
+        in_progress_at.elapsed(),
+        finished["rawOutput"]
     );
 
     let response = agent.wait_for_response(prompt_id);
