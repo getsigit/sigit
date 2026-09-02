@@ -228,16 +228,12 @@ async fn run_prompt(
     // sink is passed and only the final message is printed.
     let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let sink_opt = if config.quiet { None } else { Some(&sink) };
-    let mut assembled = String::new();
-    let mut sent = String::new();
-    let mut streamed_any = false;
+    let mut reply = crate::StreamedReply::default();
 
     let mut result = drain_to_stdout(
         backend.send_message_with_tools(&config.prompt, &tools, sink_opt),
         &mut sink_rx,
-        &mut assembled,
-        &mut sent,
-        &mut streamed_any,
+        &mut reply,
     )
     .await?;
 
@@ -300,12 +296,14 @@ async fn run_prompt(
             None // last round: force text
         };
 
+        // Whatever this round says starts a new paragraph rather than
+        // continuing the sentence the tool calls interrupted.
+        reply.interrupt();
+
         result = drain_to_stdout(
             backend.send_tool_results(tool_results, next_tools, sink_opt),
             &mut sink_rx,
-            &mut assembled,
-            &mut sent,
-            &mut streamed_any,
+            &mut reply,
         )
         .await?;
     }
@@ -318,7 +316,7 @@ async fn run_prompt(
         if !final_visible.is_empty() {
             let _ = writeln!(stdout, "{final_visible}");
         }
-    } else if streamed_any {
+    } else if reply.streamed_any {
         // The reply is already on stdout; end the line for the shell.
         let _ = writeln!(stdout);
     } else if !final_visible.is_empty() {
@@ -335,9 +333,7 @@ async fn run_prompt(
 async fn drain_to_stdout<F>(
     fut: F,
     sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-    assembled: &mut String,
-    sent: &mut String,
-    streamed_any: &mut bool,
+    reply: &mut crate::StreamedReply,
 ) -> Result<TurnResult, backend::BackendError>
 where
     F: std::future::Future<Output = Result<TurnResult, backend::BackendError>>,
@@ -347,39 +343,23 @@ where
         tokio::select! {
             done = &mut fut => break done,
             Some(piece) = sink_rx.recv() => {
-                emit_visible_chunk(&piece, assembled, sent, streamed_any);
+                emit_visible_chunk(&piece, reply);
             }
         }
     };
     // Flush tokens that landed between the last poll and the future resolving.
     while let Ok(piece) = sink_rx.try_recv() {
-        emit_visible_chunk(&piece, assembled, sent, streamed_any);
+        emit_visible_chunk(&piece, reply);
     }
     result
 }
 
-/// Append a streamed fragment, strip `<think>` reasoning from the running
-/// text, and print only the newly revealed visible suffix. Tracking the
-/// assembled text (not just deltas) keeps think-block stripping correct even
-/// when a tag spans chunk boundaries — same approach as the ACP path.
-fn emit_visible_chunk(
-    piece: &str,
-    assembled: &mut String,
-    sent: &mut String,
-    streamed_any: &mut bool,
-) {
-    assembled.push_str(piece);
-    let (_think, visible) = crate::chat::strip_think_blocks(assembled);
-    match visible.strip_prefix(sent.as_str()) {
-        Some(extra) if !extra.is_empty() => {
-            print!("{extra}");
-            let _ = std::io::stdout().flush();
-            *sent = visible;
-            *streamed_any = true;
-        }
-        // No new visible text, or the visible prefix changed retroactively
-        // (rare, e.g. a late-closing think tag): resync without reprinting.
-        _ => *sent = visible,
+/// Fold a streamed fragment into `reply` and print whatever it newly reveals —
+/// the stdio counterpart of `SiGitAgent::emit_visible_chunk`.
+fn emit_visible_chunk(piece: &str, reply: &mut crate::StreamedReply) {
+    if let Some(extra) = reply.push(piece) {
+        print!("{extra}");
+        let _ = std::io::stdout().flush();
     }
 }
 

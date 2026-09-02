@@ -13,6 +13,10 @@
 //!    would reject the whole session.
 //! 2. `selected: allow_once` — the tool must actually execute and its output
 //!    travel back to the endpoint as a tool result.
+//!
+//! A second test covers what the client renders: text from two tool rounds must
+//! reach it as separate paragraphs, since ACP clients concatenate consecutive
+//! agent-message chunks into one block.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -51,6 +55,21 @@ fn sse_tool_call(id: &str, name: &str, arguments: &str) -> String {
 
 fn sse_text(text: &str) -> String {
     sse_body(&[json!({"choices": [{"delta": {"content": text}}]})])
+}
+
+/// One round that says something and then asks for a tool — the shape that used
+/// to leave the next round's text glued to this sentence.
+fn sse_text_then_tool_call(text: &str, id: &str, name: &str, arguments: &str) -> String {
+    sse_body(&[
+        json!({"choices": [{"delta": {"content": text}}]}),
+        json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": id,
+                "function": {"name": name, "arguments": arguments},
+            }]}}]
+        }),
+    ])
 }
 
 /// Serves one scripted SSE response per request and records each request body.
@@ -208,6 +227,30 @@ impl AgentUnderTest {
         response
     }
 
+    /// The response to `session/prompt`, paired with every `agent_message_chunk`
+    /// seen on the way, concatenated exactly as a client renders them.
+    fn wait_for_prompt(&mut self, id: u64) -> (Value, String) {
+        let mut rendered = String::new();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the prompt response");
+            };
+            let update = &message["params"]["update"];
+            if message["method"] == "session/update"
+                && update["sessionUpdate"] == "agent_message_chunk"
+                && let Some(chunk) = update["content"]["text"].as_str()
+            {
+                rendered.push_str(chunk);
+            }
+            if message["id"] == id && message.get("method").is_none() {
+                assert!(message.get("error").is_none(), "prompt failed: {message}");
+                return (message, rendered);
+            }
+        }
+    }
+
     /// A request *from* the agent (has a `method` and its own id).
     fn wait_for_agent_request(&mut self, method: &str) -> Value {
         self.wait_for(&format!("agent request {method}"), |message| {
@@ -352,6 +395,63 @@ fn permission_round_trip_cancel_then_allow() {
             .unwrap_or_default()
             .contains("sigit-approved"),
         "the approved command's output should reach the endpoint: {result}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn text_from_two_tool_rounds_reaches_the_client_as_separate_paragraphs() {
+    let endpoint = start_fake_endpoint(vec![
+        // `list_directory` is read-only, so it runs without a permission gate
+        // and the two rounds follow each other straight away.
+        sse_text_then_tool_call(
+            "I'll search for this pattern.",
+            "call_1",
+            "list_directory",
+            r#"{"path":"."}"#,
+        ),
+        sse_text("Let me broaden the search:"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_spacing_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "find it"}],
+        }),
+    );
+    let (response, rendered) = agent.wait_for_prompt(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    assert!(
+        rendered.contains("pattern.\n\nLet me broaden"),
+        "the second round must open a new paragraph, got: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("pattern.Let me"),
+        "rounds must not run together into one sentence, got: {rendered:?}"
     );
 
     drop(agent);
