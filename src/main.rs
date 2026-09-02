@@ -248,6 +248,77 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
 /// context window, so the cap can afford to be generous
 const MAX_TOOL_ROUNDS: usize = 24;
 
+/// Separator between two stretches of assistant prose that a tool round split
+/// apart. ACP clients concatenate consecutive agent-message chunks into a
+/// single block, so a plain newline (or nothing at all) leaves the rounds
+/// reading as one run-on paragraph.
+const PARAGRAPH_BREAK: &str = "\n\n";
+
+/// The assistant reply being streamed over the course of one prompt, tracked
+/// across every tool round so `<think>` stripping stays correct and no text is
+/// sent twice.
+#[derive(Default)]
+struct StreamedReply {
+    /// Raw text as it arrives, reasoning tags included: think-block stripping
+    /// needs the whole string, since a tag can span chunk boundaries.
+    assembled: String,
+    /// The visible text already on the wire.
+    sent: String,
+    /// Whether any chunk has been sent, i.e. the client already has a reply.
+    streamed_any: bool,
+    /// Whether the next visible text should open a new paragraph.
+    paragraph_pending: bool,
+}
+
+impl StreamedReply {
+    /// Record that a tool round has interrupted the prose, so the next chunk
+    /// starts a paragraph. A round that opened with tool calls and no text has
+    /// no sentence to break away from, hence the `streamed_any` guard.
+    fn interrupt(&mut self) {
+        self.paragraph_pending = self.streamed_any;
+    }
+
+    /// Fold one streamed fragment into the reply and return the visible text it
+    /// newly reveals, or `None` when it reveals nothing to show (it landed
+    /// inside a `<think>` block, say).
+    fn push(&mut self, piece: &str) -> Option<String> {
+        if self.paragraph_pending {
+            // A tool round interrupted the prose. Clients concatenate
+            // consecutive agent-message chunks into one block, so the new round
+            // has to open a paragraph or it runs onto the end of the previous
+            // sentence ("…parsed with unwrap_or_else.Let me broaden the
+            // search:"). Whatever whitespace the model puts at the seam gives
+            // way to the break.
+            let piece = piece.trim_start();
+            if piece.is_empty() {
+                return None;
+            }
+            self.assembled.push_str(PARAGRAPH_BREAK);
+            self.assembled.push_str(piece);
+            self.paragraph_pending = false;
+        } else {
+            self.assembled.push_str(piece);
+        }
+
+        let (_think, visible) = chat::strip_think_blocks(&self.assembled);
+        match visible.strip_prefix(self.sent.as_str()) {
+            Some(extra) if !extra.is_empty() => {
+                let extra = extra.to_string();
+                self.sent = visible;
+                self.streamed_any = true;
+                Some(extra)
+            }
+            // No new visible text, or the visible prefix changed retroactively
+            // (rare, e.g. a late-closing think tag): just resync without
+            // resending what's already on the wire.
+            _ => {
+                self.sent = visible;
+                None
+            }
+        }
+    }
+}
+
 /// Outcome of asking the client for permission to run one tool call.
 enum PermissionVerdict {
     /// Run the tool.
@@ -728,18 +799,15 @@ impl SiGitAgent {
     /// tokens to the editor. The sink receiver is drained as the future runs, so
     /// chunks reach the client live rather than all at once when it resolves.
     ///
-    /// `assembled`/`sent`/`streamed_any` persist across the turns of a single
-    /// prompt so reasoning is stripped consistently and we never re-send text.
-    #[allow(clippy::too_many_arguments)]
+    /// `reply` persists across the turns of a single prompt so reasoning is
+    /// stripped consistently and we never re-send text.
     async fn drain_turn<F>(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
         fut: F,
         sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-        assembled: &mut String,
-        sent: &mut String,
-        streamed_any: &mut bool,
+        reply: &mut StreamedReply,
     ) -> Result<TurnResult, backend::BackendError>
     where
         F: std::future::Future<Output = Result<TurnResult, backend::BackendError>>,
@@ -749,44 +817,29 @@ impl SiGitAgent {
             tokio::select! {
                 done = &mut fut => break done,
                 Some(piece) = sink_rx.recv() => {
-                    self.emit_visible_chunk(cx, session_id, &piece, assembled, sent, streamed_any);
+                    self.emit_visible_chunk(cx, session_id, &piece, reply);
                 }
             }
         };
         // Flush tokens that landed between the last poll and the future resolving.
         while let Ok(piece) = sink_rx.try_recv() {
-            self.emit_visible_chunk(cx, session_id, &piece, assembled, sent, streamed_any);
+            self.emit_visible_chunk(cx, session_id, &piece, reply);
         }
         result
     }
 
-    /// Append a streamed fragment, strip `<think>` reasoning from the running
-    /// text, and send only the newly revealed visible suffix as a chunk. Tracking
-    /// the assembled text (not just deltas) keeps think-block stripping correct
-    /// even when a tag spans chunk boundaries.
+    /// Fold a streamed fragment into `reply` and send whatever it newly reveals
+    /// as an agent-message chunk.
     fn emit_visible_chunk(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
         piece: &str,
-        assembled: &mut String,
-        sent: &mut String,
-        streamed_any: &mut bool,
+        reply: &mut StreamedReply,
     ) {
-        assembled.push_str(piece);
-        let (_think, visible) = chat::strip_think_blocks(assembled);
-        match visible.strip_prefix(sent.as_str()) {
-            Some(extra) if !extra.is_empty() => {
-                let extra = extra.to_string();
-                *sent = visible;
-                *streamed_any = true;
-                self.send_assistant_message(cx, session_id.clone(), extra)
-                    .ok();
-            }
-            // No new visible text, or the visible prefix changed retroactively
-            // (rare, e.g. a late-closing think tag): just resync without
-            // resending what's already on the wire.
-            _ => *sent = visible,
+        if let Some(extra) = reply.push(piece) {
+            self.send_assistant_message(cx, session_id.clone(), extra)
+                .ok();
         }
     }
 
@@ -1469,9 +1522,7 @@ impl SiGitAgent {
         // alive for the whole prompt so `recv()` only ends when a turn future
         // resolves, never because every sender was dropped.
         let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let mut assembled = String::new();
-        let mut sent = String::new();
-        let mut streamed_any = false;
+        let mut reply = StreamedReply::default();
         let mut repeated_tool_calls = std::collections::HashMap::<String, usize>::new();
 
         let mut result = self
@@ -1480,9 +1531,7 @@ impl SiGitAgent {
                 &session_id,
                 backend.send_message_with_tools(&user_text, &tools, Some(&sink)),
                 &mut sink_rx,
-                &mut assembled,
-                &mut sent,
-                &mut streamed_any,
+                &mut reply,
             )
             .await
             .map_err(|error| {
@@ -1672,15 +1721,17 @@ impl SiGitAgent {
                 None // last round: force text
             };
 
+            // Whatever this round says starts a new paragraph rather than
+            // continuing the sentence the tool calls interrupted.
+            reply.interrupt();
+
             result = self
                 .drain_turn(
                     cx,
                     &session_id,
                     backend.send_tool_results(tool_results, next_tools, Some(&sink)),
                     &mut sink_rx,
-                    &mut assembled,
-                    &mut sent,
-                    &mut streamed_any,
+                    &mut reply,
                 )
                 .await
                 .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
@@ -1690,7 +1741,7 @@ impl SiGitAgent {
         // If anything streamed, the visible reply is already on the wire; only
         // send a trailing block for the non-streamed path (e.g. on-device direct
         // answers, which onde can't stream while tools are on offer).
-        if !streamed_any {
+        if !reply.streamed_any {
             let reply_text = result.text.trim().to_string();
             let final_text = if reply_text.is_empty() {
                 if round > 0 {
@@ -3617,6 +3668,74 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_reply_sends_each_fragment_as_it_is_revealed() {
+        let mut reply = StreamedReply::default();
+        assert_eq!(reply.push("Hello"), Some("Hello".to_string()));
+        assert_eq!(reply.push(", world"), Some(", world".to_string()));
+        assert!(reply.streamed_any);
+    }
+
+    #[test]
+    fn streamed_reply_opens_a_paragraph_after_a_tool_round() {
+        let mut reply = StreamedReply::default();
+        reply.push("I'll search for this pattern.");
+
+        // …tool calls run, then the next round starts talking again.
+        reply.interrupt();
+
+        assert_eq!(
+            reply.push("Let me broaden the search:"),
+            Some("\n\nLet me broaden the search:".to_string()),
+            "the new round must not run onto the end of the last sentence"
+        );
+        // Only the seam gets a break; the rest of the round streams as usual.
+        assert_eq!(reply.push(" Found them."), Some(" Found them.".to_string()));
+    }
+
+    #[test]
+    fn streamed_reply_drops_the_models_own_whitespace_at_the_seam() {
+        let mut reply = StreamedReply::default();
+        reply.push("Checking that.");
+        reply.interrupt();
+
+        // A fragment of pure whitespace reveals nothing and must not consume
+        // the pending break.
+        assert_eq!(reply.push("\n"), None);
+        assert_eq!(
+            reply.push("  Done."),
+            Some("\n\nDone.".to_string()),
+            "the break replaces the model's leading whitespace"
+        );
+    }
+
+    #[test]
+    fn streamed_reply_does_not_open_with_a_blank_paragraph() {
+        // First round was tool calls only, so nothing is on the wire yet and
+        // there is no sentence to break away from.
+        let mut reply = StreamedReply::default();
+        reply.interrupt();
+
+        assert_eq!(reply.push("Found them."), Some("Found them.".to_string()));
+    }
+
+    #[test]
+    fn streamed_reply_hides_reasoning_and_still_breaks_the_paragraph() {
+        let mut reply = StreamedReply::default();
+        reply.push("Looking now.");
+        reply.interrupt();
+
+        // A round that opens with reasoning reveals nothing until the visible
+        // text arrives — and that text still starts the new paragraph.
+        assert_eq!(reply.push("<think>weigh"), None);
+        assert_eq!(reply.push(" options</think>"), None);
+        assert_eq!(
+            reply.push("Here it is."),
+            Some("\n\nHere it is.".to_string()),
+            "the break waits for the reasoning to end and rides out with the text"
+        );
+    }
 
     #[test]
     fn explicit_acp_flag_is_accepted_without_other_arguments() {
