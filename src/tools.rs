@@ -455,16 +455,49 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
 
 async fn execute_tool_impl(name: &str, arguments: &str) -> String {
     match name {
+        TASK_TOOL_NAME => exec_task(arguments).await,
+        WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await,
+        // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
+        // and forwarded to the owning server.
+        _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
+        // Everything else is synchronous and may run for a long time: a shell
+        // command up to COMMAND_TIMEOUT, a glob over a big tree, an HTTP fetch
+        // on reqwest::blocking (which panics if polled on a runtime thread).
+        // The ACP connection multiplexes reading the client, writing
+        // notifications, and running the turn onto a single task, so blocking
+        // here freezes the editor's view of the session: the tool call's
+        // `in_progress` update — the editor's spinner — only reaches the client
+        // once the tool has already finished.
+        _ => {
+            let tool = name.to_owned();
+            let arguments = arguments.to_owned();
+            let running = tool.clone();
+            tokio::task::spawn_blocking(move || execute_sync_tool(&running, &arguments))
+                .await
+                // A `JoinError` means the tool panicked (or the runtime is
+                // shutting down). Report it as the tool's result rather than
+                // propagating: a panicking tool should cost the model one bad
+                // tool result, not the whole turn. Note this is strictly safer
+                // than running the tool inline, where the panic would unwind
+                // through the turn and take the ACP connection with it.
+                .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}"))
+        }
+    }
+}
+
+/// The synchronous tools, run on the blocking pool by [`execute_tool_impl`].
+///
+/// Everything here runs on a blocking thread with no reactor, so nothing in
+/// this match may await or drive a tokio resource. A new tool that needs the
+/// async context belongs in [`execute_tool_impl`] alongside `task` and
+/// `web_search` instead — and then owes its own answer to the question this
+/// dispatch exists for: not blocking the caller's task for its whole run.
+fn execute_sync_tool(name: &str, arguments: &str) -> String {
+    match name {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
         "search_files" => exec_search_files(arguments),
-        "read_website" => {
-            // reqwest::blocking panics inside a tokio runtime, so run on the blocking pool.
-            let args = arguments.to_owned();
-            tokio::task::spawn_blocking(move || exec_read_website(&args))
-                .await
-                .unwrap_or_else(|err| format!("Error: read_website task failed: {err}"))
-        }
+        "read_website" => exec_read_website(arguments),
         "create_directory" => exec_create_directory(arguments),
         "create_file" => exec_create_file(arguments),
         "edit_file" => exec_edit_file(arguments),
@@ -477,11 +510,6 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
         "command_output" => exec_command_output(arguments),
         "kill_command" => exec_kill_command(arguments),
         "skill" => crate::skills::activate_skill(arguments),
-        TASK_TOOL_NAME => exec_task(arguments).await,
-        WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await,
-        // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
-        // and forwarded to the owning server.
-        _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
         _ => format!("Unknown tool: {name}"),
     }
 }
