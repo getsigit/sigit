@@ -29,8 +29,13 @@ Use this skill when preparing a release for this repository.
 - Add or update the top changelog entry in `CHANGELOG.md` for the release being cut.
 - Do not treat `npm/sigit/package.json` `0.0.0-dev` as a bug by default. The npm release workflow rewrites it at publish time using `npm/scripts/render-main-package.cjs` and the release tag.
 - Do not add a hardcoded version to `pypi/pyproject.toml` for normal releases. PyPI uses `maturin` with `dynamic = ["version"]` and derives the published package version from `Cargo.toml`.
-- Release workflows are tag-driven. `release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, and `release-homebrew.yml` all derive `RELEASE_VERSION` from a `v*.*.*` tag or a manually supplied tag input.
+- Release workflows are tag-driven. `release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, `release-homebrew.yml`, `release-nuget.yml`, and `release-mcp-registry.yml` all derive `RELEASE_VERSION` from a `v*.*.*` tag or a manually supplied tag input.
 - The crate is published to crates.io (`release-crates.yml`) and the Homebrew tap is updated (`release-homebrew.yml`) as part of the tag-driven flow. Per the siGit release flow, Homebrew is auto-triggered — do not dispatch it manually.
+- `release-github.yml` builds the binaries, attaches them (plus a `.deb`/`.rpm` per Linux target built with nfpm from `packaging/nfpm.yaml`) to the GitHub release, then dispatches `release-homebrew`, `release-scoop`, `release-winget`, and `release-aur`. A dispatch failure in any one of those four is logged as a warning, not a hard failure — an unconfigured channel doesn't block the rest of the release. `release-nuget.yml` and `release-mcp-registry.yml`, by contrast, are tag-triggered directly like the other language-registry workflows, not dispatched from `release-github.yml`.
+- Every release asset carries a `.sha256` sidecar (not just the macOS Homebrew tarball). Scoop, winget, and the AUR PKGBUILD each consume the raw binaries plus their sidecar checksum, rather than the tarball.
+- npm and NuGet publish via OIDC trusted publishing — neither has a stored token in the repo. On npm this is configured per package (each `@getsigit/*` name has a trusted publisher pointing at `release-npm.yml`), so a new package needs the same setup before its first publish will work. OIDC requires npm >= 11.5.1 and Node >= 22.14.0.
+- The NuGet package (`SiGit.Code`, `dotnet tool install --global SiGit.Code`) bundles all six platform binaries under `native/<os>-<arch>/` behind a managed shim, rather than shipping one package per platform like npm/PyPI. Watch the nuget.org 250 MB package-size limit if it ever grows.
+- The baked-in official MCP server is separately listed in the public MCP Registry as `si.sigit/sigit` (`release-mcp-registry.yml`, driven by `server.json` at the repo root). It's a remote Streamable-HTTP listing, so it's verified by a DNS TXT record on the `sigit.si` domain rather than the GitHub-OIDC scheme used for package listings.
 
 ## Git release flow
 
@@ -56,7 +61,10 @@ Pushing the `v*.*.*` tag is what fires every release workflow, so create and pus
 - `npm/scripts/render-main-package.cjs`
 - `npm/`
 - `pypi/`
-- `.github/workflows/` (`release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, `release-homebrew.yml`)
+- `nuget/sigit/` (bundled-binary `.NET` tool packaging)
+- `packaging/` (`nfpm.yaml` for `.deb`/`.rpm`, plus `aur/` and `winget/` templates)
+- `server.json` (MCP Registry listing)
+- `.github/workflows/` (`release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, `release-homebrew.yml`, `release-scoop.yml`, `release-winget.yml`, `release-aur.yml`, `release-nuget.yml`, `release-mcp-registry.yml`)
 
 ## Release checklist
 
@@ -69,5 +77,6 @@ Pushing the `v*.*.*` tag is what fires every release workflow, so create and pus
 - Git flow followed: bump committed on `release/v<version>`, merged back to `development`, then `development` merged into `main`, with `v<version>` tagged on the `main` merge commit.
 - Release notes or changelog entries match the actual changes.
 - CI-equivalent local checks pass for the relevant platform or target.
-- Package names, install commands, and branding stay consistent.
-- Any known release limitations are called out explicitly.
+- Package names, install commands, and branding stay consistent across npm, PyPI, crates.io, Homebrew, NuGet, Scoop, winget, AUR, and the `.deb`/`.rpm` packages.
+- Every release asset (including the new `.deb`/`.rpm`/raw binaries consumed by Scoop, winget, and AUR) has a matching `.sha256` sidecar.
+- Any known release limitations are called out explicitly, including a dispatch failure in `release-scoop`/`release-winget`/`release-aur` (non-fatal — logged as a warning by `release-github.yml`) versus a hard failure in a directly tag-triggered workflow like `release-nuget` or `release-mcp-registry`.
