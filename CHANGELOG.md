@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.5.6
+
+### What changed
+
+- **Switching models mid-conversation no longer restarts it.** Both switching
+  to a local GGUF model and picking a different cloud tier now carry the live
+  conversation history across, repairing any half-finished tool call so
+  strict OpenAI-compatible endpoints don't reject the session
+- **Long-running tools now show progress in ACP clients.** Synchronous tools
+  (shell commands, file operations, `read_website`, ...) run on a blocking
+  thread pool instead of the ACP connection's own task, so a slow command's
+  `in_progress` update reaches the client — and Zed's spinner — while the
+  command is still running instead of arriving with the result
+- **Text from consecutive tool rounds no longer runs together.** ACP and
+  headless clients concatenate consecutive message chunks, so a reply that
+  continued after a tool call used to glue onto the previous round's last
+  sentence with no space. A blank line now opens the next round's text
+
 ## 1.5.5
 
 A distribution release. siGit Code itself is unchanged. What moved is how it
