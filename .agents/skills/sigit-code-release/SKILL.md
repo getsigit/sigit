@@ -42,6 +42,8 @@ Releases are cut from `development` and shipped on `main`. The published tags (`
 4. Merge `development` into `main` (commit message: `Merge development into main for v<version> release`).
 5. Tag `v<version>` on that `main` merge commit, then push `main` and the tag.
 
+Step 4 is the only way commits are meant to reach `main`. A feature or fix PR targeting `main` breaks that: it puts work on the release branch that `development` does not have, so the next release is cut without it. Such PRs belong on `development` (see the pull request target rule in `AGENTS.md`).
+
 Pushing the `v*.*.*` tag is what fires every release workflow, so create and push it only after the merge into `main` has landed. Do not commit, tag, or push until the user explicitly asks — confirm the version and that they want the release to go out first.
 
 ## Typical files to inspect
