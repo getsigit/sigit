@@ -26,7 +26,23 @@ from the name alone (e.g. `feature/tool-permission-system`, `fix/glob-mtime-sort
 a task, ticket, or session id (not `feature/task-q003hm`).
 
 **IMPORTANT — pull request target:** Always open pull requests against the `development` branch,
-never `main`. `main` is release-only; `development` is where day-to-day work integrates.
+never `main`. `main` is release-only; `development` is where day-to-day work integrates, and the
+release merge (see the `sigit-code-release` skill) is the one thing that ever puts commits on
+`main`.
+
+This rule needs help to hold, because the repository's default branch is `main`: both
+`gh pr create` and the GitHub web form pre-select it, so a PR lands on the wrong base unless the
+base is passed explicitly. Pass it every time, and check that it took:
+
+```sh
+gh pr create --base development --head <branch>
+gh pr view <number> --json baseRefName
+```
+
+Retargeting a PR that was opened against `main` costs nothing before it merges:
+`gh pr edit <number> --base development`. After it merges it costs real work — the change sits on
+`main` while `development`, which the next release is cut from, does not have it, and someone has
+to carry it back by hand. PR #65 went in that way.
 
 **IMPORTANT — branch off `development`:** Start every working branch from the latest
 `origin/development`. Exception: when new work *depends on* a feature branch that has not merged
