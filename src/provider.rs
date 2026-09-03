@@ -29,11 +29,19 @@ const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 /// largest). Always offered in `/models`; selecting one requires a signed-in
 /// account.
 ///
-/// There are two lines because the cloud serves two independent families, and a
-/// tier is only routable when the cloud has that family configured. Which family
-/// is which, and what runs behind either, is deliberately not represented here:
-/// the client knows tier names and nothing else.
-pub const CLOUD_TIERS: &[&str] = &["fast", "balanced", "large", "mini", "air", "pro", "oke"];
+/// The tiers group into several independent lines, and a tier is only routable
+/// when the cloud has that line's family configured. Which family is which, and
+/// what runs behind any of them, is deliberately not represented here: the
+/// client knows tier names and nothing else.
+///
+/// This list mirrors onde-cloud's router catalogue (`src/router.rs`) and
+/// sigit-si's `CloudCatalog`. A tier the cloud serves but this list omits is
+/// simply invisible in `/models` and the editor picker, so all three sides have
+/// to be updated together when a tier is added.
+pub const CLOUD_TIERS: &[&str] = &[
+    "fast", "balanced", "large", "mini", "air", "pro", "oke", "flux", "apex", "aura", "orbit",
+    "nova",
+];
 
 /// Base URL of the siGit Code Cloud inference endpoint. Override with
 /// `SIGIT_CLOUD_URL` (dev: `http://localhost:8090/v1`).
@@ -70,6 +78,11 @@ fn tier_to_model(tier: &str) -> String {
         "air" => "onde-air",
         "pro" => "onde-pro",
         "oke" => "onde-kkk",
+        "flux" => "onde-flux",
+        "apex" => "onde-apex",
+        "aura" => "onde-aura",
+        "orbit" => "onde-orbit",
+        "nova" => "onde-nova",
         other => other,
     }
     .to_string()
