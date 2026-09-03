@@ -474,12 +474,24 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
             let running = tool.clone();
             tokio::task::spawn_blocking(move || execute_sync_tool(&running, &arguments))
                 .await
+                // A `JoinError` means the tool panicked (or the runtime is
+                // shutting down). Report it as the tool's result rather than
+                // propagating: a panicking tool should cost the model one bad
+                // tool result, not the whole turn. Note this is strictly safer
+                // than running the tool inline, where the panic would unwind
+                // through the turn and take the ACP connection with it.
                 .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}"))
         }
     }
 }
 
 /// The synchronous tools, run on the blocking pool by [`execute_tool_impl`].
+///
+/// Everything here runs on a blocking thread with no reactor, so nothing in
+/// this match may await or drive a tokio resource. A new tool that needs the
+/// async context belongs in [`execute_tool_impl`] alongside `task` and
+/// `web_search` instead — and then owes its own answer to the question this
+/// dispatch exists for: not blocking the caller's task for its whole run.
 fn execute_sync_tool(name: &str, arguments: &str) -> String {
     match name {
         "read_file" => exec_read_file(arguments),

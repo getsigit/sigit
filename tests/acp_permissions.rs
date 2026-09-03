@@ -399,15 +399,23 @@ fn a_slow_commands_progress_reaches_the_client_while_it_runs() {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
 
-    // The command has to take a couple of seconds through `sh -c` / `cmd /C`.
+    // The command has to run for a few seconds through `sh -c` / `cmd /C`.
     // `sleep` is neither a cmd builtin nor on a Windows runner's PATH (Git's
     // usr\bin, which carries the MSYS coreutils, is deliberately left off it),
     // and the Windows job hung on it rather than failing fast. `ping` ships in
     // System32, waits a second between echoes, and never reads stdin.
+    //
+    // Four seconds against the one-second assertion below is deliberate
+    // padding. A busy runner only ever widens the gap being measured — it
+    // cannot make the command finish sooner — so the one way a correct agent
+    // could fail here is this thread being descheduled for seconds between
+    // reading the two updates off the channel. Three seconds of slack covers
+    // that without weakening the assertion, which is separating four seconds
+    // from the 164µs the blocking version produced.
     #[cfg(unix)]
-    let command = "sleep 2";
+    let command = "sleep 4";
     #[cfg(windows)]
-    let command = "ping -n 3 127.0.0.1";
+    let command = "ping -n 5 127.0.0.1";
 
     // `SIGIT_PERMISSIONS=allow` skips the gate, so the only thing between the
     // two updates below is the command itself.
