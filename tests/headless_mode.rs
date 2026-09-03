@@ -46,6 +46,21 @@ fn sse_text(text: &str) -> String {
     sse_body(&[json!({"choices": [{"delta": {"content": text}}]})])
 }
 
+/// One round that says something and then asks for a tool — the shape that used
+/// to leave the next round's text glued to this sentence.
+fn sse_text_then_tool_call(text: &str, id: &str, name: &str, arguments: &str) -> String {
+    sse_body(&[
+        json!({"choices": [{"delta": {"content": text}}]}),
+        json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": id,
+                "function": {"name": name, "arguments": arguments},
+            }]}}]
+        }),
+    ])
+}
+
 /// Serves one scripted SSE response per request and records each request body.
 struct FakeEndpoint {
     port: u16,
@@ -289,6 +304,50 @@ fn ask_level_tool_without_allow_flag_is_denied_but_run_completes() {
     assert!(
         !content.contains("must-not-run"),
         "the denied command must not have executed: {content}"
+    );
+}
+
+#[test]
+fn text_from_two_tool_rounds_is_not_run_together() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_text_then_tool_call(
+            "I'll search for this pattern.",
+            "call_1",
+            "run_command",
+            r#"{"command":"echo first"}"#,
+        ),
+        sse_text("Let me broaden the search:"),
+    ]);
+    let scratch = scratch("spacing");
+    let cwd = scratch.cwd.to_str().unwrap().to_string();
+
+    let output = run_headless(
+        endpoint.port,
+        &scratch,
+        &[
+            "-p",
+            "find it",
+            "--allow-tool",
+            "run_command",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("pattern.\n\nLet me broaden"),
+        "the second round must open a new paragraph, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("pattern.Let me"),
+        "rounds must not run together into one sentence, got: {stdout:?}"
     );
 }
 
