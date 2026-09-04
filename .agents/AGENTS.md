@@ -301,6 +301,14 @@ winget, and the AUR PKGBUILD each need one, and they consume the raw binaries ra
 tarball. `release-github` also builds a `.deb` and `.rpm` per Linux target with nfpm
 (`packaging/nfpm.yaml`), packaging the already-built binary rather than re-invoking cargo.
 
+Re-pushing a tag fires every release workflow a second time, so each one is grouped by tag in a
+`concurrency` block with `cancel-in-progress: false` — the duplicate queues behind the original
+rather than interrupting a publish that is halfway through uploading. What keeps the queued run
+from going red is the "is this version already published?" check each publishing workflow does
+before it uploads. Those checks are load-bearing, not belt-and-braces: v1.5.6 published twice
+because the crates.io one asked the API with curl's default User-Agent, which crates.io answers
+with a 403, which read as "not published yet".
+
 Three of these need credentials or a one-time manual step before they work:
 
 - Scoop needs a `getsigit/scoop-bucket` repo and a `SCOOP_BUCKET_TOKEN` secret, mirroring the
