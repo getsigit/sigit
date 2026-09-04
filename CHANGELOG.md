@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### What changed
+
+- **Multi-root projects now work in the editor.** When a client opens several
+  directories in one project, ACP sends the extra ones as
+  `additionalDirectories`; siGit used to log them and move on, so everything
+  outside the first root was invisible. All the roots are now part of the
+  session: the model is told about each one, every root's `AGENTS.md` /
+  `CLAUDE.md` is loaded, and skills, slash commands, and subagent types are
+  discovered from all of them (primary root first, so it still wins name
+  collisions). `/status` lists the roots when there is more than one, and
+  headless runs take the same thing as repeatable `--add-dir <dir>` flags.
+  MCP servers are the exception: discovery happens once at startup, before a
+  session exists, so a second root's `.sigit/mcp.toml` is not picked up
+
 ## 1.5.6
 
 ### What changed
