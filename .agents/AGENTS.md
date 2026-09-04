@@ -198,10 +198,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `tests/mcp_stdio.rs`, driven by the test-only `src/bin/mcp_stdio_stub.rs` helper binary
   (excluded from the published crate via `exclude` in `Cargo.toml`). The baked-in official
   server is *also* listed in the public MCP Registry as `si.sigit/sigit` — a **remote**
-  Streamable-HTTP listing (`server.json` at the repo root, published by
-  `release-mcp-registry.yml`). Because it's a remote server, the registry's URL-match rule
-  forces a domain namespace (`si.sigit` ↔ `sigit.si`) verified by a DNS TXT record, not the
-  GitHub-OIDC scheme `smbcloud-cli` uses for its package listing.
+  Streamable-HTTP listing owned by the [`getsigit/si`](https://github.com/getsigit/si) repo
+  (`server.json` at its root, published by its `release-mcp-registry.yml`), not this one. Because
+  it's a remote server, the registry's URL-match rule forces a domain namespace (`si.sigit` ↔
+  `sigit.si`) verified by a DNS TXT record, not the GitHub-OIDC scheme `smbcloud-cli` uses for its
+  package listing.
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
