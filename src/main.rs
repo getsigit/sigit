@@ -75,9 +75,9 @@ use agent_client_protocol::schema::v1::{
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
@@ -1093,8 +1093,14 @@ impl SiGitAgent {
                 AgentCapabilities::default()
                     .load_session(true)
                     .session_capabilities(
-                        SessionCapabilities::new().fork(SessionForkCapabilities::new()),
-                    ),
+                    SessionCapabilities::new()
+                        .fork(SessionForkCapabilities::new())
+                        // Without this, a client that has several directories
+                        // open never sends the extra ones: Zed drops every root
+                        // but the first and tells the user the agent has no
+                        // multi-root support. See `workspace.rs`.
+                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
+                ),
             )
             .meta(initialize_meta()))
     }

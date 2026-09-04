@@ -199,7 +199,16 @@ fn a_skill_from_a_second_root_is_offered_to_the_model() {
         "initialize",
         json!({"protocolVersion": 1, "clientCapabilities": {}}),
     );
-    agent.wait_for_response(id);
+    let initialize = agent.wait_for_response(id);
+
+    // Zed only sends `additionalDirectories` to an agent that advertises this;
+    // without it the client keeps the first root, drops the rest, and tells the
+    // user the agent has no multi-root support.
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["additionalDirectories"]
+            .is_object(),
+        "additionalDirectories capability missing from {initialize}"
+    );
 
     let id = agent.request(
         "session/new",

@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::workspace;
+
 /// Instruction file names to look for in each directory, in priority order.
 /// Only the first match in a given directory is loaded.
 const INSTRUCTION_FILE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
@@ -84,8 +86,10 @@ pub fn load_workspace_instructions(cwd: &Path, additional_roots: &[PathBuf]) -> 
         };
 
         // Dedup by canonical path so the same file reached via two roots (or a
-        // symlink) is only loaded once.
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // symlink) is only loaded once. Two roots that each carry their own
+        // AGENTS.md still contribute both: the paths differ, and each one is
+        // the instructions for its own repository.
+        let canonical = workspace::canonical_key(&path);
         if seen.contains(&canonical) {
             continue;
         }

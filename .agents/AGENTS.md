@@ -226,7 +226,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/workspace.rs`** — the directories the session treats as project roots. An editor can
   open several at once (Zed calls it a multi-root project) and ACP carries the extras as
   `additional_directories` on every session request; the headless CLI takes them as repeatable
-  `--add-dir` flags. The process still has one working directory, so the extra roots live in a
+  `--add-dir` flags. A client only sends those extras to an agent that advertises
+  `sessionCapabilities.additionalDirectories` in its `initialize` reply, so that capability in
+  `handle_initialize` is what makes the rest of this reachable — without it Zed keeps the first
+  root, drops the others, and shows "This agent doesn't currently support multi-root workspaces".
+  The process still has one working directory, so the extra roots live in a
   process-global here and `project_dirs()` returns cwd-first, extras after. Project-local
   discovery reads it: skills, slash commands, subagent types, and instruction files all scan
   every root. MCP is deliberately not on that list — `mcp::init` runs once at startup, before

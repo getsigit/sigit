@@ -13,7 +13,7 @@
 //! startup (`mcp::init`), before any session exists, so a second root's
 //! `.sigit/mcp.toml` has nobody to tell.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
 
 /// The session's roots beyond `cwd`. Empty for an ordinary single-root project.
@@ -25,7 +25,7 @@ static ADDITIONAL_ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 /// dropped — an editor is free to send any of those, and every consumer here
 /// would either scan nothing or do the same work twice.
 pub fn set_additional_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut seen: Vec<PathBuf> = vec![canonical(cwd)];
+    let mut seen: Vec<PathBuf> = vec![canonical_key(cwd)];
     let mut kept: Vec<PathBuf> = Vec::new();
 
     for root in roots {
@@ -36,7 +36,7 @@ pub fn set_additional_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
             );
             continue;
         }
-        let key = canonical(root);
+        let key = canonical_key(root);
         if seen.contains(&key) {
             continue;
         }
@@ -70,8 +70,42 @@ pub fn project_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+/// A comparison key for a path: its canonical form when the filesystem can
+/// give one, and otherwise the path made absolute and lexically normalized.
+///
+/// The fallback matters. `canonicalize` fails on a path the process cannot
+/// resolve (an unreadable parent, a root that vanished between the client
+/// sending it and us reading it), and returning the path untouched there would
+/// let `.` and `..` segments or a relative spelling of a root that is already
+/// in the list read as a new one.
+pub fn canonical_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| normalize(path))
+}
+
+/// Absolute + lexically normalized: `.` dropped, `..` folded into the previous
+/// segment. Purely textual, so it never touches the filesystem.
+fn normalize(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -108,5 +142,19 @@ mod tests {
 
         assert!(additional_roots().is_empty());
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn keys_a_path_the_filesystem_cannot_resolve() {
+        // Nothing here exists, so `canonicalize` fails on every one of them and
+        // the lexical fallback is what has to make the three agree.
+        let base = std::env::temp_dir().join("sigit-ws-missing");
+        let direct = canonical_key(&base.join("root"));
+        let dotted = canonical_key(&base.join(".").join("root"));
+        let backtracked = canonical_key(&base.join("other").join("..").join("root"));
+
+        assert_eq!(direct, dotted);
+        assert_eq!(direct, backtracked);
+        assert!(direct.is_absolute());
     }
 }
