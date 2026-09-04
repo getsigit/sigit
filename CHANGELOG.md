@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A shell command can no longer wedge the editor session.** Tool commands
+  inherited siGit's own stdin, which in ACP mode is the JSON-RPC pipe from the
+  editor. A command that read stdin — a signing passphrase prompt, a pager, a
+  `git` credential ask — blocked on it and consumed the client's next request
+  out of the pipe, so nothing typed afterwards ever reached the agent and the
+  session stayed dead past the command timeout. Commands, hooks, and the
+  co-author `git` helpers now run with stdin closed, so a command that wants
+  input gets EOF and reports an error instead
+- **A command that prints a lot no longer stalls for two minutes.**
+  `run_command` waited for the command to exit before reading its output, so
+  anything past the pipe buffer (a build, a verbose test run) blocked writing
+  while siGit blocked waiting, until the 120-second timeout killed it. Output
+  is now drained while the command runs
+- **The command timeout now stops the whole command.** It killed only the
+  shell, leaving anything that shell had started running and unreaped; it now
+  kills the process group
+
 ## 1.5.6
 
 ### What changed

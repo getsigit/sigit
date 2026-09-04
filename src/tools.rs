@@ -1941,22 +1941,57 @@ fn exec_delete_file(arguments: &str) -> String {
 
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const COMMAND_OUTPUT_LIMIT: usize = 50_000;
+/// How long to keep waiting for the output drains once the command itself has
+/// exited. Only a process that outlived the shell and still holds a pipe can
+/// use this up, so it is short.
+const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Spawn `command_str` through the platform shell with piped stdout/stderr.
 /// Shared by the foreground and background paths of `run_command`.
+///
+/// stdin is `/dev/null`, never inherited. In ACP mode sigit's stdin is the
+/// JSON-RPC pipe from the editor, and a child holding that fd can read the
+/// client's next request out of it: the agent never sees the request, the
+/// editor waits forever for a reply, and the session is wedged past any
+/// timeout this function's callers apply. Null also means a command that wants
+/// input gets EOF and fails instead of blocking on input nobody can type.
+///
+/// On Unix the child also leads its own process group, so a timeout can kill
+/// the whole tree. `sh -c` may fork rather than exec (dash does), and a
+/// surviving grandchild keeps the pipe write ends open.
 fn spawn_shell(command_str: &str, cwd_path: &Path) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     let (shell, flag) = ("sh", "-c");
     #[cfg(windows)]
     let (shell, flag) = ("cmd", "/C");
 
-    Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .arg(flag)
         .arg(command_str)
         .current_dir(cwd_path)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn()
+}
+
+/// SIGKILL a shell spawned by [`spawn_shell`] and everything it started, then
+/// reap it so the timeout path doesn't leave a zombie behind.
+fn kill_shell_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Negative pid is the process group; the child is its leader. Fall
+        // back to the child alone if the group is already gone.
+        if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } != 0 {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(windows)]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Trailer identifying siGit Code as the co-author of commits it creates.
@@ -1970,10 +2005,15 @@ fn spawn_shell(command_str: &str, cwd_path: &Path) -> std::io::Result<std::proce
 pub const COMMIT_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: siGit Code <noreply@sigit.si>";
 
 /// Run `git <args>` in `cwd`, returning trimmed stdout on success.
+///
+/// stdin is null for the same reason as [`spawn_shell`]: git can ask for input
+/// (a credential, a signing passphrase), and inheriting the ACP pipe would let
+/// it read the editor's next request instead.
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
     output
@@ -2008,6 +2048,7 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
     let amend = Command::new("git")
         .args(["commit", "--amend", "--no-edit", "--trailer"])
         .arg(COMMIT_CO_AUTHOR_TRAILER)
+        .stdin(std::process::Stdio::null())
         .current_dir(cwd)
         .output()
         .ok()?;
@@ -2086,13 +2127,33 @@ fn exec_run_command(arguments: &str) -> String {
         Err(err) => return format!("Error: failed to spawn command: {err}"),
     };
 
+    // Drain both pipes on their own threads. Waiting first and reading after
+    // deadlocks the moment a command writes more than the pipe buffer holds
+    // (64 KiB on Linux, less on macOS): the child blocks on the full pipe, we
+    // block on the child, and the only way out is the timeout. A build or a
+    // verbose test run crosses that on its own.
+    let (chunks_tx, chunks_rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
+    let drain = |tag: u8, pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let tx = chunks_tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let _ = tx.send((tag, buf));
+        });
+    };
+    drain(0, child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    drain(1, child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    drop(chunks_tx);
+
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_status)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= COMMAND_TIMEOUT {
-                    let _ = child.kill();
+                    kill_shell_tree(&mut child);
                     return format!(
                         "Error: command timed out after {} seconds and was killed.",
                         COMMAND_TIMEOUT.as_secs()
@@ -2102,17 +2163,27 @@ fn exec_run_command(arguments: &str) -> String {
             }
             Err(err) => return format!("Error: failed to wait on command: {err}"),
         }
-    }
-
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(err) => return format!("Error: failed to read command output: {err}"),
     };
 
-    let exit_code = output.status.code().unwrap_or(-1);
+    // Collect what the drains read, bounded. The shell has exited, but a
+    // grandchild that outlived it can still hold a pipe open, and joining
+    // those threads would wait on it forever.
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let deadline = std::time::Instant::now() + OUTPUT_GRACE;
+    for _ in 0..2 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match chunks_rx.recv_timeout(remaining) {
+            Ok((0, bytes)) => stdout_bytes = bytes,
+            Ok((_, bytes)) => stderr_bytes = bytes,
+            Err(_) => break,
+        }
+    }
+
+    let exit_code = status.code().unwrap_or(-1);
     let mut combined = String::new();
-    combined.push_str(&String::from_utf8_lossy(&output.stdout));
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    combined.push_str(&String::from_utf8_lossy(&stdout_bytes));
+    combined.push_str(&String::from_utf8_lossy(&stderr_bytes));
 
     // A new commit appeared under this command: make sure it carries the
     // siGit co-author trailer (see `ensure_commit_co_author`).
@@ -2136,7 +2207,7 @@ fn exec_run_command(arguments: &str) -> String {
         combined
     };
 
-    if output.status.success() {
+    if status.success() {
         if truncated.is_empty() {
             format!("Command succeeded (exit code {exit_code}) with no output.")
         } else {
@@ -3083,6 +3154,55 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// The wait loop used to read the pipes only after the child exited, so a
+    /// command that outgrew the pipe buffer blocked on the write, we blocked on
+    /// the child, and the whole thing sat there until the 120-second timeout.
+    #[test]
+    fn run_command_survives_more_output_than_a_pipe_buffer_holds() {
+        let dir = std::env::temp_dir();
+        // ~400 KB, well past any platform's pipe buffer. It also crosses
+        // COMMAND_OUTPUT_LIMIT, so the result is truncated; the point of the
+        // test is that the command finishes at all.
+        let line = "x".repeat(199);
+        let command = format!("for i in $(seq 1 2000); do echo {line}; done");
+        let args = json!({"command": command, "cwd": dir.to_str().unwrap()}).to_string();
+
+        let started = std::time::Instant::now();
+        let result = exec_run_command(&args);
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "run_command took {:?}; it deadlocked on the pipe",
+            started.elapsed()
+        );
+        assert!(
+            result.contains("Exit code 0"),
+            "unexpected result: {result}"
+        );
+        assert!(
+            result.contains("output truncated"),
+            "expected the 50000-byte cap to bite: {result}"
+        );
+    }
+
+    /// A command that wants input gets EOF instead of blocking forever on a
+    /// pipe nobody is going to write to (in ACP mode, the editor's own).
+    #[test]
+    fn run_command_gives_a_command_that_reads_stdin_an_empty_one() {
+        let dir = std::env::temp_dir();
+        let args = json!({"command": "cat", "cwd": dir.to_str().unwrap()}).to_string();
+
+        let started = std::time::Instant::now();
+        let result = exec_run_command(&args);
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "run_command blocked on stdin for {:?}",
+            started.elapsed()
+        );
+        assert!(result.contains("no output"), "unexpected result: {result}");
     }
 
     #[test]
