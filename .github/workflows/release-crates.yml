@@ -70,8 +70,11 @@ jobs:
           # Branch on the status code rather than on curl's exit status, so an
           # answer we do not understand stops the job instead of quietly
           # degrading into that same failure.
+          # Retry first, so a timeout or a 5xx costs a few seconds instead of
+          # the whole release.
           STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "User-Agent: getsigit/sigit release workflow (github.com/getsigit/sigit)" \
+            --retry 3 --retry-delay 2 --retry-all-errors \
+            -H "User-Agent: ${GITHUB_REPOSITORY} release workflow (https://github.com/${GITHUB_REPOSITORY})" \
             "https://crates.io/api/v1/crates/sigit/${VERSION}")
 
           case "$STATUS" in

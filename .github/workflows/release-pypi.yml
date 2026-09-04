@@ -186,6 +186,7 @@ jobs:
           # blocked request would read as "not published yet" and send the
           # publish below into a version that is already there.
           STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --retry 3 --retry-delay 2 --retry-all-errors \
             "https://pypi.org/pypi/sigit-code/${RELEASE_VERSION}/json")
 
           case "$STATUS" in

@@ -304,7 +304,8 @@ jobs:
           # means the package itself is not on NuGet, which is the first
           # release and a real "not published".
           index=$(mktemp)
-          STATUS=$(curl -sS -o "${index}" -w '%{http_code}' "${package_index_url}")
+          STATUS=$(curl -sS -o "${index}" -w '%{http_code}' \
+            --retry 3 --retry-delay 2 --retry-all-errors "${package_index_url}")
 
           case "$STATUS" in
             200)
