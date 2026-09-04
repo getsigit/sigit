@@ -166,9 +166,18 @@ jobs:
           cd "${node_pkg}"
 
           npm_package_name="@getsigit/${node_pkg}"
-          if npm view "${npm_package_name}@${node_version}" version >/dev/null 2>&1; then
+
+          # `npm view` exits non-zero both when the version is genuinely
+          # unpublished and when the registry could not be reached, so treat
+          # only an E404 as "not published yet". Anything else stops the job
+          # instead of publishing over a version that is already there.
+          if view_output=$(npm view "${npm_package_name}@${node_version}" version 2>&1); then
             echo "${npm_package_name}@${node_version} already exists on npm, skipping publish"
             exit 0
+          elif ! grep -q "E404" <<<"${view_output}"; then
+            echo "npm view failed while checking ${npm_package_name}@${node_version}:" >&2
+            echo "${view_output}" >&2
+            exit 1
           fi
 
           npm publish --access public
@@ -222,9 +231,15 @@ jobs:
           npm_package_name="@getsigit/sigit"
           npm_package_version="${{ env.RELEASE_VERSION }}"
 
-          if npm view "${npm_package_name}@${npm_package_version}" version >/dev/null 2>&1; then
+          # Same E404-only reading as the platform packages above: a registry
+          # failure must not look like an unpublished version.
+          if view_output=$(npm view "${npm_package_name}@${npm_package_version}" version 2>&1); then
             echo "${npm_package_name}@${npm_package_version} already exists on npm, skipping publish"
             exit 0
+          elif ! grep -q "E404" <<<"${view_output}"; then
+            echo "npm view failed while checking ${npm_package_name}@${npm_package_version}:" >&2
+            echo "${view_output}" >&2
+            exit 1
           fi
 
           npm install

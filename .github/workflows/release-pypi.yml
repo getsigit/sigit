@@ -181,12 +181,26 @@ jobs:
         id: pypi-check
         shell: bash
         run: |
-          if curl -fsS "https://pypi.org/pypi/sigit-code/${RELEASE_VERSION}/json" >/dev/null 2>&1; then
-            echo "sigit-code ${RELEASE_VERSION} already exists on PyPI, skipping publish"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          # Branch on the status code rather than on curl's exit status: with
+          # -f every non-2xx answer looks alike, so a registry outage or a
+          # blocked request would read as "not published yet" and send the
+          # publish below into a version that is already there.
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/sigit-code/${RELEASE_VERSION}/json")
+
+          case "$STATUS" in
+            200)
+              echo "sigit-code ${RELEASE_VERSION} already exists on PyPI, skipping publish"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected ${STATUS} from PyPI while checking whether sigit-code ${RELEASE_VERSION} is published" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Publish distribution
         if: steps.pypi-check.outputs.exists != 'true'
