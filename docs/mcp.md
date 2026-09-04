@@ -63,6 +63,8 @@ The server is published to the
 [official MCP Registry](https://registry.modelcontextprotocol.io) as
 **`si.sigit/sigit`**, a remote Streamable-HTTP listing, so registry-aware
 clients can add it in one click. The registry only stores metadata; the
-`server.json` and publish workflow live in this repo, and namespace ownership is
-proven by a DNS TXT record on `sigit.si`. The internal setup and release runbook
-live with the server (private `sigit-si` repo).
+`server.json` and publish workflow live in the
+[`getsigit/si`](https://github.com/getsigit/si) repo (the `si` CLI, also an
+MCP client of this server), and namespace ownership is proven by a DNS TXT
+record on `sigit.si`. The internal setup and release runbook live with the
+server (private `sigit-si` repo).

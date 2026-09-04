@@ -14,9 +14,12 @@
 //! 2. `selected: allow_once` — the tool must actually execute and its output
 //!    travel back to the endpoint as a tool result.
 //!
-//! A second test covers what the client renders: text from two tool rounds must
-//! reach it as separate paragraphs, since ACP clients concatenate consecutive
-//! agent-message chunks into one block.
+//! A second test covers live progress: a slow command's `in_progress` tool call
+//! must reach the client while the command is still running, which is what the
+//! editor's spinner is driven from. A third test covers what the client
+//! renders: text from two tool rounds must reach it as separate paragraphs,
+//! since ACP clients concatenate consecutive agent-message chunks into one
+//! block.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -143,21 +146,34 @@ struct AgentUnderTest {
 }
 
 fn spawn_agent(port: u16, config_dir: &std::path::Path) -> AgentUnderTest {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sigit"))
+    spawn_agent_with_permissions(port, config_dir, None)
+}
+
+/// `permissions` sets `SIGIT_PERMISSIONS`; `None` leaves the default `ask` mode
+/// in place, which is what the permission round-trip needs.
+fn spawn_agent_with_permissions(
+    port: u16,
+    config_dir: &std::path::Path,
+    permissions: Option<&str>,
+) -> AgentUnderTest {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sigit"));
+    command
         .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
         .env("OPENAI_API_KEY", "test-key")
         .env("SIGIT_MODEL", "scripted-model")
         .env("SIGIT_CONFIG_DIR", config_dir)
         .env("SIGIT_MCP", "off")
-        // A fresh config dir means the default permission mode, `ask` — make
-        // sure the environment can't turn the gate off underneath the test.
-        .env_remove("SIGIT_PERMISSIONS")
         .env_remove("SIGIT_LOCAL_INFERENCE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sigit in ACP mode");
+        .stderr(Stdio::null());
+    match permissions {
+        // A fresh config dir means the default permission mode, `ask` — make
+        // sure the environment can't turn the gate off underneath the test.
+        None => command.env_remove("SIGIT_PERMISSIONS"),
+        Some(mode) => command.env("SIGIT_PERMISSIONS", mode),
+    };
+    let mut child = command.spawn().expect("spawn sigit in ACP mode");
 
     let stdout = child.stdout.take().unwrap();
     let (message_tx, incoming) = channel();
@@ -225,6 +241,22 @@ impl AgentUnderTest {
             "request {id} failed: {response}"
         );
         response
+    }
+
+    /// The first `session/update` whose payload satisfies `matches`.
+    ///
+    /// Only used by tests that run with the permission gate off, so a
+    /// `session/request_permission` means the run is misconfigured — say that
+    /// rather than waiting out the timeout on a request nobody will answer.
+    fn wait_for_update(&mut self, what: &str, matches: impl Fn(&Value) -> bool) -> Value {
+        let message = self.wait_for(what, |message| {
+            assert!(
+                message["method"] != "session/request_permission",
+                "unexpected permission request while waiting for {what}: {message}"
+            );
+            message["method"] == "session/update" && matches(&message["params"]["update"])
+        });
+        message["params"]["update"].clone()
     }
 
     /// The response to `session/prompt`, paired with every `agent_message_chunk`
@@ -396,6 +428,98 @@ fn permission_round_trip_cancel_then_allow() {
             .contains("sigit-approved"),
         "the approved command's output should reach the endpoint: {result}"
     );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_slow_commands_progress_reaches_the_client_while_it_runs() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_progress_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // The command has to run for a few seconds through `sh -c` / `cmd /C`.
+    // `sleep` is neither a cmd builtin nor on a Windows runner's PATH (Git's
+    // usr\bin, which carries the MSYS coreutils, is deliberately left off it),
+    // and the Windows job hung on it rather than failing fast. `ping` ships in
+    // System32, waits a second between echoes, and never reads stdin.
+    //
+    // Four seconds against the one-second assertion below is deliberate
+    // padding. A busy runner only ever widens the gap being measured — it
+    // cannot make the command finish sooner — so the one way a correct agent
+    // could fail here is this thread being descheduled for seconds between
+    // reading the two updates off the channel. Three seconds of slack covers
+    // that without weakening the assertion, which is separating four seconds
+    // from the 164µs the blocking version produced.
+    #[cfg(unix)]
+    let command = "sleep 4";
+    #[cfg(windows)]
+    let command = "ping -n 5 127.0.0.1";
+
+    // `SIGIT_PERMISSIONS=allow` skips the gate, so the only thing between the
+    // two updates below is the command itself.
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_1",
+            "run_command",
+            &json!({"command": command, "cwd": cwd}).to_string(),
+        ),
+        sse_text("done"),
+    ]);
+
+    let mut agent = spawn_agent_with_permissions(endpoint.port, &config_dir, Some("allow"));
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the slow command"}],
+        }),
+    );
+
+    let started = agent.wait_for_update("the tool call starting", |update| {
+        update["sessionUpdate"] == "tool_call" && update["toolCallId"] == "call_1"
+    });
+    let in_progress_at = Instant::now();
+    assert_eq!(
+        started["status"], "in_progress",
+        "a running tool call must be announced as in_progress: {started}"
+    );
+
+    let finished = agent.wait_for_update("the tool call finishing", |update| {
+        update["sessionUpdate"] == "tool_call_update"
+            && update["toolCallId"] == "call_1"
+            && update["status"] == "completed"
+    });
+
+    // The command runs between the two updates. If the turn blocked the
+    // connection's actors, both would only reach the client once it had
+    // already finished, and the editor would never draw a spinner.
+    assert!(
+        in_progress_at.elapsed() >= Duration::from_millis(1_000),
+        "in_progress arrived only {:?} before completed — the client had no \
+         window to show progress in. `{command}` said: {}",
+        in_progress_at.elapsed(),
+        finished["rawOutput"]
+    );
+
+    let response = agent.wait_for_response(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);

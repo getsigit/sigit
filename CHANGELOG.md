@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.5.6
+
+### What changed
+
+- **Switching models mid-conversation no longer restarts it.** Both switching
+  to a local GGUF model and picking a different cloud tier now carry the live
+  conversation history across, repairing any half-finished tool call so
+  strict OpenAI-compatible endpoints don't reject the session
+- **Long-running tools now show progress in ACP clients.** Synchronous tools
+  (shell commands, file operations, `read_website`, ...) run on a blocking
+  thread pool instead of the ACP connection's own task, so a slow command's
+  `in_progress` update reaches the client — and Zed's spinner — while the
+  command is still running instead of arriving with the result
+- **Text from consecutive tool rounds no longer runs together.** ACP and
+  headless clients concatenate consecutive message chunks, so a reply that
+  continued after a tool call used to glue onto the previous round's last
+  sentence with no space. A blank line now opens the next round's text
+- **New onde-cloud model tiers.** The model picker (`/models` in the TUI, the
+  config panel in editors) now offers five additional siGit Code Cloud tiers —
+  `flux`, `apex`, `aura`, `orbit`, and `nova` — alongside the existing Fast,
+  Balanced, Large, Mini, Air, Pro, and KKK options. The tier list mirrors
+  onde-cloud's router catalogue, so all three sides (the picker, the router,
+  and the cloud catalogue) have to be updated together when a tier is added
+- **MCP Registry listing moved to `getsigit/si`.** The `server.json` manifest
+  and its `release-mcp-registry.yml` publish workflow now live in the
+  [`getsigit/si`](https://github.com/getsigit/si) repo alongside the si CLI's
+  other code, since the registry entry describes the si platform rather than
+  the coding agent
+
 ## 1.5.5
 
 A distribution release. siGit Code itself is unchanged. What moved is how it
