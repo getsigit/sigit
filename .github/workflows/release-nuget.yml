@@ -10,6 +10,14 @@ on:
         description: "Release tag (e.g. v1.5.2)"
         required: true
 
+concurrency:
+  # A re-pushed or re-dispatched tag fires this a second time. Queue the
+  # duplicate behind the original instead of cancelling it: cancelling a run
+  # mid-publish can leave a channel half-uploaded, whereas a queued duplicate
+  # just hits the "already published" check and exits clean.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -288,12 +296,35 @@ jobs:
         shell: bash
         run: |
           package_index_url="https://api.nuget.org/v3-flatcontainer/sigit.code/index.json"
-          if curl -fsS "${package_index_url}" | grep -F "\"${RELEASE_VERSION}\"" >/dev/null; then
-            echo "${NUGET_PACKAGE_ID} ${RELEASE_VERSION} already exists on NuGet, skipping publish"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+
+          # Keep the fetch and the version match separate. Piping curl into
+          # grep hides a failed fetch behind an empty match, so an outage or a
+          # blocked request would read as "not published yet" and send the
+          # publish below into a version that is already there. A 404 here
+          # means the package itself is not on NuGet, which is the first
+          # release and a real "not published".
+          index=$(mktemp)
+          STATUS=$(curl -sS -o "${index}" -w '%{http_code}' \
+            --retry 3 --retry-delay 2 --retry-all-errors "${package_index_url}")
+
+          case "$STATUS" in
+            200)
+              if grep -F "\"${RELEASE_VERSION}\"" "${index}" >/dev/null; then
+                echo "${NUGET_PACKAGE_ID} ${RELEASE_VERSION} already exists on NuGet, skipping publish"
+                echo "exists=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "exists=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            404)
+              echo "${NUGET_PACKAGE_ID} is not on NuGet yet, publishing its first version"
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected ${STATUS} from NuGet while checking whether ${NUGET_PACKAGE_ID} ${RELEASE_VERSION} is published" >&2
+              exit 1
+              ;;
+          esac
 
       # Exchange the workflow's OIDC token for a short-lived NuGet API key. The
       # key is written to the environment for the subsequent `dotnet nuget push`

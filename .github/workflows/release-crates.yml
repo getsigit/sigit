@@ -10,6 +10,14 @@ on:
         description: "Release tag (e.g. v1.0.2)"
         required: true
 
+concurrency:
+  # A re-pushed or re-dispatched tag fires this a second time. Queue the
+  # duplicate behind the original instead of cancelling it: cancelling a run
+  # mid-publish can leave a channel half-uploaded, whereas a queued duplicate
+  # just hits the "already published" check and exits clean.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -56,12 +64,32 @@ jobs:
             print(next(p['version'] for p in pkgs if p['name']=='sigit'))")
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-          if curl -fsS "https://crates.io/api/v1/crates/sigit/${VERSION}" >/dev/null 2>&1; then
-            echo "sigit ${VERSION} already exists on crates.io, skipping publish"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          # crates.io answers 403 to requests without a descriptive
+          # User-Agent, so curl's default one makes this look like a 404 and
+          # the publish below runs into "crate already exists on the index".
+          # Branch on the status code rather than on curl's exit status, so an
+          # answer we do not understand stops the job instead of quietly
+          # degrading into that same failure.
+          # Retry first, so a timeout or a 5xx costs a few seconds instead of
+          # the whole release.
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --retry 3 --retry-delay 2 --retry-all-errors \
+            -H "User-Agent: ${GITHUB_REPOSITORY} release workflow (https://github.com/${GITHUB_REPOSITORY})" \
+            "https://crates.io/api/v1/crates/sigit/${VERSION}")
+
+          case "$STATUS" in
+            200)
+              echo "sigit ${VERSION} already exists on crates.io, skipping publish"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected ${STATUS} from crates.io while checking whether sigit ${VERSION} is published" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Publish to crates.io
         if: steps.crates-check.outputs.exists != 'true'
