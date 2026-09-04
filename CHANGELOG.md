@@ -17,6 +17,17 @@
   headless clients concatenate consecutive message chunks, so a reply that
   continued after a tool call used to glue onto the previous round's last
   sentence with no space. A blank line now opens the next round's text
+- **New onde-cloud model tiers.** The model picker (`/models` in the TUI, the
+  config panel in editors) now offers five additional siGit Code Cloud tiers —
+  `flux`, `apex`, `aura`, `orbit`, and `nova` — alongside the existing Fast,
+  Balanced, Large, Mini, Air, Pro, and KKK options. The tier list mirrors
+  onde-cloud's router catalogue, so all three sides (the picker, the router,
+  and the cloud catalogue) have to be updated together when a tier is added
+- **MCP Registry listing moved to `getsigit/si`.** The `server.json` manifest
+  and its `release-mcp-registry.yml` publish workflow now live in the
+  [`getsigit/si`](https://github.com/getsigit/si) repo alongside the si CLI's
+  other code, since the registry entry describes the si platform rather than
+  the coding agent
 
 ## 1.5.5
 
