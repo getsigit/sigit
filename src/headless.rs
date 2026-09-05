@@ -31,8 +31,8 @@ use crate::{permissions, provider, session_store, settings, tools};
 /// live under this key, so a follow-up feature can resume it.
 pub const HEADLESS_SESSION: &str = "headless";
 
-pub const USAGE: &str = "Usage: sigit -p \"<prompt>\" [--cwd <dir>] [--quiet] \
-                         [--allow-tool <name>]... [--deny-tool <name>]...";
+pub const USAGE: &str = "Usage: sigit -p \"<prompt>\" [--cwd <dir>] [--add-dir <dir>]... \
+                         [--quiet] [--allow-tool <name>]... [--deny-tool <name>]...";
 
 /// Parsed `sigit -p` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,9 @@ pub struct HeadlessConfig {
     /// Working directory to enter before anything loads (instruction files and
     /// project-local MCP config then resolve from it).
     pub cwd: Option<PathBuf>,
+    /// Extra project roots beyond `cwd`, the headless counterpart of a
+    /// multi-root project in the editor (see `workspace.rs`).
+    pub add_dirs: Vec<PathBuf>,
     /// Print only the final assistant message to stdout (no streaming).
     pub quiet: bool,
     /// Tools pre-approved for the run (fed to `permissions::grant_for_session`).
@@ -62,6 +65,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
 
     let mut prompt: Option<String> = None;
     let mut cwd: Option<PathBuf> = None;
+    let mut add_dirs: Vec<PathBuf> = Vec::new();
     let mut quiet = false;
     let mut allow_tools: Vec<String> = Vec::new();
     let mut deny_tools: Vec<String> = Vec::new();
@@ -83,6 +87,12 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
                     .next()
                     .ok_or_else(|| "--cwd requires a directory argument".to_string())?;
                 cwd = Some(PathBuf::from(value));
+            }
+            "--add-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--add-dir requires a directory argument".to_string())?;
+                add_dirs.push(PathBuf::from(value));
             }
             "--quiet" => quiet = true,
             "--allow-tool" => {
@@ -111,6 +121,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
     Ok(Some(HeadlessConfig {
         prompt,
         cwd,
+        add_dirs,
         quiet,
         allow_tools,
         deny_tools,
@@ -138,8 +149,8 @@ fn deny_flag_denial(tool_name: &str) -> String {
 
 /// Run one headless prompt to completion. Returns the process exit code.
 ///
-/// The caller (`main`) has already applied `--cwd`, initialized logging to
-/// stderr, set up the model cache, and run MCP discovery.
+/// The caller (`main`) has already applied `--cwd` and `--add-dir`, initialized
+/// logging to stderr, set up the model cache, and run MCP discovery.
 pub async fn run(config: HeadlessConfig) -> i32 {
     // Fresh permission state for the run, then apply the flag grants.
     permissions::reset_session(HEADLESS_SESSION);
@@ -186,7 +197,10 @@ pub async fn run(config: HeadlessConfig) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut system_prompt = crate::system_prompt_for_model(true).to_string();
     system_prompt.push_str("\n\n");
-    system_prompt.push_str(&crate::session_context_message(&cwd));
+    system_prompt.push_str(&crate::session_context_message(
+        &cwd,
+        &crate::workspace::additional_roots(),
+    ));
 
     let backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
         cfg.base_url,
@@ -417,6 +431,29 @@ mod tests {
         assert!(config.quiet);
         assert_eq!(config.allow_tools, vec!["run_command", "edit_file"]);
         assert_eq!(config.deny_tools, vec!["delete_file"]);
+    }
+
+    #[test]
+    fn add_dir_is_repeatable_and_keeps_its_order() {
+        let config = parse_args(&args(&[
+            "-p",
+            "look around",
+            "--add-dir",
+            "/tmp/lib",
+            "--add-dir",
+            "/tmp/docs",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config.add_dirs,
+            vec![PathBuf::from("/tmp/lib"), PathBuf::from("/tmp/docs")]
+        );
+    }
+
+    #[test]
+    fn add_dir_without_a_value_is_a_usage_error() {
+        assert!(parse_args(&args(&["-p", "x", "--add-dir"])).is_err());
     }
 
     #[test]

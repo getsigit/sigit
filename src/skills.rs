@@ -192,10 +192,11 @@ pub fn discover_skills() -> Vec<Skill> {
 fn skill_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
-    // Project-local skills win over user-global ones.
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd.join(".sigit").join("skills"));
-        roots.push(cwd.join(".claude").join("skills"));
+    // Project-local roots win over user-global ones. A multi-root project has
+    // more than one of them (see `workspace.rs`), ordered primary root first.
+    for dir in crate::workspace::project_dirs() {
+        roots.push(dir.join(".sigit").join("skills"));
+        roots.push(dir.join(".claude").join("skills"));
     }
 
     // User-global siGit config dir (honours SIGIT_CONFIG_DIR).
