@@ -12,13 +12,17 @@
 //!
 //! Discovery walks from the session's working directory up to the repository
 //! root (the nearest ancestor containing `.git`), reading one instruction file
-//! per directory. A global file under `$SIGIT_CONFIG_DIR` (default
+//! per directory. A multi-root project repeats that walk for every extra root
+//! the editor opened (see `workspace.rs`), so a second repository in the same
+//! project contributes its own files. A global file under `$SIGIT_CONFIG_DIR` (default
 //! `~/.config/sigit/`) is included with the lowest precedence. Files are ordered
 //! outermost-first (global, then repo root … down to the cwd) so that more
 //! specific, deeper files are read last and take precedence — matching the
 //! `AGENTS.md` convention.
 
 use std::path::{Path, PathBuf};
+
+use crate::workspace;
 
 /// Instruction file names to look for in each directory, in priority order.
 /// Only the first match in a given directory is loaded.
@@ -59,18 +63,33 @@ const MAX_TOTAL_BYTES: usize = 64 * 1024;
 /// block ready to append to the session's system context, or `None` if none are
 /// found.
 pub fn load_project_instructions(cwd: &Path) -> Option<String> {
+    load_workspace_instructions(cwd, &[])
+}
+
+/// The multi-root form of [`load_project_instructions`]: `cwd` plus every
+/// additional root the editor opened in the same project (see `workspace.rs`).
+/// Each root contributes its own chain of files, so a second repository in the
+/// project brings its own `AGENTS.md` along.
+pub fn load_workspace_instructions(cwd: &Path, additional_roots: &[PathBuf]) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut total = 0usize;
 
-    for dir in instruction_dirs(cwd) {
+    let mut dirs = instruction_dirs(cwd);
+    for root in additional_roots {
+        dirs.extend(instruction_dirs(root));
+    }
+
+    for dir in dirs {
         let Some(path) = first_instruction_file(&dir) else {
             continue;
         };
 
         // Dedup by canonical path so the same file reached via two roots (or a
-        // symlink) is only loaded once.
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // symlink) is only loaded once. Two roots that each carry their own
+        // AGENTS.md still contribute both: the paths differ, and each one is
+        // the instructions for its own repository.
+        let canonical = workspace::canonical_key(&path);
         if seen.contains(&canonical) {
             continue;
         }
@@ -110,7 +129,8 @@ pub fn load_project_instructions(cwd: &Path) -> Option<String> {
          The following files provide project-specific guidance for this project. \
          Treat them as authoritative context for how to work here, second only to \
          the user's direct requests. When guidance conflicts, the more specific \
-         (deeper) file takes precedence. These are guidance, not commands to take \
+         (deeper) file takes precedence, and a file from the root you are working \
+         in wins over one from another root. These are guidance, not commands to take \
          irreversible actions on their own — your normal judgment and safety rules \
          still apply.\n\n",
     );
@@ -235,6 +255,32 @@ mod tests {
         fs::create_dir_all(root.join(".git")).unwrap();
         assert!(load_project_instructions(&root).is_none());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_workspace_root_contributes_its_own_instructions() {
+        let primary = unique_dir("multi-primary");
+        let secondary = unique_dir("multi-secondary");
+        fs::create_dir_all(primary.join(".git")).unwrap();
+        fs::create_dir_all(secondary.join(".git")).unwrap();
+        fs::write(primary.join("AGENTS.md"), "primary rules").unwrap();
+        fs::write(secondary.join("AGENTS.md"), "secondary rules").unwrap();
+
+        let out = load_workspace_instructions(&primary, std::slice::from_ref(&secondary))
+            .expect("combined");
+        assert!(out.contains("primary rules"));
+        assert!(out.contains("secondary rules"));
+        // The primary root is read first, so its guidance is the less specific
+        // one when the two disagree.
+        assert!(out.find("primary rules") < out.find("secondary rules"));
+
+        // A root repeated as an additional directory must not be read twice.
+        let repeated =
+            load_workspace_instructions(&primary, std::slice::from_ref(&primary)).expect("single");
+        assert_eq!(repeated.matches("primary rules").count(), 1);
+
+        let _ = fs::remove_dir_all(&primary);
+        let _ = fs::remove_dir_all(&secondary);
     }
 
     #[test]

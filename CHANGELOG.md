@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### What changed
+
+- **Multi-root projects now work in the editor.** When a client opens several
+  directories in one project, ACP sends the extra ones as
+  `additionalDirectories` — but only to an agent that says it wants them, which
+  siGit never did, so Zed kept the first root and showed a banner saying
+  multi-root workspaces were unsupported. The capability is now advertised at
+  `initialize`, and the directories that arrive are no longer logged and thrown
+  away. All the roots are now part of the session: the model is told about each
+  one, every root's `AGENTS.md` / `CLAUDE.md` is loaded, and skills, slash
+  commands, and subagent types are discovered from all of them (primary root
+  first, so it still wins name collisions). `/status` lists the roots when
+  there is more than one, and headless runs take the same thing as repeatable
+  `--add-dir <dir>` flags. MCP servers are the exception: discovery happens
+  once at startup, before a session exists, so a second root's `.sigit/mcp.toml`
+  is not picked up
+
 ### Fixed
 
 - **A refused turn now shows the endpoint's own message.** siGit pasted the
