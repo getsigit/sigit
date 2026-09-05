@@ -3166,7 +3166,14 @@ mod tests {
         // COMMAND_OUTPUT_LIMIT, so the result is truncated; the point of the
         // test is that the command finishes at all.
         let line = "x".repeat(199);
+        // ~400 KB, well past any platform's pipe buffer. It also crosses
+        // COMMAND_OUTPUT_LIMIT, so the result is truncated; the point of the
+        // test is that the command finishes at all.
+        #[cfg(unix)]
         let command = format!("for i in $(seq 1 2000); do echo {line}; done");
+        // cmd has no seq; echo is a builtin so 2000 iterations stay fast.
+        #[cfg(windows)]
+        let command = format!("for /L %i in (1,1,2000) do @echo {line}");
         let args = json!({"command": command, "cwd": dir.to_str().unwrap()}).to_string();
 
         let started = std::time::Instant::now();
