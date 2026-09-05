@@ -48,6 +48,7 @@ mod setup;
 mod skills;
 mod subagents;
 mod tools;
+mod workspace;
 
 /// Serializes tests that mutate process-global state: env vars
 /// (`SIGIT_CONFIG_DIR` etc.) and the current directory. `cargo test` runs
@@ -74,9 +75,9 @@ use agent_client_protocol::schema::v1::{
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
@@ -351,19 +352,41 @@ const CLOUD_LOGIN_PROMPT: &str = "siGit Code Cloud needs an account. Sign in wit
     `/login <email> <password>` (or the Authenticate button), then pick the tier again. \
     Create an account at https://sigit.si.";
 
-/// The per-session context system message: cwd guidance plus any project
-/// instruction files (`AGENTS.md` / `CLAUDE.md`) found for that directory. Used
-/// by every session entry point so on-device and cloud backends get the same
-/// always-on project context.
-fn session_context_message(cwd: &std::path::Path) -> String {
-    let mut message = format!(
-        "The user's project working directory is {}. \
-         Always use absolute paths under this directory for all file \
-         and directory operations. This is the root of the project \
-         the user has open in their editor.",
-        cwd.display()
-    );
-    if let Some(project_instructions) = instructions::load_project_instructions(cwd) {
+/// The per-session context system message: root-directory guidance plus any
+/// project instruction files (`AGENTS.md` / `CLAUDE.md`) found for those roots.
+/// Used by every session entry point so on-device and cloud backends get the
+/// same always-on project context.
+///
+/// `additional_roots` is empty for an ordinary project and non-empty for a
+/// multi-root one, where the editor opened several directories at once (see
+/// `workspace.rs`).
+fn session_context_message(cwd: &std::path::Path, additional_roots: &[PathBuf]) -> String {
+    let mut message = if additional_roots.is_empty() {
+        format!(
+            "The user's project working directory is {}. \
+             Always use absolute paths under this directory for all file \
+             and directory operations. This is the root of the project \
+             the user has open in their editor.",
+            cwd.display()
+        )
+    } else {
+        let mut roots = format!("- {} (primary)", cwd.display());
+        for root in additional_roots {
+            roots.push_str(&format!("\n- {}", root.display()));
+        }
+        format!(
+            "The user has a multi-root project open in their editor, with these \
+             root directories:\n{roots}\n\
+             All of them are in scope: read, search and edit files in any of them. \
+             Always use absolute paths for file and directory operations, since a \
+             relative path resolves against the primary root only. When the user \
+             names a file without saying which root it is in, look for it in each \
+             root before asking."
+        )
+    };
+    if let Some(project_instructions) =
+        instructions::load_workspace_instructions(cwd, additional_roots)
+    {
         message.push_str("\n\n");
         message.push_str(&project_instructions);
     }
@@ -1028,7 +1051,7 @@ impl SiGitAgent {
         if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
             self.engine
                 .push_history(onde::inference::ChatMessage::system(
-                    session_context_message(&cwd),
+                    session_context_message(&cwd, &workspace::additional_roots()),
                 ))
                 .await;
         }
@@ -1070,8 +1093,14 @@ impl SiGitAgent {
                 AgentCapabilities::default()
                     .load_session(true)
                     .session_capabilities(
-                        SessionCapabilities::new().fork(SessionForkCapabilities::new()),
-                    ),
+                    SessionCapabilities::new()
+                        .fork(SessionForkCapabilities::new())
+                        // Without this, a client that has several directories
+                        // open never sends the extra ones: Zed drops every root
+                        // but the first and tells the user the agent has no
+                        // multi-root support. See `workspace.rs`.
+                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
+                ),
             )
             .meta(initialize_meta()))
     }
@@ -1123,6 +1152,25 @@ impl SiGitAgent {
         }
     }
 
+    /// Record the session's roots and move the process into the primary one.
+    ///
+    /// The editor sends `cwd` plus, for a multi-root project, the other
+    /// directories it has open. Tool calls may use relative paths, so the
+    /// process follows `cwd`; the extra roots go to `workspace`, which is where
+    /// project-local discovery picks them up. Returns the roots that were kept.
+    fn enter_session_roots(&self, cwd: &std::path::Path, additional: &[PathBuf]) -> Vec<PathBuf> {
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(cwd.to_path_buf());
+        }
+        let additional_roots = workspace::set_additional_roots(cwd, additional);
+        if cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", cwd.display());
+        }
+        additional_roots
+    }
+
     async fn handle_load_session(
         &self,
         cx: &ConnectionTo<Client>,
@@ -1138,28 +1186,19 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        if let Ok(mut guard) = self.session_cwd.lock() {
-            *guard = Some(args.cwd.clone());
-        }
+        let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
 
         // A session boundary: grants and plan mode from the previous life of
         // this session id must not carry over — and since one shared engine
         // means one live conversation, state for every other id is dead too.
         permissions::reset_all();
 
-        // tool calls use relative paths, so we need to match the editor's cwd
-        if args.cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(&args.cwd)
-        {
-            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-        }
-
         // start from a clean slate; a stored session (below) replaces it
         self.engine.clear_history().await;
 
         self.engine
             .push_history(onde::inference::ChatMessage::system(
-                session_context_message(&args.cwd),
+                session_context_message(&args.cwd, &additional_roots),
             ))
             .await;
 
@@ -1215,21 +1254,14 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        if let Ok(mut guard) = self.session_cwd.lock() {
-            *guard = Some(args.cwd.clone());
-        }
-        if args.cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(&args.cwd)
-        {
-            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-        }
+        let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
 
         // no persistence, so fork == fresh session
         self.engine.clear_history().await;
 
         self.engine
             .push_history(onde::inference::ChatMessage::system(
-                session_context_message(&args.cwd),
+                session_context_message(&args.cwd, &additional_roots),
             ))
             .await;
 
@@ -1270,20 +1302,13 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        if let Ok(mut guard) = self.session_cwd.lock() {
-            *guard = Some(args.cwd.clone());
-        }
-        if args.cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(&args.cwd)
-        {
-            log::warn!("could not set cwd to {}: {err}", args.cwd.display());
-        }
+        let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
 
         self.engine.clear_history().await;
 
         self.engine
             .push_history(onde::inference::ChatMessage::system(
-                session_context_message(&args.cwd),
+                session_context_message(&args.cwd, &additional_roots),
             ))
             .await;
 
@@ -1878,7 +1903,10 @@ impl SiGitAgent {
         // gets at session load, so the cloud model shares the same project context.
         if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
             system_prompt.push_str("\n\n");
-            system_prompt.push_str(&session_context_message(&cwd));
+            system_prompt.push_str(&session_context_message(
+                &cwd,
+                &workspace::additional_roots(),
+            ));
         }
         let cloud_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
             cfg.base_url,
@@ -2762,16 +2790,26 @@ async fn exec_slash_acp(
             let info = agent.engine.info().await;
             let model = info.model_name.as_deref().unwrap_or("(none)");
             let memory = info.approx_memory.as_deref().unwrap_or("unknown");
-            agent
-                .send_assistant_message(
-                    cx,
-                    session_id,
-                    format!(
-                        "status: {:?}  model: {}  memory: {}  history: {} turns",
-                        info.status, model, memory, info.history_length,
-                    ),
-                )
-                .ok();
+            let mut report = format!(
+                "status: {:?}  model: {}  memory: {}  history: {} turns",
+                info.status, model, memory, info.history_length,
+            );
+            // Only worth a line when the project has more than one root —
+            // otherwise it just repeats what the editor already shows.
+            let extra_roots = workspace::additional_roots();
+            if !extra_roots.is_empty() {
+                let cwd = agent
+                    .session_cwd
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                report.push_str(&format!("\nproject roots: {} (primary)", cwd.display()));
+                for root in &extra_roots {
+                    report.push_str(&format!(", {}", root.display()));
+                }
+            }
+            agent.send_assistant_message(cx, session_id, report).ok();
         }
         SlashCommand::Models(None) => {
             let current_model = agent.current_model.lock().unwrap().clone();
@@ -3619,6 +3657,21 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("sigit: cannot use --cwd {}: {error}", dir.display());
                 std::process::exit(2);
             }
+            // --add-dir is the headless form of a multi-root project: extra
+            // roots that project-local discovery scans alongside the cwd.
+            if !config.add_dirs.is_empty() {
+                for dir in &config.add_dirs {
+                    if !dir.is_dir() {
+                        eprintln!(
+                            "sigit: cannot use --add-dir {}: not a directory",
+                            dir.display()
+                        );
+                        std::process::exit(2);
+                    }
+                }
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                workspace::set_additional_roots(&cwd, &config.add_dirs);
+            }
             setup::setup_shared_model_cache();
             // Best-effort MCP discovery (incl. the official server), like the
             // other entry points, so MCP tools are offered to the model.
@@ -3668,6 +3721,24 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_context_message_lists_every_root_of_a_multi_root_project() {
+        let primary = PathBuf::from("/tmp/primary");
+        let secondary = PathBuf::from("/tmp/secondary");
+
+        let single = session_context_message(&primary, &[]);
+        assert!(single.contains("/tmp/primary"));
+        assert!(!single.contains("multi-root"));
+
+        let multi = session_context_message(&primary, &[secondary]);
+        assert!(multi.contains("multi-root"));
+        assert!(multi.contains("/tmp/primary (primary)"));
+        assert!(multi.contains("/tmp/secondary"));
+        // Relative paths only resolve against the primary root, so the model is
+        // told to address the others absolutely.
+        assert!(multi.contains("absolute paths"));
+    }
 
     #[test]
     fn streamed_reply_sends_each_fragment_as_it_is_revealed() {
