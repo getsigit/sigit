@@ -10,14 +10,27 @@
   siGit never did, so Zed kept the first root and showed a banner saying
   multi-root workspaces were unsupported. The capability is now advertised at
   `initialize`, and the directories that arrive are no longer logged and thrown
-  away. All the roots are now part of the
-  session: the model is told about each one, every root's `AGENTS.md` /
-  `CLAUDE.md` is loaded, and skills, slash commands, and subagent types are
-  discovered from all of them (primary root first, so it still wins name
-  collisions). `/status` lists the roots when there is more than one, and
-  headless runs take the same thing as repeatable `--add-dir <dir>` flags.
-  MCP servers are the exception: discovery happens once at startup, before a
-  session exists, so a second root's `.sigit/mcp.toml` is not picked up
+  away. All the roots are now part of the session: the model is told about each
+  one, every root's `AGENTS.md` / `CLAUDE.md` is loaded, and skills, slash
+  commands, and subagent types are discovered from all of them (primary root
+  first, so it still wins name collisions). `/status` lists the roots when
+  there is more than one, and headless runs take the same thing as repeatable
+  `--add-dir <dir>` flags. MCP servers are the exception: discovery happens
+  once at startup, before a session exists, so a second root's `.sigit/mcp.toml`
+  is not picked up
+
+### Fixed
+
+- **A refused turn now shows the endpoint's own message.** siGit pasted the
+  status line and the raw JSON body into the editor's error banner, so a
+  billing or allowance message arrived wrapped in
+  `endpoint returned 429 Too Many Requests: {"error":{"message":…`. The message
+  the endpoint wrote is what the banner shows now; the status is only used when
+  there is no message to show
+- **An error that arrives mid-stream is no longer silent.** An endpoint that
+  fails after the response is already open reports it as a frame in the stream.
+  That frame carries no `choices`, so siGit parsed it as an empty chunk and
+  skipped it, and the turn ended as though the model had answered with nothing
 
 ## 1.5.6
 

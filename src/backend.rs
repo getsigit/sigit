@@ -478,8 +478,8 @@ impl OpenAiBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let detail = response.text().await.unwrap_or_default();
-            return Err(format!("endpoint returned {status}: {detail}"));
+            let body = response.text().await.unwrap_or_default();
+            return Err(describe_api_error(status, &body));
         }
 
         if let Some(sink) = sink {
@@ -558,6 +558,16 @@ impl OpenAiBackend {
                 }
                 if data.is_empty() {
                     continue;
+                }
+
+                // An endpoint that fails after the status line is already sent
+                // reports it in the stream instead, as an ordinary `data:`
+                // frame holding an error envelope. siGit Code Cloud does this
+                // when the upstream fails mid-turn. It has no `choices`, so
+                // without this it parses as an empty chunk and is skipped, and
+                // the turn ends looking like the model simply said nothing.
+                if let Some(message) = api_error_message(data) {
+                    return Err(message);
                 }
 
                 let chunk: StreamCompletion = match serde_json::from_str(data) {
@@ -778,6 +788,67 @@ impl InferenceBackend for OpenAiBackend {
     }
 }
 
+// ── OpenAI error shape ────────────────────────────────────────────────────────
+
+/// The OpenAI error envelope: `{"error": {"message": ..., "type": ...}}`.
+///
+/// Every endpoint siGit talks to speaks it, including siGit Code Cloud, whose
+/// messages are written for the person reading them ("Monthly siGit Code Cloud
+/// allowance reached..."). Worth unwrapping rather than pasting the raw body
+/// into the editor's error banner.
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorBody {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// How much of an unparseable error body to keep. An endpoint behind a proxy
+/// can answer with a full HTML page, and the whole thing ends up in the
+/// editor's error banner.
+const ERROR_BODY_LIMIT: usize = 500;
+
+/// Turn an error response into something worth showing a person.
+///
+/// The endpoint's own message wins when there is one: it is written for the
+/// user, and the status code repeats what it already says. Anything else falls
+/// back to the status plus whatever the body held, which is all there is to go
+/// on.
+fn describe_api_error(status: reqwest::StatusCode, body: &str) -> String {
+    if let Some(message) = api_error_message(body) {
+        return message;
+    }
+
+    let body = body.trim();
+    if body.is_empty() {
+        return format!("endpoint returned {status}");
+    }
+
+    let mut detail = body;
+    if detail.len() > ERROR_BODY_LIMIT {
+        let mut cut = ERROR_BODY_LIMIT;
+        while !detail.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        detail = &detail[..cut];
+        return format!("endpoint returned {status}: {detail}…");
+    }
+    format!("endpoint returned {status}: {detail}")
+}
+
+/// The human-readable message out of an OpenAI error envelope, if the body is
+/// one and carries a non-empty message.
+fn api_error_message(body: &str) -> Option<String> {
+    let envelope: ApiErrorEnvelope = serde_json::from_str(body).ok()?;
+    let message = envelope.error.message?;
+    let message = message.trim();
+    (!message.is_empty()).then(|| message.to_string())
+}
+
 // ── OpenAI response shapes ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -966,6 +1037,59 @@ pub async fn adopt_carryover(backend: &dyn InferenceBackend, carried: Vec<serde_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case from the issue: the endpoint says something a person can act
+    /// on, and the status code and JSON around it are noise.
+    #[test]
+    fn an_endpoints_own_message_is_what_the_user_sees() {
+        let body = r#"{"error":{"message":"Monthly siGit Code Cloud allowance reached. It resets at the start of your next billing period.","type":"server_error"}}"#;
+
+        let described = describe_api_error(reqwest::StatusCode::TOO_MANY_REQUESTS, body);
+
+        assert_eq!(
+            described,
+            "Monthly siGit Code Cloud allowance reached. \
+             It resets at the start of your next billing period."
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_an_error_envelope_keeps_the_status() {
+        let described =
+            describe_api_error(reqwest::StatusCode::BAD_GATEWAY, "<html>bad gateway</html>");
+
+        assert!(described.contains("502"), "{described}");
+        assert!(described.contains("bad gateway"), "{described}");
+    }
+
+    #[test]
+    fn an_empty_body_still_says_something() {
+        let described = describe_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "   ");
+
+        assert_eq!(described, "endpoint returned 500 Internal Server Error");
+    }
+
+    #[test]
+    fn an_oversized_body_is_cut_down() {
+        let body = "x".repeat(ERROR_BODY_LIMIT * 3);
+
+        let described = describe_api_error(reqwest::StatusCode::BAD_GATEWAY, &body);
+
+        assert!(described.len() < ERROR_BODY_LIMIT + 100, "{described}");
+        assert!(described.ends_with('…'), "{described}");
+    }
+
+    /// An envelope with nothing useful in it must not shadow the status, which
+    /// would leave the user with an empty error.
+    #[test]
+    fn an_envelope_with_a_blank_message_falls_back() {
+        let described = describe_api_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"  "}}"#,
+        );
+
+        assert!(described.contains("403"), "{described}");
+    }
 
     #[test]
     fn tools_json_wraps_function_schema() {

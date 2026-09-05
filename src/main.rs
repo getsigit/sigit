@@ -1561,7 +1561,11 @@ impl SiGitAgent {
             .await
             .map_err(|error| {
                 log::error!("send_message_with_tools failed: {error}");
-                agent_client_protocol::Error::new(-32603, format!("inference failed: {error}"))
+                // Verbatim, no prefix: the backend has already turned this into
+                // something worth reading (see `describe_api_error`), and it is
+                // what the editor puts in its error banner. The context a
+                // prefix would add is in the log line above.
+                agent_client_protocol::Error::new(-32603, error)
             })?;
 
         let mut round = 0;
@@ -1759,7 +1763,10 @@ impl SiGitAgent {
                     &mut reply,
                 )
                 .await
-                .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
+                .map_err(|error| {
+                    log::error!("send_tool_results failed: {error}");
+                    agent_client_protocol::Error::new(-32603, error)
+                })?;
         }
 
         // ── Final text response ───────────────────────────────────────────

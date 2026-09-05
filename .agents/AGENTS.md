@@ -116,7 +116,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   smbCloud, and stay general otherwise).
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
   `ToolResult`, `TurnResult`). Two impls: `LocalBackend` (on-device via `onde::ChatEngine`) and
-  `OpenAiBackend` (any OpenAI-compatible HTTP endpoint).
+  `OpenAiBackend` (any OpenAI-compatible HTTP endpoint). A `BackendError` is user-facing: the
+  ACP prompt handler passes it to the client verbatim and the editor puts it in an error banner,
+  so `describe_api_error` unwraps the OpenAI `{"error":{"message":…}}` envelope and shows that
+  message on its own, falling back to the status only when there is nothing to unwrap. An
+  endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
+  the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
+  explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
