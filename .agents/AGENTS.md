@@ -126,7 +126,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
   `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
-  unless the commit already exists on a remote, which is never rewritten. Also owns the `task`
+  unless the commit already exists on a remote, which is never rewritten. Every child process it
+  spawns (`spawn_shell`, the `git` helpers, and `hooks.rs`) sets `stdin` to null and never
+  inherits it: in ACP mode sigit's stdin is the JSON-RPC pipe from the editor, so a command that
+  reads stdin both blocks forever and eats the client's next request, wedging the session past
+  any timeout. On Unix the shell also leads its own process group so the timeout kills the whole
+  tree, and stdout/stderr are drained on threads while the command runs — waiting first and
+  reading after deadlocks as soon as the output outgrows the pipe buffer. Also owns the `task`
   tool: a nested agent loop in a fresh conversation, offered only when `subagent_available()`
   (a subagent factory is registered — see `register_subagent_factory_for` in `main.rs`; on-device
   registers a `None`-returning factory since onde has a single shared history). A subagent's

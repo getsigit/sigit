@@ -10,14 +10,33 @@
   siGit never did, so Zed kept the first root and showed a banner saying
   multi-root workspaces were unsupported. The capability is now advertised at
   `initialize`, and the directories that arrive are no longer logged and thrown
-  away. All the roots are now part of the
-  session: the model is told about each one, every root's `AGENTS.md` /
-  `CLAUDE.md` is loaded, and skills, slash commands, and subagent types are
-  discovered from all of them (primary root first, so it still wins name
-  collisions). `/status` lists the roots when there is more than one, and
-  headless runs take the same thing as repeatable `--add-dir <dir>` flags.
-  MCP servers are the exception: discovery happens once at startup, before a
-  session exists, so a second root's `.sigit/mcp.toml` is not picked up
+  away. All the roots are now part of the session: the model is told about each
+  one, every root's `AGENTS.md` / `CLAUDE.md` is loaded, and skills, slash
+  commands, and subagent types are discovered from all of them (primary root
+  first, so it still wins name collisions). `/status` lists the roots when
+  there is more than one, and headless runs take the same thing as repeatable
+  `--add-dir <dir>` flags. MCP servers are the exception: discovery happens
+  once at startup, before a session exists, so a second root's `.sigit/mcp.toml`
+  is not picked up
+
+### Fixed
+
+- **A shell command can no longer wedge the editor session.** Tool commands
+  inherited siGit's own stdin, which in ACP mode is the JSON-RPC pipe from the
+  editor. A command that read stdin — a signing passphrase prompt, a pager, a
+  `git` credential ask — blocked on it and consumed the client's next request
+  out of the pipe, so nothing typed afterwards ever reached the agent and the
+  session stayed dead past the command timeout. Commands, hooks, and the
+  co-author `git` helpers now run with stdin closed, so a command that wants
+  input gets EOF and reports an error instead
+- **A command that prints a lot no longer stalls for two minutes.**
+  `run_command` waited for the command to exit before reading its output, so
+  anything past the pipe buffer (a build, a verbose test run) blocked writing
+  while siGit blocked waiting, until the 120-second timeout killed it. Output
+  is now drained while the command runs
+- **The command timeout now stops the whole command.** It killed only the
+  shell, leaving anything that shell had started running and unreaped; it now
+  kills the process group
 
 ## 1.5.6
 
