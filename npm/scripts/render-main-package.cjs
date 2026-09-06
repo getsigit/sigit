@@ -3,10 +3,13 @@
 const fs = require("fs");
 const path = require("path");
 
-const [outputPath, version] = process.argv.slice(2);
+const [outputPath, version, templateName = "package-main.json.tmpl"] =
+  process.argv.slice(2);
 
 if (!outputPath || !version) {
-  throw new Error("Usage: render-main-package.cjs <output-path> <version>");
+  throw new Error(
+    "Usage: render-main-package.cjs <output-path> <version> [template-name]",
+  );
 }
 
 const npmRoot = path.resolve(__dirname, "..");
@@ -25,10 +28,8 @@ function interpolate(template, variables) {
   });
 }
 
-// Read and interpolate package-main.json.tmpl
-const template = fs.readFileSync(
-  path.join(npmRoot, "package-main.json.tmpl"),
-  "utf-8",
-);
+// Read and interpolate the requested template: package-main.json.tmpl for
+// @getsigit/sigit, package-compat.json.tmpl for the @smbcloud/sigit copy.
+const template = fs.readFileSync(path.join(npmRoot, templateName), "utf-8");
 
 fs.writeFileSync(path.resolve(outputPath), interpolate(template, vars));
