@@ -37,6 +37,16 @@
 - **The command timeout now stops the whole command.** It killed only the
   shell, leaving anything that shell had started running and unreaped; it now
   kills the process group
+- **A refused turn now shows the endpoint's own message.** siGit pasted the
+  status line and the raw JSON body into the editor's error banner, so a
+  billing or allowance message arrived wrapped in
+  `endpoint returned 429 Too Many Requests: {"error":{"message":…`. The message
+  the endpoint wrote is what the banner shows now; the status is only used when
+  there is no message to show
+- **An error that arrives mid-stream is no longer silent.** An endpoint that
+  fails after the response is already open reports it as a frame in the stream.
+  That frame carries no `choices`, so siGit parsed it as an empty chunk and
+  skipped it, and the turn ended as though the model had answered with nothing
 
 ## 1.5.6
 
