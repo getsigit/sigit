@@ -116,7 +116,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   smbCloud, and stay general otherwise).
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
   `ToolResult`, `TurnResult`). Two impls: `LocalBackend` (on-device via `onde::ChatEngine`) and
-  `OpenAiBackend` (any OpenAI-compatible HTTP endpoint).
+  `OpenAiBackend` (any OpenAI-compatible HTTP endpoint). A `BackendError` is user-facing: the
+  ACP prompt handler passes it to the client verbatim and the editor puts it in an error banner,
+  so `describe_api_error` unwraps the OpenAI `{"error":{"message":…}}` envelope and shows that
+  message on its own, falling back to the status only when there is nothing to unwrap. An
+  endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
+  the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
+  explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
@@ -126,7 +132,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
   `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
-  unless the commit already exists on a remote, which is never rewritten. Also owns the `task`
+  unless the commit already exists on a remote, which is never rewritten. Every child process it
+  spawns (`spawn_shell`, the `git` helpers, and `hooks.rs`) sets `stdin` to null and never
+  inherits it: in ACP mode sigit's stdin is the JSON-RPC pipe from the editor, so a command that
+  reads stdin both blocks forever and eats the client's next request, wedging the session past
+  any timeout. On Unix the shell also leads its own process group so the timeout kills the whole
+  tree, and stdout/stderr are drained on threads while the command runs — waiting first and
+  reading after deadlocks as soon as the output outgrows the pipe buffer. Also owns the `task`
   tool: a nested agent loop in a fresh conversation, offered only when `subagent_available()`
   (a subagent factory is registered — see `register_subagent_factory_for` in `main.rs`; on-device
   registers a `None`-returning factory since onde has a single shared history). A subagent's

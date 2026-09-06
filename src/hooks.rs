@@ -198,6 +198,9 @@ fn run_hook(cmd: &str, context: &HookContext, cwd: &Path, timeout: Duration) {
         .arg(&substituted)
         .current_dir(cwd)
         .envs(context.env_vars())
+        // Never the agent's stdin: in ACP mode that is the JSON-RPC pipe from
+        // the editor, and a hook reading it swallows the client's next request.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Put the hook in its own process group so a timeout kill can take out the
