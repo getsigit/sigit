@@ -283,19 +283,22 @@ impl AgentUnderTest {
         }
     }
 
-    fn wait_for_prompt_updates(&mut self, id: u64) -> (Value, Vec<Value>) {
+    fn wait_for_response_with_updates(&mut self, id: u64) -> (Value, Vec<Value>) {
         let mut updates = Vec::new();
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let Ok(message) = self.incoming.recv_timeout(remaining) else {
-                panic!("timed out waiting for the prompt response");
+                panic!("timed out waiting for response to request {id}");
             };
             if message["method"] == "session/update" {
                 updates.push(message["params"]["update"].clone());
             }
             if message["id"] == id && message.get("method").is_none() {
-                assert!(message.get("error").is_none(), "prompt failed: {message}");
+                assert!(
+                    message.get("error").is_none(),
+                    "request {id} failed: {message}"
+                );
                 return (message, updates);
             }
         }
@@ -445,6 +448,107 @@ fn permission_round_trip_cancel_then_allow() {
             .unwrap_or_default()
             .contains("sigit-approved"),
         "the approved command's output should reach the endpoint: {result}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn successful_config_option_changes_are_rendered_as_system_status_cards() {
+    let endpoint = start_fake_endpoint(vec![]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_config_messages_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(
+        config_dir.join("credentials.toml"),
+        "access_token = \"tok_test\"\nemail = \"dev@sigit.si\"\n",
+    )
+    .unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-local-inference",
+            "value": "local-inference-off",
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(id);
+    assert!(
+        response["result"]["configOptions"].is_array(),
+        "config response should refresh picker options: {response}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "agent_message_chunk"),
+        "Local Inference picker changes are passive UI state, not chat text: {updates:?}"
+    );
+    let status = updates
+        .iter()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call"
+                && update["kind"] == "think"
+                && update["status"] == "completed"
+        })
+        .expect("Local Inference change should render as a system-style status card");
+    assert_eq!(
+        status["title"],
+        "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
+    );
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-model",
+            "value": "sigit-cloud:mini",
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(id);
+    assert!(
+        response["result"]["configOptions"].is_array(),
+        "config response should refresh picker options: {response}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "agent_message_chunk"),
+        "successful model picker changes must not be rendered as assistant chat text: {updates:?}"
+    );
+    let status = updates
+        .iter()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call"
+                && update["kind"] == "think"
+                && update["status"] == "completed"
+        })
+        .expect("cloud tier change should render as a system-style status card");
+    assert!(
+        status["title"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Switched to siGit Code Cloud"),
+        "unexpected cloud switch status title: {status}"
     );
 
     drop(agent);
@@ -726,7 +830,7 @@ fn write_todos_reaches_the_client_as_an_acp_plan() {
             "prompt": [{"type": "text", "text": "fix the ACP display"}],
         }),
     );
-    let (response, updates) = agent.wait_for_prompt_updates(prompt_id);
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
     assert_eq!(response["result"]["stopReason"], "end_turn");
 
     let plan = updates
@@ -796,7 +900,7 @@ fn write_todos_with_an_unknown_status_still_reaches_the_client() {
             "prompt": [{"type": "text", "text": "plan the work"}],
         }),
     );
-    let (_response, updates) = agent.wait_for_prompt_updates(prompt_id);
+    let (_response, updates) = agent.wait_for_response_with_updates(prompt_id);
 
     let plan = updates
         .iter()
@@ -847,7 +951,7 @@ fn unconvertible_write_todos_falls_back_to_a_tool_call_card() {
             "prompt": [{"type": "text", "text": "plan the work"}],
         }),
     );
-    let (_response, updates) = agent.wait_for_prompt_updates(prompt_id);
+    let (_response, updates) = agent.wait_for_response_with_updates(prompt_id);
 
     assert!(
         !updates

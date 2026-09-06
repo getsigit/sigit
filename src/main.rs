@@ -849,6 +849,25 @@ impl SiGitAgent {
         ))
     }
 
+    fn send_system_status(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        title: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::ToolCall(
+                ToolCall::new(
+                    format!("system-status-{}", uuid::Uuid::new_v4()),
+                    title.into(),
+                )
+                .kind(ToolKind::Think)
+                .status(ToolCallStatus::Completed),
+            ),
+        ))
+    }
+
     /// Run one inference turn (`fut`) while concurrently forwarding any streamed
     /// tokens to the editor. The sink receiver is drained as the future runs, so
     /// chunks reach the client live rather than all at once when it resolves.
@@ -2162,7 +2181,7 @@ impl SiGitAgent {
             } else {
                 "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
             };
-            self.send_assistant_message(cx, args.session_id.clone(), format!("\n\n{message}"))
+            self.send_system_status(cx, args.session_id.clone(), message)
                 .ok();
             // Rebuild so the Model picker reflects the new emphasis/order.
             let current = self.current_model.lock().unwrap().clone();
@@ -2217,15 +2236,27 @@ impl SiGitAgent {
 
         // ── siGit Code Cloud tier: no local load; sign-in gated ─────────────
         if let Some(tier) = model_id.strip_prefix("sigit-cloud:") {
-            let message = match self.switch_to_cloud_tier(tier).await {
-                Some(display_name) => format!("Switched to {display_name}."),
-                None => CLOUD_LOGIN_PROMPT.to_string(),
-            };
-            // Start on a fresh line: ACP clients concatenate consecutive
-            // agent-message chunks into one block, so without this the switch
-            // confirmation runs onto the end of the previous assistant message.
-            self.send_assistant_message(cx, args.session_id.clone(), format!("\n\n{message}"))
-                .ok();
+            match self.switch_to_cloud_tier(tier).await {
+                Some(display_name) => {
+                    self.send_system_status(
+                        cx,
+                        args.session_id.clone(),
+                        format!("Switched to {display_name}."),
+                    )
+                    .ok();
+                }
+                None => {
+                    // The picker response updates successful selections. When the
+                    // selection cannot apply because auth is missing, surface that
+                    // actionable state in the thread.
+                    self.send_assistant_message(
+                        cx,
+                        args.session_id.clone(),
+                        format!("\n\n{CLOUD_LOGIN_PROMPT}"),
+                    )
+                    .ok();
+                }
+            }
 
             let current = self.current_model.lock().unwrap().clone();
             let config_options = build_model_config_options(&current);
