@@ -271,8 +271,14 @@ Ok(ForkSessionResponse::new(new_id).config_options(config_options))
 per-session picker (see Config options below).
 
 The session requests carry `cwd: PathBuf` and (with the feature)
-`additional_directories: Vec<PathBuf>`. siGit stashes `cwd`, `set_current_dir`s
-to it, and pushes a system message telling the model to use absolute paths under it.
+`additional_directories: Vec<PathBuf>` — the other directories of a multi-root
+project, sent only to an agent whose `initialize` reply carries
+`SessionCapabilities::new().additional_directories(SessionAdditionalDirectoriesCapabilities::new())`. `SiGitAgent::enter_session_roots` stashes `cwd`, `set_current_dir`s to
+it, hands the extras to `workspace::set_additional_roots`, and returns the ones
+that survived (a root that isn't a directory, repeats, or just names `cwd` again
+is dropped). `session_context_message` then names every root in the system
+message, and project-local discovery — skills, slash commands, subagent types,
+instruction files — scans all of them, primary root first.
 
 ### `PromptRequest` / blocks
 
@@ -555,8 +561,17 @@ Editor                                Agent
 10. **Zed re-fires the last config selection on connect** — make
     `setConfigOption` a no-op when the requested model is already active, and
     never start a model switch while a startup load is still in flight (GPU OOM).
-11. **Store `SessionId` as `SessionId`**, not `String`, so `==` is clean.
-12. **`SetSessionConfigOptionResponse::new(config_options)`** — the response
+11. **`additional_directories` is not decoration** — dropping it means a
+    multi-root project silently behaves as if only the first root existed, with
+    the other repositories' `AGENTS.md` and skills missing. Route it through
+    `workspace.rs`, not just the log line. Handling it is also only half the
+    job: Zed gates the field on
+    `agentCapabilities.sessionCapabilities.additionalDirectories` being present
+    in the `initialize` reply, so an agent that reads the field but never
+    advertises the capability is never sent one, and the user gets a banner
+    saying the agent has no multi-root support.
+12. **Store `SessionId` as `SessionId`**, not `String`, so `==` is clean.
+13. **`SetSessionConfigOptionResponse::new(config_options)`** — the response
     carries the *rebuilt* options so the picker reflects the new current value.
 
 ---

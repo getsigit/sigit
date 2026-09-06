@@ -116,7 +116,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   smbCloud, and stay general otherwise).
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
   `ToolResult`, `TurnResult`). Two impls: `LocalBackend` (on-device via `onde::ChatEngine`) and
-  `OpenAiBackend` (any OpenAI-compatible HTTP endpoint).
+  `OpenAiBackend` (any OpenAI-compatible HTTP endpoint). A `BackendError` is user-facing: the
+  ACP prompt handler passes it to the client verbatim and the editor puts it in an error banner,
+  so `describe_api_error` unwraps the OpenAI `{"error":{"message":…}}` envelope and shows that
+  message on its own, falling back to the status only when there is nothing to unwrap. An
+  endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
+  the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
+  explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
@@ -126,7 +132,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
   `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
-  unless the commit already exists on a remote, which is never rewritten. Also owns the `task`
+  unless the commit already exists on a remote, which is never rewritten. Every child process it
+  spawns (`spawn_shell`, the `git` helpers, and `hooks.rs`) sets `stdin` to null and never
+  inherits it: in ACP mode sigit's stdin is the JSON-RPC pipe from the editor, so a command that
+  reads stdin both blocks forever and eats the client's next request, wedging the session past
+  any timeout. On Unix the shell also leads its own process group so the timeout kills the whole
+  tree, and stdout/stderr are drained on threads while the command runs — waiting first and
+  reading after deadlocks as soon as the output outgrows the pipe buffer. Also owns the `task`
   tool: a nested agent loop in a fresh conversation, offered only when `subagent_available()`
   (a subagent factory is registered — see `register_subagent_factory_for` in `main.rs`; on-device
   registers a `None`-returning factory since onde has a single shared history). A subagent's
@@ -145,7 +157,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   HTTP/JSON-RPC implementation.
 - **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
-  instructions) from `.sigit/skills/` and `.claude/skills/` in the cwd, `$SIGIT_CONFIG_DIR/skills/`,
+  instructions) from `.sigit/skills/` and `.claude/skills/` in every project root (see `src/workspace.rs`),
+  `$SIGIT_CONFIG_DIR/skills/`,
   and `~/.claude/skills/`. Progressive disclosure: the discovery list (name + description) is
   baked into the dynamically-built `skill` tool's description, and activating a skill (the model
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
@@ -153,7 +166,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   and only when at least one skill exists.
 - **`src/commands.rs`** — user-defined slash commands. Discovers Markdown files (each an
   optional YAML frontmatter block — `description`, `argument-hint` — followed by a prompt-template
-  body) from `.sigit/commands/` and `.claude/commands/` in the cwd, `$SIGIT_CONFIG_DIR/commands/`,
+  body) from `.sigit/commands/` and `.claude/commands/` in every project root, `$SIGIT_CONFIG_DIR/commands/`,
   and `~/.claude/commands/`. A subdirectory namespaces the command with `:`
   (`.sigit/commands/git/commit.md` → `/git:commit`). Unlike skills there's no tool-call
   indirection: invoking one works exactly like the built-in `/init` — `commands::render`
@@ -167,7 +180,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/subagents.rs`** — configurable subagent types for the `task` tool. Discovers Markdown
   files (YAML frontmatter `name` + `description`, optional comma-separated `tools:` allow-list,
   then a Markdown body that becomes the subagent's system prompt) from `.sigit/agents/` and
-  `.claude/agents/` in the cwd, `$SIGIT_CONFIG_DIR/agents/`, and `~/.claude/agents/`. Passing a
+  `.claude/agents/` in every project root, `$SIGIT_CONFIG_DIR/agents/`, and `~/.claude/agents/`. Passing a
   type's `name` as `task`'s `subagent_type` argument swaps in that system prompt and, if `tools:`
   is set, narrows the offered toolset to its *intersection* with `SUBAGENT_TOOL_NAMES` — the
   security-relevant narrowing logic lives in `tools.rs` next to that constant, not here; this
@@ -218,9 +231,22 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
   plus a global file under `$SIGIT_CONFIG_DIR`. Files are ordered outermost-first so the deepest
-  (most specific) wins. The combined block is injected via `session_context_message` in `main.rs`
-  — pushed as a system message at every ACP session entry point (new/load/fork + model switch)
-  and appended to the system prompt on the cloud and TUI-startup paths.
+  (most specific) wins. In a multi-root project that walk is repeated for every root
+  (`load_workspace_instructions`). The combined block is injected via `session_context_message`
+  in `main.rs` — pushed as a system message at every ACP session entry point (new/load/fork +
+  model switch) and appended to the system prompt on the cloud and TUI-startup paths.
+- **`src/workspace.rs`** — the directories the session treats as project roots. An editor can
+  open several at once (Zed calls it a multi-root project) and ACP carries the extras as
+  `additional_directories` on every session request; the headless CLI takes them as repeatable
+  `--add-dir` flags. A client only sends those extras to an agent that advertises
+  `sessionCapabilities.additionalDirectories` in its `initialize` reply, so that capability in
+  `handle_initialize` is what makes the rest of this reachable — without it Zed keeps the first
+  root, drops the others, and shows "This agent doesn't currently support multi-root workspaces".
+  The process still has one working directory, so the extra roots live in a
+  process-global here and `project_dirs()` returns cwd-first, extras after. Project-local
+  discovery reads it: skills, slash commands, subagent types, and instruction files all scan
+  every root. MCP is deliberately not on that list — `mcp::init` runs once at startup, before
+  any session exists, so a second root's `.sigit/mcp.toml` has nobody to tell.
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
 - **`src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
@@ -300,6 +326,14 @@ Every release asset now carries a `.sha256` sidecar, not just the macOS Homebrew
 winget, and the AUR PKGBUILD each need one, and they consume the raw binaries rather than the
 tarball. `release-github` also builds a `.deb` and `.rpm` per Linux target with nfpm
 (`packaging/nfpm.yaml`), packaging the already-built binary rather than re-invoking cargo.
+
+Re-pushing a tag fires every release workflow a second time, so each one is grouped by tag in a
+`concurrency` block with `cancel-in-progress: false` — the duplicate queues behind the original
+rather than interrupting a publish that is halfway through uploading. What keeps the queued run
+from going red is the "is this version already published?" check each publishing workflow does
+before it uploads. Those checks are load-bearing, not belt-and-braces: v1.5.6 published twice
+because the crates.io one asked the API with curl's default User-Agent, which crates.io answers
+with a 403, which read as "not published yet".
 
 Three of these need credentials or a one-time manual step before they work:
 

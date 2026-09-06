@@ -104,10 +104,11 @@ pub fn format_agent_types_list() -> String {
 fn agent_type_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
-    // Project-local types win over user-global ones.
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd.join(".sigit").join("agents"));
-        roots.push(cwd.join(".claude").join("agents"));
+    // Project-local roots win over user-global ones. A multi-root project has
+    // more than one of them (see `workspace.rs`), ordered primary root first.
+    for dir in crate::workspace::project_dirs() {
+        roots.push(dir.join(".sigit").join("agents"));
+        roots.push(dir.join(".claude").join("agents"));
     }
 
     // User-global siGit config dir (honours SIGIT_CONFIG_DIR).

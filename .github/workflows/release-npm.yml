@@ -10,6 +10,14 @@ on:
         description: "Release tag (e.g. v0.1.1)"
         required: true
 
+concurrency:
+  # A re-pushed or re-dispatched tag fires this a second time. Queue the
+  # duplicate behind the original instead of cancelling it: cancelling a run
+  # mid-publish can leave a channel half-uploaded, whereas a queued duplicate
+  # just hits the "already published" check and exits clean.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   id-token: write
   contents: read
@@ -108,8 +116,10 @@ jobs:
         shell: bash
         run: npm install -g npm@latest
 
-      # Authentication is OIDC: each @getsigit/* package has a Trusted
-      # Publisher pointing at this workflow, so there is no token to leak.
+      # Authentication is OIDC: each @getsigit/* and @smbcloud/* package has a
+      # Trusted Publisher pointing at this workflow, so there is no token to
+      # leak. @smbcloud is the pre-1.5.5 scope, published alongside @getsigit
+      # so that an install made before the rename keeps updating.
       - name: Publish platform package to NPM
         shell: bash
         run: |
@@ -141,13 +151,6 @@ jobs:
           # Create the package directory
           mkdir -p "${node_pkg}/bin"
 
-          # Generate package.json + README for this platform slice
-          node ./scripts/render-platform-package.cjs \
-            "${node_pkg}" \
-            "${node_version}" \
-            "${node_os}" \
-            "${node_arch}"
-
           # Windows binaries carry a .exe extension
           if [ "${{ matrix.build.OS }}" = "windows-2022" ]; then
             cargo_bin="${cargo_bin}.exe"
@@ -155,18 +158,36 @@ jobs:
 
           cp "../target/${{ matrix.build.TARGET }}/release/${cargo_bin}" "${node_pkg}/bin"
 
-          cd "${node_pkg}"
+          # One binary, published under both scopes: re-render package.json and
+          # README for each, from the same directory.
+          for scope in "@getsigit" "@smbcloud"; do
+            node ./scripts/render-platform-package.cjs \
+              "${node_pkg}" \
+              "${node_version}" \
+              "${node_os}" \
+              "${node_arch}" \
+              "${scope}"
 
-          npm_package_name="@getsigit/${node_pkg}"
-          if npm view "${npm_package_name}@${node_version}" version >/dev/null 2>&1; then
-            echo "${npm_package_name}@${node_version} already exists on npm, skipping publish"
-            exit 0
-          fi
+            npm_package_name="${scope}/${node_pkg}"
 
-          npm publish --access public
+            # `npm view` exits non-zero both when the version is genuinely
+            # unpublished and when the registry could not be reached, so treat
+            # only an E404 as "not published yet". Anything else stops the job
+            # instead of publishing over a version that is already there.
+            if view_output=$(npm view "${npm_package_name}@${node_version}" version 2>&1); then
+              echo "${npm_package_name}@${node_version} already exists on npm, skipping publish"
+              continue
+            elif ! grep -q "E404" <<<"${view_output}"; then
+              echo "npm view failed while checking ${npm_package_name}@${node_version}:" >&2
+              echo "${view_output}" >&2
+              exit 1
+            fi
+
+            (cd "${node_pkg}" && npm publish --access public)
+          done
 
   publish-npm-base:
-    name: Publish base NPM package (@getsigit/sigit)
+    name: Publish base NPM packages (@getsigit/sigit, @smbcloud/sigit)
     needs: publish-npm-binaries
     runs-on: ubuntu-latest
 
@@ -200,25 +221,47 @@ jobs:
         shell: bash
         run: npm install -g npm@latest
 
-      - name: Publish base package to NPM
+      - name: Publish base packages to NPM
         shell: bash
         run: |
           cd npm/sigit
 
-          # Rewrite package.json with the correct release version and
-          # matching optionalDependency versions
-          node ../scripts/render-main-package.cjs \
-            "./package.json" \
-            "${{ env.RELEASE_VERSION }}"
-
-          npm_package_name="@getsigit/sigit"
           npm_package_version="${{ env.RELEASE_VERSION }}"
 
-          if npm view "${npm_package_name}@${npm_package_version}" version >/dev/null 2>&1; then
-            echo "${npm_package_name}@${npm_package_version} already exists on npm, skipping publish"
-            exit 0
-          fi
+          # Rewrite package.json with the correct release version and matching
+          # optionalDependency versions, then build. The compiled launcher is
+          # scope-agnostic — it reads its own package.json at runtime to decide
+          # which scope to resolve the platform binary from — so both packages
+          # ship the same lib/ and it only needs building once.
+          node ../scripts/render-main-package.cjs \
+            "./package.json" \
+            "${npm_package_version}"
 
           npm install
           npm run build
-          npm publish --access public
+
+          # @getsigit/sigit is the canonical package; @smbcloud/sigit is the
+          # pre-1.5.5 name, kept publishing so installs predating the rename
+          # keep updating. Its template points optionalDependencies at the
+          # @smbcloud platform packages.
+          for template in "package-main.json.tmpl" "package-compat.json.tmpl"; do
+            node ../scripts/render-main-package.cjs \
+              "./package.json" \
+              "${npm_package_version}" \
+              "${template}"
+
+            npm_package_name=$(node -p "require('./package.json').name")
+
+            # Same E404-only reading as the platform packages above: a registry
+            # failure must not look like an unpublished version.
+            if view_output=$(npm view "${npm_package_name}@${npm_package_version}" version 2>&1); then
+              echo "${npm_package_name}@${npm_package_version} already exists on npm, skipping publish"
+              continue
+            elif ! grep -q "E404" <<<"${view_output}"; then
+              echo "npm view failed while checking ${npm_package_name}@${npm_package_version}:" >&2
+              echo "${view_output}" >&2
+              exit 1
+            fi
+
+            npm publish --access public
+          done

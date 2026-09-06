@@ -10,6 +10,14 @@ on:
         description: "Release tag (e.g. v0.1.1)"
         required: true
 
+concurrency:
+  # A re-pushed or re-dispatched tag fires this a second time. Queue the
+  # duplicate behind the original instead of cancelling it: cancelling a run
+  # mid-publish can leave a channel half-uploaded, whereas a queued duplicate
+  # just hits the "already published" check and exits clean.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   id-token: write
   contents: read
@@ -173,12 +181,27 @@ jobs:
         id: pypi-check
         shell: bash
         run: |
-          if curl -fsS "https://pypi.org/pypi/sigit-code/${RELEASE_VERSION}/json" >/dev/null 2>&1; then
-            echo "sigit-code ${RELEASE_VERSION} already exists on PyPI, skipping publish"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          # Branch on the status code rather than on curl's exit status: with
+          # -f every non-2xx answer looks alike, so a registry outage or a
+          # blocked request would read as "not published yet" and send the
+          # publish below into a version that is already there.
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --retry 3 --retry-delay 2 --retry-all-errors \
+            "https://pypi.org/pypi/sigit-code/${RELEASE_VERSION}/json")
+
+          case "$STATUS" in
+            200)
+              echo "sigit-code ${RELEASE_VERSION} already exists on PyPI, skipping publish"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected ${STATUS} from PyPI while checking whether sigit-code ${RELEASE_VERSION} is published" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Publish distribution
         if: steps.pypi-check.outputs.exists != 'true'

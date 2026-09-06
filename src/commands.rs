@@ -155,10 +155,11 @@ pub fn format_commands_list() -> String {
 fn command_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
-    // Project-local commands win over user-global ones.
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd.join(".sigit").join("commands"));
-        roots.push(cwd.join(".claude").join("commands"));
+    // Project-local roots win over user-global ones. A multi-root project has
+    // more than one of them (see `workspace.rs`), ordered primary root first.
+    for dir in crate::workspace::project_dirs() {
+        roots.push(dir.join(".sigit").join("commands"));
+        roots.push(dir.join(".claude").join("commands"));
     }
 
     // User-global siGit config dir (honours SIGIT_CONFIG_DIR).

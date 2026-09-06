@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.5.7
+
+### What changed
+
+- **`@smbcloud/sigit` gets releases again.** The npm scope moved to
+  `@getsigit` in 1.5.5 and the old package was left sitting on the registry at
+  1.5.2, so an install made before the rename went quiet — `npm update` had
+  nothing to give it and nothing said why. All seven packages now publish under
+  both scopes from the same build, so `@smbcloud/sigit` is a full install again
+  rather than a stub, with its own platform binaries and no dependency on the
+  new scope. It prints a line on stderr saying where the package moved to;
+  `SIGIT_SUPPRESS_SCOPE_NOTICE=1` turns that off. This is a migration path, not
+  a second home: `@getsigit/sigit` is what the docs, the Homebrew tap, and the
+  ACP registry entry point at, and it is the name to move to
+- **Multi-root projects now work in the editor.** When a client opens several
+  directories in one project, ACP sends the extra ones as
+  `additionalDirectories` — but only to an agent that says it wants them, which
+  siGit never did, so Zed kept the first root and showed a banner saying
+  multi-root workspaces were unsupported. The capability is now advertised at
+  `initialize`, and the directories that arrive are no longer logged and thrown
+  away. All the roots are now part of the session: the model is told about each
+  one, every root's `AGENTS.md` / `CLAUDE.md` is loaded, and skills, slash
+  commands, and subagent types are discovered from all of them (primary root
+  first, so it still wins name collisions). `/status` lists the roots when
+  there is more than one, and headless runs take the same thing as repeatable
+  `--add-dir <dir>` flags. MCP servers are the exception: discovery happens
+  once at startup, before a session exists, so a second root's `.sigit/mcp.toml`
+  is not picked up
+
+### Fixed
+
+- **A shell command can no longer wedge the editor session.** Tool commands
+  inherited siGit's own stdin, which in ACP mode is the JSON-RPC pipe from the
+  editor. A command that read stdin — a signing passphrase prompt, a pager, a
+  `git` credential ask — blocked on it and consumed the client's next request
+  out of the pipe, so nothing typed afterwards ever reached the agent and the
+  session stayed dead past the command timeout. Commands, hooks, and the
+  co-author `git` helpers now run with stdin closed, so a command that wants
+  input gets EOF and reports an error instead
+- **A command that prints a lot no longer stalls for two minutes.**
+  `run_command` waited for the command to exit before reading its output, so
+  anything past the pipe buffer (a build, a verbose test run) blocked writing
+  while siGit blocked waiting, until the 120-second timeout killed it. Output
+  is now drained while the command runs
+- **The command timeout now stops the whole command.** It killed only the
+  shell, leaving anything that shell had started running and unreaped; it now
+  kills the process group
+- **A refused turn now shows the endpoint's own message.** siGit pasted the
+  status line and the raw JSON body into the editor's error banner, so a
+  billing or allowance message arrived wrapped in
+  `endpoint returned 429 Too Many Requests: {"error":{"message":…`. The message
+  the endpoint wrote is what the banner shows now; the status is only used when
+  there is no message to show
+- **An error that arrives mid-stream is no longer silent.** An endpoint that
+  fails after the response is already open reports it as a frame in the stream.
+  That frame carries no `choices`, so siGit parsed it as an empty chunk and
+  skipped it, and the turn ended as though the model had answered with nothing
+
 ## 1.5.6
 
 ### What changed

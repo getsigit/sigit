@@ -20,6 +20,14 @@ on:
         description: "Release tag (e.g. v1.5.2)"
         required: true
 
+concurrency:
+  # A re-pushed or re-dispatched tag fires this a second time. Queue the
+  # duplicate behind the original instead of cancelling it: cancelling a run
+  # mid-publish can leave a channel half-uploaded, whereas a queued duplicate
+  # just hits the "already published" check and exits clean.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

@@ -3,12 +3,19 @@
 const fs = require("fs");
 const path = require("path");
 
-const [packageName, version, operatingSystem, architecture] =
-  process.argv.slice(2);
+const [
+  packageName,
+  version,
+  operatingSystem,
+  architecture,
+  // `@smbcloud` is the pre-1.5.5 scope, still published alongside `@getsigit`
+  // so installs made before the rename keep updating.
+  scope = "@getsigit",
+] = process.argv.slice(2);
 
 if (!packageName || !version || !operatingSystem || !architecture) {
   throw new Error(
-    "Usage: render-platform-package.cjs <package-name> <version> <os> <arch>",
+    "Usage: render-platform-package.cjs <package-name> <version> <os> <arch> [scope]",
   );
 }
 
@@ -19,6 +26,7 @@ fs.mkdirSync(packageDirectory, { recursive: true });
 
 // Variable map for template interpolation
 const vars = {
+  node_scope: scope,
   node_pkg: packageName,
   node_version: version,
   node_os: operatingSystem,
