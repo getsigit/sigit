@@ -1,9 +1,19 @@
 # Changelog
 
-## Unreleased
+## 1.5.7
 
 ### What changed
 
+- **`@smbcloud/sigit` gets releases again.** The npm scope moved to
+  `@getsigit` in 1.5.5 and the old package was left sitting on the registry at
+  1.5.2, so an install made before the rename went quiet — `npm update` had
+  nothing to give it and nothing said why. All seven packages now publish under
+  both scopes from the same build, so `@smbcloud/sigit` is a full install again
+  rather than a stub, with its own platform binaries and no dependency on the
+  new scope. It prints a line on stderr saying where the package moved to;
+  `SIGIT_SUPPRESS_SCOPE_NOTICE=1` turns that off. This is a migration path, not
+  a second home: `@getsigit/sigit` is what the docs, the Homebrew tap, and the
+  ACP registry entry point at, and it is the name to move to
 - **Multi-root projects now work in the editor.** When a client opens several
   directories in one project, ACP sends the extra ones as
   `additionalDirectories` — but only to an agent that says it wants them, which

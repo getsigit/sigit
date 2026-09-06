@@ -21,6 +21,14 @@ npm install -g @getsigit/sigit
 
 npm pulls in the right binary for your platform automatically.
 
+If you installed this before 1.5.5, you have it under its old name,
+`@smbcloud/sigit`. That name still gets every release, so nothing is broken,
+but `@getsigit/sigit` is the one to move to:
+
+```sh
+npm uninstall -g @smbcloud/sigit && npm install -g @getsigit/sigit
+```
+
 Supported targets:
 
 - macOS, Apple Silicon and Intel
