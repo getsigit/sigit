@@ -75,10 +75,11 @@ use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
@@ -346,6 +347,35 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
         "write_todos" => ToolKind::Think,
         _ => ToolKind::Other,
     }
+}
+
+fn todos_arguments_to_plan(arguments: &str) -> Option<Plan> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let todos = args.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(todos.len());
+    for todo in todos {
+        let content = todo.get("content")?.as_str()?.trim();
+        if content.is_empty() {
+            return None;
+        }
+        // Unknown and absent statuses both fall back to pending, matching how
+        // `exec_write_todos` renders them. The two have to agree: the executor
+        // reports success for an off-enum status, so rejecting the plan here
+        // would leave a stale list on screen while the model believes it
+        // reported progress.
+        let status = match todo.get("status").and_then(serde_json::Value::as_str) {
+            Some("completed") => PlanEntryStatus::Completed,
+            Some("in_progress") => PlanEntryStatus::InProgress,
+            _ => PlanEntryStatus::Pending,
+        };
+        entries.push(PlanEntry::new(content, PlanEntryPriority::Medium, status));
+    }
+
+    Some(Plan::new(entries))
 }
 
 /// Shown when a siGit Code Cloud tier is selected without a signed-in account.
@@ -874,6 +904,18 @@ impl SiGitAgent {
         update: SessionUpdate,
     ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(session_id, update))
+    }
+
+    fn send_plan_update(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        plan: Plan,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::Plan(plan),
+        ))
     }
 
     /// Advertise siGit's slash commands to the client. Editors like Zed parse
@@ -1609,29 +1651,42 @@ impl SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Model tool calls are agent actions in ACP too, not merely an
-                // implementation detail of the completion loop. Announce each
-                // one before it runs and close it afterwards so clients such as
-                // Zed can render activity while the next inference round is in
-                // flight. Previously only model loading emitted ToolCall events,
-                // leaving an otherwise working tool round visually indistinct
-                // from a stalled response.
-                let raw_input: serde_json::Value = serde_json::from_str(&tc.arguments)
-                    .unwrap_or_else(|e| {
-                        log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
-                        serde_json::Value::String(tc.arguments.clone())
-                    });
-                self.send_tool_call_update(
-                    cx,
-                    session_id.clone(),
-                    SessionUpdate::ToolCall(
-                        ToolCall::new(tc.id.clone(), tc.name.clone())
-                            .kind(tool_kind_for(&tc.name))
-                            .status(ToolCallStatus::InProgress)
-                            .raw_input(raw_input),
-                    ),
-                )
-                .ok();
+                // Only treat the call as a plan once its arguments have actually
+                // produced one. Keying off the tool name alone means a
+                // `write_todos` the converter rejects sends no plan *and* skips
+                // the tool-call card below, so the call disappears from the
+                // client while the model is told the list was updated.
+                let plan = (tc.name == "write_todos")
+                    .then(|| todos_arguments_to_plan(&tc.arguments))
+                    .flatten();
+                let render_as_plan = plan.is_some();
+                if let Some(plan) = plan {
+                    self.send_plan_update(cx, session_id.clone(), plan).ok();
+                } else {
+                    // Model tool calls are agent actions in ACP too, not merely an
+                    // implementation detail of the completion loop. Announce each
+                    // one before it runs and close it afterwards so clients such as
+                    // Zed can render activity while the next inference round is in
+                    // flight. Previously only model loading emitted ToolCall events,
+                    // leaving an otherwise working tool round visually indistinct
+                    // from a stalled response.
+                    let raw_input: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .unwrap_or_else(|e| {
+                            log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
+                            serde_json::Value::String(tc.arguments.clone())
+                        });
+                    self.send_tool_call_update(
+                        cx,
+                        session_id.clone(),
+                        SessionUpdate::ToolCall(
+                            ToolCall::new(tc.id.clone(), tc.name.clone())
+                                .kind(tool_kind_for(&tc.name))
+                                .status(ToolCallStatus::InProgress)
+                                .raw_input(raw_input),
+                        ),
+                    )
+                    .ok();
+                }
 
                 let signature = format!("{}\n{}", tc.name, tc.arguments);
                 let repeat_count = repeated_tool_calls
@@ -1727,17 +1782,19 @@ impl SiGitAgent {
 
                 log::info!("  ← {} chars", output.len());
 
-                self.send_tool_call_update(
-                    cx,
-                    session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                        tc.id.clone(),
-                        ToolCallUpdateFields::new()
-                            .status(ToolCallStatus::Completed)
-                            .raw_output(serde_json::Value::String(output.clone())),
-                    )),
-                )
-                .ok();
+                if !render_as_plan {
+                    self.send_tool_call_update(
+                        cx,
+                        session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            tc.id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::Completed)
+                                .raw_output(serde_json::Value::String(output.clone())),
+                        )),
+                    )
+                    .ok();
+                }
 
                 tool_results.push(BackendToolResult {
                     tool_call_id: tc.id.clone(),
