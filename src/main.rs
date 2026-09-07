@@ -75,10 +75,11 @@ use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
@@ -346,6 +347,35 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
         "write_todos" => ToolKind::Think,
         _ => ToolKind::Other,
     }
+}
+
+fn todos_arguments_to_plan(arguments: &str) -> Option<Plan> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let todos = args.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(todos.len());
+    for todo in todos {
+        let content = todo.get("content")?.as_str()?.trim();
+        if content.is_empty() {
+            return None;
+        }
+        // Unknown and absent statuses both fall back to pending, matching how
+        // `exec_write_todos` renders them. The two have to agree: the executor
+        // reports success for an off-enum status, so rejecting the plan here
+        // would leave a stale list on screen while the model believes it
+        // reported progress.
+        let status = match todo.get("status").and_then(serde_json::Value::as_str) {
+            Some("completed") => PlanEntryStatus::Completed,
+            Some("in_progress") => PlanEntryStatus::InProgress,
+            _ => PlanEntryStatus::Pending,
+        };
+        entries.push(PlanEntry::new(content, PlanEntryPriority::Medium, status));
+    }
+
+    Some(Plan::new(entries))
 }
 
 /// Shown when a siGit Code Cloud tier is selected without a signed-in account.
@@ -819,6 +849,25 @@ impl SiGitAgent {
         ))
     }
 
+    fn send_system_status(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        title: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::ToolCall(
+                ToolCall::new(
+                    format!("system-status-{}", uuid::Uuid::new_v4()),
+                    title.into(),
+                )
+                .kind(ToolKind::Think)
+                .status(ToolCallStatus::Completed),
+            ),
+        ))
+    }
+
     /// Run one inference turn (`fut`) while concurrently forwarding any streamed
     /// tokens to the editor. The sink receiver is drained as the future runs, so
     /// chunks reach the client live rather than all at once when it resolves.
@@ -874,6 +923,18 @@ impl SiGitAgent {
         update: SessionUpdate,
     ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(session_id, update))
+    }
+
+    fn send_plan_update(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        plan: Plan,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::Plan(plan),
+        ))
     }
 
     /// Advertise siGit's slash commands to the client. Editors like Zed parse
@@ -1595,7 +1656,19 @@ impl SiGitAgent {
                         let after = backend::estimate_tokens(&backend.history_snapshot().await);
                         log::info!("prompt({}) compacted to ≈{} tokens", session_id, after);
                     }
-                    Err(error) => log::warn!("prompt({}) compaction failed: {error}", session_id),
+                    Err(error) => {
+                        log::warn!("prompt({}) compaction failed: {error}", session_id);
+                        self.send_assistant_message(
+                            cx,
+                            session_id,
+                            format!(
+                                "This session is too large, and siGit Code could not compact it: \
+                                 {error}. Start a new thread or run `/clear`, then retry."
+                            ),
+                        )
+                        .ok();
+                        return Ok(PromptResponse::new(StopReason::EndTurn));
+                    }
                 }
             }
 
@@ -1609,29 +1682,42 @@ impl SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
-                // Model tool calls are agent actions in ACP too, not merely an
-                // implementation detail of the completion loop. Announce each
-                // one before it runs and close it afterwards so clients such as
-                // Zed can render activity while the next inference round is in
-                // flight. Previously only model loading emitted ToolCall events,
-                // leaving an otherwise working tool round visually indistinct
-                // from a stalled response.
-                let raw_input: serde_json::Value = serde_json::from_str(&tc.arguments)
-                    .unwrap_or_else(|e| {
-                        log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
-                        serde_json::Value::String(tc.arguments.clone())
-                    });
-                self.send_tool_call_update(
-                    cx,
-                    session_id.clone(),
-                    SessionUpdate::ToolCall(
-                        ToolCall::new(tc.id.clone(), tc.name.clone())
-                            .kind(tool_kind_for(&tc.name))
-                            .status(ToolCallStatus::InProgress)
-                            .raw_input(raw_input),
-                    ),
-                )
-                .ok();
+                // Only treat the call as a plan once its arguments have actually
+                // produced one. Keying off the tool name alone means a
+                // `write_todos` the converter rejects sends no plan *and* skips
+                // the tool-call card below, so the call disappears from the
+                // client while the model is told the list was updated.
+                let plan = (tc.name == "write_todos")
+                    .then(|| todos_arguments_to_plan(&tc.arguments))
+                    .flatten();
+                let render_as_plan = plan.is_some();
+                if let Some(plan) = plan {
+                    self.send_plan_update(cx, session_id.clone(), plan).ok();
+                } else {
+                    // Model tool calls are agent actions in ACP too, not merely an
+                    // implementation detail of the completion loop. Announce each
+                    // one before it runs and close it afterwards so clients such as
+                    // Zed can render activity while the next inference round is in
+                    // flight. Previously only model loading emitted ToolCall events,
+                    // leaving an otherwise working tool round visually indistinct
+                    // from a stalled response.
+                    let raw_input: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .unwrap_or_else(|e| {
+                            log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
+                            serde_json::Value::String(tc.arguments.clone())
+                        });
+                    self.send_tool_call_update(
+                        cx,
+                        session_id.clone(),
+                        SessionUpdate::ToolCall(
+                            ToolCall::new(tc.id.clone(), tc.name.clone())
+                                .kind(tool_kind_for(&tc.name))
+                                .status(ToolCallStatus::InProgress)
+                                .raw_input(raw_input),
+                        ),
+                    )
+                    .ok();
+                }
 
                 let signature = format!("{}\n{}", tc.name, tc.arguments);
                 let repeat_count = repeated_tool_calls
@@ -1727,17 +1813,19 @@ impl SiGitAgent {
 
                 log::info!("  ← {} chars", output.len());
 
-                self.send_tool_call_update(
-                    cx,
-                    session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                        tc.id.clone(),
-                        ToolCallUpdateFields::new()
-                            .status(ToolCallStatus::Completed)
-                            .raw_output(serde_json::Value::String(output.clone())),
-                    )),
-                )
-                .ok();
+                if !render_as_plan {
+                    self.send_tool_call_update(
+                        cx,
+                        session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            tc.id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::Completed)
+                                .raw_output(serde_json::Value::String(output.clone())),
+                        )),
+                    )
+                    .ok();
+                }
 
                 tool_results.push(BackendToolResult {
                     tool_call_id: tc.id.clone(),
@@ -2093,7 +2181,7 @@ impl SiGitAgent {
             } else {
                 "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
             };
-            self.send_assistant_message(cx, args.session_id.clone(), format!("\n\n{message}"))
+            self.send_system_status(cx, args.session_id.clone(), message)
                 .ok();
             // Rebuild so the Model picker reflects the new emphasis/order.
             let current = self.current_model.lock().unwrap().clone();
@@ -2148,15 +2236,27 @@ impl SiGitAgent {
 
         // ── siGit Code Cloud tier: no local load; sign-in gated ─────────────
         if let Some(tier) = model_id.strip_prefix("sigit-cloud:") {
-            let message = match self.switch_to_cloud_tier(tier).await {
-                Some(display_name) => format!("Switched to {display_name}."),
-                None => CLOUD_LOGIN_PROMPT.to_string(),
-            };
-            // Start on a fresh line: ACP clients concatenate consecutive
-            // agent-message chunks into one block, so without this the switch
-            // confirmation runs onto the end of the previous assistant message.
-            self.send_assistant_message(cx, args.session_id.clone(), format!("\n\n{message}"))
-                .ok();
+            match self.switch_to_cloud_tier(tier).await {
+                Some(display_name) => {
+                    self.send_system_status(
+                        cx,
+                        args.session_id.clone(),
+                        format!("Switched to {display_name}."),
+                    )
+                    .ok();
+                }
+                None => {
+                    // The picker response updates successful selections. When the
+                    // selection cannot apply because auth is missing, surface that
+                    // actionable state in the thread.
+                    self.send_assistant_message(
+                        cx,
+                        args.session_id.clone(),
+                        format!("\n\n{CLOUD_LOGIN_PROMPT}"),
+                    )
+                    .ok();
+                }
+            }
 
             let current = self.current_model.lock().unwrap().clone();
             let config_options = build_model_config_options(&current);
@@ -2466,17 +2566,21 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
             if item.tool_calling {
                 desc_parts.push("tool calling".to_string());
             }
+            desc_parts.push(format!(
+                "{} context",
+                models::format_context_window_short(item.context_window_tokens)
+            ));
             desc_parts.push(item.description.clone());
             if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
                 desc_parts.push("download on select".to_string());
             }
             // ASCII-only for the same reason as the name (see `ascii_safe`).
             let description = ascii_safe(&desc_parts.join(" - "));
-            // Keep badges ASCII: Zed truncates the picker label at a fixed byte
-            // offset and panics if the cut splits a multi-byte char. See
-            // `ascii_safe` below.
+            // Keep labels short for the Zed bottom bar. Source/routing detail
+            // belongs in descriptions; the selected value is rendered without
+            // the config-option title, so repeated badges become visual noise.
             let source_badge = if item.cloud_tier.is_some() {
-                " [siGit Code Cloud]"
+                ""
             } else if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
                 " [Onde]"
             } else {
@@ -2486,15 +2590,17 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
                     _ => "",
                 }
             };
-            // For cloud tiers use just the tier title (e.g. "Balanced") so the
-            // label reads "Balanced [siGit Code Cloud]" instead of repeating the
-            // brand. The display name can carry non-ASCII (the cloud tier label
-            // is "siGit Code Cloud · Balanced"), so sanitize the whole label.
+            // For cloud tiers use just the tier title (e.g. "Balanced"). The
+            // display name can carry non-ASCII (the cloud tier label is
+            // "siGit Code Cloud · Balanced"), so sanitize the whole label.
             let base_name = match &item.cloud_tier {
                 Some(tier) => crate::provider::tier_title(tier),
                 None => item.display_name.clone(),
             };
-            let name = ascii_safe(&format!("{base_name}{source_badge}"));
+            let name = ascii_safe(&format!(
+                "{base_name} - {}{source_badge}",
+                models::format_context_window(item.context_window_tokens)
+            ));
             SessionConfigSelectOption::new(
                 SessionConfigValueId::new(item.config.model_id.as_str()),
                 name,
@@ -2514,18 +2620,18 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
     let local_options = vec![
         SessionConfigSelectOption::new(
             SessionConfigValueId::new(LOCAL_INFERENCE_ON),
-            "On (on-device)".to_string(),
+            "Local".to_string(),
         )
         .description("Run inference on-device; on-device models are highlighted".to_string()),
         SessionConfigSelectOption::new(
             SessionConfigValueId::new(LOCAL_INFERENCE_OFF),
-            "Off (siGit Code Cloud)".to_string(),
+            "Cloud".to_string(),
         )
         .description("Use siGit Code Cloud; cloud tiers are highlighted".to_string()),
     ];
     let local_option = SessionConfigOption::select(
         LOCAL_INFERENCE_CONFIG_ID,
-        "Local Inference",
+        "Inference",
         local_current,
         local_options,
     )
@@ -3885,5 +3991,53 @@ mod tests {
         for i in 0..=safe.len() {
             assert!(safe.is_char_boundary(i));
         }
+    }
+
+    #[test]
+    fn acp_config_option_labels_show_context_window() {
+        let current = GgufModelConfig {
+            model_id: "sigit-cloud:oke".to_string(),
+            files: Vec::new(),
+            tok_model_id: None,
+            display_name: provider::cloud_tier_label("oke"),
+            approx_memory: "Cloud".to_string(),
+            chat_template: None,
+        };
+        let options = serde_json::to_value(build_model_config_options(&current)).unwrap();
+        let all_options = options.as_array().expect("config options");
+
+        let model = all_options
+            .iter()
+            .find(|option| option["id"] == MODEL_CONFIG_ID)
+            .expect("model config option");
+        let model_names: Vec<&str> = model["options"]
+            .as_array()
+            .expect("model select options")
+            .iter()
+            .filter_map(|option| option["name"].as_str())
+            .collect();
+        assert!(model_names.contains(&"Oke - 200K ctx"));
+        assert!(
+            !model_names
+                .iter()
+                .any(|name| name.contains("siGit Code Cloud")),
+            "cloud branding belongs in descriptions, not selected-value labels: {model_names:?}"
+        );
+        assert!(
+            model_names.iter().all(|name| name.contains(" ctx")),
+            "every model option should expose its context window: {model_names:?}"
+        );
+
+        let inference = all_options
+            .iter()
+            .find(|option| option["id"] == LOCAL_INFERENCE_CONFIG_ID)
+            .expect("inference config option");
+        let inference_names: Vec<&str> = inference["options"]
+            .as_array()
+            .expect("inference select options")
+            .iter()
+            .filter_map(|option| option["name"].as_str())
+            .collect();
+        assert_eq!(inference_names, ["Local", "Cloud"]);
     }
 }
