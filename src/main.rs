@@ -2566,17 +2566,21 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
             if item.tool_calling {
                 desc_parts.push("tool calling".to_string());
             }
+            desc_parts.push(format!(
+                "{} context",
+                models::format_context_window_short(item.context_window_tokens)
+            ));
             desc_parts.push(item.description.clone());
             if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
                 desc_parts.push("download on select".to_string());
             }
             // ASCII-only for the same reason as the name (see `ascii_safe`).
             let description = ascii_safe(&desc_parts.join(" - "));
-            // Keep badges ASCII: Zed truncates the picker label at a fixed byte
-            // offset and panics if the cut splits a multi-byte char. See
-            // `ascii_safe` below.
+            // Keep labels short for the Zed bottom bar. Source/routing detail
+            // belongs in descriptions; the selected value is rendered without
+            // the config-option title, so repeated badges become visual noise.
             let source_badge = if item.cloud_tier.is_some() {
-                " [siGit Code Cloud]"
+                ""
             } else if item.cache_health == setup::ModelCacheHealth::NotDownloaded {
                 " [Onde]"
             } else {
@@ -2586,15 +2590,17 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
                     _ => "",
                 }
             };
-            // For cloud tiers use just the tier title (e.g. "Balanced") so the
-            // label reads "Balanced [siGit Code Cloud]" instead of repeating the
-            // brand. The display name can carry non-ASCII (the cloud tier label
-            // is "siGit Code Cloud · Balanced"), so sanitize the whole label.
+            // For cloud tiers use just the tier title (e.g. "Balanced"). The
+            // display name can carry non-ASCII (the cloud tier label is
+            // "siGit Code Cloud · Balanced"), so sanitize the whole label.
             let base_name = match &item.cloud_tier {
                 Some(tier) => crate::provider::tier_title(tier),
                 None => item.display_name.clone(),
             };
-            let name = ascii_safe(&format!("{base_name}{source_badge}"));
+            let name = ascii_safe(&format!(
+                "{base_name} - {}{source_badge}",
+                models::format_context_window(item.context_window_tokens)
+            ));
             SessionConfigSelectOption::new(
                 SessionConfigValueId::new(item.config.model_id.as_str()),
                 name,
@@ -2614,18 +2620,18 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
     let local_options = vec![
         SessionConfigSelectOption::new(
             SessionConfigValueId::new(LOCAL_INFERENCE_ON),
-            "On (on-device)".to_string(),
+            "Local".to_string(),
         )
         .description("Run inference on-device; on-device models are highlighted".to_string()),
         SessionConfigSelectOption::new(
             SessionConfigValueId::new(LOCAL_INFERENCE_OFF),
-            "Off (siGit Code Cloud)".to_string(),
+            "Cloud".to_string(),
         )
         .description("Use siGit Code Cloud; cloud tiers are highlighted".to_string()),
     ];
     let local_option = SessionConfigOption::select(
         LOCAL_INFERENCE_CONFIG_ID,
-        "Local Inference",
+        "Inference",
         local_current,
         local_options,
     )
@@ -3985,5 +3991,53 @@ mod tests {
         for i in 0..=safe.len() {
             assert!(safe.is_char_boundary(i));
         }
+    }
+
+    #[test]
+    fn acp_config_option_labels_show_context_window() {
+        let current = GgufModelConfig {
+            model_id: "sigit-cloud:oke".to_string(),
+            files: Vec::new(),
+            tok_model_id: None,
+            display_name: provider::cloud_tier_label("oke"),
+            approx_memory: "Cloud".to_string(),
+            chat_template: None,
+        };
+        let options = serde_json::to_value(build_model_config_options(&current)).unwrap();
+        let all_options = options.as_array().expect("config options");
+
+        let model = all_options
+            .iter()
+            .find(|option| option["id"] == MODEL_CONFIG_ID)
+            .expect("model config option");
+        let model_names: Vec<&str> = model["options"]
+            .as_array()
+            .expect("model select options")
+            .iter()
+            .filter_map(|option| option["name"].as_str())
+            .collect();
+        assert!(model_names.contains(&"Oke - 200K ctx"));
+        assert!(
+            !model_names
+                .iter()
+                .any(|name| name.contains("siGit Code Cloud")),
+            "cloud branding belongs in descriptions, not selected-value labels: {model_names:?}"
+        );
+        assert!(
+            model_names.iter().all(|name| name.contains(" ctx")),
+            "every model option should expose its context window: {model_names:?}"
+        );
+
+        let inference = all_options
+            .iter()
+            .find(|option| option["id"] == LOCAL_INFERENCE_CONFIG_ID)
+            .expect("inference config option");
+        let inference_names: Vec<&str> = inference["options"]
+            .as_array()
+            .expect("inference select options")
+            .iter()
+            .filter_map(|option| option["name"].as_str())
+            .collect();
+        assert_eq!(inference_names, ["Local", "Cloud"]);
     }
 }

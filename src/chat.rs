@@ -627,6 +627,9 @@ mod tui {
         StreamEnd,
         /// a complete (non-streamed) assistant reply
         Response(String),
+        /// estimated tokens the conversation now occupies; drives the context
+        /// gauge in the title bar. Sent after compaction and at end of turn.
+        ContextUsage(usize),
         Error(String),
         /// the inference task wants to run a mutating tool and is paused on
         /// `reply`; the user answers with y (once) / a (session) / n (deny)
@@ -760,6 +763,9 @@ mod tui {
         model_picker_items: Vec<ModelPickerItem>,
         current_model_name: String,
         tool_calling: bool,
+        /// Estimated tokens the conversation currently occupies, as of the last
+        /// completed turn. `None` until the first turn finishes.
+        context_tokens_used: Option<usize>,
         /// `/thinking` — expand the model's reasoning on rendered messages.
         /// Display-only: never changes what is sent to the model or saved.
         show_thinking: bool,
@@ -889,6 +895,7 @@ mod tui {
                 model_picker_items: items,
                 current_model_name,
                 tool_calling,
+                context_tokens_used: None,
                 show_thinking: false,
                 tools_expanded: false,
                 backend,
@@ -1007,6 +1014,24 @@ mod tui {
         fn thinking_frame(&self) -> &'static str {
             let idx = (self.thinking_tick as usize) % THINKING_FRAMES.len();
             THINKING_FRAMES[idx]
+        }
+
+        /// Context window of the model currently serving inference, falling back
+        /// to the compaction budget when the model isn't in the picker list
+        /// (e.g. a provider-supplied name we don't ship a config for).
+        ///
+        /// An env-configured provider names itself after its model id rather
+        /// than a catalogue display name, so match either. Getting this wrong
+        /// is silent: the gauge just divides by the wrong number.
+        fn context_window_tokens(&self) -> u64 {
+            self.model_picker_items
+                .iter()
+                .find(|item| {
+                    item.display_name == self.current_model_name
+                        || item.config.model_id == self.current_model_name
+                })
+                .map(|item| item.context_window_tokens)
+                .unwrap_or(crate::backend::DEFAULT_CONTEXT_TOKEN_BUDGET as u64)
         }
 
         fn tick(&mut self) {
@@ -1278,6 +1303,10 @@ mod tui {
                 ModelCacheHealth::NotDownloaded => "  ↓ download",
             };
             let current_badge = if current { "  ← current" } else { "" };
+            let context_badge = format!(
+                "  {}",
+                crate::models::format_context_window(item.context_window_tokens)
+            );
             let disabled_badge = match item.cache_health {
                 ModelCacheHealth::Complete | ModelCacheHealth::NotDownloaded => "",
                 ModelCacheHealth::Incomplete => "  (unselectable)",
@@ -1331,6 +1360,16 @@ mod tui {
                         Style::default().fg(Color::Black).bg(Color::Green)
                     } else {
                         Style::default().fg(Color::Green).bg(Color::Black)
+                    },
+                ),
+                Span::styled(
+                    context_badge,
+                    if selected {
+                        Style::default().fg(Color::Black).bg(Color::Green)
+                    } else if item_active {
+                        Style::default().fg(Color::Gray).bg(Color::Black)
+                    } else {
+                        Style::default().fg(Color::DarkGray).bg(Color::Black)
                     },
                 ),
                 Span::styled(health_badge.to_string(), health_style),
@@ -2094,6 +2133,8 @@ mod tui {
         } else {
             " [tools off] "
         };
+        let window = app.context_window_tokens();
+        let used = app.context_tokens_used.unwrap_or(0) as u64;
         let line = Line::from(vec![
             Span::styled(
                 model_label,
@@ -2106,8 +2147,49 @@ mod tui {
                 tool_label,
                 Style::default().fg(Color::Black).bg(Color::DarkGray),
             ),
+            Span::styled(
+                format!(" {} ", context_gauge_label(used, window)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(context_gauge_color(used, window)),
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
+    }
+
+    /// `"84% · 168K/200K ctx"` — the share of the active model's context window
+    /// the conversation occupies, as of the last completed turn.
+    fn context_gauge_label(used: u64, window: u64) -> String {
+        if window == 0 {
+            return "ctx —".to_string();
+        }
+        let percent = (used.saturating_mul(100) / window).min(100);
+        format!(
+            "{percent}% · {}/{}",
+            compact_tokens(used),
+            crate::models::format_context_window(window)
+        )
+    }
+
+    /// Warn as the window fills: auto-compaction kicks in near the budget, so
+    /// the colour is a heads-up that the next turn may be summarized.
+    fn context_gauge_color(used: u64, window: u64) -> Color {
+        if window == 0 {
+            return Color::DarkGray;
+        }
+        match used.saturating_mul(100) / window {
+            0..=69 => Color::DarkGray,
+            70..=89 => Color::Yellow,
+            _ => Color::Red,
+        }
+    }
+
+    fn compact_tokens(tokens: u64) -> String {
+        if tokens >= 1_000 {
+            format!("{}K", tokens / 1_000)
+        } else {
+            tokens.to_string()
+        }
     }
 
     fn render_loading_title(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -2758,6 +2840,7 @@ mod tui {
                 crate::permissions::reset_session(crate::permissions::TUI_SESSION);
                 // The saved session must not resurrect what the user just wiped.
                 crate::session_store::delete(TUI_STORE_SESSION);
+                app.context_tokens_used = None;
                 app.messages.push(ChatMessage::system(format!(
                     "Cleared {cleared} turn(s). History is empty.",
                 )));
@@ -2777,6 +2860,7 @@ mod tui {
                         {
                             log::warn!("session save after /compact failed: {error}");
                         }
+                        app.context_tokens_used = Some(after);
                         app.messages.push(ChatMessage::system(format!(
                             "Compacted history: ~{before} → ~{after} tokens (estimated)."
                         )));
@@ -2790,6 +2874,7 @@ mod tui {
             SlashCommand::Resume => match crate::session_store::load(TUI_STORE_SESSION) {
                 Some(history) if !history.is_empty() => {
                     let restored = history.len();
+                    app.context_tokens_used = Some(crate::backend::estimate_tokens(&history));
                     app.backend.restore_history(history).await;
                     app.messages.push(ChatMessage::system(format!(
                         "Restored {restored} message(s) from the saved session. \
@@ -3150,6 +3235,7 @@ mod tui {
                         let after =
                             crate::backend::estimate_tokens(&backend.history_snapshot().await);
                         log::info!("compacted history to ≈{after} tokens");
+                        let _ = tx.send(InferenceUpdate::ContextUsage(after)).await;
                     }
                     Err(error) => log::warn!("history compaction failed: {error}"),
                 }
@@ -3312,6 +3398,11 @@ mod tui {
         // Persist the completed turn so /resume (or a restart) can pick the
         // conversation back up.
         let snapshot = backend.history_snapshot().await;
+        let _ = tx
+            .send(InferenceUpdate::ContextUsage(
+                crate::backend::estimate_tokens(&snapshot),
+            ))
+            .await;
         if let Err(error) = crate::session_store::save(TUI_STORE_SESSION, &snapshot) {
             log::warn!("session save failed: {error}");
         }
@@ -3368,6 +3459,7 @@ mod tui {
                 match rx.try_recv() {
                     Ok(ModelLoadUpdate::Loaded(model_name)) => {
                         engine.clear_history().await;
+                        app.context_tokens_used = None;
                         if let Some(tc) = app.pending_tool_calling.take() {
                             app.tool_calling = tc;
                         }
@@ -3484,6 +3576,9 @@ mod tui {
                         Some(InferenceUpdate::Response(text)) => {
                             app.stop_thinking();
                             app.messages.push(ChatMessage::assistant(text));
+                        }
+                        Some(InferenceUpdate::ContextUsage(tokens)) => {
+                            app.context_tokens_used = Some(tokens);
                         }
                         Some(InferenceUpdate::Error(msg)) => {
                             app.finalize_stream();
@@ -3826,6 +3921,38 @@ mod tui {
             format!("{:.0} KB", bytes as f64 / KB as f64)
         } else {
             format!("{bytes} B")
+        }
+    }
+    #[cfg(test)]
+    mod tui_tests {
+        use super::{compact_tokens, context_gauge_color, context_gauge_label};
+        use ratatui::style::Color;
+
+        #[test]
+        fn context_gauge_reports_share_of_the_window() {
+            assert_eq!(context_gauge_label(168_000, 200_000), "84% · 168K/200K ctx");
+            assert_eq!(context_gauge_label(0, 24_000), "0% · 0/24K ctx");
+            // Over-full history (pre-compaction) clamps rather than reading 130%.
+            assert_eq!(context_gauge_label(31_000, 24_000), "100% · 31K/24K ctx");
+        }
+
+        #[test]
+        fn context_gauge_handles_an_unknown_window() {
+            assert_eq!(context_gauge_label(1_000, 0), "ctx —");
+            assert_eq!(context_gauge_color(1_000, 0), Color::DarkGray);
+        }
+
+        #[test]
+        fn context_gauge_warms_up_as_the_window_fills() {
+            assert_eq!(context_gauge_color(1_000, 24_000), Color::DarkGray);
+            assert_eq!(context_gauge_color(18_000, 24_000), Color::Yellow);
+            assert_eq!(context_gauge_color(23_000, 24_000), Color::Red);
+        }
+
+        #[test]
+        fn compact_tokens_abbreviates_thousands_only() {
+            assert_eq!(compact_tokens(999), "999");
+            assert_eq!(compact_tokens(1_500), "1K");
         }
     }
 } // end #[cfg(unix)] mod tui
