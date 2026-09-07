@@ -28,7 +28,8 @@ use tokio::sync::Mutex;
 // ── Neutral types ───────────────────────────────────────────────────────────────
 
 /// A tool the model may call, in a provider-neutral form. `parameters_schema` is
-/// a JSON Schema encoded as a string (matching how siGit already declares tools).
+/// a JSON Schema encoded as a string (matching how siGit Code already declares
+/// tools).
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: String,
@@ -482,15 +483,22 @@ impl OpenAiBackend {
             return Err(describe_api_error(status, &body));
         }
 
+        // The specs are needed downstream to type the arguments of any tool
+        // call the model emitted as text rather than as a structured call.
+        let tools = tools.unwrap_or(&[]);
         if let Some(sink) = sink {
-            self.consume_stream(response, sink).await
+            self.consume_stream(response, sink, tools).await
         } else {
-            self.consume_json(response).await
+            self.consume_json(response, tools).await
         }
     }
 
     /// Parse a single non-streaming chat-completion response.
-    async fn consume_json(&self, response: reqwest::Response) -> Result<TurnResult, BackendError> {
+    async fn consume_json(
+        &self,
+        response: reqwest::Response,
+        tools: &[ToolSpec],
+    ) -> Result<TurnResult, BackendError> {
         let parsed: ChatCompletion = response
             .json()
             .await
@@ -515,6 +523,41 @@ impl OpenAiBackend {
             })
             .collect();
 
+        // Some models write a tool call out as literal `<tool_call>` text
+        // instead of using the structured field (see `inline_tool_calls`).
+        // Recover it, or the turn ends with the tag rendered as prose and
+        // whatever the model meant to do is dropped.
+        if tool_calls.is_empty() {
+            let (cleaned, recovered) = crate::inline_tool_calls::extract(&text, tools);
+            if !recovered.is_empty() {
+                log::warn!(
+                    "recovered {} tool call(s) the model emitted as text instead of a structured call",
+                    recovered.len()
+                );
+                let tool_calls: Vec<ToolCall> = recovered
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCall {
+                        id: format!("call_recovered_{index}"),
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                    .collect();
+                // Record the recovered shape, not the raw tag: the tool
+                // results that follow have to answer an assistant message
+                // that actually carries these calls, or the next request is
+                // rejected for orphaned tool results.
+                self.history
+                    .lock()
+                    .await
+                    .push(streamed_assistant_history(&cleaned, &tool_calls));
+                return Ok(TurnResult {
+                    text: cleaned,
+                    tool_calls,
+                });
+            }
+        }
+
         // Record the assistant turn so later tool results have context.
         self.history.lock().await.push(message.into_history_value());
 
@@ -528,6 +571,7 @@ impl OpenAiBackend {
         &self,
         response: reqwest::Response,
         sink: &TokenSink,
+        tools: &[ToolSpec],
     ) -> Result<TurnResult, BackendError> {
         use futures::StreamExt;
 
@@ -538,6 +582,13 @@ impl OpenAiBackend {
         let mut text = String::new();
         let mut tool_accum: Vec<StreamingToolCall> = Vec::new();
         let mut done = false;
+        // Recovers a tool call the model wrote as literal `<tool_call>` text
+        // instead of a structured delta. Scanning here (rather than after the
+        // stream) keeps the tag off the UI: content goes straight to `sink` as
+        // it arrives, so by the time a whole turn is assembled the tag has
+        // already been rendered. See `inline_tool_calls`.
+        let mut scanner = crate::inline_tool_calls::StreamScanner::new(tools);
+        let mut recovered: Vec<ToolCall> = Vec::new();
 
         while let Some(item) = stream.next().await {
             let bytes = item.map_err(|error| format!("stream read error: {error}"))?;
@@ -583,9 +634,31 @@ impl OpenAiBackend {
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
-                    text.push_str(&content);
-                    if sink.send(content).is_err() {
-                        // Consumer dropped (turn cancelled) — stop reading.
+                    let mut cancelled = false;
+                    for event in scanner.push(&content) {
+                        match event {
+                            crate::inline_tool_calls::ScanEvent::Text(chunk) => {
+                                text.push_str(&chunk);
+                                if sink.send(chunk).is_err() {
+                                    // Consumer dropped (turn cancelled).
+                                    cancelled = true;
+                                    break;
+                                }
+                            }
+                            crate::inline_tool_calls::ScanEvent::ToolCall(call) => {
+                                log::warn!(
+                                    "recovered tool call '{}' the model emitted as text instead of a structured call",
+                                    call.name
+                                );
+                                recovered.push(ToolCall {
+                                    id: format!("call_recovered_{}", recovered.len()),
+                                    name: call.name,
+                                    arguments: call.arguments,
+                                });
+                            }
+                        }
+                    }
+                    if cancelled {
                         done = true;
                         break;
                     }
@@ -615,7 +688,13 @@ impl OpenAiBackend {
             }
         }
 
-        let tool_calls: Vec<ToolCall> = tool_accum
+        // Text held back waiting on a tag that never closed is just text.
+        if let Some(leftover) = scanner.take_pending() {
+            text.push_str(&leftover);
+            let _ = sink.send(leftover);
+        }
+
+        let mut tool_calls: Vec<ToolCall> = tool_accum
             .iter()
             .filter(|call| !call.name.is_empty())
             .enumerate()
@@ -629,6 +708,7 @@ impl OpenAiBackend {
                 arguments: call.arguments.clone(),
             })
             .collect();
+        tool_calls.extend(recovered);
 
         // Record the assistant turn so later tool results have context.
         self.history

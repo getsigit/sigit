@@ -581,3 +581,84 @@ fn text_from_two_tool_rounds_reaches_the_client_as_separate_paragraphs() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// A model that writes its tool call out as literal `<tool_call>` text instead
+/// of using the structured field must still drive the loop. Before recovery
+/// the tag was streamed to the client as prose and the turn ended with no tool
+/// calls, so the request silently went unanswered (getsigit/sigit#73).
+#[test]
+fn a_tool_call_emitted_as_text_is_executed_rather_than_rendered() {
+    let endpoint = start_fake_endpoint(vec![
+        // Split mid-tag, the way a real stream arrives.
+        sse_body(&[
+            json!({"choices": [{"delta": {"content": "Checking the repo: <tool_c"}}]}),
+            json!({"choices": [{"delta": {"content": "all>command_output<arg_key>task_id</arg_key>"}}]}),
+            json!({"choices": [{"delta": {"content": "<arg_value>2</arg_value></tool_call>"}}]}),
+        ]),
+        sse_text("All done."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_inline_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "check the repo"}],
+        }),
+    );
+    let (_response, rendered) = agent.wait_for_prompt(prompt_id);
+
+    // The raw tag must never be shown to the user.
+    assert!(
+        !rendered.contains("<tool_call>") && !rendered.contains("<arg_key>"),
+        "raw tool-call markup reached the client: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Checking the repo:"),
+        "surrounding prose should still stream: {rendered:?}"
+    );
+
+    // The loop has to keep going: a second request means the recovered call
+    // ran and its result was sent back. Before recovery the turn ended here.
+    let requests = endpoint.requests.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected a follow-up request carrying the tool result, got {}",
+        requests.len()
+    );
+    let follow_up = &requests[1];
+    let messages = follow_up["messages"].as_array().expect("messages");
+    assert!(
+        messages.iter().any(|message| message["role"] == "tool"),
+        "the follow-up should answer the recovered call: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message["role"] == "assistant" && message["tool_calls"].is_array() }),
+        "history must record the recovered call, not the raw tag: {messages:?}"
+    );
+    drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

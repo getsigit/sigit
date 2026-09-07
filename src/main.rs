@@ -37,6 +37,7 @@ mod credentials;
 mod frontmatter;
 mod headless;
 mod hooks;
+mod inline_tool_calls;
 mod instructions;
 mod mcp;
 mod models;
