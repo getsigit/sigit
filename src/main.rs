@@ -1637,7 +1637,19 @@ impl SiGitAgent {
                         let after = backend::estimate_tokens(&backend.history_snapshot().await);
                         log::info!("prompt({}) compacted to ≈{} tokens", session_id, after);
                     }
-                    Err(error) => log::warn!("prompt({}) compaction failed: {error}", session_id),
+                    Err(error) => {
+                        log::warn!("prompt({}) compaction failed: {error}", session_id);
+                        self.send_assistant_message(
+                            cx,
+                            session_id,
+                            format!(
+                                "This session is too large, and siGit Code could not compact it: \
+                                 {error}. Start a new thread or run `/clear`, then retry."
+                            ),
+                        )
+                        .ok();
+                        return Ok(PromptResponse::new(StopReason::EndTurn));
+                    }
                 }
             }
 

@@ -76,6 +76,51 @@ pub const COMPACT_KEEP_LAST: usize = 6;
 const SUMMARIZE_PROMPT: &str = "Summarize this coding session so far: decisions made, \
     files touched, current state, open items. Be concise and factual.";
 
+/// Render a history snapshot as a plain-text transcript, with tool calls and
+/// tool results spelled out as prose rather than left in their wire shapes.
+///
+/// Compaction summarizes a conversation that is, by definition, thick with
+/// `tool_calls` and `role: "tool"` messages — but the summarization round asks
+/// for a plain answer and so sends no `tools` array. Forwarding the raw shapes
+/// in that request produces tool blocks with no schema to validate against,
+/// which strict endpoints reject outright: Anthropic answers 400, so every
+/// compaction of a session that had ever run a tool failed, permanently, no
+/// matter how small the history was. Flattening to text keeps everything the
+/// summary actually needs and drops the shapes that only make sense alongside
+/// a tool schema. It also sidesteps orphaned `tool_call_id`s and role-
+/// alternation rules, neither of which a transcript can violate.
+fn transcript_for_summary(history: &[serde_json::Value]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for message in history {
+        let role = message["role"].as_str().unwrap_or("user");
+        // The system prompt is carried over verbatim, so it needn't be summarized.
+        if role == "system" {
+            continue;
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(text) = message["content"].as_str()
+            && !text.trim().is_empty()
+        {
+            parts.push(text.to_string());
+        }
+        for call in message["tool_calls"].as_array().into_iter().flatten() {
+            parts.push(format!(
+                "called {}({})",
+                call["function"]["name"].as_str().unwrap_or("tool"),
+                call["function"]["arguments"].as_str().unwrap_or_default(),
+            ));
+        }
+        if parts.is_empty() {
+            continue;
+        }
+
+        let label = if role == "tool" { "tool result" } else { role };
+        lines.push(format!("{label}: {}", parts.join("\n")));
+    }
+    lines.join("\n\n")
+}
+
 /// Crude token estimate for a history snapshot: serialized characters / 4.
 /// Deliberately model-agnostic — it only needs to be in the right ballpark to
 /// decide when compaction is worth an extra inference round.
@@ -818,12 +863,30 @@ impl InferenceBackend for OpenAiBackend {
     async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
         let snapshot: Vec<serde_json::Value> = self.history.lock().await.clone();
 
-        // Ask the endpoint for a summary of the conversation so far, through
-        // the ordinary completion machinery (non-streaming).
-        self.history
-            .lock()
-            .await
-            .push(serde_json::json!({ "role": "user", "content": SUMMARIZE_PROMPT }));
+        let system = snapshot
+            .first()
+            .filter(|message| message["role"] == "system")
+            .cloned();
+
+        // Ask the endpoint for a summary of the conversation so far, through the
+        // ordinary completion machinery (non-streaming). The request carries the
+        // conversation as a flattened transcript in a single user message rather
+        // than the live history: this round offers no tools, and a tool-shaped
+        // history sent without a tool schema is rejected upstream (see
+        // `transcript_for_summary`).
+        let mut request = Vec::new();
+        if let Some(system) = system.clone() {
+            request.push(system);
+        }
+        request.push(serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "{}\n\n{SUMMARIZE_PROMPT}",
+                transcript_for_summary(&snapshot),
+            ),
+        }));
+        *self.history.lock().await = request;
+
         let summary = match self.complete(None, None).await {
             Ok(result) => result.text,
             Err(error) => {
@@ -833,10 +896,6 @@ impl InferenceBackend for OpenAiBackend {
             }
         };
 
-        let system = snapshot
-            .first()
-            .filter(|message| message["role"] == "system")
-            .cloned();
         let non_system: Vec<serde_json::Value> = snapshot
             .iter()
             .filter(|message| message["role"] != "system")
@@ -1422,12 +1481,16 @@ mod tests {
     }
 
     /// Minimal scripted OpenAI-compatible endpoint: accepts one HTTP request on
-    /// a std listener and answers with a fixed non-streaming completion.
-    fn spawn_completion_stub(summary: &str) -> std::net::SocketAddr {
+    /// a std listener and answers with a fixed non-streaming completion. The
+    /// receiver yields the request body the backend actually put on the wire.
+    fn spawn_completion_stub(
+        summary: &str,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
         let body = serde_json::json!({
             "choices": [{ "message": { "role": "assistant", "content": summary } }]
         })
@@ -1456,6 +1519,9 @@ mod tests {
                         })
                         .unwrap_or(0);
                     if request.len() >= headers_end + 4 + content_length {
+                        let _ = sender.send(
+                            String::from_utf8_lossy(&request[headers_end + 4..]).into_owned(),
+                        );
                         break;
                     }
                 }
@@ -1468,12 +1534,12 @@ mod tests {
             );
             let _ = stream.write_all(response.as_bytes());
         });
-        addr
+        (addr, receiver)
     }
 
     #[tokio::test]
     async fn compact_history_rebuilds_system_summary_and_tail() {
-        let addr = spawn_completion_stub("We refactored backend.rs; tests pass.");
+        let (addr, _requests) = spawn_completion_stub("We refactored backend.rs; tests pass.");
         let backend = OpenAiBackend::new(
             format!("http://{addr}/v1"),
             "test-key",
@@ -1508,6 +1574,66 @@ mod tests {
             history[3],
             serde_json::json!({ "role": "user", "content": "message 4" })
         );
+    }
+
+    /// Compacting a tool-heavy session must not put tool shapes on the wire.
+    /// The summarization round offers no `tools`, and endpoints reject tool
+    /// calls and tool results that arrive without a schema — which used to make
+    /// compaction fail forever in any session that had run a single tool.
+    #[tokio::test]
+    async fn compact_history_sends_no_tool_artifacts() {
+        let (addr, requests) = spawn_completion_stub("Ran git status on main.");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("be helpful".into()),
+        );
+        {
+            let mut history = backend.history.lock().await;
+            history.push(serde_json::json!({ "role": "user", "content": "check the repo" }));
+            history.push(serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "run_command", "arguments": "{\"command\":\"git status\"}" },
+                }],
+            }));
+            history.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "on branch main",
+            }));
+        }
+
+        backend.compact_history(2).await.unwrap();
+
+        let body: serde_json::Value =
+            serde_json::from_str(&requests.recv().unwrap()).expect("request body is JSON");
+        assert!(
+            body.get("tools").is_none(),
+            "summarization offers no tools: {body}"
+        );
+        for message in body["messages"].as_array().unwrap() {
+            assert!(
+                message.get("tool_calls").is_none(),
+                "no tool_calls may be sent without a schema: {message}"
+            );
+            assert_ne!(
+                message["role"], "tool",
+                "no tool results may be sent without a schema: {message}"
+            );
+        }
+
+        // The tool round still has to survive into the summary request as prose,
+        // or the summary loses the work the session actually did.
+        let transcript = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(transcript.contains("called run_command({\"command\":\"git status\"})"));
+        assert!(transcript.contains("tool result: on branch main"));
     }
 
     #[tokio::test]
