@@ -349,6 +349,107 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
     }
 }
 
+/// The visible text of one saved history message. `content` is normally a
+/// string, but an OpenAI-compatible endpoint may hand back the block form, and
+/// tool-call-only assistant turns carry `null`.
+fn history_message_text(message: &serde_json::Value) -> String {
+    match &message["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Rebuild the `session/update` notifications that re-draw a saved conversation
+/// in the client.
+///
+/// ACP's `session/load` is a replay: the client renders the reopened thread
+/// purely from the updates the agent streams while the request is in flight.
+/// Restoring history into the backend is what makes the *model* remember, but
+/// it puts nothing on screen, so a reopened session came up blank and looked
+/// like a brand-new one (issue #77).
+fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
+    // Match results to their calls up front so each call replays as one
+    // finished tool call instead of a call followed by a loose result.
+    let mut outputs: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for message in history {
+        if message["role"] == "tool"
+            && let (Some(id), Some(content)) = (
+                message["tool_call_id"].as_str(),
+                message["content"].as_str(),
+            )
+        {
+            outputs.insert(id, content);
+        }
+    }
+
+    let mut updates = Vec::new();
+    for message in history {
+        match message["role"].as_str().unwrap_or_default() {
+            // Seeded context and project instructions were never on screen.
+            "system" => {}
+            "user" => {
+                let text = history_message_text(message);
+                if !text.trim().is_empty() {
+                    updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                        ContentBlock::from(text),
+                    )));
+                }
+            }
+            "assistant" => {
+                let (_think, visible) = chat::strip_think_blocks(&history_message_text(message));
+                if !visible.trim().is_empty() {
+                    updates.push(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                        ContentBlock::from(visible),
+                    )));
+                }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let name = call["function"]["name"].as_str().unwrap_or("tool");
+                    let arguments = call["function"]["arguments"].as_str().unwrap_or("");
+
+                    // `write_todos` renders as a plan while it runs; replay it
+                    // the same way, and let a later list replace an earlier one
+                    // exactly as it did live.
+                    if name == "write_todos"
+                        && let Some(plan) = todos_arguments_to_plan(arguments)
+                    {
+                        updates.push(SessionUpdate::Plan(plan));
+                        continue;
+                    }
+
+                    // A saved call is always finished — nothing is still
+                    // running when the session file is written.
+                    let id = call["id"].as_str().unwrap_or_default();
+                    // A call saved without an id would otherwise collapse into
+                    // one entry per replay; give each its own.
+                    let replay_id = if id.is_empty() {
+                        format!("replay-{}", uuid::Uuid::new_v4())
+                    } else {
+                        id.to_string()
+                    };
+                    let mut tool_call = ToolCall::new(replay_id, name)
+                        .kind(tool_kind_for(name))
+                        .status(ToolCallStatus::Completed)
+                        .raw_input(serde_json::from_str::<serde_json::Value>(arguments).ok());
+                    if let Some(output) = outputs.get(id) {
+                        tool_call =
+                            tool_call.raw_output(serde_json::Value::String((*output).to_string()));
+                    }
+                    updates.push(SessionUpdate::ToolCall(tool_call));
+                }
+            }
+            // Folded into the tool call above.
+            "tool" => {}
+            other => log::debug!("session replay: skipping unknown history role '{other}'"),
+        }
+    }
+    updates
+}
+
 fn todos_arguments_to_plan(arguments: &str) -> Option<Plan> {
     let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let todos = args.get("todos")?.as_array()?;
@@ -1273,10 +1374,21 @@ impl SiGitAgent {
         // freshly seeded state wholesale.
         if let Some(history) = session_store::load(&args.session_id.to_string()) {
             let restored = history.len();
+
+            // Replay before restoring: the client draws the reopened thread
+            // from these notifications alone, and `restore_history` consumes
+            // the snapshot.
+            let updates = history_replay_updates(&history);
+            let replayed = updates.len();
+            for update in updates {
+                cx.send_notification(SessionNotification::new(args.session_id.clone(), update))
+                    .ok();
+            }
+
             let backend = self.backend.lock().await.clone();
             backend.restore_history(history).await;
             log::info!(
-                "load_session: restored {restored} message(s) for {}",
+                "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
                 args.session_id
             );
         }
@@ -3852,6 +3964,120 @@ mod tests {
         // Relative paths only resolve against the primary root, so the model is
         // told to address the others absolutely.
         assert!(multi.contains("absolute paths"));
+    }
+
+    #[test]
+    fn history_replay_redraws_the_conversation_for_the_client() {
+        let history = vec![
+            serde_json::json!({ "role": "system", "content": "project context" }),
+            serde_json::json!({ "role": "user", "content": "read the changelog" }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "<think>which file?</think>Reading it now.",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"/tmp/CHANGELOG.md\"}" },
+                }],
+            }),
+            serde_json::json!({ "role": "tool", "tool_call_id": "call_1", "content": "# Changelog" }),
+            serde_json::json!({ "role": "assistant", "content": "It starts at v1.0." }),
+        ];
+
+        let updates = history_replay_updates(&history);
+
+        // The system message seeded the model; it was never on screen.
+        assert_eq!(updates.len(), 4, "{updates:#?}");
+
+        match &updates[0] {
+            SessionUpdate::UserMessageChunk(chunk) => {
+                assert!(format!("{:?}", chunk.content).contains("read the changelog"));
+            }
+            other => panic!("expected the user message first, got {other:?}"),
+        }
+        match &updates[1] {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                let rendered = format!("{:?}", chunk.content);
+                assert!(rendered.contains("Reading it now."));
+                // Reasoning stays hidden on replay, exactly as it did live.
+                assert!(!rendered.contains("which file?"));
+            }
+            other => panic!("expected the assistant reply, got {other:?}"),
+        }
+        match &updates[2] {
+            SessionUpdate::ToolCall(call) => {
+                assert_eq!(call.title, "read_file");
+                assert_eq!(call.kind, ToolKind::Read);
+                // Nothing is still running in a saved session.
+                assert_eq!(call.status, ToolCallStatus::Completed);
+                assert_eq!(
+                    call.raw_input,
+                    Some(serde_json::json!({"path": "/tmp/CHANGELOG.md"}))
+                );
+                // The result is folded into its call rather than replayed loose.
+                assert_eq!(
+                    call.raw_output,
+                    Some(serde_json::Value::String("# Changelog".to_string()))
+                );
+            }
+            other => panic!("expected the tool call, got {other:?}"),
+        }
+        assert!(matches!(updates[3], SessionUpdate::AgentMessageChunk(_)));
+    }
+
+    #[test]
+    fn history_replay_renders_write_todos_as_a_plan() {
+        let history = vec![serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {
+                    "name": "write_todos",
+                    "arguments": "{\"todos\":[{\"content\":\"Ship it\",\"status\":\"completed\"}]}",
+                },
+            }],
+        })];
+
+        match history_replay_updates(&history).as_slice() {
+            [SessionUpdate::Plan(plan)] => {
+                assert_eq!(plan.entries.len(), 1);
+                assert_eq!(plan.entries[0].content, "Ship it");
+                assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
+            }
+            other => panic!("expected one plan update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_replay_skips_messages_with_nothing_to_show() {
+        // A tool-call-only assistant turn (`content: null`), an empty reply and
+        // a blank user message must not become empty bubbles in the client.
+        let history = vec![
+            serde_json::json!({ "role": "user", "content": "   " }),
+            serde_json::json!({ "role": "assistant", "content": null }),
+            serde_json::json!({ "role": "assistant", "content": "" }),
+        ];
+        assert!(history_replay_updates(&history).is_empty());
+    }
+
+    #[test]
+    fn history_replay_reads_block_form_content() {
+        // Some OpenAI-compatible endpoints hand back content blocks rather than
+        // a plain string; both reach the session file.
+        let history = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "check " },
+                { "type": "text", "text": "this file" },
+            ],
+        })];
+
+        match history_replay_updates(&history).as_slice() {
+            [SessionUpdate::UserMessageChunk(chunk)] => {
+                assert!(format!("{:?}", chunk.content).contains("check this file"));
+            }
+            other => panic!("expected one user message, got {other:?}"),
+        }
     }
 
     #[test]
