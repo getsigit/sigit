@@ -72,16 +72,18 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, DeleteSessionRequest, DeleteSessionResponse,
+    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
     SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    SessionDeleteCapabilities, SessionForkCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -362,6 +364,35 @@ fn history_message_text(message: &serde_json::Value) -> String {
             .join(""),
         _ => String::new(),
     }
+}
+
+/// First user message, trimmed to one short line — the thread label a client
+/// shows in its history list.
+fn title_from_history(history: &[serde_json::Value]) -> Option<String> {
+    let text = history
+        .iter()
+        .find(|message| message["role"] == "user")
+        .map(history_message_text)?;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    const MAX_LEN: usize = 60;
+    if collapsed.chars().count() <= MAX_LEN {
+        return Some(collapsed);
+    }
+    let mut truncated: String = collapsed.chars().take(MAX_LEN).collect();
+    if let Some(last_space) = truncated.rfind(' ') {
+        truncated.truncate(last_space);
+    }
+    truncated.push('…');
+    Some(truncated)
+}
+
+/// RFC 3339 formatting for `SessionInfo.updated_at`, sourced from the
+/// transcript file's mtime rather than a separately tracked timestamp.
+fn rfc3339(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
 }
 
 /// Rebuild the `session/update` notifications that re-draw a saved conversation
@@ -1256,14 +1287,16 @@ impl SiGitAgent {
                 AgentCapabilities::default()
                     .load_session(true)
                     .session_capabilities(
-                    SessionCapabilities::new()
-                        .fork(SessionForkCapabilities::new())
-                        // Without this, a client that has several directories
-                        // open never sends the extra ones: Zed drops every root
-                        // but the first and tells the user the agent has no
-                        // multi-root support. See `workspace.rs`.
-                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
-                ),
+                        SessionCapabilities::new()
+                            .fork(SessionForkCapabilities::new())
+                            // Without this, a client that has several directories
+                            // open never sends the extra ones: Zed drops every root
+                            // but the first and tells the user the agent has no
+                            // multi-root support. See `workspace.rs`.
+                            .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
+                            .list(SessionListCapabilities::new())
+                            .delete(SessionDeleteCapabilities::new()),
+                    ),
             )
             .meta(initialize_meta()))
     }
@@ -1332,6 +1365,54 @@ impl SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", cwd.display());
         }
         additional_roots
+    }
+
+    /// Serve `session/list`: a pure filesystem read, no engine or backend
+    /// access, so it stays answerable while a turn is in flight (registered
+    /// inline, not in the `turn_lock` group).
+    ///
+    /// Sessions with no metadata sidecar are skipped — that covers transcripts
+    /// saved before this existed and the singleton `tui`/`headless` entries,
+    /// neither of which has a meaningful cwd for an editor's thread list.
+    async fn handle_list_sessions(
+        &self,
+        args: ListSessionsRequest,
+    ) -> agent_client_protocol::Result<ListSessionsResponse> {
+        let sessions = session_store::list()
+            .into_iter()
+            .filter_map(|entry| {
+                let meta = entry.meta?;
+                if let Some(cwd) = &args.cwd
+                    && *cwd != meta.cwd
+                {
+                    return None;
+                }
+                Some(
+                    SessionInfo::new(SessionId::new(entry.id), meta.cwd)
+                        .additional_directories(meta.additional_directories)
+                        .title(meta.title)
+                        .updated_at(rfc3339(entry.modified)),
+                )
+            })
+            .collect();
+
+        Ok(ListSessionsResponse::new(sessions))
+    }
+
+    /// Serve `session/delete`: removes the transcript and its metadata
+    /// sidecar, and drops any permission grants so they don't outlive the
+    /// thread. Registered in the `turn_lock` group — without the lock a
+    /// delete could land between a turn's inference and its end-of-turn
+    /// `session_store::save`, and the save would resurrect the file the user
+    /// just removed.
+    async fn handle_delete_session(
+        &self,
+        args: DeleteSessionRequest,
+    ) -> agent_client_protocol::Result<DeleteSessionResponse> {
+        log::info!("delete_session: id={}", args.session_id);
+        session_store::delete(&args.session_id.to_string());
+        permissions::reset_session(&args.session_id.to_string());
+        Ok(DeleteSessionResponse::new())
     }
 
     async fn handle_load_session(
@@ -2008,6 +2089,19 @@ impl SiGitAgent {
         let snapshot = backend.history_snapshot().await;
         if let Err(error) = session_store::save(&session_id.to_string(), &snapshot) {
             log::warn!("prompt({}) session save failed: {error}", session_id);
+        }
+
+        // Metadata sidecar for `session/list`. Written every turn — cheap, and
+        // self-healing for sessions that predate this change.
+        if let Some(cwd) = self.session_cwd.lock().ok().and_then(|guard| guard.clone()) {
+            let meta = session_store::SessionMeta {
+                cwd,
+                additional_directories: workspace::additional_roots(),
+                title: title_from_history(&snapshot),
+            };
+            if let Err(error) = session_store::save_meta(&session_id.to_string(), &meta) {
+                log::warn!("prompt({}) session meta save failed: {error}", session_id);
+            }
         }
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
@@ -3640,6 +3734,15 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: ListSessionsRequest, responder, _cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_list_sessions(req).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         // Turn-affecting handlers below run in spawned tasks, serialized by
         // `turn_lock`, so the dispatch loop stays free to route client
         // responses (permission answers) while a turn is in flight. Awaiting a
@@ -3715,6 +3818,19 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                             responder,
                             state.handle_set_session_config_option(&task_cx, req).await,
                         )
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: DeleteSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let _turn = state.turn_lock.lock().await;
+                        handle_response(responder, state.handle_delete_session(req).await)
                     })
                 }
             },
@@ -3964,6 +4080,47 @@ mod tests {
         // Relative paths only resolve against the primary root, so the model is
         // told to address the others absolutely.
         assert!(multi.contains("absolute paths"));
+    }
+
+    #[test]
+    fn title_from_history_picks_the_first_user_message() {
+        let history = vec![
+            serde_json::json!({ "role": "system", "content": "project context" }),
+            serde_json::json!({ "role": "user", "content": "  what do\nthe   notes say?  " }),
+            serde_json::json!({ "role": "assistant", "content": "The notes say hello." }),
+            serde_json::json!({ "role": "user", "content": "a later question" }),
+        ];
+        assert_eq!(
+            title_from_history(&history),
+            Some("what do the notes say?".to_string())
+        );
+
+        assert_eq!(title_from_history(&[]), None);
+
+        let no_user = vec![serde_json::json!({ "role": "system", "content": "just context" })];
+        assert_eq!(title_from_history(&no_user), None);
+
+        let blank = vec![serde_json::json!({ "role": "user", "content": "   " })];
+        assert_eq!(title_from_history(&blank), None);
+    }
+
+    #[test]
+    fn title_from_history_truncates_long_text_on_a_word_boundary() {
+        let text = "a".repeat(50) + " " + &"b".repeat(50);
+        let history = vec![serde_json::json!({ "role": "user", "content": text })];
+        let title = title_from_history(&history).unwrap();
+        assert!(title.ends_with('…'), "{title}");
+        assert!(title.chars().count() <= 61, "{title}");
+        assert!(
+            title.starts_with(&"a".repeat(50)),
+            "must truncate on a word boundary rather than mid-word: {title}"
+        );
+    }
+
+    #[test]
+    fn rfc3339_formats_a_known_epoch_second() {
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(rfc3339(time), "2023-11-14T22:13:20+00:00");
     }
 
     #[test]

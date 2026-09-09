@@ -59,6 +59,9 @@ rpassword = "7"
 base64 = "0.22"
 rand = "0.9"
 sha2 = "0.10"
+# RFC 3339 timestamps for `session/list`. Already pulled in transitively by
+# onde-mistralrs-core and serde_with, so this costs nothing extra to build.
+chrono = "0.4"
 
 # Release binaries ship to five registries, and the NuGet package bundles all
 # six targets in a single archive, so binary size is a distribution constraint

@@ -111,9 +111,22 @@ The agent loop is backend-agnostic. The flow: a turn (messages + tool specs) goe
 feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete backend.
 
 - **`src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
-  new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`
-  (note: it bakes in smbCloud-specific context the agent should use when the repo is clearly
-  smbCloud, and stay general otherwise).
+  new/load/fork/prompt/cancel/list/delete, config options, slash-command advertisement), and the
+  `SYSTEM_PROMPT` (note: it bakes in smbCloud-specific context the agent should use when the repo
+  is clearly smbCloud, and stay general otherwise). `session/list` and `session/delete` are served
+  from the metadata sidecar `session_store` writes at the end of every `handle_prompt` turn
+  (`SessionMeta`: cwd, additional roots, a title derived from the first user message by
+  `title_from_history`); `handle_list_sessions` is a pure filesystem read registered inline
+  alongside `initialize` (answerable mid-turn), while `handle_delete_session` runs in the
+  `turn_lock`-serialized group like load/fork/new/prompt so a delete can't race the end-of-turn
+  save and resurrect the file it just removed.
+- **`src/session_store.rs`** — durable session storage: one JSON-lines transcript per session at
+  `sessions/<id>.jsonl`, plus a `sessions/<id>.meta.json` sidecar (`SessionMeta`) carrying the ACP
+  fields a transcript alone doesn't have (cwd, additional roots, title). `list()` (consumed by both
+  the Unix-only TUI History tab and the cross-platform ACP `session/list` handler) skips sessions
+  with no sidecar — that covers transcripts saved before the sidecar existed and the singleton
+  `tui`/`headless` entries, which have no meaningful cwd for an editor's thread list. Writes are
+  atomic (temp file + rename) for both files.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
   `ToolResult`, `TurnResult`). Two impls: `LocalBackend` (on-device via `onde::ChatEngine`) and
   `OpenAiBackend` (any OpenAI-compatible HTTP endpoint). A `BackendError` is user-facing: the

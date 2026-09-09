@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Editors can now list and delete siGit Code threads.** `session/list` and
+  `session/delete` were unadvertised, so Zed's "Import Threads" picker showed
+  siGit Code with a warning triangle even though every ACP turn was already
+  saved to disk. A session now writes a small metadata sidecar (cwd,
+  additional roots, a title from its first message) alongside its transcript,
+  so a client can list threads for the open project, reopen one through the
+  existing `session/load` replay, and remove one it no longer wants
+
 ## 1.5.7
 
 ### What changed

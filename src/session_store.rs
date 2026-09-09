@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Config directory: `$SIGIT_CONFIG_DIR` or `~/.config/sigit`.
@@ -48,6 +49,57 @@ fn sanitize_id(session_id: &str) -> String {
 
 fn session_path(session_id: &str) -> Option<PathBuf> {
     sessions_dir().map(|dir| dir.join(format!("{}.jsonl", sanitize_id(session_id))))
+}
+
+/// `<sessions_dir>/<id>.meta.json`. Note this does not collide with the
+/// `list()` extension filter (`== Some("jsonl")`): the extension of
+/// `"a.meta.json"` is `json`, not `jsonl`.
+fn meta_path(session_id: &str) -> Option<PathBuf> {
+    sessions_dir().map(|dir| dir.join(format!("{}.meta.json", sanitize_id(session_id))))
+}
+
+/// ACP-facing metadata for a saved session, kept alongside its transcript so
+/// `session/list` can be served without touching the model backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Persist `meta` for `session_id`, replacing any previous sidecar. Same
+/// atomic temp-file + rename pattern as [`save`].
+pub fn save_meta(session_id: &str, meta: &SessionMeta) -> Result<(), String> {
+    let path =
+        meta_path(session_id).ok_or_else(|| "cannot resolve config directory".to_string())?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "session meta path has no parent".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {dir:?}: {error}"))?;
+
+    let body = serde_json::to_string(meta).map_err(|error| format!("serialize meta: {error}"))?;
+
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        sanitize_id(session_id),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, body).map_err(|error| format!("write {tmp:?}: {error}"))?;
+    std::fs::rename(&tmp, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {tmp:?} -> {path:?}: {error}")
+    })?;
+    Ok(())
+}
+
+/// Load the saved metadata for `session_id`, or `None` when no sidecar exists
+/// (or it cannot be parsed) — matching how [`load`] tolerates junk.
+pub fn load_meta(session_id: &str) -> Option<SessionMeta> {
+    let path = meta_path(session_id)?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 /// Persist a history snapshot for `session_id`, replacing any previous save.
@@ -97,19 +149,21 @@ pub fn load(session_id: &str) -> Option<Vec<Value>> {
     )
 }
 
-/// Remove the saved history for `session_id`. Missing files are fine.
+/// Remove the saved history for `session_id`, along with its metadata
+/// sidecar. Missing files are fine.
 pub fn delete(session_id: &str) {
     if let Some(path) = session_path(session_id) {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(path) = meta_path(session_id) {
         let _ = std::fs::remove_file(path);
     }
 }
 
 /// One saved session as seen on disk.
 ///
-/// Cross-platform like the rest of the store, though today only the Unix-only
-/// TUI (`chat.rs` History tab) consumes it — hence the non-Unix dead-code gate,
-/// mirroring `permissions::TUI_SESSION`.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// Cross-platform: consumed by the Unix-only TUI (`chat.rs` History tab) and
+/// by the ACP `session/list` handler (`main.rs`) on every platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     /// The sanitized id (the file stem), which `load`/`delete` accept as-is.
@@ -118,12 +172,14 @@ pub struct SessionEntry {
     pub modified: std::time::SystemTime,
     /// Number of history messages (non-empty lines) in the file.
     pub message_count: usize,
+    /// The metadata sidecar, when one was recorded. `None` for sessions saved
+    /// before this existed, or for the singleton `tui`/`headless` entries.
+    pub meta: Option<SessionMeta>,
 }
 
 /// List the saved sessions, newest first. Non-`.jsonl` entries (temp files,
 /// stray junk) are skipped. A missing or unreadable sessions dir yields an
 /// empty list.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub fn list() -> Vec<SessionEntry> {
     let Some(dir) = sessions_dir() else {
         return Vec::new();
@@ -147,10 +203,12 @@ pub fn list() -> Vec<SessionEntry> {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(std::time::UNIX_EPOCH);
+            let meta = load_meta(&id);
             Some(SessionEntry {
                 id,
                 modified,
                 message_count,
+                meta,
             })
         })
         .collect();
@@ -251,9 +309,67 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, "newer");
         assert_eq!(listed[0].message_count, 1);
+        assert!(
+            listed[0].meta.is_none(),
+            "no sidecar was written for either session"
+        );
         assert_eq!(listed[1].id, "older");
         assert_eq!(listed[1].message_count, 3);
         assert!(listed[0].modified >= listed[1].modified);
+
+        unsafe { std::env::remove_var("SIGIT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Same single-test-per-env-var pattern as the tests above.
+    #[test]
+    fn meta_round_trips_and_is_removed_with_the_session() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("sigit_sessions_meta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: serialized by ENV_TEST_LOCK; restored below.
+        unsafe { std::env::set_var("SIGIT_CONFIG_DIR", &dir) };
+
+        // Missing sidecar → None.
+        assert_eq!(load_meta("sess-1"), None);
+
+        let meta = SessionMeta {
+            cwd: PathBuf::from("/tmp/project"),
+            additional_directories: vec![PathBuf::from("/tmp/other-root")],
+            title: Some("what do the notes say?".to_string()),
+        };
+        save(
+            "sess-1",
+            &[serde_json::json!({ "role": "user", "content": "hi" })],
+        )
+        .unwrap();
+        save_meta("sess-1", &meta).unwrap();
+        assert_eq!(load_meta("sess-1"), Some(meta.clone()));
+
+        // A sidecar with no title round-trips too.
+        let untitled = SessionMeta {
+            cwd: PathBuf::from("/tmp/project"),
+            additional_directories: vec![],
+            title: None,
+        };
+        save_meta("sess-1", &untitled).unwrap();
+        assert_eq!(load_meta("sess-1"), Some(untitled));
+
+        // list() surfaces the sidecar for a session that has one.
+        let listed = list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].meta.as_ref().map(|m| &m.cwd),
+            Some(&PathBuf::from("/tmp/project"))
+        );
+
+        // delete() removes both the transcript and the sidecar.
+        delete("sess-1");
+        assert_eq!(load("sess-1"), None);
+        assert_eq!(load_meta("sess-1"), None);
+        assert!(list().is_empty());
 
         unsafe { std::env::remove_var("SIGIT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
