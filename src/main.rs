@@ -4040,6 +4040,9 @@ mod tests {
 
     #[test]
     fn history_replay_redraws_the_conversation_for_the_client() {
+        let changelog_path = std::env::current_dir().unwrap().join("CHANGELOG.md");
+        let changelog_path_text = changelog_path.to_string_lossy().into_owned();
+        let arguments = serde_json::json!({ "path": changelog_path_text }).to_string();
         let history = vec![
             serde_json::json!({ "role": "system", "content": "project context" }),
             serde_json::json!({ "role": "user", "content": "read the changelog" }),
@@ -4048,7 +4051,7 @@ mod tests {
                 "content": "<think>which file?</think>Reading it now.",
                 "tool_calls": [{
                     "id": "call_1", "type": "function",
-                    "function": { "name": "read_file", "arguments": "{\"path\":\"/tmp/CHANGELOG.md\"}" },
+                    "function": { "name": "read_file", "arguments": arguments },
                 }],
             }),
             serde_json::json!({ "role": "tool", "tool_call_id": "call_1", "content": "# Changelog" }),
@@ -4077,13 +4080,13 @@ mod tests {
         }
         match &updates[2] {
             SessionUpdate::ToolCall(call) => {
-                assert_eq!(call.title, "read_file · /tmp/CHANGELOG.md");
+                assert_eq!(call.title, format!("read_file · {changelog_path_text}"));
                 assert_eq!(call.kind, ToolKind::Read);
                 // Nothing is still running in a saved session.
                 assert_eq!(call.status, ToolCallStatus::Completed);
                 assert_eq!(
                     call.raw_input,
-                    Some(serde_json::json!({"path": "/tmp/CHANGELOG.md"}))
+                    Some(serde_json::json!({"path": changelog_path_text}))
                 );
                 // The result is folded into its call rather than replayed loose.
                 assert_eq!(
@@ -4094,7 +4097,7 @@ mod tests {
                 // output shows up as displayable content, not just raw_output.
                 assert!(format!("{:?}", call.content).contains("# Changelog"));
                 assert_eq!(call.locations.len(), 1);
-                assert_eq!(call.locations[0].path, PathBuf::from("/tmp/CHANGELOG.md"));
+                assert_eq!(call.locations[0].path, changelog_path);
             }
             other => panic!("expected the tool call, got {other:?}"),
         }
