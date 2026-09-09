@@ -280,7 +280,15 @@ fn loading_a_saved_session_replays_it_to_the_client() {
         .iter()
         .find(|update| update["sessionUpdate"] == "tool_call")
         .unwrap_or_else(|| panic!("the tool call must come back: {replay:#?}"));
-    assert_eq!(tool_call["title"], "read_file");
+    // The full path can run past the title's truncation cap under a long
+    // scratch dir, so check the readable prefix rather than an exact match.
+    assert!(
+        tool_call["title"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("read_file · "),
+        "title should read '<tool> · <path>': {tool_call}"
+    );
     // Nothing is still running in a saved session, and the result is folded
     // back into its call rather than replayed as a loose message.
     assert_eq!(tool_call["status"], "completed");
@@ -290,6 +298,12 @@ fn loading_a_saved_session_replays_it_to_the_client() {
             .unwrap_or_default()
             .contains("hello from the notes"),
         "the tool result must ride along with its call: {tool_call}"
+    );
+    // The card must be expandable on replay, not just carry raw_output —
+    // that's the point of issue #78.
+    assert!(
+        format!("{:?}", tool_call["content"]).contains("hello from the notes"),
+        "the replayed card must show its output as content: {tool_call}"
     );
 
     // The seeded system context is the model's, not the user's — it must never
