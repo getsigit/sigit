@@ -4,6 +4,14 @@
 
 ### What changed
 
+- **Editor panels can switch permission mode without a slash command.** ACP
+  clients now get a Permissions selector next to the model controls with
+  Manual, Auto, and Plan choices for the current session. Manual keeps the
+  existing approval prompts, Auto lets mutating tools run unattended while
+  still respecting explicit deny rules in `settings.toml`, and Plan keeps the
+  agent in research-only mode. The selector follows `/plan` and `/clear`, and
+  it is deliberately session-scoped so a risky Auto choice does not persist
+  into the next task
 - **`@smbcloud/sigit` gets releases again.** The npm scope moved to
   `@getsigit` in 1.5.5 and the old package was left sitting on the registry at
   1.5.2, so an install made before the rename went quiet — `npm update` had

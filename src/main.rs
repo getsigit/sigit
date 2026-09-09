@@ -1395,7 +1395,7 @@ impl SiGitAgent {
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
+            build_config_options(&guard, &args.session_id.to_string())
         };
 
         self.advertise_commands(cx, args.session_id.clone());
@@ -1444,7 +1444,7 @@ impl SiGitAgent {
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
+            build_config_options(&guard, &new_id.to_string())
         };
 
         self.advertise_commands(cx, new_id.clone());
@@ -1491,7 +1491,7 @@ impl SiGitAgent {
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
+            build_config_options(&guard, &session_id.to_string())
         };
 
         self.advertise_commands(cx, session_id.clone());
@@ -2241,7 +2241,7 @@ impl SiGitAgent {
         // Push refreshed picker + commands so the editor reflects current state.
         let config_options = {
             let guard = self.current_model.lock().unwrap();
-            build_model_config_options(&guard)
+            build_config_options(&guard, &session_id.to_string())
         };
         self.send_tool_call_update(
             cx,
@@ -2297,7 +2297,46 @@ impl SiGitAgent {
                 .ok();
             // Rebuild so the Model picker reflects the new emphasis/order.
             let current = self.current_model.lock().unwrap().clone();
-            let config_options = build_model_config_options(&current);
+            let config_options = build_config_options(&current, &args.session_id.to_string());
+            return Ok(SetSessionConfigOptionResponse::new(config_options));
+        }
+
+        // ── Permissions dropdown (issue #76) ────────────────────────────────
+        if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
+            let session_key = args.session_id.to_string();
+            let message = match args.value.as_value_id().map(|v| v.0.as_ref()) {
+                Some(PERMISSION_MODE_MANUAL) => {
+                    permissions::set_plan_mode(&session_key, false);
+                    permissions::set_session_mode(
+                        &session_key,
+                        Some(settings::PermissionMode::Ask),
+                    );
+                    "Permissions: Manual — the agent asks before running mutating tools."
+                }
+                Some(PERMISSION_MODE_AUTO) => {
+                    permissions::set_plan_mode(&session_key, false);
+                    permissions::set_session_mode(
+                        &session_key,
+                        Some(settings::PermissionMode::Allow),
+                    );
+                    "Permissions: Auto — tools run without asking, subject to settings.toml rules."
+                }
+                Some(PERMISSION_MODE_PLAN) => {
+                    permissions::set_plan_mode(&session_key, true);
+                    "Permissions: Plan — the agent researches with read-only tools and presents \
+                     a plan; edits and commands are blocked."
+                }
+                other => {
+                    return Err(agent_client_protocol::Error::new(
+                        -32602,
+                        format!("unknown Permissions value: {other:?}"),
+                    ));
+                }
+            };
+            self.send_system_status(cx, args.session_id.clone(), message)
+                .ok();
+            let current = self.current_model.lock().unwrap().clone();
+            let config_options = build_config_options(&current, &session_key);
             return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
@@ -2341,7 +2380,7 @@ impl SiGitAgent {
                     "set_session_config_option: {} is already the active selection, skipping",
                     current.display_name
                 );
-                let config_options = build_model_config_options(&current);
+                let config_options = build_config_options(&current, &args.session_id.to_string());
                 return Ok(SetSessionConfigOptionResponse::new(config_options));
             }
         }
@@ -2371,7 +2410,7 @@ impl SiGitAgent {
             }
 
             let current = self.current_model.lock().unwrap().clone();
-            let config_options = build_model_config_options(&current);
+            let config_options = build_config_options(&current, &args.session_id.to_string());
             return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
@@ -2608,7 +2647,7 @@ impl SiGitAgent {
 
                 let config_options = {
                     let guard = self.current_model.lock().unwrap();
-                    build_model_config_options(&guard)
+                    build_config_options(&guard, &args.session_id.to_string())
                 };
 
                 log::info!("model switch complete");
@@ -2648,6 +2687,16 @@ const LOCAL_INFERENCE_CONFIG_ID: &str = "sigit-local-inference";
 const LOCAL_INFERENCE_ON: &str = "local-inference-on";
 const LOCAL_INFERENCE_OFF: &str = "local-inference-off";
 
+/// config option ID for the Permissions dropdown (issue #76): flips the
+/// session between asking for approval, running tools unattended, and plan
+/// mode, without touching `settings.toml`.
+const PERMISSION_MODE_CONFIG_ID: &str = "sigit-permission-mode";
+
+/// `select` value ids for the Permissions dropdown.
+const PERMISSION_MODE_MANUAL: &str = "permission-mode-manual";
+const PERMISSION_MODE_AUTO: &str = "permission-mode-auto";
+const PERMISSION_MODE_PLAN: &str = "permission-mode-plan";
+
 /// Replace non-ASCII chars so a downstream byte-index truncation can't split a
 /// multi-byte char. Zed slices the model-picker label at a fixed byte offset
 /// (`agent_ui/src/config_options.rs`) and panics — crashing the whole editor —
@@ -2659,7 +2708,10 @@ fn ascii_safe(s: &str) -> String {
         .collect()
 }
 
-fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionConfigOption> {
+fn build_config_options(
+    current_model: &GgufModelConfig,
+    session_key: &str,
+) -> Vec<SessionConfigOption> {
     // The full list, including the siGit Code Cloud tiers, so the panel picker
     // mirrors the TUI `/models`. Cloud entries are sign-in gated at selection.
     let items = models::build_model_picker_items();
@@ -2749,8 +2801,46 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
     )
     .description("Toggle on-device inference; changes which models are highlighted");
 
+    // Permissions dropdown (issue #76): Manual (ask), Auto (run unattended),
+    // Plan (research only). Derived, never stored — see `permissions.rs`.
+    let permission_current = SessionConfigValueId::new(if permissions::plan_mode(session_key) {
+        PERMISSION_MODE_PLAN
+    } else {
+        match permissions::effective_mode(session_key) {
+            settings::PermissionMode::Allow => PERMISSION_MODE_AUTO,
+            settings::PermissionMode::Ask | settings::PermissionMode::Deny => {
+                PERMISSION_MODE_MANUAL
+            }
+        }
+    });
+    let permission_options = vec![
+        SessionConfigSelectOption::new(
+            SessionConfigValueId::new(PERMISSION_MODE_MANUAL),
+            "Manual".to_string(),
+        )
+        .description("Ask before running mutating tools".to_string()),
+        SessionConfigSelectOption::new(
+            SessionConfigValueId::new(PERMISSION_MODE_AUTO),
+            "Auto".to_string(),
+        )
+        .description("Run tools without asking, subject to settings.toml rules".to_string()),
+        SessionConfigSelectOption::new(
+            SessionConfigValueId::new(PERMISSION_MODE_PLAN),
+            "Plan".to_string(),
+        )
+        .description("Research only; no edits or commands".to_string()),
+    ];
+    let permission_option = SessionConfigOption::select(
+        PERMISSION_MODE_CONFIG_ID,
+        "Permissions",
+        permission_current,
+        permission_options,
+    )
+    .category(SessionConfigOptionCategory::Mode)
+    .description("How tool calls are approved for this session");
+
     if options.is_empty() {
-        return vec![local_option];
+        return vec![local_option, permission_option];
     }
 
     let current_value = SessionConfigValueId::new(current_model.model_id.as_str());
@@ -2760,6 +2850,7 @@ fn build_model_config_options(current_model: &GgufModelConfig) -> Vec<SessionCon
             .category(SessionConfigOptionCategory::Model)
             .description("Select an on-device model or a siGit Code Cloud tier"),
         local_option,
+        permission_option,
     ]
 }
 
@@ -2970,6 +3061,19 @@ async fn exec_slash_acp(
             permissions::reset_session(&session_id.to_string());
             // The saved session must not resurrect what the user just wiped.
             session_store::delete(&session_id.to_string());
+            // The wipe drops the session's Permissions override too; push the
+            // refreshed chip so it doesn't keep showing a stale pick.
+            let config_options = {
+                let current = agent.current_model.lock().unwrap();
+                build_config_options(&current, &session_id.to_string())
+            };
+            agent
+                .send_tool_call_update(
+                    cx,
+                    session_id.clone(),
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+                )
+                .ok();
             agent
                 .send_assistant_message(
                     cx,
@@ -2989,6 +3093,19 @@ async fn exec_slash_acp(
                 "Plan mode OFF — the agent may execute tools again (subject to the \
                  permission policy)."
             };
+            // Keep the panel Permissions chip in step: /plan on moves it to
+            // Plan, /plan off drops it back to whatever the session mode is.
+            let config_options = {
+                let current = agent.current_model.lock().unwrap();
+                build_config_options(&current, &session_key)
+            };
+            agent
+                .send_tool_call_update(
+                    cx,
+                    session_id.clone(),
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+                )
+                .ok();
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Permissions => {
@@ -3175,7 +3292,7 @@ async fn exec_slash_acp(
             // Refresh the panel so the Model picker reflects the new emphasis.
             let config_options = {
                 let current = agent.current_model.lock().unwrap();
-                build_model_config_options(&current)
+                build_config_options(&current, &session_id.to_string())
             };
             agent
                 .send_tool_call_update(
@@ -4229,7 +4346,7 @@ mod tests {
             approx_memory: "Cloud".to_string(),
             chat_template: None,
         };
-        let options = serde_json::to_value(build_model_config_options(&current)).unwrap();
+        let options = serde_json::to_value(build_config_options(&current, "t-config")).unwrap();
         let all_options = options.as_array().expect("config options");
 
         let model = all_options
@@ -4265,5 +4382,19 @@ mod tests {
             .filter_map(|option| option["name"].as_str())
             .collect();
         assert_eq!(inference_names, ["Local", "Cloud"]);
+
+        let permissions = all_options
+            .iter()
+            .find(|option| option["id"] == PERMISSION_MODE_CONFIG_ID)
+            .expect("permissions config option");
+        assert_eq!(permissions["category"], "mode");
+        assert_eq!(permissions["currentValue"], PERMISSION_MODE_MANUAL);
+        let permission_names: Vec<&str> = permissions["options"]
+            .as_array()
+            .expect("permissions select options")
+            .iter()
+            .filter_map(|option| option["name"].as_str())
+            .collect();
+        assert_eq!(permission_names, ["Manual", "Auto", "Plan"]);
     }
 }
