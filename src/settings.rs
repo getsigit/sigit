@@ -230,26 +230,11 @@ pub fn permission_rules() -> PermissionRules {
 }
 
 /// The tool's explicit `[permissions.tools]` override, or `None` when it has
-/// no entry. Unlike [`permission_mode_for`] this never falls back to the
-/// default or the env override, so callers can tell "the user set a mode for
-/// this exact tool" apart from "the tool inherits the default".
+/// no entry. This never falls back to the default or the env override, so
+/// callers can tell "the user set a mode for this exact tool" apart from "the
+/// tool inherits the default".
 pub fn permission_mode_explicit(tool_name: &str) -> Option<PermissionMode> {
     load().permissions.tools.get(tool_name).copied()
-}
-
-/// The effective permission mode for one tool: its `[permissions.tools]`
-/// override when present, else the default (see [`permission_default`]).
-pub fn permission_mode_for(tool_name: &str) -> PermissionMode {
-    let settings = load();
-    if let Some(mode) = settings.permissions.tools.get(tool_name) {
-        return *mode;
-    }
-    if let Ok(raw) = std::env::var(PERMISSIONS_ENV)
-        && let Some(mode) = PermissionMode::parse(&raw)
-    {
-        return mode;
-    }
-    settings.permissions.default
 }
 
 #[cfg(test)]
@@ -295,7 +280,7 @@ mod tests {
         // overrides.
         unsafe { std::env::remove_var(PERMISSIONS_ENV) };
         assert_eq!(permission_default(), PermissionMode::Ask);
-        assert_eq!(permission_mode_for("run_command"), PermissionMode::Ask);
+        assert_eq!(permission_mode_explicit("run_command"), None);
 
         let mut settings = load();
         settings.permissions.default = PermissionMode::Allow;
@@ -305,16 +290,18 @@ mod tests {
             .insert("delete_file".to_string(), PermissionMode::Deny);
         store(&settings).unwrap();
         assert_eq!(permission_default(), PermissionMode::Allow);
-        assert_eq!(permission_mode_for("run_command"), PermissionMode::Allow);
-        assert_eq!(permission_mode_for("delete_file"), PermissionMode::Deny);
+        assert_eq!(permission_mode_explicit("run_command"), None);
+        assert_eq!(
+            permission_mode_explicit("delete_file"),
+            Some(PermissionMode::Deny)
+        );
 
         unsafe { std::env::set_var(PERMISSIONS_ENV, "deny") };
         assert_eq!(permission_default(), PermissionMode::Deny);
-        assert_eq!(permission_mode_for("run_command"), PermissionMode::Deny);
         assert_eq!(
-            permission_mode_for("delete_file"),
-            PermissionMode::Deny,
-            "per-tool override still wins"
+            permission_mode_explicit("delete_file"),
+            Some(PermissionMode::Deny),
+            "per-tool override is unaffected by the env var"
         );
         unsafe { std::env::set_var(PERMISSIONS_ENV, "garbage") };
         assert_eq!(

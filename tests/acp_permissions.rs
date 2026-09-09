@@ -294,6 +294,10 @@ impl AgentUnderTest {
             if message["method"] == "session/update" {
                 updates.push(message["params"]["update"].clone());
             }
+            assert!(
+                message["method"] != "session/request_permission",
+                "unexpected permission request while waiting for response {id}: {message}"
+            );
             if message["id"] == id && message.get("method").is_none() {
                 assert!(
                     message.get("error").is_none(),
@@ -549,6 +553,160 @@ fn successful_config_option_changes_are_rendered_as_system_status_cards() {
             .unwrap_or_default()
             .starts_with("Switched to siGit Code Cloud"),
         "unexpected cloud switch status title: {status}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn auto_permission_mode_runs_mutating_tools_without_asking() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo sigit-auto"}"#),
+        sse_text("done"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_auto_perm_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-permission-mode",
+            "value": "permission-mode-auto",
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(id);
+    let permissions = response["result"]["configOptions"]
+        .as_array()
+        .expect("config options")
+        .iter()
+        .find(|option| option["id"] == "sigit-permission-mode")
+        .expect("permissions config option");
+    assert_eq!(permissions["currentValue"], "permission-mode-auto");
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "agent_message_chunk"),
+        "Permissions picker changes are passive UI state, not chat text: {updates:?}"
+    );
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "expected tool round and final round");
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_1")
+        .expect("tool result for the automatic call");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sigit-auto"),
+        "automatic command output should reach the endpoint: {result}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn plan_permission_mode_denies_mutating_tools_without_asking() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo sigit-plan"}"#),
+        sse_text("planned"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_plan_perm_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-permission-mode",
+            "value": "permission-mode-plan",
+        }),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(id);
+    let permissions = response["result"]["configOptions"]
+        .as_array()
+        .expect("config options")
+        .iter()
+        .find(|option| option["id"] == "sigit-permission-mode")
+        .expect("permissions config option");
+    assert_eq!(permissions["currentValue"], "permission-mode-plan");
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected denied tool round and final round"
+    );
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_1")
+        .expect("tool result for the blocked call");
+    let content = result["content"].as_str().unwrap_or_default();
+    assert!(
+        content.contains("Plan mode is active") && content.contains("was not executed"),
+        "plan mode should return an instructive denial to the endpoint: {result}"
     );
 
     drop(agent);
