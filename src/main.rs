@@ -81,7 +81,8 @@ use agent_client_protocol::schema::v1::{
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
     SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -349,6 +350,86 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
     }
 }
 
+/// The longest run of consecutive backticks in `text`, so a fence built around
+/// it can't be broken out of by output that itself contains ```` ``` ````.
+fn longest_backtick_run(text: &str) -> usize {
+    let mut max = 0;
+    let mut current = 0;
+    for c in text.chars() {
+        if c == '`' {
+            current += 1;
+            max = max.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    max
+}
+
+/// Fences `text` as a Markdown code block, sizing the fence from the longest
+/// backtick run already in `text` so it can't break out of the block.
+fn fenced_code_block(language: &str, text: &str) -> String {
+    let fence = "`".repeat((longest_backtick_run(text) + 1).max(3));
+    let language = if language
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '+'))
+    {
+        language
+    } else {
+        ""
+    };
+    format!("{fence}{language}\n{text}\n{fence}")
+}
+
+/// Displays tool arguments as JSON when they parse as JSON, otherwise as an
+/// unlabelled code block so malformed arguments do not get misleading syntax
+/// highlighting.
+fn tool_arguments_content(arguments_json: &str) -> ToolCallContent {
+    let language = if serde_json::from_str::<serde_json::Value>(arguments_json).is_ok() {
+        "json"
+    } else {
+        ""
+    };
+    fenced_code_block(language, &chat::pretty_tool_arguments(arguments_json)).into()
+}
+
+/// Wraps a tool's output as the display content of its ACP tool-call card
+/// (issue #78). Capped via [`chat::cap_output_preview`] — display only, the
+/// model still gets the full output — and fenced so plain-text output (or a
+/// stray tag, per issue #73) renders literally instead of as markdown.
+fn tool_output_content(output: &str) -> ToolCallContent {
+    if output.is_empty() {
+        return "(no output)".to_string().into();
+    }
+    fenced_code_block("", &chat::cap_output_preview(output)).into()
+}
+
+/// A single-file location for the path-bearing tools, so ACP clients can
+/// follow the agent through a file as it works (issue #78's "follow-along").
+fn tool_call_locations(name: &str, arguments_json: &str) -> Vec<ToolCallLocation> {
+    if !matches!(
+        name,
+        "read_file" | "create_file" | "edit_file" | "multi_edit" | "delete_file"
+    ) {
+        return Vec::new();
+    }
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments_json) else {
+        return Vec::new();
+    };
+    let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    let path_buf = PathBuf::from(path);
+    let absolute = if path_buf.is_absolute() {
+        path_buf
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path_buf)
+    };
+    vec![ToolCallLocation::new(absolute)]
+}
+
 /// The visible text of one saved history message. `content` is normally a
 /// string, but an OpenAI-compatible endpoint may hand back the block form, and
 /// tool-call-only assistant turns carry `null`.
@@ -431,9 +512,12 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
                     } else {
                         id.to_string()
                     };
-                    let mut tool_call = ToolCall::new(replay_id, name)
+                    let output = outputs.get(id).copied().unwrap_or_default();
+                    let mut tool_call = ToolCall::new(replay_id, chat::tool_title(name, arguments))
                         .kind(tool_kind_for(name))
                         .status(ToolCallStatus::Completed)
+                        .content(vec![tool_output_content(output)])
+                        .locations(tool_call_locations(name, arguments))
                         .raw_input(serde_json::from_str::<serde_json::Value>(arguments).ok());
                     if let Some(output) = outputs.get(id) {
                         tool_call =
@@ -1818,13 +1902,16 @@ impl SiGitAgent {
                             log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
                             serde_json::Value::String(tc.arguments.clone())
                         });
+                    let invocation_content = tool_arguments_content(&tc.arguments);
                     self.send_tool_call_update(
                         cx,
                         session_id.clone(),
                         SessionUpdate::ToolCall(
-                            ToolCall::new(tc.id.clone(), tc.name.clone())
+                            ToolCall::new(tc.id.clone(), chat::tool_title(&tc.name, &tc.arguments))
                                 .kind(tool_kind_for(&tc.name))
                                 .status(ToolCallStatus::InProgress)
+                                .content(vec![invocation_content])
+                                .locations(tool_call_locations(&tc.name, &tc.arguments))
                                 .raw_input(raw_input),
                         ),
                     )
@@ -1901,6 +1988,7 @@ impl SiGitAgent {
                                             ),
                                         });
                                     }
+                                    let cancelled_reason = "Not executed: the user cancelled the turn at the permission prompt.";
                                     self.send_tool_call_update(
                                         cx,
                                         session_id.clone(),
@@ -1908,9 +1996,11 @@ impl SiGitAgent {
                                             tc.id.clone(),
                                             ToolCallUpdateFields::new()
                                                 .status(ToolCallStatus::Failed)
+                                                .content(vec![tool_output_content(
+                                                    cancelled_reason,
+                                                )])
                                                 .raw_output(serde_json::Value::String(
-                                                    "Not executed: the user cancelled the turn at the permission prompt."
-                                                        .to_string(),
+                                                    cancelled_reason.to_string(),
                                                 )),
                                         )),
                                     )
@@ -1933,6 +2023,7 @@ impl SiGitAgent {
                             tc.id.clone(),
                             ToolCallUpdateFields::new()
                                 .status(ToolCallStatus::Completed)
+                                .content(vec![tool_output_content(&output)])
                                 .raw_output(serde_json::Value::String(output.clone())),
                         )),
                     )
@@ -4085,6 +4176,9 @@ mod tests {
 
     #[test]
     fn history_replay_redraws_the_conversation_for_the_client() {
+        let changelog_path = std::env::current_dir().unwrap().join("CHANGELOG.md");
+        let changelog_path_text = changelog_path.to_string_lossy().into_owned();
+        let arguments = serde_json::json!({ "path": changelog_path_text }).to_string();
         let history = vec![
             serde_json::json!({ "role": "system", "content": "project context" }),
             serde_json::json!({ "role": "user", "content": "read the changelog" }),
@@ -4093,7 +4187,7 @@ mod tests {
                 "content": "<think>which file?</think>Reading it now.",
                 "tool_calls": [{
                     "id": "call_1", "type": "function",
-                    "function": { "name": "read_file", "arguments": "{\"path\":\"/tmp/CHANGELOG.md\"}" },
+                    "function": { "name": "read_file", "arguments": arguments },
                 }],
             }),
             serde_json::json!({ "role": "tool", "tool_call_id": "call_1", "content": "# Changelog" }),
@@ -4122,19 +4216,24 @@ mod tests {
         }
         match &updates[2] {
             SessionUpdate::ToolCall(call) => {
-                assert_eq!(call.title, "read_file");
+                assert_eq!(call.title, format!("read_file · {changelog_path_text}"));
                 assert_eq!(call.kind, ToolKind::Read);
                 // Nothing is still running in a saved session.
                 assert_eq!(call.status, ToolCallStatus::Completed);
                 assert_eq!(
                     call.raw_input,
-                    Some(serde_json::json!({"path": "/tmp/CHANGELOG.md"}))
+                    Some(serde_json::json!({"path": changelog_path_text}))
                 );
                 // The result is folded into its call rather than replayed loose.
                 assert_eq!(
                     call.raw_output,
                     Some(serde_json::Value::String("# Changelog".to_string()))
                 );
+                // Replay is expandable exactly like a live card: the saved
+                // output shows up as displayable content, not just raw_output.
+                assert!(format!("{:?}", call.content).contains("# Changelog"));
+                assert_eq!(call.locations.len(), 1);
+                assert_eq!(call.locations[0].path, changelog_path);
             }
             other => panic!("expected the tool call, got {other:?}"),
         }
@@ -4162,6 +4261,28 @@ mod tests {
                 assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
             }
             other => panic!("expected one plan update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_replay_shows_a_placeholder_for_a_call_with_no_recorded_output() {
+        // A session file can carry a tool call whose result was never saved
+        // (e.g. an older session format). Replay must not show an empty card.
+        let history = vec![serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "run_command", "arguments": "{\"command\":\"git add -A\"}" },
+            }],
+        })];
+
+        match history_replay_updates(&history).as_slice() {
+            [SessionUpdate::ToolCall(call)] => {
+                assert!(format!("{:?}", call.content).contains("(no output)"));
+                assert_eq!(call.raw_output, None);
+            }
+            other => panic!("expected one tool call, got {other:?}"),
         }
     }
 
@@ -4396,5 +4517,73 @@ mod tests {
             .filter_map(|option| option["name"].as_str())
             .collect();
         assert_eq!(permission_names, ["Manual", "Auto", "Plan"]);
+    }
+
+    #[test]
+    fn tool_output_content_shows_a_placeholder_for_empty_output() {
+        let content = tool_output_content("");
+        assert!(format!("{content:?}").contains("(no output)"));
+    }
+
+    #[test]
+    fn tool_output_content_preserves_whitespace_only_output() {
+        let content = tool_output_content("   \n\t  ");
+        let rendered = format!("{content:?}");
+        assert!(!rendered.contains("(no output)"));
+        assert!(rendered.contains("   \\n\\t  "));
+    }
+
+    #[test]
+    fn tool_arguments_content_only_labels_valid_json() {
+        let json = format!("{:?}", tool_arguments_content(r#"{"path":"src/main.rs"}"#));
+        let malformed = format!("{:?}", tool_arguments_content("{not json"));
+        assert!(json.contains("```json"));
+        assert!(!malformed.contains("```json"));
+        assert!(malformed.contains("{not json"));
+    }
+
+    #[test]
+    fn fenced_code_block_drops_an_unsafe_language() {
+        let block = fenced_code_block("json\nnot fenced", "{}");
+        assert_eq!(block, "```\n{}\n```");
+    }
+
+    #[test]
+    fn tool_output_content_widens_the_fence_around_embedded_backticks() {
+        let output = "here is a fence:\n```\ncode\n```";
+        let content = tool_output_content(output);
+        let rendered = format!("{content:?}");
+        // A three-backtick fence would terminate early on the embedded ```;
+        // the wrapping fence must be longer than any run already present.
+        assert!(rendered.contains("````"));
+    }
+
+    #[test]
+    fn tool_output_content_caps_long_output_via_cap_output_preview() {
+        // Comfortably past chat's internal preview cap without depending on
+        // its exact value, which is private to that module.
+        let output = "x".repeat(10_000);
+        let content = tool_output_content(&output);
+        let rendered = format!("{content:?}");
+        assert!(rendered.contains("truncated"));
+    }
+
+    #[test]
+    fn longest_backtick_run_finds_the_widest_run() {
+        assert_eq!(longest_backtick_run("no backticks here"), 0);
+        assert_eq!(longest_backtick_run("one ` two `` three ``` four"), 3);
+    }
+
+    #[test]
+    fn tool_call_locations_require_a_known_tool_and_string_path() {
+        assert!(tool_call_locations("read_file", "{not json").is_empty());
+        assert!(tool_call_locations("read_file", r#"{"path":42}"#).is_empty());
+        assert!(
+            tool_call_locations("future_multi_file_tool", r#"{"path":"src/main.rs"}"#).is_empty()
+        );
+
+        let locations = tool_call_locations("multi_edit", r#"{"path":"src/main.rs"}"#);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("src/main.rs"));
     }
 }
