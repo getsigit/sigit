@@ -283,6 +283,31 @@ impl AgentUnderTest {
         }
     }
 
+    fn wait_for_response_with_updates(&mut self, id: u64) -> (Value, Vec<Value>) {
+        let mut updates = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for response to request {id}");
+            };
+            if message["method"] == "session/update" {
+                updates.push(message["params"]["update"].clone());
+            }
+            assert!(
+                message["method"] != "session/request_permission",
+                "unexpected permission request while waiting for response {id}: {message}"
+            );
+            if message["id"] == id && message.get("method").is_none() {
+                assert!(
+                    message.get("error").is_none(),
+                    "request {id} failed: {message}"
+                );
+                return (message, updates);
+            }
+        }
+    }
+
     /// A request *from* the agent (has a `method` and its own id).
     fn wait_for_agent_request(&mut self, method: &str) -> Value {
         self.wait_for(&format!("agent request {method}"), |message| {
@@ -434,6 +459,261 @@ fn permission_round_trip_cancel_then_allow() {
 }
 
 #[test]
+fn successful_config_option_changes_are_rendered_as_system_status_cards() {
+    let endpoint = start_fake_endpoint(vec![]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_config_messages_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(
+        config_dir.join("credentials.toml"),
+        "access_token = \"tok_test\"\nemail = \"dev@sigit.si\"\n",
+    )
+    .unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-local-inference",
+            "value": "local-inference-off",
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(id);
+    assert!(
+        response["result"]["configOptions"].is_array(),
+        "config response should refresh picker options: {response}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "agent_message_chunk"),
+        "Local Inference picker changes are passive UI state, not chat text: {updates:?}"
+    );
+    let status = updates
+        .iter()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call"
+                && update["kind"] == "think"
+                && update["status"] == "completed"
+        })
+        .expect("Local Inference change should render as a system-style status card");
+    assert_eq!(
+        status["title"],
+        "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
+    );
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-model",
+            "value": "sigit-cloud:mini",
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(id);
+    assert!(
+        response["result"]["configOptions"].is_array(),
+        "config response should refresh picker options: {response}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "agent_message_chunk"),
+        "successful model picker changes must not be rendered as assistant chat text: {updates:?}"
+    );
+    let status = updates
+        .iter()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call"
+                && update["kind"] == "think"
+                && update["status"] == "completed"
+        })
+        .expect("cloud tier change should render as a system-style status card");
+    assert!(
+        status["title"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Switched to siGit Code Cloud"),
+        "unexpected cloud switch status title: {status}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn auto_permission_mode_runs_mutating_tools_without_asking() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo sigit-auto"}"#),
+        sse_text("done"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_auto_perm_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-permission-mode",
+            "value": "permission-mode-auto",
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(id);
+    let permissions = response["result"]["configOptions"]
+        .as_array()
+        .expect("config options")
+        .iter()
+        .find(|option| option["id"] == "sigit-permission-mode")
+        .expect("permissions config option");
+    assert_eq!(permissions["currentValue"], "permission-mode-auto");
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "agent_message_chunk"),
+        "Permissions picker changes are passive UI state, not chat text: {updates:?}"
+    );
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "expected tool round and final round");
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_1")
+        .expect("tool result for the automatic call");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sigit-auto"),
+        "automatic command output should reach the endpoint: {result}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn plan_permission_mode_denies_mutating_tools_without_asking() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo sigit-plan"}"#),
+        sse_text("planned"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_plan_perm_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-permission-mode",
+            "value": "permission-mode-plan",
+        }),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(id);
+    let permissions = response["result"]["configOptions"]
+        .as_array()
+        .expect("config options")
+        .iter()
+        .find(|option| option["id"] == "sigit-permission-mode")
+        .expect("permissions config option");
+    assert_eq!(permissions["currentValue"], "permission-mode-plan");
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected denied tool round and final round"
+    );
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_1")
+        .expect("tool result for the blocked call");
+    let content = result["content"].as_str().unwrap_or_default();
+    assert!(
+        content.contains("Plan mode is active") && content.contains("was not executed"),
+        "plan mode should return an instructive denial to the endpoint: {result}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
 fn a_slow_commands_progress_reaches_the_client_while_it_runs() {
     let scratch = std::env::temp_dir().join(format!("sigit_acp_progress_{}", std::process::id()));
     let config_dir = scratch.join("config");
@@ -576,6 +856,272 @@ fn text_from_two_tool_rounds_reaches_the_client_as_separate_paragraphs() {
     assert!(
         !rendered.contains("pattern.Let me"),
         "rounds must not run together into one sentence, got: {rendered:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A model that writes its tool call out as literal `<tool_call>` text instead
+/// of using the structured field must still drive the loop. Before recovery
+/// the tag was streamed to the client as prose and the turn ended with no tool
+/// calls, so the request silently went unanswered (getsigit/sigit#73).
+#[test]
+fn a_tool_call_emitted_as_text_is_executed_rather_than_rendered() {
+    let endpoint = start_fake_endpoint(vec![
+        // Split mid-tag, the way a real stream arrives.
+        sse_body(&[
+            json!({"choices": [{"delta": {"content": "Checking the repo: <tool_c"}}]}),
+            json!({"choices": [{"delta": {"content": "all>command_output<arg_key>task_id</arg_key>"}}]}),
+            json!({"choices": [{"delta": {"content": "<arg_value>2</arg_value></tool_call>"}}]}),
+        ]),
+        sse_text("All done."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_inline_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "check the repo"}],
+        }),
+    );
+    let (_response, rendered) = agent.wait_for_prompt(prompt_id);
+
+    // The raw tag must never be shown to the user.
+    assert!(
+        !rendered.contains("<tool_call>") && !rendered.contains("<arg_key>"),
+        "raw tool-call markup reached the client: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Checking the repo:"),
+        "surrounding prose should still stream: {rendered:?}"
+    );
+
+    // The loop has to keep going: a second request means the recovered call
+    // ran and its result was sent back. Before recovery the turn ended here.
+    let requests = endpoint.requests.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected a follow-up request carrying the tool result, got {}",
+        requests.len()
+    );
+    let follow_up = &requests[1];
+    let messages = follow_up["messages"].as_array().expect("messages");
+    assert!(
+        messages.iter().any(|message| message["role"] == "tool"),
+        "the follow-up should answer the recovered call: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message["role"] == "assistant" && message["tool_calls"].is_array() }),
+        "history must record the recovered call, not the raw tag: {messages:?}"
+    );
+    drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn write_todos_reaches_the_client_as_an_acp_plan() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_1",
+            "write_todos",
+            &json!({
+                "todos": [
+                    {"content": "Fetch issue screenshot", "status": "completed"},
+                    {"content": "Implement ACP styling", "status": "in_progress"},
+                    {"content": "Build and verify", "status": "pending"}
+                ]
+            })
+            .to_string(),
+        ),
+        sse_text("Continuing."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_plan_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "fix the ACP display"}],
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let plan = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "plan")
+        .expect("write_todos should be rendered as an ACP plan update");
+    assert_eq!(plan["entries"][0]["content"], "Fetch issue screenshot");
+    assert_eq!(plan["entries"][0]["status"], "completed");
+    assert_eq!(plan["entries"][1]["status"], "in_progress");
+    assert_eq!(plan["entries"][2]["status"], "pending");
+
+    assert!(
+        !updates.iter().any(|update| {
+            update["sessionUpdate"] == "tool_call" && update["title"] == "write_todos"
+        }),
+        "write_todos must not show up as a generic tool-call card: {updates:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// An off-enum status must not make the whole call vanish. `exec_write_todos`
+/// renders it as pending and reports success, so the plan has to carry it the
+/// same way; dropping the plan here would leave the client showing a stale list.
+#[test]
+fn write_todos_with_an_unknown_status_still_reaches_the_client() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_1",
+            "write_todos",
+            &json!({
+                "todos": [
+                    {"content": "Fetch issue screenshot", "status": "completed"},
+                    {"content": "Ship it", "status": "cancelled"}
+                ]
+            })
+            .to_string(),
+        ),
+        sse_text("Continuing."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_plan_odd_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "plan the work"}],
+        }),
+    );
+    let (_response, updates) = agent.wait_for_response_with_updates(prompt_id);
+
+    let plan = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "plan")
+        .expect("an unknown status must not drop the plan");
+    assert_eq!(plan["entries"][1]["content"], "Ship it");
+    assert_eq!(plan["entries"][1]["status"], "pending");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Arguments the converter cannot turn into a plan fall back to the ordinary
+/// tool-call card. Without that fallback the call is announced nowhere at all.
+#[test]
+fn unconvertible_write_todos_falls_back_to_a_tool_call_card() {
+    let endpoint = start_fake_endpoint(vec![
+        // `todos` is absent, so there is no plan to build. `exec_write_todos`
+        // answers with an error string, and the client still has to see the call.
+        sse_tool_call("call_1", "write_todos", &json!({"items": []}).to_string()),
+        sse_text("Continuing."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_plan_bad_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "plan the work"}],
+        }),
+    );
+    let (_response, updates) = agent.wait_for_response_with_updates(prompt_id);
+
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "plan"),
+        "there is no plan to send: {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|update| {
+            update["sessionUpdate"] == "tool_call" && update["title"] == "write_todos"
+        }),
+        "the call must still be announced as a tool call: {updates:?}"
     );
 
     drop(agent);

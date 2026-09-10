@@ -28,7 +28,8 @@ use tokio::sync::Mutex;
 // ── Neutral types ───────────────────────────────────────────────────────────────
 
 /// A tool the model may call, in a provider-neutral form. `parameters_schema` is
-/// a JSON Schema encoded as a string (matching how siGit already declares tools).
+/// a JSON Schema encoded as a string (matching how siGit Code already declares
+/// tools).
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: String,
@@ -74,6 +75,51 @@ pub const COMPACT_KEEP_LAST: usize = 6;
 /// The summarization request sent to the model when compacting history.
 const SUMMARIZE_PROMPT: &str = "Summarize this coding session so far: decisions made, \
     files touched, current state, open items. Be concise and factual.";
+
+/// Render a history snapshot as a plain-text transcript, with tool calls and
+/// tool results spelled out as prose rather than left in their wire shapes.
+///
+/// Compaction summarizes a conversation that is, by definition, thick with
+/// `tool_calls` and `role: "tool"` messages — but the summarization round asks
+/// for a plain answer and so sends no `tools` array. Forwarding the raw shapes
+/// in that request produces tool blocks with no schema to validate against,
+/// which strict endpoints reject outright: Anthropic answers 400, so every
+/// compaction of a session that had ever run a tool failed, permanently, no
+/// matter how small the history was. Flattening to text keeps everything the
+/// summary actually needs and drops the shapes that only make sense alongside
+/// a tool schema. It also sidesteps orphaned `tool_call_id`s and role-
+/// alternation rules, neither of which a transcript can violate.
+fn transcript_for_summary(history: &[serde_json::Value]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for message in history {
+        let role = message["role"].as_str().unwrap_or("user");
+        // The system prompt is carried over verbatim, so it needn't be summarized.
+        if role == "system" {
+            continue;
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(text) = message["content"].as_str()
+            && !text.trim().is_empty()
+        {
+            parts.push(text.to_string());
+        }
+        for call in message["tool_calls"].as_array().into_iter().flatten() {
+            parts.push(format!(
+                "called {}({})",
+                call["function"]["name"].as_str().unwrap_or("tool"),
+                call["function"]["arguments"].as_str().unwrap_or_default(),
+            ));
+        }
+        if parts.is_empty() {
+            continue;
+        }
+
+        let label = if role == "tool" { "tool result" } else { role };
+        lines.push(format!("{label}: {}", parts.join("\n")));
+    }
+    lines.join("\n\n")
+}
 
 /// Crude token estimate for a history snapshot: serialized characters / 4.
 /// Deliberately model-agnostic — it only needs to be in the right ballpark to
@@ -482,15 +528,22 @@ impl OpenAiBackend {
             return Err(describe_api_error(status, &body));
         }
 
+        // The specs are needed downstream to type the arguments of any tool
+        // call the model emitted as text rather than as a structured call.
+        let tools = tools.unwrap_or(&[]);
         if let Some(sink) = sink {
-            self.consume_stream(response, sink).await
+            self.consume_stream(response, sink, tools).await
         } else {
-            self.consume_json(response).await
+            self.consume_json(response, tools).await
         }
     }
 
     /// Parse a single non-streaming chat-completion response.
-    async fn consume_json(&self, response: reqwest::Response) -> Result<TurnResult, BackendError> {
+    async fn consume_json(
+        &self,
+        response: reqwest::Response,
+        tools: &[ToolSpec],
+    ) -> Result<TurnResult, BackendError> {
         let parsed: ChatCompletion = response
             .json()
             .await
@@ -515,6 +568,41 @@ impl OpenAiBackend {
             })
             .collect();
 
+        // Some models write a tool call out as literal `<tool_call>` text
+        // instead of using the structured field (see `inline_tool_calls`).
+        // Recover it, or the turn ends with the tag rendered as prose and
+        // whatever the model meant to do is dropped.
+        if tool_calls.is_empty() {
+            let (cleaned, recovered) = crate::inline_tool_calls::extract(&text, tools);
+            if !recovered.is_empty() {
+                log::warn!(
+                    "recovered {} tool call(s) the model emitted as text instead of a structured call",
+                    recovered.len()
+                );
+                let tool_calls: Vec<ToolCall> = recovered
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCall {
+                        id: format!("call_recovered_{index}"),
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                    .collect();
+                // Record the recovered shape, not the raw tag: the tool
+                // results that follow have to answer an assistant message
+                // that actually carries these calls, or the next request is
+                // rejected for orphaned tool results.
+                self.history
+                    .lock()
+                    .await
+                    .push(streamed_assistant_history(&cleaned, &tool_calls));
+                return Ok(TurnResult {
+                    text: cleaned,
+                    tool_calls,
+                });
+            }
+        }
+
         // Record the assistant turn so later tool results have context.
         self.history.lock().await.push(message.into_history_value());
 
@@ -528,6 +616,7 @@ impl OpenAiBackend {
         &self,
         response: reqwest::Response,
         sink: &TokenSink,
+        tools: &[ToolSpec],
     ) -> Result<TurnResult, BackendError> {
         use futures::StreamExt;
 
@@ -538,6 +627,13 @@ impl OpenAiBackend {
         let mut text = String::new();
         let mut tool_accum: Vec<StreamingToolCall> = Vec::new();
         let mut done = false;
+        // Recovers a tool call the model wrote as literal `<tool_call>` text
+        // instead of a structured delta. Scanning here (rather than after the
+        // stream) keeps the tag off the UI: content goes straight to `sink` as
+        // it arrives, so by the time a whole turn is assembled the tag has
+        // already been rendered. See `inline_tool_calls`.
+        let mut scanner = crate::inline_tool_calls::StreamScanner::new(tools);
+        let mut recovered: Vec<ToolCall> = Vec::new();
 
         while let Some(item) = stream.next().await {
             let bytes = item.map_err(|error| format!("stream read error: {error}"))?;
@@ -583,9 +679,31 @@ impl OpenAiBackend {
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
-                    text.push_str(&content);
-                    if sink.send(content).is_err() {
-                        // Consumer dropped (turn cancelled) — stop reading.
+                    let mut cancelled = false;
+                    for event in scanner.push(&content) {
+                        match event {
+                            crate::inline_tool_calls::ScanEvent::Text(chunk) => {
+                                text.push_str(&chunk);
+                                if sink.send(chunk).is_err() {
+                                    // Consumer dropped (turn cancelled).
+                                    cancelled = true;
+                                    break;
+                                }
+                            }
+                            crate::inline_tool_calls::ScanEvent::ToolCall(call) => {
+                                log::warn!(
+                                    "recovered tool call '{}' the model emitted as text instead of a structured call",
+                                    call.name
+                                );
+                                recovered.push(ToolCall {
+                                    id: format!("call_recovered_{}", recovered.len()),
+                                    name: call.name,
+                                    arguments: call.arguments,
+                                });
+                            }
+                        }
+                    }
+                    if cancelled {
                         done = true;
                         break;
                     }
@@ -615,7 +733,13 @@ impl OpenAiBackend {
             }
         }
 
-        let tool_calls: Vec<ToolCall> = tool_accum
+        // Text held back waiting on a tag that never closed is just text.
+        if let Some(leftover) = scanner.take_pending() {
+            text.push_str(&leftover);
+            let _ = sink.send(leftover);
+        }
+
+        let mut tool_calls: Vec<ToolCall> = tool_accum
             .iter()
             .filter(|call| !call.name.is_empty())
             .enumerate()
@@ -629,6 +753,7 @@ impl OpenAiBackend {
                 arguments: call.arguments.clone(),
             })
             .collect();
+        tool_calls.extend(recovered);
 
         // Record the assistant turn so later tool results have context.
         self.history
@@ -738,12 +863,30 @@ impl InferenceBackend for OpenAiBackend {
     async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
         let snapshot: Vec<serde_json::Value> = self.history.lock().await.clone();
 
-        // Ask the endpoint for a summary of the conversation so far, through
-        // the ordinary completion machinery (non-streaming).
-        self.history
-            .lock()
-            .await
-            .push(serde_json::json!({ "role": "user", "content": SUMMARIZE_PROMPT }));
+        let system = snapshot
+            .first()
+            .filter(|message| message["role"] == "system")
+            .cloned();
+
+        // Ask the endpoint for a summary of the conversation so far, through the
+        // ordinary completion machinery (non-streaming). The request carries the
+        // conversation as a flattened transcript in a single user message rather
+        // than the live history: this round offers no tools, and a tool-shaped
+        // history sent without a tool schema is rejected upstream (see
+        // `transcript_for_summary`).
+        let mut request = Vec::new();
+        if let Some(system) = system.clone() {
+            request.push(system);
+        }
+        request.push(serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "{}\n\n{SUMMARIZE_PROMPT}",
+                transcript_for_summary(&snapshot),
+            ),
+        }));
+        *self.history.lock().await = request;
+
         let summary = match self.complete(None, None).await {
             Ok(result) => result.text,
             Err(error) => {
@@ -753,10 +896,6 @@ impl InferenceBackend for OpenAiBackend {
             }
         };
 
-        let system = snapshot
-            .first()
-            .filter(|message| message["role"] == "system")
-            .cloned();
         let non_system: Vec<serde_json::Value> = snapshot
             .iter()
             .filter(|message| message["role"] != "system")
@@ -1342,12 +1481,16 @@ mod tests {
     }
 
     /// Minimal scripted OpenAI-compatible endpoint: accepts one HTTP request on
-    /// a std listener and answers with a fixed non-streaming completion.
-    fn spawn_completion_stub(summary: &str) -> std::net::SocketAddr {
+    /// a std listener and answers with a fixed non-streaming completion. The
+    /// receiver yields the request body the backend actually put on the wire.
+    fn spawn_completion_stub(
+        summary: &str,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
         let body = serde_json::json!({
             "choices": [{ "message": { "role": "assistant", "content": summary } }]
         })
@@ -1376,6 +1519,9 @@ mod tests {
                         })
                         .unwrap_or(0);
                     if request.len() >= headers_end + 4 + content_length {
+                        let _ = sender.send(
+                            String::from_utf8_lossy(&request[headers_end + 4..]).into_owned(),
+                        );
                         break;
                     }
                 }
@@ -1388,12 +1534,12 @@ mod tests {
             );
             let _ = stream.write_all(response.as_bytes());
         });
-        addr
+        (addr, receiver)
     }
 
     #[tokio::test]
     async fn compact_history_rebuilds_system_summary_and_tail() {
-        let addr = spawn_completion_stub("We refactored backend.rs; tests pass.");
+        let (addr, _requests) = spawn_completion_stub("We refactored backend.rs; tests pass.");
         let backend = OpenAiBackend::new(
             format!("http://{addr}/v1"),
             "test-key",
@@ -1428,6 +1574,66 @@ mod tests {
             history[3],
             serde_json::json!({ "role": "user", "content": "message 4" })
         );
+    }
+
+    /// Compacting a tool-heavy session must not put tool shapes on the wire.
+    /// The summarization round offers no `tools`, and endpoints reject tool
+    /// calls and tool results that arrive without a schema — which used to make
+    /// compaction fail forever in any session that had run a single tool.
+    #[tokio::test]
+    async fn compact_history_sends_no_tool_artifacts() {
+        let (addr, requests) = spawn_completion_stub("Ran git status on main.");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("be helpful".into()),
+        );
+        {
+            let mut history = backend.history.lock().await;
+            history.push(serde_json::json!({ "role": "user", "content": "check the repo" }));
+            history.push(serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "run_command", "arguments": "{\"command\":\"git status\"}" },
+                }],
+            }));
+            history.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "on branch main",
+            }));
+        }
+
+        backend.compact_history(2).await.unwrap();
+
+        let body: serde_json::Value =
+            serde_json::from_str(&requests.recv().unwrap()).expect("request body is JSON");
+        assert!(
+            body.get("tools").is_none(),
+            "summarization offers no tools: {body}"
+        );
+        for message in body["messages"].as_array().unwrap() {
+            assert!(
+                message.get("tool_calls").is_none(),
+                "no tool_calls may be sent without a schema: {message}"
+            );
+            assert_ne!(
+                message["role"], "tool",
+                "no tool results may be sent without a schema: {message}"
+            );
+        }
+
+        // The tool round still has to survive into the summary request as prose,
+        // or the summary loses the work the session actually did.
+        let transcript = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(transcript.contains("called run_command({\"command\":\"git status\"})"));
+        assert!(transcript.contains("tool result: on branch main"));
     }
 
     #[tokio::test]

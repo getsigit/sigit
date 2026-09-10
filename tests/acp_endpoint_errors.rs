@@ -50,6 +50,34 @@ fn error_in_stream_reply() -> Reply {
     }
 }
 
+fn sse_tool_call(id: &str, name: &str, arguments: &str) -> Reply {
+    Reply {
+        status: "200 OK",
+        content_type: "text/event-stream",
+        body: format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "function": {"name": name, "arguments": arguments},
+                }]}}]
+            })
+        ),
+    }
+}
+
+fn upstream_500_reply() -> Reply {
+    Reply {
+        status: "500 Internal Server Error",
+        content_type: "application/json",
+        body: json!({
+            "error": {"message": "Onde Cloud upstream error (500)", "type": "server_error"}
+        })
+        .to_string(),
+    }
+}
+
 fn start_fake_endpoint(replies: Vec<Reply>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake endpoint");
     let port = listener.local_addr().unwrap().port();
@@ -179,6 +207,23 @@ impl AgentUnderTest {
         message
     }
 
+    fn wait_for_prompt_updates(&mut self, id: u64) -> (Value, Vec<Value>) {
+        let mut updates = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the response to request {id}");
+            };
+            if message["method"] == "session/update" {
+                updates.push(message["params"]["update"].clone());
+            }
+            if message["id"] == id && message.get("method").is_none() {
+                return (message, updates);
+            }
+        }
+    }
+
     fn open_session(&mut self, cwd: &std::path::Path) -> String {
         let id = self.request(
             "initialize",
@@ -257,6 +302,55 @@ fn an_error_frame_mid_stream_is_not_swallowed() {
         "expected a failure: {response}"
     );
     assert_is_the_endpoints_message(&response);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn failed_compaction_in_an_oversized_acp_turn_is_reported_as_chat_text() {
+    let dir = scratch("compact");
+    let port = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_1",
+            "run_command",
+            r#"{"command":"echo should-not-run"}"#,
+        ),
+        upstream_500_reply(),
+    ]);
+    let mut agent = spawn_agent(port, &dir.join("config"));
+    let session_id = agent.open_session(&dir.join("work"));
+
+    let oversized_prompt = "x".repeat(120_000);
+    let id = agent.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": oversized_prompt}]}),
+    );
+    let (response, updates) = agent.wait_for_prompt_updates(id);
+
+    assert!(
+        response.get("error").is_none(),
+        "compaction failure should be a readable chat message, not an ACP error: {response}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let rendered = updates
+        .iter()
+        .filter_map(|update| {
+            (update["sessionUpdate"] == "agent_message_chunk")
+                .then(|| update["content"]["text"].as_str())
+                .flatten()
+        })
+        .collect::<String>();
+    assert!(
+        rendered.contains("could not compact it: Onde Cloud upstream error (500)"),
+        "wrong rendered message: {rendered:?}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "tool_call"),
+        "tools should not run after compaction fails: {updates:?}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -53,6 +53,7 @@ pub(crate) struct ModelPickerItem {
     pub(crate) description: String,
     pub(crate) tool_calling: bool,
     pub(crate) max_tokens: u64,
+    pub(crate) context_window_tokens: u64,
     pub(crate) config: GgufModelConfig,
     pub(crate) source_label: String,
 
@@ -97,6 +98,48 @@ fn max_tokens_for(model_id: &str) -> u64 {
     if is_tool_calling(model_id) { 4096 } else { 512 }
 }
 
+/// Usable context window shown in editor model pickers.
+///
+/// This is intentionally separate from `max_tokens`, which is the generation
+/// cap. Qwen GGUFs are used at their default 32K window; Qwen2.5 can be stretched
+/// further with YaRN in some deployments, but siGit Code does not configure that
+/// here.
+fn context_window_tokens_for(model_id: &str) -> u64 {
+    if model_id == "TheBloke/deepseek-coder-6.7B-instruct-GGUF" {
+        16_000
+    } else {
+        32_768
+    }
+}
+
+/// Context window advertised for siGit Code Cloud tiers.
+///
+/// Deliberately a value of its own rather than the compaction budget: the
+/// budget is when siGit Code summarizes history, not how much the model can
+/// hold.
+/// Deriving the label from it made a user-facing number move whenever that
+/// tuning constant changed, and understated the window by an order of
+/// magnitude.
+pub(crate) const CLOUD_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
+/// Render a context window as a short badge, e.g. `24K ctx`.
+///
+/// Shared by the TUI `/models` picker and the ACP session-config labels so a
+/// model reads the same in both editors.
+pub(crate) fn format_context_window(tokens: u64) -> String {
+    format!("{} ctx", format_context_window_short(tokens))
+}
+
+/// The same magnitude without the `ctx` suffix, for places that supply their
+/// own wording (e.g. "200K context").
+pub(crate) fn format_context_window_short(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
 // ── Builder ───────────────────────────────────────────────────────────────────
 
 /// collect every model the picker should show: local cache, remote available, fallback.
@@ -125,12 +168,14 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
 
         let tool_calling = is_tool_calling(info.id);
         let max_tokens = max_tokens_for(info.id);
+        let context_window_tokens = context_window_tokens_for(info.id);
 
         items.push(ModelPickerItem {
             display_name: config.display_name.clone(),
             description: config.approx_memory.clone(),
             tool_calling,
             max_tokens,
+            context_window_tokens,
             config,
             source_label: "Onde".to_string(),
 
@@ -145,12 +190,14 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
         let config = GgufModelConfig::platform_default();
         let tool_calling = is_tool_calling(&config.model_id);
         let max_tokens = max_tokens_for(&config.model_id);
+        let context_window_tokens = context_window_tokens_for(&config.model_id);
 
         items.push(ModelPickerItem {
             display_name: config.display_name.clone(),
             description: config.approx_memory.clone(),
             tool_calling,
             max_tokens,
+            context_window_tokens,
             config,
             source_label: "Platform default".to_string(),
 
@@ -178,6 +225,7 @@ pub(crate) fn build_model_picker_items() -> Vec<ModelPickerItem> {
             description: "siGit Code Cloud".to_string(),
             tool_calling: true,
             max_tokens: 4096,
+            context_window_tokens: CLOUD_CONTEXT_WINDOW_TOKENS,
             config,
             source_label: "siGit Code Cloud".to_string(),
             source: ModelSource::Cloud,
@@ -224,12 +272,14 @@ fn discovered_model_to_picker_item(model: DiscoveredModel) -> Option<ModelPicker
 
     let tool_calling = is_tool_calling(&model.model_id);
     let max_tokens = max_tokens_for(&model.model_id);
+    let context_window_tokens = context_window_tokens_for(&model.model_id);
 
     Some(ModelPickerItem {
         display_name: config.display_name.clone(),
         description: config.approx_memory.clone(),
         tool_calling,
         max_tokens,
+        context_window_tokens,
         config,
         source_label,
 
