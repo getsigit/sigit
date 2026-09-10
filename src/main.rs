@@ -370,7 +370,27 @@ fn longest_backtick_run(text: &str) -> usize {
 /// backtick run already in `text` so it can't break out of the block.
 fn fenced_code_block(language: &str, text: &str) -> String {
     let fence = "`".repeat((longest_backtick_run(text) + 1).max(3));
+    let language = if language
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '+'))
+    {
+        language
+    } else {
+        ""
+    };
     format!("{fence}{language}\n{text}\n{fence}")
+}
+
+/// Displays tool arguments as JSON when they parse as JSON, otherwise as an
+/// unlabelled code block so malformed arguments do not get misleading syntax
+/// highlighting.
+fn tool_arguments_content(arguments_json: &str) -> ToolCallContent {
+    let language = if serde_json::from_str::<serde_json::Value>(arguments_json).is_ok() {
+        "json"
+    } else {
+        ""
+    };
+    fenced_code_block(language, &chat::pretty_tool_arguments(arguments_json)).into()
 }
 
 /// Wraps a tool's output as the display content of its ACP tool-call card
@@ -378,7 +398,7 @@ fn fenced_code_block(language: &str, text: &str) -> String {
 /// model still gets the full output — and fenced so plain-text output (or a
 /// stray tag, per issue #73) renders literally instead of as markdown.
 fn tool_output_content(output: &str) -> ToolCallContent {
-    if output.trim().is_empty() {
+    if output.is_empty() {
         return "(no output)".to_string().into();
     }
     fenced_code_block("", &chat::cap_output_preview(output)).into()
@@ -1882,8 +1902,7 @@ impl SiGitAgent {
                             log::warn!("malformed JSON in tool arguments for '{}': {e}", tc.name);
                             serde_json::Value::String(tc.arguments.clone())
                         });
-                    let invocation_content =
-                        fenced_code_block("json", &chat::pretty_tool_arguments(&tc.arguments));
+                    let invocation_content = tool_arguments_content(&tc.arguments);
                     self.send_tool_call_update(
                         cx,
                         session_id.clone(),
@@ -1891,7 +1910,7 @@ impl SiGitAgent {
                             ToolCall::new(tc.id.clone(), chat::tool_title(&tc.name, &tc.arguments))
                                 .kind(tool_kind_for(&tc.name))
                                 .status(ToolCallStatus::InProgress)
-                                .content(vec![invocation_content.into()])
+                                .content(vec![invocation_content])
                                 .locations(tool_call_locations(&tc.name, &tc.arguments))
                                 .raw_input(raw_input),
                         ),
@@ -4371,8 +4390,31 @@ mod tests {
 
     #[test]
     fn tool_output_content_shows_a_placeholder_for_empty_output() {
-        let content = tool_output_content("   \n\t  ");
+        let content = tool_output_content("");
         assert!(format!("{content:?}").contains("(no output)"));
+    }
+
+    #[test]
+    fn tool_output_content_preserves_whitespace_only_output() {
+        let content = tool_output_content("   \n\t  ");
+        let rendered = format!("{content:?}");
+        assert!(!rendered.contains("(no output)"));
+        assert!(rendered.contains("   \\n\\t  "));
+    }
+
+    #[test]
+    fn tool_arguments_content_only_labels_valid_json() {
+        let json = format!("{:?}", tool_arguments_content(r#"{"path":"src/main.rs"}"#));
+        let malformed = format!("{:?}", tool_arguments_content("{not json"));
+        assert!(json.contains("```json"));
+        assert!(!malformed.contains("```json"));
+        assert!(malformed.contains("{not json"));
+    }
+
+    #[test]
+    fn fenced_code_block_drops_an_unsafe_language() {
+        let block = fenced_code_block("json\nnot fenced", "{}");
+        assert_eq!(block, "```\n{}\n```");
     }
 
     #[test]
@@ -4399,5 +4441,18 @@ mod tests {
     fn longest_backtick_run_finds_the_widest_run() {
         assert_eq!(longest_backtick_run("no backticks here"), 0);
         assert_eq!(longest_backtick_run("one ` two `` three ``` four"), 3);
+    }
+
+    #[test]
+    fn tool_call_locations_require_a_known_tool_and_string_path() {
+        assert!(tool_call_locations("read_file", "{not json").is_empty());
+        assert!(tool_call_locations("read_file", r#"{"path":42}"#).is_empty());
+        assert!(
+            tool_call_locations("future_multi_file_tool", r#"{"path":"src/main.rs"}"#).is_empty()
+        );
+
+        let locations = tool_call_locations("multi_edit", r#"{"path":"src/main.rs"}"#);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("src/main.rs"));
     }
 }
