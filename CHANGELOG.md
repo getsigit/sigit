@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.5.7
+## 1.5.8
 
 ### What changed
 
@@ -12,6 +12,74 @@
   agent in research-only mode. The selector follows `/plan` and `/clear`, and
   it is deliberately session-scoped so a risky Auto choice does not persist
   into the next task
+- **Tool calls in the editor are worth opening now.** Zed only drew the
+  disclosure arrow on the handful of cards siGit set `content` on — the model
+  download and switch spinners — because everything else carried nothing but
+  `rawInput` and `rawOutput`, fields ACP gives clients no display guidance for.
+  Every tool call now gets a fenced content block: the pretty-printed arguments
+  while it runs, then the tool's output once it finishes, with a `(no output)`
+  placeholder for a silent command like `git add`. Cards are titled
+  `<tool> · <arg>` rather than the bare tool name, path-bearing tools set
+  `locations` so the editor can follow along, and a replayed session gets the
+  same treatment as a live one
+- **The context window is visible before compaction fires.** Both model pickers
+  show each model's window, and the TUI title bar has a gauge for how much of
+  it the conversation is using. Cloud tiers report their own window instead of
+  the compaction budget — the budget is when siGit Code summarizes history, not
+  how much the model can hold, and labelling one with the other understated the
+  window by an order of magnitude
+- **`write_todos` renders as a plan, not a tool card.** Zed and other clients
+  have real progress UI for `session/update` plans, so the model's todo list
+  goes there
+- **Picker changes read as status rather than chat.** Switching model or
+  inference backend is UI state, so it renders as a completed think-kind tool
+  call. The sign-in prompt stays an assistant message, since it needs the user
+  to act on it
+
+### Fixed
+
+- **A reopened thread comes back with its history.** Clicking a saved thread in
+  Zed sends `session/load`, and the client draws the thread purely from the
+  `session/update` notifications the agent streams while that request is in
+  flight. siGit restored the saved history into the backend, which is what
+  makes the model remember, but sent the client nothing — so the thread opened
+  empty and looked like a brand new conversation. The snapshot is now turned
+  into updates before it is restored: user and assistant text as message chunks
+  with reasoning stripped, each tool call completed with its result folded in,
+  and `write_todos` as a plan the way it renders live. System messages stay
+  out, since they seeded the model and were never on screen
+- **Compaction no longer fails in every session that ran a tool.**
+  `compact_history` asked for the summary through `complete(None, None)`, which
+  sends no tools array but left the live history in place. That history is
+  thick with assistant `tool_calls` and `role: "tool"` messages, and an
+  endpoint handed tool shapes with no schema to check them against rejects the
+  request — Anthropic answers 400. So compaction failed on every attempt in any
+  session that had run a single tool, however small the history was, and then
+  retried on every prompt and tool round while that history kept growing. The
+  conversation now goes as a flattened transcript in one user message, which
+  keeps what the summary needs and drops the shapes that only mean anything
+  next to a tool schema
+- **A tool call emitted as text is no longer dropped.** Qwen 3, GLM and
+  DeepSeek write a call as `<tool_call>NAME<arg_key>…` in their chat template
+  and rely on the serving stack to parse it back into `tool_calls`. When that
+  doesn't happen the tag arrives as ordinary content, so it was rendered
+  verbatim in the editor and the turn ended as though the model had chosen to
+  answer in prose. Both the streaming and non-streaming paths now scan content
+  for those blocks and turn well-formed ones back into real calls, typing
+  argument values from the turn's own tool schemas. The streaming scanner holds
+  back only enough text to catch a tag straddling a chunk boundary, so ordinary
+  answers still stream token by token. A block that doesn't match the expected
+  shape is left in the text untouched: reissuing a `run_command` is cheap, but
+  guessing wrong at a half-parsed `edit_file` would write the wrong change to a
+  file
+- **Tool-call content survives awkward output.** Whitespace-only output is
+  preserved rather than collapsed, malformed arguments no longer get a
+  misleading JSON fence, and fence language identifiers are sanitized
+
+## 1.5.7
+
+### What changed
+
 - **`@smbcloud/sigit` gets releases again.** The npm scope moved to
   `@getsigit` in 1.5.5 and the old package was left sitting on the registry at
   1.5.2, so an install made before the rename went quiet — `npm update` had
