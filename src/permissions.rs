@@ -8,7 +8,7 @@
 //!
 //! 1. **Plan mode** — a per-session switch that denies every mutating tool with
 //!    a message telling the model to present a plan instead. Toggled via
-//!    `/plan on|off` (TUI and ACP).
+//!    `/plan on|off` (TUI and ACP) or the panel Permissions dropdown.
 //! 2. **Session grants** — "always allow this session", recorded when the user
 //!    picks that option in an approval prompt. For `run_command` the grant is
 //!    scoped to the command's first two whitespace-separated tokens (approving
@@ -24,8 +24,11 @@
 //!    before `allow`, so a deny always beats an allow matching the same call.
 //! 4. **Per-tool override** — `[permissions.tools]` in `settings.toml`, e.g.
 //!    `run_command = "ask"`, `edit_file = "allow"`, `delete_file = "deny"`.
-//! 5. **Default mode** — `[permissions] default = "ask"|"allow"|"deny"` in
-//!    `settings.toml`; `ask` on a fresh install.
+//! 5. **Session mode (panel dropdown), else the stored default** — the ACP
+//!    panel's Permissions selector (`Manual`/`Auto`) picks a
+//!    [`settings::PermissionMode`] for the session, stored beside `plan_mode`;
+//!    with no session override, `[permissions] default = "ask"|"allow"|"deny"`
+//!    in `settings.toml` applies (`ask` on a fresh install).
 //!
 //! Pattern matching (rules and session grants share it): `*` is a glob-style
 //! wildcard (the `glob` tool's translator). A pattern ending in `*` matches
@@ -133,6 +136,9 @@ struct SessionPerms {
     always_allow: HashSet<String>,
     /// When set, every mutating tool is denied with a plan-mode message.
     plan_mode: bool,
+    /// Session override picked from the panel Permissions dropdown. `None`
+    /// means "use the stored default" (see [`effective_mode`]).
+    mode: Option<PermissionMode>,
 }
 
 fn sessions() -> &'static Mutex<HashMap<String, SessionPerms>> {
@@ -312,7 +318,11 @@ pub fn decision_for(session: &str, tool_name: &str, arguments: &str) -> Decision
         return Decision::Allow;
     }
 
-    match settings::permission_mode_for(tool_name) {
+    let mode = match settings::permission_mode_explicit(tool_name) {
+        Some(explicit) => explicit,
+        None => with_session(session, |s| s.mode).unwrap_or_else(settings::permission_default),
+    };
+    match mode {
         PermissionMode::Allow => Decision::Allow,
         PermissionMode::Ask => Decision::Ask,
         PermissionMode::Deny => Decision::Deny(format!(
@@ -363,6 +373,25 @@ pub fn plan_mode(session: &str) -> bool {
     with_session(session, |s| s.plan_mode)
 }
 
+/// Set (or clear) the session's permission-mode override, picked from the
+/// panel Permissions dropdown. `None` reverts the session to the stored
+/// default (see [`effective_mode`]).
+pub fn set_session_mode(session: &str, mode: Option<PermissionMode>) {
+    with_session(session, |s| s.mode = mode);
+}
+
+/// The session's permission-mode override, if one was picked from the panel
+/// dropdown. `None` means the session follows the stored default.
+pub fn session_mode(session: &str) -> Option<PermissionMode> {
+    with_session(session, |s| s.mode)
+}
+
+/// The permission mode that actually governs this session: its dropdown
+/// override when set, else `settings::permission_default()`.
+pub fn effective_mode(session: &str) -> PermissionMode {
+    session_mode(session).unwrap_or_else(settings::permission_default)
+}
+
 /// Drop all recorded state for a session (fresh session, /clear, or session
 /// teardown) so grants never outlive the conversation they were given in.
 pub fn reset_session(session: &str) {
@@ -384,11 +413,16 @@ pub fn reset_all() {
     map.clear();
 }
 
-/// Status summary for `/permissions` and `/status`: the default mode, plan
-/// mode, the granular session grants, and the active rule lists.
+/// Status summary for `/permissions` and `/status`: the default mode, the
+/// session mode override (if any), plan mode, the granular session grants,
+/// and the active rule lists.
 pub fn describe(session: &str) -> String {
     let plan = if plan_mode(session) { "on" } else { "off" };
     let default = settings::permission_default();
+    let mode = match session_mode(session) {
+        Some(mode) => format!("{mode} (session override)"),
+        None => format!("{default} (stored default)"),
+    };
     let granted = with_session(session, |s| {
         let mut names: Vec<&str> = s.always_allow.iter().map(String::as_str).collect();
         names.sort_unstable();
@@ -408,7 +442,7 @@ pub fn describe(session: &str) -> String {
         }
     };
     format!(
-        "permissions: default={default} | plan mode: {plan} | session grants: {granted}\n\
+        "permissions: mode={mode} | plan mode: {plan} | session grants: {granted}\n\
          rules: deny: {} | allow: {}\n\
          read-only tools always run; configure [permissions] in settings.toml",
         render(&rules.deny),
@@ -779,6 +813,97 @@ mod tests {
         assert_eq!(run_command_decision(session, "ls -la"), Decision::Allow);
         assert_eq!(run_command_decision(session, "lsof"), Decision::Ask);
         reset_session(session);
+    }
+
+    #[test]
+    fn session_mode_overrides_default_mode() {
+        let _guard = env_guard();
+        let session = "t-mode";
+        reset_session(session);
+        assert_eq!(effective_mode(session), PermissionMode::Ask);
+        assert_eq!(run_command_decision(session, "cargo test"), Decision::Ask);
+
+        set_session_mode(session, Some(PermissionMode::Allow));
+        assert_eq!(effective_mode(session), PermissionMode::Allow);
+        assert_eq!(run_command_decision(session, "cargo test"), Decision::Allow);
+
+        set_session_mode(session, None);
+        assert_eq!(effective_mode(session), PermissionMode::Ask);
+        assert_eq!(run_command_decision(session, "cargo test"), Decision::Ask);
+        reset_session(session);
+    }
+
+    #[test]
+    fn explicit_tool_override_beats_session_mode() {
+        let _guard = env_guard();
+        let session = "t-mode-override";
+        reset_session(session);
+        set_session_mode(session, Some(PermissionMode::Allow));
+
+        let mut settings = settings::load();
+        settings
+            .permissions
+            .tools
+            .insert("delete_file".to_string(), PermissionMode::Deny);
+        settings::store(&settings).unwrap();
+
+        assert!(matches!(
+            decision_for(session, "delete_file", r#"{"path":"src/a.rs"}"#),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            run_command_decision(session, "cargo test"),
+            Decision::Allow,
+            "run_command has no explicit override, so the session mode applies"
+        );
+        reset_session(session);
+    }
+
+    #[test]
+    fn deny_rule_beats_session_mode() {
+        let _guard = env_guard();
+        let session = "t-mode-deny-rule";
+        reset_session(session);
+        set_session_mode(session, Some(PermissionMode::Allow));
+        store_rules(&[], &["run_command(git push*)"]);
+
+        assert!(matches!(
+            run_command_decision(session, "git push"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            run_command_decision(session, "git status"),
+            Decision::Allow,
+            "an unmatched command still follows the session mode"
+        );
+        reset_session(session);
+    }
+
+    #[test]
+    fn plan_mode_outranks_session_mode() {
+        let _guard = env_guard();
+        let session = "t-mode-plan";
+        reset_session(session);
+        set_session_mode(session, Some(PermissionMode::Allow));
+        set_plan_mode(session, true);
+        assert!(matches!(
+            run_command_decision(session, "cargo test"),
+            Decision::Deny(_)
+        ));
+        set_plan_mode(session, false);
+        reset_session(session);
+    }
+
+    #[test]
+    fn reset_session_clears_session_mode() {
+        let _guard = env_guard();
+        let session = "t-mode-reset";
+        reset_session(session);
+        set_session_mode(session, Some(PermissionMode::Allow));
+        assert_eq!(session_mode(session), Some(PermissionMode::Allow));
+        reset_session(session);
+        assert_eq!(session_mode(session), None);
+        assert_eq!(effective_mode(session), PermissionMode::Ask);
     }
 
     #[test]
