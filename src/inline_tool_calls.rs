@@ -77,9 +77,11 @@ pub fn extract(text: &str, tools: &[ToolSpec]) -> (String, Vec<Recovered>) {
     (out, calls)
 }
 
-/// Parse one block's inner text: a name, then zero or more
+/// Parse one block's inner text: an offered tool name, then zero or more
 /// `<arg_key>K</arg_key><arg_value>V</arg_value>` pairs. Returns `None` the
-/// moment anything departs from that shape.
+/// moment anything departs from that shape. The malformed opening marker is
+/// accepted only for the first argument; later arguments stay strict so text
+/// that merely resembles a call cannot be recovered as one.
 fn parse_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
     let key_idx = inner.find("<arg_key>");
     let malformed_key_idx = inner.find(OPEN_TAG);
@@ -93,7 +95,7 @@ fn parse_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
         (None, Some(idx)) => (inner[..idx].trim(), &inner[idx..], true),
         (None, None) => (inner.trim(), "", false),
     };
-    if name.is_empty() || name.contains(['<', '>']) || !tools.iter().any(|tool| tool.name == name) {
+    if name.is_empty() || name.contains(['<', '>']) || !offered_tool(tools, name) {
         return None;
     }
 
@@ -124,6 +126,10 @@ fn parse_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
         name: name.to_string(),
         arguments: serde_json::Value::Object(args).to_string(),
     })
+}
+
+fn offered_tool(tools: &[ToolSpec], name: &str) -> bool {
+    tools.iter().any(|tool| tool.name == name)
 }
 
 fn split_once<'a>(s: &'a str, delim: &str) -> Option<(&'a str, &'a str)> {
@@ -370,7 +376,25 @@ mod tests {
     #[test]
     fn an_unknown_malformed_call_is_left_alone() {
         let text = "<tool_call>not_offered<tool_call>command</arg_key><arg_value>pwd</arg_value></tool_call>";
-        let (out, calls) = extract(text, &[]);
+        let (out, calls) = extract(text, &[command_output_spec()]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn malformed_marker_is_accepted_only_for_the_first_argument() {
+        let tools = vec![spec(
+            "run_command",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "cwd": { "type": "string" }
+                }
+            }),
+        )];
+        let text = "<tool_call>run_command<arg_key>command</arg_key><arg_value>pwd</arg_value><tool_call>cwd</arg_key><arg_value>/tmp</arg_value></tool_call>";
+        let (out, calls) = extract(text, &tools);
         assert_eq!(out, text);
         assert!(calls.is_empty());
     }
