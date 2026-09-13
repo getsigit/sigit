@@ -81,17 +81,31 @@ pub fn extract(text: &str, tools: &[ToolSpec]) -> (String, Vec<Recovered>) {
 /// `<arg_key>K</arg_key><arg_value>V</arg_value>` pairs. Returns `None` the
 /// moment anything departs from that shape.
 fn parse_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
-    let (name, mut rest) = match inner.find("<arg_key>") {
-        Some(idx) => (inner[..idx].trim(), &inner[idx..]),
-        None => (inner.trim(), ""),
+    let key_idx = inner.find("<arg_key>");
+    let malformed_key_idx = inner.find(OPEN_TAG);
+    let (name, mut rest, malformed_first_key) = match (key_idx, malformed_key_idx) {
+        (Some(key_idx), Some(malformed_key_idx)) if malformed_key_idx < key_idx => (
+            inner[..malformed_key_idx].trim(),
+            &inner[malformed_key_idx..],
+            true,
+        ),
+        (Some(idx), _) => (inner[..idx].trim(), &inner[idx..], false),
+        (None, Some(idx)) => (inner[..idx].trim(), &inner[idx..], true),
+        (None, None) => (inner.trim(), "", false),
     };
-    if name.is_empty() || name.contains(['<', '>']) {
+    if name.is_empty() || name.contains(['<', '>']) || !tools.iter().any(|tool| tool.name == name) {
         return None;
     }
 
     let mut args = serde_json::Map::new();
+    let mut first_key = true;
     while !rest.is_empty() {
-        let (key, after_key) = split_once(rest.strip_prefix("<arg_key>")?, "</arg_key>")?;
+        let key_open = if first_key && malformed_first_key {
+            OPEN_TAG
+        } else {
+            "<arg_key>"
+        };
+        let (key, after_key) = split_once(rest.strip_prefix(key_open)?, "</arg_key>")?;
         let (value, after_value) =
             split_once(after_key.strip_prefix("<arg_value>")?, "</arg_value>")?;
         let key = key.trim();
@@ -103,6 +117,7 @@ fn parse_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
             coerce(value, declared_type(tools, name, key).as_deref()),
         );
         rest = after_value;
+        first_key = false;
     }
 
     Some(Recovered {
@@ -324,6 +339,43 @@ mod tests {
     }
 
     #[test]
+    fn recovers_glm_call_with_a_malformed_first_argument_marker() {
+        let tools = vec![spec(
+            "run_command",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "run_in_background": { "type": "boolean" }
+                }
+            }),
+        )];
+        let (text, calls) = extract(
+            "<tool_call>run_command<tool_call>command</arg_key><arg_value>sleep 240; gh run view --job 103708582541 --repo ondeinference/ed --log 2>&1 | grep -E \"Compiling ed|Finished|error\\[|error:\" | tail -15</arg_value><arg_key>cwd</arg_key><arg_value>/Users/setoelkahfi/Repositories/onde-ed</arg_value><arg_key>run_in_background</arg_key><arg_value>true</arg_value></tool_call>",
+            &tools,
+        );
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(
+            args["command"],
+            "sleep 240; gh run view --job 103708582541 --repo ondeinference/ed --log 2>&1 | grep -E \"Compiling ed|Finished|error\\[|error:\" | tail -15"
+        );
+        assert_eq!(args["cwd"], "/Users/setoelkahfi/Repositories/onde-ed");
+        assert_eq!(args["run_in_background"], true);
+    }
+
+    #[test]
+    fn an_unknown_malformed_call_is_left_alone() {
+        let text = "<tool_call>not_offered<tool_call>command</arg_key><arg_value>pwd</arg_value></tool_call>";
+        let (out, calls) = extract(text, &[]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
     fn a_malformed_block_is_left_alone_rather_than_guessed_at() {
         // The mis-tagged shape seen in practice: an opening `<arg_value>`
         // where `<arg_key>` was meant. Guessing at an edit_file call is worse
@@ -378,6 +430,43 @@ mod tests {
         assert_eq!(text, "polling  done", "no tag fragment may reach the UI");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "command_output");
+    }
+
+    #[test]
+    fn scanner_recovers_glm_call_with_malformed_marker_split_across_chunks() {
+        let tools = vec![spec(
+            "run_command",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } }
+            }),
+        )];
+        let mut scanner = StreamScanner::new(&tools);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+
+        for chunk in [
+            "before ",
+            "<tool_call>run_command<tool_",
+            "call>command</arg_key><arg_value>pwd</arg_value></tool_call>",
+            " after",
+        ] {
+            for event in scanner.push(chunk) {
+                match event {
+                    ScanEvent::Text(value) => text.push_str(&value),
+                    ScanEvent::ToolCall(call) => calls.push(call),
+                }
+            }
+        }
+        if let Some(rest) = scanner.take_pending() {
+            text.push_str(&rest);
+        }
+
+        assert_eq!(text, "before  after");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "pwd");
     }
 
     #[test]
