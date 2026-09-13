@@ -943,6 +943,86 @@ fn a_tool_call_emitted_as_text_is_executed_rather_than_rendered() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// Kimi K3 may emit tool calls in XTML content blocks even when the endpoint is
+/// OpenAI-compatible. The backend should recover those before ACP sees them,
+/// unwrap visible response text, and hide private thinking text.
+#[test]
+fn a_kimi_k3_tool_call_emitted_as_text_is_executed_rather_than_rendered() {
+    let endpoint = start_fake_endpoint(vec![
+        // Split across frames to cover the streaming scanner, not just the
+        // complete-response extractor.
+        sse_body(&[
+            json!({"choices": [{"delta": {"content": "<|open|>think<|sep|>private notes<|close|>think<|sep|>"}}]}),
+            json!({"choices": [{"delta": {"content": "<|open|>response<|sep|>Checking the repo:<|close|>response<|sep|> <|open|>too"}}]}),
+            json!({"choices": [{"delta": {"content": "ls<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|>"}}]}),
+            json!({"choices": [{"delta": {"content": "<|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"}}]}),
+        ]),
+        sse_text("All done."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_kimi_k3_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "check the repo"}],
+        }),
+    );
+    let (_response, rendered) = agent.wait_for_prompt(prompt_id);
+
+    assert!(
+        !rendered.contains("<|open|>")
+            && !rendered.contains("<|sep|>")
+            && !rendered.contains("private notes"),
+        "raw Kimi K3 markup reached the client: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Checking the repo:"),
+        "response text should still be shown: {rendered:?}"
+    );
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected a follow-up request carrying the tool result, got {}",
+        requests.len()
+    );
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    assert!(
+        messages.iter().any(|message| message["role"] == "tool"),
+        "the follow-up should answer the recovered call: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message["role"] == "assistant" && message["tool_calls"].is_array() }),
+        "history must record the recovered call, not the raw tag: {messages:?}"
+    );
+    drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn write_todos_reaches_the_client_as_an_acp_plan() {
     let endpoint = start_fake_endpoint(vec![
