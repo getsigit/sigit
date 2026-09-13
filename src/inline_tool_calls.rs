@@ -124,7 +124,7 @@ fn parse_k3_tools_block(inner: &str, tools: &[ToolSpec]) -> Option<Vec<Recovered
         }
 
         let (call_inner, after_call) = split_once(after_header, K3_CALL_CLOSE)?;
-        let arguments = parse_k3_arguments(call_inner)?;
+        let arguments = parse_k3_arguments(call_inner, tools, name)?;
         calls.push(Recovered {
             name: name.to_string(),
             arguments: serde_json::Value::Object(arguments).to_string(),
@@ -135,7 +135,11 @@ fn parse_k3_tools_block(inner: &str, tools: &[ToolSpec]) -> Option<Vec<Recovered
     Some(calls)
 }
 
-fn parse_k3_arguments(mut rest: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+fn parse_k3_arguments(
+    mut rest: &str,
+    tools: &[ToolSpec],
+    tool_name: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut args = serde_json::Map::new();
 
     while !rest.trim().is_empty() {
@@ -144,10 +148,18 @@ fn parse_k3_arguments(mut rest: &str) -> Option<serde_json::Map<String, serde_js
         let (attr_text, after_header) = split_once(header, K3_SEP)?;
         let attrs = parse_k3_attributes(attr_text)?;
         let key = attrs.get("key")?.trim();
-        let value_type = attrs.get("type").map(String::as_str).unwrap_or("string");
         if key.is_empty() {
             return None;
         }
+        // K3 normally emits `type` for every argument. If an endpoint omits
+        // it, retain the legacy recovery path's schema-based typing instead of
+        // turning e.g. an integer `task_id` into a JSON string.
+        let schema_type = declared_type(tools, tool_name, key);
+        let value_type = attrs
+            .get("type")
+            .map(String::as_str)
+            .or(schema_type.as_deref())
+            .unwrap_or("string");
 
         let (raw_value, after_argument) = split_once(after_header, K3_ARGUMENT_CLOSE)?;
         let value = if value_type == "string" {
@@ -190,6 +202,9 @@ fn parse_k3_attributes(mut text: &str) -> Option<HashMap<String, String>> {
 }
 
 fn decode_k3_attribute(value: &str) -> String {
+    // K3's encoder escapes only `&` and `"` in attributes. These replacements
+    // deliberately mirror that format rather than implementing general HTML
+    // entity decoding (which could alter literal argument names).
     value.replace("&quot;", "\"").replace("&amp;", "&")
 }
 
@@ -323,23 +338,20 @@ impl<'a> StreamScanner<'a> {
                     None => break,
                 },
                 K3_RESPONSE_OPEN => {
-                    let Some(event) =
+                    let Some(mut unwrapped) =
                         self.drain_wrapped_text(K3_RESPONSE_OPEN, K3_RESPONSE_CLOSE, true)
                     else {
                         break;
                     };
-                    if let Some(event) = event {
-                        events.push(event);
-                    }
+                    events.append(&mut unwrapped);
                 }
                 K3_THINK_OPEN => {
-                    let Some(event) = self.drain_wrapped_text(K3_THINK_OPEN, K3_THINK_CLOSE, false)
+                    let Some(mut unwrapped) =
+                        self.drain_wrapped_text(K3_THINK_OPEN, K3_THINK_CLOSE, false)
                     else {
                         break;
                     };
-                    if let Some(event) = event {
-                        events.push(event);
-                    }
+                    events.append(&mut unwrapped);
                 }
                 _ => unreachable!("unknown inline marker"),
             }
@@ -381,18 +393,43 @@ impl<'a> StreamScanner<'a> {
         open: &str,
         close: &str,
         emit_inner: bool,
-    ) -> Option<Option<ScanEvent>> {
-        let close_rel = self.pending[open.len()..].find(close)?;
+    ) -> Option<Vec<ScanEvent>> {
+        let after_open = &self.pending[open.len()..];
+        let close_rel = match after_open.find(close) {
+            Some(close_rel) => close_rel,
+            None => {
+                // A malformed response/think wrapper must not swallow a later
+                // valid tool block forever. Preserve the malformed prefix as
+                // text, leave the next marker pending, and resume scanning.
+                let (next_rel, _) = find_next_marker(after_open)?;
+                return Some(vec![ScanEvent::Text(
+                    self.pending
+                        .drain(..open.len() + next_rel)
+                        .collect::<String>(),
+                )]);
+            }
+        };
         let close_idx = open.len() + close_rel;
         let block: String = self.pending.drain(..close_idx + close.len()).collect();
 
         if emit_inner {
             let inner = &block[open.len()..block.len() - close.len()];
-            Some(Some(ScanEvent::Text(inner.to_string())))
+            Some(scan_complete_text(inner, self.tools))
         } else {
-            Some(None)
+            Some(Vec::new())
         }
     }
+}
+
+/// Scan text from a wrapper whose closing marker has already arrived. This
+/// preserves event order when a response body itself contains an inline block.
+fn scan_complete_text(text: &str, tools: &[ToolSpec]) -> Vec<ScanEvent> {
+    let mut scanner = StreamScanner::new(tools);
+    let mut events = scanner.push(text);
+    if let Some(rest) = scanner.take_pending() {
+        events.push(ScanEvent::Text(rest));
+    }
+    events
 }
 
 fn find_next_marker<'a>(text: &str) -> Option<(usize, &'a str)> {
@@ -540,6 +577,18 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k3_missing_argument_type_uses_the_tool_schema() {
+        let tools = vec![command_output_spec()];
+        let (_, calls) = extract(
+            "<|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
+            &tools,
+        );
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["task_id"], 2);
+        assert!(args["task_id"].is_number());
+    }
+
+    #[test]
     fn kimi_k3_multiple_calls_are_recovered_in_order() {
         let tools = vec![command_output_spec()];
         let (_, calls) = extract(
@@ -564,10 +613,23 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k3_response_content_is_scanned_for_nested_tool_calls() {
+        let tools = vec![command_output_spec()];
+        let (text, calls) = extract(
+            "<|open|>response<|sep|>before <|open|>think<|sep|>private<|close|>think<|sep|><|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|> after<|close|>response<|sep|>",
+            &tools,
+        );
+        assert_eq!(text, "before  after");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "command_output");
+    }
+
+    #[test]
     fn kimi_k3_attribute_entities_are_decoded() {
         let attrs = parse_k3_attributes(r#"tool="run&quot;command" key="a&amp;b""#).unwrap();
         assert_eq!(attrs["tool"], "run\"command");
         assert_eq!(attrs["key"], "a&b");
+        assert_eq!(decode_k3_attribute("line&#10;break"), "line&#10;break");
     }
 
     #[test]
@@ -654,6 +716,45 @@ mod tests {
         assert_eq!(text, "pre  post");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "run_command");
+    }
+
+    #[test]
+    fn scanner_recovers_tools_after_an_unclosed_k3_wrapper() {
+        let tools = vec![command_output_spec()];
+        let mut scanner = StreamScanner::new(&tools);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+
+        for chunk in [
+            "before <|open|>response<|sep|>broken ",
+            "<|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|> after",
+        ] {
+            for event in scanner.push(chunk) {
+                match event {
+                    ScanEvent::Text(chunk) => text.push_str(&chunk),
+                    ScanEvent::ToolCall(call) => calls.push(call),
+                }
+            }
+        }
+        if let Some(rest) = scanner.take_pending() {
+            text.push_str(&rest);
+        }
+
+        assert_eq!(text, "before <|open|>response<|sep|>broken  after");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "command_output");
+    }
+
+    #[test]
+    fn scanner_recovers_tools_after_an_unclosed_k3_think_wrapper() {
+        let tools = vec![command_output_spec()];
+        let (text, calls) = extract(
+            "<|open|>think<|sep|>broken <|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
+            &tools,
+        );
+        assert_eq!(text, "<|open|>think<|sep|>broken ");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "command_output");
     }
 
     #[test]
