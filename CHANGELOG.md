@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.5.9
+
+### Fixed
+
+- **Kimi K3 tool calls no longer arrive as raw protocol text.** Kimi K3 renders
+  a call in Moonshot's XTML protocol — pipe-delimited open/sep/close tokens
+  wrapping named blocks — and when the serving stack doesn't parse that back
+  into structured tool calls, the whole block surfaced in the editor as literal
+  text and the turn ended as though the model had answered in prose. The
+  inline-call recovery now speaks that protocol alongside the legacy XML tags:
+  tools blocks are parsed into real calls (several per block, argument values
+  decoded and typed from the block's own type attribute or, when it is
+  missing, the turn's tool schemas), response blocks are unwrapped so their
+  text still renders, and think blocks are dropped as private reasoning rather
+  than shown. The streaming scanner watches all the opening markers, so a
+  block split across chunk boundaries still recovers
+- **GLM's mis-tagged calls recover too.** GLM sometimes precedes the legacy
+  block's first argument key with another tool-call opening tag instead of the
+  arg-key opening tag the format calls for, and the recovery rejected the
+  whole block when it did — the call surfaced as text and whatever it was
+  trying to do was dropped. The parser now accepts that alias for the first
+  argument only — later arguments stay strict, so text that merely resembles a
+  call cannot be recovered as one — in both the whole-blob and streaming
+  paths, and the scanner tolerates the malformed marker split across chunk
+  boundaries. Recovery in both protocols also checks the call's name against
+  the tools actually offered in the turn: a tag naming a tool that was never
+  in the turn's spec stays on screen instead of being executed
+
 ## 1.5.8
 
 ### What changed
