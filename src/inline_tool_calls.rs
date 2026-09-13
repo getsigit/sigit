@@ -75,21 +75,43 @@ pub fn extract(text: &str, tools: &[ToolSpec]) -> (String, Vec<Recovered>) {
     (out, calls)
 }
 
-/// Parse one legacy XML block's inner text: a name, then zero or more
-/// `<arg_key>K</arg_key><arg_value>V</arg_value>` pairs. Returns `None` the
-/// moment anything departs from that shape.
+/// Parse one legacy XML block's inner text: an offered tool name, then zero or
+/// more `<arg_key>K</arg_key><arg_value>V</arg_value>` pairs. The malformed
+/// opening marker observed from GLM is accepted only for the first argument;
+/// later arguments stay strict so text that merely resembles a call cannot be
+/// recovered as one.
 fn parse_xml_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
-    let (name, mut rest) = match inner.find("<arg_key>") {
-        Some(idx) => (inner[..idx].trim(), &inner[idx..]),
-        None => (inner.trim(), ""),
+    let key_idx = inner.find("<arg_key>");
+    let malformed_key_idx = inner.find(XML_OPEN_TAG);
+    let (name, mut rest, malformed_first_key) = match (key_idx, malformed_key_idx) {
+        (Some(key_idx), Some(malformed_key_idx)) if malformed_key_idx < key_idx => (
+            inner[..malformed_key_idx].trim(),
+            &inner[malformed_key_idx..],
+            true,
+        ),
+        (Some(idx), _) => (inner[..idx].trim(), &inner[idx..], false),
+        (None, Some(idx)) => (inner[..idx].trim(), &inner[idx..], true),
+        (None, None) => (inner.trim(), "", false),
     };
     if name.is_empty() || name.contains(['<', '>']) || !offered_tool(tools, name) {
         return None;
     }
 
     let mut args = serde_json::Map::new();
+    let mut first_key = true;
     while !rest.is_empty() {
-        let (key, after_key) = split_once(rest.strip_prefix("<arg_key>")?, "</arg_key>")?;
+        // The GLM alias is permitted exactly once, at the first key. A later
+        // `<tool_call>` must reject the complete block rather than letting a
+        // partial call escape recovery.
+        if !first_key && rest.starts_with(XML_OPEN_TAG) {
+            return None;
+        }
+        let key_open = if first_key && malformed_first_key {
+            XML_OPEN_TAG
+        } else {
+            "<arg_key>"
+        };
+        let (key, after_key) = split_once(rest.strip_prefix(key_open)?, "</arg_key>")?;
         let (value, after_value) =
             split_once(after_key.strip_prefix("<arg_value>")?, "</arg_value>")?;
         let key = key.trim();
@@ -101,6 +123,7 @@ fn parse_xml_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
             coerce(value, declared_type(tools, name, key).as_deref()),
         );
         rest = after_value;
+        first_key = false;
     }
 
     Some(Recovered {
@@ -527,6 +550,38 @@ mod tests {
     }
 
     #[test]
+    fn recovers_glm_call_with_a_malformed_first_argument_marker() {
+        let tools = vec![run_command_spec()];
+        let (text, calls) = extract(
+            "<tool_call>run_command<tool_call>command</arg_key><arg_value>pwd</arg_value><arg_key>cwd</arg_key><arg_value>/tmp</arg_value></tool_call>",
+            &tools,
+        );
+
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "pwd");
+        assert_eq!(args["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn unknown_glm_tool_is_left_as_text() {
+        let text = "<tool_call>not_offered<tool_call>command</arg_key><arg_value>pwd</arg_value></tool_call>";
+        let (out, calls) = extract(text, &[run_command_spec()]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn malformed_glm_marker_is_accepted_only_for_the_first_argument() {
+        let text = "<tool_call>run_command<arg_key>command</arg_key><arg_value>pwd</arg_value><tool_call>cwd</arg_key><arg_value>/tmp</arg_value></tool_call>";
+        let (out, calls) = extract(text, &[run_command_spec()]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
     fn a_malformed_block_is_left_alone_rather_than_guessed_at() {
         let text = "<tool_call>edit_file<arg_value>new_text</arg_key><arg_value>def x; end</arg_value></tool_call>";
         let (out, calls) = extract(text, &[run_command_spec()]);
@@ -685,6 +740,37 @@ mod tests {
         assert_eq!(text, "polling  done", "no tag fragment may reach the UI");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "command_output");
+    }
+
+    #[test]
+    fn scanner_recovers_glm_call_with_malformed_marker_split_across_chunks() {
+        let tools = vec![run_command_spec()];
+        let mut scanner = StreamScanner::new(&tools);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+
+        for chunk in [
+            "before ",
+            "<tool_call>run_command<tool_",
+            "call>command</arg_key><arg_value>pwd</arg_value></tool_call>",
+            " after",
+        ] {
+            for event in scanner.push(chunk) {
+                match event {
+                    ScanEvent::Text(value) => text.push_str(&value),
+                    ScanEvent::ToolCall(call) => calls.push(call),
+                }
+            }
+        }
+        if let Some(rest) = scanner.take_pending() {
+            text.push_str(&rest);
+        }
+
+        assert_eq!(text, "before  after");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "pwd");
     }
 
     #[test]
