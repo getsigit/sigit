@@ -100,6 +100,12 @@ fn parse_xml_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
     let mut args = serde_json::Map::new();
     let mut first_key = true;
     while !rest.is_empty() {
+        // The GLM alias is permitted exactly once, at the first key. A later
+        // `<tool_call>` must reject the complete block rather than letting a
+        // partial call escape recovery.
+        if !first_key && rest.starts_with(XML_OPEN_TAG) {
+            return None;
+        }
         let key_open = if first_key && malformed_first_key {
             XML_OPEN_TAG
         } else {
@@ -557,6 +563,14 @@ mod tests {
         let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(args["command"], "pwd");
         assert_eq!(args["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn unknown_glm_tool_is_left_as_text() {
+        let text = "<tool_call>not_offered<tool_call>command</arg_key><arg_value>pwd</arg_value></tool_call>";
+        let (out, calls) = extract(text, &[run_command_spec()]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
     }
 
     #[test]
