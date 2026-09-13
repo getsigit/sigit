@@ -240,6 +240,41 @@ jobs:
             echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Checkout tag
+        # The release job otherwise only downloads artifacts; the changelog
+        # has to be read from the tree at the tag being released.
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Compose release notes
+        # The release page carries the section of CHANGELOG.md for this
+        # version, not a bare "Full changelog" default. A missing section is
+        # a hard failure: publishing a release whose notes don't match its
+        # changelog is worse than stopping the job.
+        shell: bash
+        run: |
+          version="${{ steps.tag.outputs.tag }}"
+          version="${version#v}"
+          section="$(awk -v ver="${version}" '
+            $0 == "## " ver { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [ -z "${section//[$' \t\n']/}" ]; then
+            echo "No ## ${version} section found in CHANGELOG.md" >&2
+            exit 1
+          fi
+          {
+            printf '%s\n' "${section}"
+            printf '\n---\n\n'
+            printf 'Full changelog: https://github.com/%s/blob/%s/CHANGELOG.md\n' \
+              "${GITHUB_REPOSITORY}" "${{ steps.tag.outputs.tag }}"
+            printf '\n---\n\n'
+            printf 'About siGit Code: [sigit.si/code](https://sigit.si/code)\n'
+          } > release_notes.md
+          cat release_notes.md
+
       - name: Download binary artifacts
         uses: actions/download-artifact@v4
         with:
@@ -258,6 +293,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          body_path: release_notes.md
           files: release/*
 
       # These channels all publish somewhere outside this repo (a tap, a Scoop
