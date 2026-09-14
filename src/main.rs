@@ -1733,7 +1733,15 @@ impl SiGitAgent {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
-        let user_text = match parse_slash(&user_text) {
+        let slash_command = parse_slash_from_prompt_texts(args.prompt.iter().filter_map(|block| {
+            if let ContentBlock::Text(text) = block {
+                Some(text.text.as_str())
+            } else {
+                None
+            }
+        }));
+
+        let user_text = match slash_command {
             // `/init` is not a status command: it substitutes the canned
             // AGENTS.md-generation prompt and runs a normal agent turn, so the
             // exploration and file write go through the ordinary tools and
@@ -3034,6 +3042,15 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
         "/exit" | "/quit" | "/q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string(), argument.map(str::to_string)),
     })
+}
+
+/// ACP clients may prepend context as separate text blocks before the user's
+/// input. Search from the end so a standalone slash command in the final user
+/// block is still dispatched locally instead of being buried in joined context.
+fn parse_slash_from_prompt_texts<'a>(
+    texts: impl DoubleEndedIterator<Item = &'a str>,
+) -> Option<SlashCommand> {
+    texts.rev().find_map(parse_slash)
 }
 
 /// `on`/`off` (and synonyms) → `Some(bool)`; missing or unrecognized → `None`
@@ -4413,6 +4430,20 @@ mod tests {
         assert!(matches!(parse_slash("/init"), Some(SlashCommand::Init)));
         // Trailing whitespace comes from editors that submit the raw line.
         assert!(matches!(parse_slash(" /init "), Some(SlashCommand::Init)));
+    }
+
+    #[test]
+    fn parse_slash_finds_command_after_client_context_blocks() {
+        let texts = [
+            "<system-reminder>Xcode context</system-reminder>",
+            "Project structure: App/App.swift",
+            "/models",
+        ];
+
+        assert!(matches!(
+            parse_slash_from_prompt_texts(texts.into_iter()),
+            Some(SlashCommand::Models(None))
+        ));
     }
 
     #[test]
