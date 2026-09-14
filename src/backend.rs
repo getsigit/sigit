@@ -159,12 +159,15 @@ pub trait InferenceBackend: Send + Sync {
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError>;
 
-    /// Continue the turn by returning tool results. `tools` may be `None` on the
-    /// final round to force a text answer. `sink` streams that text when set.
+    /// Continue the turn by returning tool results. `allow_tool_calls` controls
+    /// whether `tools` are offered again; the complete catalog remains available
+    /// so a disabled round can recognize and suppress tool-shaped model output.
+    /// `sink` streams assistant text when set.
     async fn send_tool_results(
         &self,
         results: Vec<ToolResult>,
-        tools: Option<&[ToolSpec]>,
+        tools: &[ToolSpec],
+        allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError>;
 
@@ -257,7 +260,8 @@ impl InferenceBackend for LocalBackend {
     async fn send_tool_results(
         &self,
         results: Vec<ToolResult>,
-        tools: Option<&[ToolSpec]>,
+        tools: &[ToolSpec],
+        allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
         let onde_results: Vec<onde::inference::ToolResult> = results
@@ -268,10 +272,10 @@ impl InferenceBackend for LocalBackend {
             })
             .collect();
 
-        // The final round passes `tools = None` to force a text answer; that's
-        // the only round onde can stream, since no further tool calls are parsed.
+        // A forced-text round is the only round onde can stream, since no
+        // further tool calls are parsed.
         if let Some(sink) = sink
-            && tools.is_none()
+            && !allow_tool_calls
         {
             let rx = self
                 .engine
@@ -281,7 +285,7 @@ impl InferenceBackend for LocalBackend {
             return drain_onde_stream(rx, sink).await;
         }
 
-        let onde_tools = tools.map(to_onde_tools);
+        let onde_tools = allow_tool_calls.then(|| to_onde_tools(tools));
         let result = self
             .engine
             .send_tool_results(onde_results, onde_tools.as_deref())
@@ -485,12 +489,14 @@ impl OpenAiBackend {
             .collect()
     }
 
-    /// POST the current history (plus `tools`) and apply the assistant reply to
-    /// history, returning the neutral turn result. Streams via SSE when `sink`
-    /// is set; otherwise reads a single JSON response.
+    /// POST the current history and apply the assistant reply to history.
+    /// `tools` is always the known catalog, while `allow_tool_calls` determines
+    /// whether it is advertised to the model and whether returned calls may run.
+    /// Streams via SSE when `sink` is set; otherwise reads a single JSON response.
     async fn complete(
         &self,
-        tools: Option<&[ToolSpec]>,
+        tools: &[ToolSpec],
+        allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -501,9 +507,7 @@ impl OpenAiBackend {
             "messages": *self.history.lock().await,
             "stream": streaming,
         });
-        if let Some(tools) = tools
-            && !tools.is_empty()
-        {
+        if allow_tool_calls && !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(Self::tools_json(tools));
             // OpenAI specifies `auto` as the default when tools are present,
             // but not every OpenAI-compatible gateway implements that default.
@@ -528,13 +532,11 @@ impl OpenAiBackend {
             return Err(describe_api_error(status, &body));
         }
 
-        // The specs are needed downstream to type the arguments of any tool
-        // call the model emitted as text rather than as a structured call.
-        let tools = tools.unwrap_or(&[]);
         if let Some(sink) = sink {
-            self.consume_stream(response, sink, tools).await
+            self.consume_stream(response, sink, tools, allow_tool_calls)
+                .await
         } else {
-            self.consume_json(response, tools).await
+            self.consume_json(response, tools, allow_tool_calls).await
         }
     }
 
@@ -543,6 +545,7 @@ impl OpenAiBackend {
         &self,
         response: reqwest::Response,
         tools: &[ToolSpec],
+        allow_tool_calls: bool,
     ) -> Result<TurnResult, BackendError> {
         let parsed: ChatCompletion = response
             .json()
@@ -556,7 +559,7 @@ impl OpenAiBackend {
             .map(|choice| choice.message)
             .ok_or_else(|| "endpoint returned no choices".to_string())?;
 
-        let text = message.content.clone().unwrap_or_default();
+        let mut text = message.content.clone().unwrap_or_default();
         let tool_calls: Vec<ToolCall> = message
             .tool_calls
             .iter()
@@ -567,6 +570,23 @@ impl OpenAiBackend {
                 arguments: call.function.arguments.clone(),
             })
             .collect();
+
+        if !allow_tool_calls {
+            let (cleaned, recovered) = crate::inline_tool_calls::extract(&text, tools);
+            text = cleaned;
+            let suppressed = tool_calls.len() + recovered.len();
+            if suppressed > 0 {
+                log::warn!("suppressed {suppressed} tool call(s) from a forced-text response");
+            }
+            self.history
+                .lock()
+                .await
+                .push(streamed_assistant_history(&text, &[]));
+            return Ok(TurnResult {
+                text,
+                tool_calls: Vec::new(),
+            });
+        }
 
         // Some models write a tool call out as literal `<tool_call>` text
         // instead of using the structured field (see `inline_tool_calls`).
@@ -617,6 +637,7 @@ impl OpenAiBackend {
         response: reqwest::Response,
         sink: &TokenSink,
         tools: &[ToolSpec],
+        allow_tool_calls: bool,
     ) -> Result<TurnResult, BackendError> {
         use futures::StreamExt;
 
@@ -691,15 +712,22 @@ impl OpenAiBackend {
                                 }
                             }
                             crate::inline_tool_calls::ScanEvent::ToolCall(call) => {
-                                log::warn!(
-                                    "recovered tool call '{}' the model emitted as text instead of a structured call",
-                                    call.name
-                                );
-                                recovered.push(ToolCall {
-                                    id: format!("call_recovered_{}", recovered.len()),
-                                    name: call.name,
-                                    arguments: call.arguments,
-                                });
+                                if allow_tool_calls {
+                                    log::warn!(
+                                        "recovered tool call '{}' the model emitted as text instead of a structured call",
+                                        call.name
+                                    );
+                                    recovered.push(ToolCall {
+                                        id: format!("call_recovered_{}", recovered.len()),
+                                        name: call.name,
+                                        arguments: call.arguments,
+                                    });
+                                } else {
+                                    log::warn!(
+                                        "suppressed inline tool call '{}' from a forced-text response",
+                                        call.name
+                                    );
+                                }
                             }
                         }
                     }
@@ -709,6 +737,10 @@ impl OpenAiBackend {
                     }
                 }
                 for delta in choice.delta.tool_calls.into_iter().flatten() {
+                    if !allow_tool_calls {
+                        log::warn!("suppressed a structured tool call from a forced-text response");
+                        continue;
+                    }
                     let index = delta.index.unwrap_or(0) as usize;
                     if tool_accum.len() <= index {
                         tool_accum.resize_with(index + 1, StreamingToolCall::default);
@@ -813,13 +845,14 @@ impl InferenceBackend for OpenAiBackend {
             .lock()
             .await
             .push(serde_json::json!({ "role": "user", "content": text }));
-        self.complete(Some(tools), sink).await
+        self.complete(tools, true, sink).await
     }
 
     async fn send_tool_results(
         &self,
         results: Vec<ToolResult>,
-        tools: Option<&[ToolSpec]>,
+        tools: &[ToolSpec],
+        allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
         {
@@ -832,7 +865,7 @@ impl InferenceBackend for OpenAiBackend {
                 }));
             }
         }
-        self.complete(tools, sink).await
+        self.complete(tools, allow_tool_calls, sink).await
     }
 
     async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>) {
@@ -887,7 +920,7 @@ impl InferenceBackend for OpenAiBackend {
         }));
         *self.history.lock().await = request;
 
-        let summary = match self.complete(None, None).await {
+        let summary = match self.complete(&[], false, None).await {
             Ok(result) => result.text,
             Err(error) => {
                 // Roll back the summarization request; the turn never happened.

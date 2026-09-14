@@ -2044,11 +2044,7 @@ impl SiGitAgent {
                 });
             }
 
-            let next_tools = if round < MAX_TOOL_ROUNDS && !force_text {
-                Some(tools.as_slice())
-            } else {
-                None // last round: force text
-            };
+            let allow_tool_calls = round < MAX_TOOL_ROUNDS && !force_text;
 
             // Whatever this round says starts a new paragraph rather than
             // continuing the sentence the tool calls interrupted.
@@ -2058,7 +2054,7 @@ impl SiGitAgent {
                 .drain_turn(
                     cx,
                     &session_id,
-                    backend.send_tool_results(tool_results, next_tools, Some(&sink)),
+                    backend.send_tool_results(tool_results, &tools, allow_tool_calls, Some(&sink)),
                     &mut sink_rx,
                     &mut reply,
                 )

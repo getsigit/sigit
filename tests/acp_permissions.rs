@@ -943,6 +943,120 @@ fn a_tool_call_emitted_as_text_is_executed_rather_than_rendered() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// Once the repetition guard removes tools from a request, a model may still
+/// emit its learned tool syntax. Known calls must be removed from the visible
+/// response without being executed or recorded as orphaned history entries.
+#[test]
+fn forced_text_suppresses_glm_check_status_tool_markup() {
+    let repeated_arguments = json!({"task_id": 1}).to_string();
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "command_output", &repeated_arguments),
+        sse_tool_call("call_2", "command_output", &repeated_arguments),
+        sse_tool_call("call_3", "command_output", &repeated_arguments),
+        sse_body(&[
+            json!({"choices": [{"delta": {"content": "Build is still running. <tool_call>command_output CheckStatus=true_or_poll_"}}]}),
+            json!({"choices": [{"delta": {"content": "again_with_different_params</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>"}}]}),
+            // Also enforce the forced-text boundary for a structured call.
+            json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_4",
+                "function": {"name": "command_output", "arguments": "{\"task_id\":999}"},
+            }]}}]}),
+        ]),
+        sse_text("Next turn."),
+    ]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_forced_text_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "keep polling"}],
+        }),
+    );
+    let (response, rendered) = agent.wait_for_prompt(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert!(
+        rendered.contains("Build is still running."),
+        "surrounding prose should remain visible: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("<tool_call>")
+            && !rendered.contains("<arg_key>")
+            && !rendered.contains("CheckStatus"),
+        "forced tool markup reached the client: {rendered:?}"
+    );
+
+    {
+        let requests = endpoint.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "a forced-text tool call must not start another inference round"
+        );
+        assert!(
+            requests[3].get("tools").is_none(),
+            "the repetition guard must not advertise tools: {:?}",
+            requests[3]
+        );
+    }
+
+    // Start another turn so the prior assistant message is replayed and its
+    // sanitized history shape can be inspected in the recorded request.
+    let next_prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "what happened?"}],
+        }),
+    );
+    agent.wait_for_prompt(next_prompt_id);
+
+    let requests = endpoint.requests.lock().unwrap();
+    let replayed_messages = requests[4]["messages"].as_array().expect("messages");
+    let prior_assistant = replayed_messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message["role"] == "assistant"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Build is still running."))
+        })
+        .expect("sanitized forced-text assistant response");
+    assert!(prior_assistant.get("tool_calls").is_none());
+    assert!(
+        !prior_assistant["content"]
+            .as_str()
+            .expect("assistant content")
+            .contains("<tool_call>")
+    );
+    drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// Kimi K3 may emit tool calls in XTML content blocks even when the endpoint is
 /// OpenAI-compatible. The backend should recover those before ACP sees them,
 /// unwrap visible response text, and hide private thinking text.
