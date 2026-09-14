@@ -43,6 +43,8 @@ pub const CLOUD_TIERS: &[&str] = &[
     "nova",
 ];
 
+pub const DEFAULT_CLOUD_TIER: &str = "nova";
+
 /// Base URL of the siGit Code Cloud inference endpoint. Override with
 /// `SIGIT_CLOUD_URL` (dev: `http://localhost:8090/v1`).
 pub fn cloud_base_url() -> String {
@@ -258,5 +260,11 @@ mod tests {
         assert_eq!(non_empty(Some("  ".to_string())), None);
         assert_eq!(non_empty(Some(" x ".to_string())), Some("x".to_string()));
         assert_eq!(non_empty(None), None);
+    }
+
+    #[test]
+    fn maps_default_cloud_tier_to_wire_model_id() {
+        assert_eq!(DEFAULT_CLOUD_TIER, "nova");
+        assert_eq!(tier_to_model(DEFAULT_CLOUD_TIER), "onde-nova");
     }
 }

@@ -2248,7 +2248,11 @@ impl SiGitAgent {
         if settings::local_inference_enabled() {
             return;
         }
-        if self.switch_to_cloud_tier("balanced").await.is_some() {
+        if self
+            .switch_to_cloud_tier(provider::DEFAULT_CLOUD_TIER)
+            .await
+            .is_some()
+        {
             log::info!("startup: local inference off; routing inference to siGit Code Cloud");
         } else {
             log::warn!(
@@ -3645,7 +3649,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 let cloud_when_off = if settings::local_inference_enabled() {
                     None
                 } else {
-                    provider::cloud_tier_provider("balanced")
+                    provider::cloud_tier_provider(provider::DEFAULT_CLOUD_TIER)
                 };
 
                 match cloud_when_off {
