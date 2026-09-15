@@ -576,7 +576,15 @@ impl OpenAiBackend {
             text = cleaned;
             let suppressed = tool_calls.len() + recovered.len();
             if suppressed > 0 {
-                log::warn!("suppressed {suppressed} tool call(s) from a forced-text response");
+                let names = tool_calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .chain(recovered.iter().map(|call| call.name.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                log::warn!(
+                    "suppressed {suppressed} tool call(s) from a forced-text response: {names}"
+                );
             }
             self.history
                 .lock()
@@ -717,17 +725,12 @@ impl OpenAiBackend {
                                         "recovered tool call '{}' the model emitted as text instead of a structured call",
                                         call.name
                                     );
-                                    recovered.push(ToolCall {
-                                        id: format!("call_recovered_{}", recovered.len()),
-                                        name: call.name,
-                                        arguments: call.arguments,
-                                    });
-                                } else {
-                                    log::warn!(
-                                        "suppressed inline tool call '{}' from a forced-text response",
-                                        call.name
-                                    );
                                 }
+                                recovered.push(ToolCall {
+                                    id: format!("call_recovered_{}", recovered.len()),
+                                    name: call.name,
+                                    arguments: call.arguments,
+                                });
                             }
                         }
                     }
@@ -737,10 +740,6 @@ impl OpenAiBackend {
                     }
                 }
                 for delta in choice.delta.tool_calls.into_iter().flatten() {
-                    if !allow_tool_calls {
-                        log::warn!("suppressed a structured tool call from a forced-text response");
-                        continue;
-                    }
                     let index = delta.index.unwrap_or(0) as usize;
                     if tool_accum.len() <= index {
                         tool_accum.resize_with(index + 1, StreamingToolCall::default);
@@ -786,6 +785,19 @@ impl OpenAiBackend {
             })
             .collect();
         tool_calls.extend(recovered);
+
+        if !allow_tool_calls && !tool_calls.is_empty() {
+            let names = tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::warn!(
+                "suppressed {} tool call(s) from a forced-text response: {names}",
+                tool_calls.len()
+            );
+            tool_calls.clear();
+        }
 
         // Record the assistant turn so later tool results have context.
         self.history
