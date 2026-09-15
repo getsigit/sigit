@@ -170,7 +170,7 @@ pub async fn run(config: HeadlessConfig) -> i32 {
         if settings::local_inference_enabled() {
             None
         } else {
-            provider::cloud_tier_provider("balanced")
+            provider::cloud_tier_provider(provider::DEFAULT_CLOUD_TIER)
         }
     });
     let Some(cfg) = provider_cfg else {

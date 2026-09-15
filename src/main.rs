@@ -1733,7 +1733,15 @@ impl SiGitAgent {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
-        let user_text = match parse_slash(&user_text) {
+        let slash_command = parse_slash_from_prompt_texts(args.prompt.iter().filter_map(|block| {
+            if let ContentBlock::Text(text) = block {
+                Some(text.text.as_str())
+            } else {
+                None
+            }
+        }));
+
+        let user_text = match slash_command {
             // `/init` is not a status command: it substitutes the canned
             // AGENTS.md-generation prompt and runs a normal agent turn, so the
             // exploration and file write go through the ordinary tools and
@@ -2248,7 +2256,11 @@ impl SiGitAgent {
         if settings::local_inference_enabled() {
             return;
         }
-        if self.switch_to_cloud_tier("balanced").await.is_some() {
+        if self
+            .switch_to_cloud_tier(provider::DEFAULT_CLOUD_TIER)
+            .await
+            .is_some()
+        {
             log::info!("startup: local inference off; routing inference to siGit Code Cloud");
         } else {
             log::warn!(
@@ -3032,6 +3044,15 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
     })
 }
 
+/// ACP clients may prepend context as separate text blocks before the user's
+/// input. Search from the end so a standalone slash command in the final user
+/// block is still dispatched locally instead of being buried in joined context.
+fn parse_slash_from_prompt_texts<'a>(
+    texts: impl DoubleEndedIterator<Item = &'a str>,
+) -> Option<SlashCommand> {
+    texts.rev().find_map(parse_slash)
+}
+
 /// `on`/`off` (and synonyms) → `Some(bool)`; missing or unrecognized → `None`
 /// (meaning "toggle the current value").
 fn parse_on_off(arg: Option<&str>) -> Option<bool> {
@@ -3645,7 +3666,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 let cloud_when_off = if settings::local_inference_enabled() {
                     None
                 } else {
-                    provider::cloud_tier_provider("balanced")
+                    provider::cloud_tier_provider(provider::DEFAULT_CLOUD_TIER)
                 };
 
                 match cloud_when_off {
@@ -4409,6 +4430,20 @@ mod tests {
         assert!(matches!(parse_slash("/init"), Some(SlashCommand::Init)));
         // Trailing whitespace comes from editors that submit the raw line.
         assert!(matches!(parse_slash(" /init "), Some(SlashCommand::Init)));
+    }
+
+    #[test]
+    fn parse_slash_finds_command_after_client_context_blocks() {
+        let texts = [
+            "<system-reminder>Xcode context</system-reminder>",
+            "Project structure: App/App.swift",
+            "/models",
+        ];
+
+        assert!(matches!(
+            parse_slash_from_prompt_texts(texts.into_iter()),
+            Some(SlashCommand::Models(None))
+        ));
     }
 
     #[test]
