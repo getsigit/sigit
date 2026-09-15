@@ -4193,7 +4193,19 @@ mod tests {
 
     #[test]
     fn history_replay_redraws_the_conversation_for_the_client() {
-        let changelog_path = std::env::current_dir().unwrap().join("CHANGELOG.md");
+        // A fixed path, not `std::env::current_dir()`: the cwd is process-global
+        // and a handful of other tests (skills/commands/subagents discovery,
+        // the subagent end-to-end test) briefly `set_current_dir` to a temp
+        // directory behind `ENV_TEST_LOCK`. This test asserts on the exact
+        // rendered title, so racing one of them mid-run doesn't just read a
+        // stale value — it can hand back a temp path long enough to trip the
+        // title's truncation, breaking an assertion that has nothing to do
+        // with the cwd. A literal path sidesteps the shared state entirely.
+        let changelog_path = if cfg!(windows) {
+            PathBuf::from(r"C:\repo\CHANGELOG.md")
+        } else {
+            PathBuf::from("/repo/CHANGELOG.md")
+        };
         let changelog_path_text = changelog_path.to_string_lossy().into_owned();
         let arguments = serde_json::json!({ "path": changelog_path_text }).to_string();
         let history = vec![
