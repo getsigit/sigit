@@ -939,13 +939,9 @@ async fn run_subagent(backend: &dyn InferenceBackend, prompt: &str, allowed: &[S
         }
 
         // On the last round, offer no tools so the model must produce text.
-        let next_tools = if round < SUBAGENT_MAX_TOOL_ROUNDS {
-            Some(specs.as_slice())
-        } else {
-            None
-        };
+        let allow_tool_calls = round < SUBAGENT_MAX_TOOL_ROUNDS;
         result = match backend
-            .send_tool_results(tool_results, next_tools, None)
+            .send_tool_results(tool_results, &specs, allow_tool_calls, None)
             .await
         {
             Ok(r) => r,

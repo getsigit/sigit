@@ -83,16 +83,22 @@ pub fn extract(text: &str, tools: &[ToolSpec]) -> (String, Vec<Recovered>) {
 fn parse_xml_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
     let key_idx = inner.find("<arg_key>");
     let malformed_key_idx = inner.find(XML_OPEN_TAG);
-    let (name, mut rest, malformed_first_key) = match (key_idx, malformed_key_idx) {
-        (Some(key_idx), Some(malformed_key_idx)) if malformed_key_idx < key_idx => (
-            inner[..malformed_key_idx].trim(),
-            &inner[malformed_key_idx..],
-            true,
-        ),
-        (Some(idx), _) => (inner[..idx].trim(), &inner[idx..], false),
-        (None, Some(idx)) => (inner[..idx].trim(), &inner[idx..], true),
-        (None, None) => (inner.trim(), "", false),
-    };
+    let check_status_name = key_idx.and_then(|idx| parse_check_status_preamble(&inner[..idx]));
+    let (name, mut rest, malformed_first_key) =
+        if let (Some(idx), Some(name)) = (key_idx, check_status_name) {
+            (name, &inner[idx..], false)
+        } else {
+            match (key_idx, malformed_key_idx) {
+                (Some(key_idx), Some(malformed_key_idx)) if malformed_key_idx < key_idx => (
+                    inner[..malformed_key_idx].trim(),
+                    &inner[malformed_key_idx..],
+                    true,
+                ),
+                (Some(idx), _) => (inner[..idx].trim(), &inner[idx..], false),
+                (None, Some(idx)) => (inner[..idx].trim(), &inner[idx..], true),
+                (None, None) => (inner.trim(), "", false),
+            }
+        };
     if name.is_empty() || name.contains(['<', '>']) || !offered_tool(tools, name) {
         return None;
     }
@@ -130,6 +136,24 @@ fn parse_xml_block(inner: &str, tools: &[ToolSpec]) -> Option<Recovered> {
         name: name.to_string(),
         arguments: serde_json::Value::Object(args).to_string(),
     })
+}
+
+/// Some GLM-family responses prefix the real arguments with generation-control
+/// metadata shaped like `tool_name CheckStatus=value</arg_value>`. It is not a
+/// tool argument: accept that exact bounded preamble and discard it, while
+/// leaving every other malformed prefix untouched.
+fn parse_check_status_preamble(prefix: &str) -> Option<&str> {
+    let (name, status) = prefix.trim().split_once(" CheckStatus=")?;
+    let status = status.strip_suffix("</arg_value>")?;
+    if name.is_empty()
+        || status.is_empty()
+        || !status
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return None;
+    }
+    Some(name)
 }
 
 fn parse_k3_tools_block(inner: &str, tools: &[ToolSpec]) -> Option<Vec<Recovered>> {
@@ -566,6 +590,47 @@ mod tests {
     }
 
     #[test]
+    fn recovers_glm_call_with_check_status_before_real_arguments() {
+        let tools = vec![command_output_spec()];
+        let (text, calls) = extract(
+            "polling <tool_call>command_output CheckStatus=true_or_poll_again_with_different_params</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>",
+            &tools,
+        );
+
+        assert_eq!(text, "polling ");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "command_output");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["task_id"], 1);
+        assert!(args["task_id"].is_number());
+        assert!(args.get("CheckStatus").is_none());
+    }
+
+    #[test]
+    fn malformed_check_status_preamble_is_left_as_text() {
+        let text = "<tool_call>command_output CheckStatus=keep going</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>";
+        let (out, calls) = extract(text, &[command_output_spec()]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn check_status_after_a_real_argument_is_left_as_text() {
+        let text = "<tool_call>command_output<arg_key>task_id</arg_key><arg_value>1</arg_value> CheckStatus=true_or_poll_again_with_different_params</arg_value></tool_call>";
+        let (out, calls) = extract(text, &[command_output_spec()]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn check_status_for_an_unknown_tool_is_left_as_text() {
+        let text = "<tool_call>not_offered CheckStatus=true_or_poll_again_with_different_params</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>";
+        let (out, calls) = extract(text, &[command_output_spec()]);
+        assert_eq!(out, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
     fn unknown_glm_tool_is_left_as_text() {
         let text = "<tool_call>not_offered<tool_call>command</arg_key><arg_value>pwd</arg_value></tool_call>";
         let (out, calls) = extract(text, &[run_command_spec()]);
@@ -771,6 +836,35 @@ mod tests {
         assert_eq!(calls[0].name, "run_command");
         let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(args["command"], "pwd");
+    }
+
+    #[test]
+    fn scanner_recovers_check_status_call_split_across_chunks() {
+        let tools = vec![command_output_spec()];
+        let mut scanner = StreamScanner::new(&tools);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+
+        for chunk in [
+            "before <tool_call>command_output CheckStatus=true_or_poll_",
+            "again_with_different_params</arg_",
+            "value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_",
+            "call> after",
+        ] {
+            for event in scanner.push(chunk) {
+                match event {
+                    ScanEvent::Text(value) => text.push_str(&value),
+                    ScanEvent::ToolCall(call) => calls.push(call),
+                }
+            }
+        }
+        if let Some(rest) = scanner.take_pending() {
+            text.push_str(&rest);
+        }
+
+        assert_eq!(text, "before  after");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "command_output");
     }
 
     #[test]
