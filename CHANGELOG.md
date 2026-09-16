@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.5.10
+
+### What changed
+
+- **Xcode's context no longer buries slash commands.** Xcode sends the user's
+  prompt as the last of several text blocks, with project context in the
+  blocks before it, so `/models` and friends sat in the middle of joined text
+  and were handed to the model instead of dispatching locally. Slash-command
+  parsing now searches the prompt's text blocks from the end, so a standalone
+  command in the final user block dispatches no matter what context the client
+  prepends
+- **The nova tier is the default cloud engine.** When local inference is off
+  and no explicit provider override is set, the cloud tier now defaults to
+  `nova` (the `onde-nova` model) instead of the balanced tier, in both the
+  interactive and headless paths
+
+### Fixed
+
+- **Malformed Chinese-model tool calls are handled end-to-end in ACP.** The
+  inline-call recovery that 1.5.9 added for Kimi K3's XTML protocol and GLM's
+  mis-tagged blocks only applied to the interactive and headless surfaces;
+  the ACP path never ran it, so an editor session still surfaced raw protocol
+  text and dropped the calls. Recovery now runs in the ACP prompt loop too,
+  covered by integration tests, and the tool names are checked against the
+  turn's offered tools before anything executes
+- **Suppressed tool-call log spam is gone.** The guard that logs when a
+  structured call is dropped for arriving as forced text fired once per
+  streamed argument fragment — one malformed call could log a warning per
+  chunk. The check now fires once per turn with the count and names of what
+  was dropped, and the non-streaming path reports the same
+- **A history-replay test no longer races on the process cwd.** One ACP test
+  built its expected path from `std::env::current_dir()` while other tests
+  briefly swap that process-global cwd, so on CI it could read a temp
+  directory mid-swap and compare a truncated title against an untruncated
+  expectation. It now uses a fixed path it never needed to derive
+
 ## 1.5.9
 
 ### Fixed
