@@ -196,6 +196,7 @@ the connection and the agent anymore. Don't reintroduce the mpsc forwarder patte
 | `NewSessionRequest` | `handle_new_session` | sets cwd, resets history, advertises commands + config options |
 | `LoadSessionRequest` | `handle_load_session` | like new_session; gated by `load_session(true)` capability |
 | `ForkSessionRequest` | `handle_fork_session` | gated by `unstable_session_fork` + `SessionForkCapabilities` |
+| `ListSessionsRequest` | `handle_list_sessions` | the editor's "Import Threads" picker; gated by `SessionListCapabilities` |
 | `PromptRequest` | `handle_prompt` | the turn: parse blocks → slash commands or tool-calling loop |
 | `SetSessionConfigOptionRequest` | `handle_set_session_config_option` | the Zed model picker — switches/downloads models |
 | `CancelNotification` | `handle_cancel` | notification, no response |
@@ -226,7 +227,8 @@ Ok(InitializeResponse::new(ProtocolVersion::V1)        // use V1, not args.proto
             .load_session(true)                        // enables LoadSessionRequest
             .session_capabilities(
                 SessionCapabilities::new()
-                    .fork(SessionForkCapabilities::new()),  // enables ForkSessionRequest
+                    .fork(SessionForkCapabilities::new())   // enables ForkSessionRequest
+                    .list(SessionListCapabilities::new()),  // enables ListSessionsRequest
             ),
     )
     .meta(initialize_meta()))                          // free-form Meta (see below)
@@ -573,6 +575,14 @@ Editor                                Agent
 12. **Store `SessionId` as `SessionId`**, not `String`, so `==` is clean.
 13. **`SetSessionConfigOptionResponse::new(config_options)`** — the response
     carries the *rebuilt* options so the picker reflects the new current value.
+14. **`session/list` needs a `cwd` per session, which history alone can't
+    supply.** `SessionInfo` requires an absolute `cwd` and the request may
+    filter on it, so `session_store` writes a `<id>.meta.json` sidecar next to
+    each saved thread; sessions without one are skipped by
+    `handle_list_sessions` rather than guessed at. Advertising
+    `SessionCapabilities::new().list(SessionListCapabilities::new())` is what
+    turns the editor's "Import Threads" picker from an error banner into a
+    list.
 
 ---
 

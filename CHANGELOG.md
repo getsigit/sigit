@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Saved threads can be imported into the editor.** siGit Code now advertises
+  ACP's `sessionCapabilities.list` and answers `session/list`, so Zed's "Import
+  Threads" picker offers the conversations stored under
+  `~/.config/sigit/sessions/` instead of reporting that the agent doesn't
+  support the capability. A saved session gets a sidecar recording the project
+  directory it ran in — listing reports that `cwd`, the extra roots of a
+  multi-root project, an ISO 8601 last-activity timestamp, and a title taken
+  from the first user message — and a request may filter on `cwd` so one
+  project is never offered another's threads. Threads saved before this have no
+  sidecar and are not listed; they still reopen by id through `session/load`
+  
+  
 ## 1.5.10
 
 ### What changed
