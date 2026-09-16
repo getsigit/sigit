@@ -1440,6 +1440,31 @@ impl SiGitAgent {
         additional_roots
     }
 
+    /// Start a clean conversation for a session entry point (new/load/fork):
+    /// wipe the previous thread from the engine *and* the active backend, seed
+    /// the session context, then route inference per the Local Inference mode.
+    ///
+    /// The backend has to be cleared too. A cloud tier or provider override
+    /// keeps its own history, and `switch_to_cloud_tier` carries whatever it
+    /// finds there into the backend it installs — so a new thread would open
+    /// holding the last one's conversation.
+    async fn begin_conversation(&self, cwd: &std::path::Path, additional_roots: &[PathBuf]) {
+        self.engine.clear_history().await;
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(
+                session_context_message(cwd, additional_roots),
+            ))
+            .await;
+
+        let backend = self.backend.lock().await.clone();
+        if backend.is_remote() {
+            backend::clear_conversation(backend.as_ref()).await;
+        }
+
+        // Honor the persisted Local Inference toggle (off + signed in → cloud).
+        self.apply_startup_inference_mode().await;
+    }
+
     /// Save a session's history plus the sidecar that says where it ran.
     ///
     /// The sidecar is written here rather than at session start so a thread the
@@ -1527,16 +1552,7 @@ impl SiGitAgent {
         permissions::reset_all();
 
         // start from a clean slate; a stored session (below) replaces it
-        self.engine.clear_history().await;
-
-        self.engine
-            .push_history(onde::inference::ChatMessage::system(
-                session_context_message(&args.cwd, &additional_roots),
-            ))
-            .await;
-
-        // Honor the persisted Local Inference toggle (off + signed in → cloud).
-        self.apply_startup_inference_mode().await;
+        self.begin_conversation(&args.cwd, &additional_roots).await;
 
         // Durable sessions: when this session id was saved before, restore its
         // history into the active backend. The snapshot includes the system
@@ -1601,16 +1617,7 @@ impl SiGitAgent {
         let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
 
         // no persistence, so fork == fresh session
-        self.engine.clear_history().await;
-
-        self.engine
-            .push_history(onde::inference::ChatMessage::system(
-                session_context_message(&args.cwd, &additional_roots),
-            ))
-            .await;
-
-        // Honor the persisted Local Inference toggle (off + signed in → cloud).
-        self.apply_startup_inference_mode().await;
+        self.begin_conversation(&args.cwd, &additional_roots).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1648,16 +1655,7 @@ impl SiGitAgent {
 
         let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
 
-        self.engine.clear_history().await;
-
-        self.engine
-            .push_history(onde::inference::ChatMessage::system(
-                session_context_message(&args.cwd, &additional_roots),
-            ))
-            .await;
-
-        // Honor the persisted Local Inference toggle (off + signed in → cloud).
-        self.apply_startup_inference_mode().await;
+        self.begin_conversation(&args.cwd, &additional_roots).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
