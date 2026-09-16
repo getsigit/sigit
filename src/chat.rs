@@ -3346,12 +3346,8 @@ mod tui {
 
             // on the last round, pass no tools so the model must produce text —
             // that's also the round we can stream on-device.
-            let next_tools = if round < MAX_TOOL_ROUNDS {
-                Some(tools.as_slice())
-            } else {
-                None
-            };
-            let sink = if next_tools.is_none() {
+            let allow_tool_calls = round < MAX_TOOL_ROUNDS;
+            let sink = if !allow_tool_calls {
                 streamed = true;
                 Some(&delta_tx)
             } else {
@@ -3359,7 +3355,7 @@ mod tui {
             };
 
             match backend
-                .send_tool_results(tool_results, next_tools, sink)
+                .send_tool_results(tool_results, &tools, allow_tool_calls, sink)
                 .await
             {
                 Ok(r) => result = r,

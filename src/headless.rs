@@ -170,7 +170,7 @@ pub async fn run(config: HeadlessConfig) -> i32 {
         if settings::local_inference_enabled() {
             None
         } else {
-            provider::cloud_tier_provider("balanced")
+            provider::cloud_tier_provider(provider::DEFAULT_CLOUD_TIER)
         }
     });
     let Some(cfg) = provider_cfg else {
@@ -304,18 +304,14 @@ async fn run_prompt(
             });
         }
 
-        let next_tools = if round < crate::MAX_TOOL_ROUNDS {
-            Some(tools.as_slice())
-        } else {
-            None // last round: force text
-        };
+        let allow_tool_calls = round < crate::MAX_TOOL_ROUNDS;
 
         // Whatever this round says starts a new paragraph rather than
         // continuing the sentence the tool calls interrupted.
         reply.interrupt();
 
         result = drain_to_stdout(
-            backend.send_tool_results(tool_results, next_tools, sink_opt),
+            backend.send_tool_results(tool_results, &tools, allow_tool_calls, sink_opt),
             &mut sink_rx,
             &mut reply,
         )
