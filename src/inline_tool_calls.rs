@@ -18,11 +18,15 @@
 //! OpenAI-compatible base URL from `providers.toml` or `OPENAI_BASE_URL`, and
 //! on-device models. A fix in any single upstream leaves the others exposed.
 //!
-//! Only well-formed shapes are recovered. A block that doesn't match is left
-//! in the text untouched, deliberately. Reissuing a `run_command` is cheap,
-//! but guessing wrong at a half-parsed `edit_file` would write the wrong
-//! change to a file, so a malformed block stays visible rather than being
-//! silently misinterpreted.
+//! Only well-formed shapes are recovered. A block that doesn't match is never
+//! guessed at: reissuing a `run_command` is cheap, but guessing wrong at a
+//! half-parsed `edit_file` would write the wrong change to a file. It isn't
+//! shown either. A tool-call block that fails to parse, or that is still open
+//! when the reply ends, is reported as [`ScanEvent::Malformed`] and kept out of
+//! both the UI and the conversation history. Left in the history, the model
+//! reads back a call it "made" with no result attached, and later turns start
+//! inventing `<function_results>` blocks of their own. The backend tells the
+//! model the call didn't run and asks for it again instead.
 
 use std::collections::HashMap;
 
@@ -53,26 +57,36 @@ pub struct Recovered {
     pub arguments: String,
 }
 
-/// Scan a complete text blob for inline tool-call blocks. Returns the text
-/// with recovered blocks removed, plus the calls recovered from them. Blocks
-/// that don't parse cleanly, and unterminated trailing tags, are left in the
-/// returned text untouched.
-pub fn extract(text: &str, tools: &[ToolSpec]) -> (String, Vec<Recovered>) {
-    let mut scanner = StreamScanner::new(tools);
-    let mut out = String::with_capacity(text.len());
-    let mut calls = Vec::new();
+/// What [`extract`] found in a complete text blob.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Extracted {
+    /// The text with every tool-call block removed, recovered or not.
+    pub text: String,
+    /// Calls recovered from well-formed blocks, in order.
+    pub calls: Vec<Recovered>,
+    /// Tool-call blocks that were dropped because they couldn't be parsed.
+    pub malformed: usize,
+}
 
-    for event in scanner.push(text) {
+/// Scan a complete text blob for inline tool-call blocks. Recovered blocks
+/// become calls; blocks that don't parse cleanly, including an unterminated
+/// trailing one, are dropped and counted in [`Extracted::malformed`].
+pub fn extract(text: &str, tools: &[ToolSpec]) -> Extracted {
+    let mut scanner = StreamScanner::new(tools);
+    let mut extracted = Extracted {
+        text: String::with_capacity(text.len()),
+        ..Extracted::default()
+    };
+
+    for event in scanner.push(text).into_iter().chain(scanner.finish()) {
         match event {
-            ScanEvent::Text(text) => out.push_str(&text),
-            ScanEvent::ToolCall(call) => calls.push(call),
+            ScanEvent::Text(text) => extracted.text.push_str(&text),
+            ScanEvent::ToolCall(call) => extracted.calls.push(call),
+            ScanEvent::Malformed(_) => extracted.malformed += 1,
         }
     }
-    if let Some(rest) = scanner.take_pending() {
-        out.push_str(&rest);
-    }
 
-    (out, calls)
+    extracted
 }
 
 /// Parse one legacy XML block's inner text: an offered tool name, then zero or
@@ -314,6 +328,9 @@ pub enum ScanEvent {
     Text(String),
     /// A tool call recovered from a completed block.
     ToolCall(Recovered),
+    /// A tool-call block that couldn't be parsed, or never closed. Carries the
+    /// raw block for logging; it must not be shown or executed.
+    Malformed(String),
 }
 
 /// Incremental scanner for a live delta stream.
@@ -342,15 +359,23 @@ impl<'a> StreamScanner<'a> {
         self.drain()
     }
 
-    /// Take whatever is still held back, e.g. a `<tool_call` or Kimi marker
-    /// prefix that never closed. Text we never saw the end of can't be
-    /// interpreted safely, so the honest thing is to hand it back as-is.
-    pub fn take_pending(&mut self) -> Option<String> {
+    /// Call once the stream has ended to flush whatever is still held back.
+    /// A tool-call block that opened but never closed is [`ScanEvent::Malformed`]:
+    /// it can't be executed safely, and it isn't prose either. Anything else,
+    /// such as a partial marker prefix or an unclosed Kimi response wrapper, is
+    /// handed back as text.
+    pub fn finish(&mut self) -> Option<ScanEvent> {
         if self.pending.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.pending))
+            return None;
         }
+        let rest = std::mem::take(&mut self.pending);
+        Some(
+            if rest.starts_with(XML_OPEN_TAG) || rest.starts_with(K3_TOOLS_OPEN) {
+                ScanEvent::Malformed(rest)
+            } else {
+                ScanEvent::Text(rest)
+            },
+        )
     }
 
     fn drain(&mut self) -> Vec<ScanEvent> {
@@ -416,7 +441,7 @@ impl<'a> StreamScanner<'a> {
         let inner = &block[XML_OPEN_TAG.len()..block.len() - XML_CLOSE_TAG.len()];
         Some(match parse_xml_block(inner, self.tools) {
             Some(call) => ScanEvent::ToolCall(call),
-            None => ScanEvent::Text(block),
+            None => ScanEvent::Malformed(block),
         })
     }
 
@@ -431,7 +456,7 @@ impl<'a> StreamScanner<'a> {
 
         Some(match parse_k3_tools_block(inner, self.tools) {
             Some(calls) => calls.into_iter().map(ScanEvent::ToolCall).collect(),
-            None => vec![ScanEvent::Text(block)],
+            None => vec![ScanEvent::Malformed(block)],
         })
     }
 
@@ -473,9 +498,7 @@ impl<'a> StreamScanner<'a> {
 fn scan_complete_text(text: &str, tools: &[ToolSpec]) -> Vec<ScanEvent> {
     let mut scanner = StreamScanner::new(tools);
     let mut events = scanner.push(text);
-    if let Some(rest) = scanner.take_pending() {
-        events.push(ScanEvent::Text(rest));
-    }
+    events.extend(scanner.finish());
     events
 }
 
@@ -547,7 +570,7 @@ mod tests {
     #[test]
     fn an_integer_argument_is_recovered_as_a_json_number() {
         let tools = vec![command_output_spec()];
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "Checking.<tool_call>command_output<arg_key>task_id</arg_key><arg_value>2</arg_value></tool_call>",
             &tools,
         );
@@ -562,7 +585,7 @@ mod tests {
     #[test]
     fn recovers_multiple_string_arguments_in_order() {
         let tools = vec![run_command_spec()];
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "<tool_call>run_command<arg_key>command</arg_key><arg_value>cargo test --locked 2>&1 | tail -20</arg_value><arg_key>cwd</arg_key><arg_value>/Users/x/sigit</arg_value><arg_key>run_in_background</arg_key><arg_value>true</arg_value></tool_call>",
             &tools,
         );
@@ -576,7 +599,7 @@ mod tests {
     #[test]
     fn recovers_glm_call_with_a_malformed_first_argument_marker() {
         let tools = vec![run_command_spec()];
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "<tool_call>run_command<tool_call>command</arg_key><arg_value>pwd</arg_value><arg_key>cwd</arg_key><arg_value>/tmp</arg_value></tool_call>",
             &tools,
         );
@@ -592,7 +615,7 @@ mod tests {
     #[test]
     fn recovers_glm_call_with_check_status_before_real_arguments() {
         let tools = vec![command_output_spec()];
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "polling <tool_call>command_output CheckStatus=true_or_poll_again_with_different_params</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>",
             &tools,
         );
@@ -607,64 +630,101 @@ mod tests {
     }
 
     #[test]
-    fn malformed_check_status_preamble_is_left_as_text() {
+    fn malformed_check_status_preamble_is_dropped() {
         let text = "<tool_call>command_output CheckStatus=keep going</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>";
-        let (out, calls) = extract(text, &[command_output_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[command_output_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn check_status_after_a_real_argument_is_left_as_text() {
+    fn check_status_after_a_real_argument_is_dropped() {
         let text = "<tool_call>command_output<arg_key>task_id</arg_key><arg_value>1</arg_value> CheckStatus=true_or_poll_again_with_different_params</arg_value></tool_call>";
-        let (out, calls) = extract(text, &[command_output_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[command_output_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn check_status_for_an_unknown_tool_is_left_as_text() {
+    fn check_status_for_an_unknown_tool_is_dropped() {
         let text = "<tool_call>not_offered CheckStatus=true_or_poll_again_with_different_params</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>";
-        let (out, calls) = extract(text, &[command_output_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[command_output_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn unknown_glm_tool_is_left_as_text() {
+    fn unknown_glm_tool_is_dropped() {
         let text = "<tool_call>not_offered<tool_call>command</arg_key><arg_value>pwd</arg_value></tool_call>";
-        let (out, calls) = extract(text, &[run_command_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
     fn malformed_glm_marker_is_accepted_only_for_the_first_argument() {
         let text = "<tool_call>run_command<arg_key>command</arg_key><arg_value>pwd</arg_value><tool_call>cwd</arg_key><arg_value>/tmp</arg_value></tool_call>";
-        let (out, calls) = extract(text, &[run_command_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn a_malformed_block_is_left_alone_rather_than_guessed_at() {
+    fn a_malformed_block_is_dropped_rather_than_guessed_at() {
         let text = "<tool_call>edit_file<arg_value>new_text</arg_key><arg_value>def x; end</arg_value></tool_call>";
-        let (out, calls) = extract(text, &[run_command_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn an_unterminated_tag_is_left_alone() {
+    fn an_unterminated_tag_is_dropped() {
         let text = "working on it <tool_call>run_command<arg_key>command</arg_key>";
-        let (out, calls) = extract(text, &[run_command_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "working on it ");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
     fn ordinary_text_passes_through_untouched() {
-        let (out, calls) = extract("if x < y then a<b, nothing to recover", &[]);
+        let Extracted {
+            text: out, calls, ..
+        } = extract("if x < y then a<b, nothing to recover", &[]);
         assert_eq!(out, "if x < y then a<b, nothing to recover");
         assert!(calls.is_empty());
     }
@@ -672,7 +732,7 @@ mod tests {
     #[test]
     fn kimi_k3_run_command_block_is_recovered_and_removed() {
         let tools = vec![run_command_spec()];
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "Working <|open|>tools<|sep|><|open|>call tool=\"run_command\" index=\"1\"<|sep|><|open|>argument key=\"command\" type=\"string\"<|sep|>sleep 180; echo waited<|close|>argument<|sep|><|open|>argument key=\"cwd\" type=\"string\"<|sep|>/Users/setoelkahfi/Repositories/onde-ed<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
             &tools,
         );
@@ -687,7 +747,7 @@ mod tests {
     #[test]
     fn kimi_k3_non_string_arguments_are_json_decoded() {
         let tools = vec![command_output_spec()];
-        let (_, calls) = extract(
+        let Extracted { calls, .. } = extract(
             "<|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
             &tools,
         );
@@ -699,7 +759,7 @@ mod tests {
     #[test]
     fn kimi_k3_missing_argument_type_uses_the_tool_schema() {
         let tools = vec![command_output_spec()];
-        let (_, calls) = extract(
+        let Extracted { calls, .. } = extract(
             "<|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
             &tools,
         );
@@ -711,7 +771,7 @@ mod tests {
     #[test]
     fn kimi_k3_multiple_calls_are_recovered_in_order() {
         let tools = vec![command_output_spec()];
-        let (_, calls) = extract(
+        let Extracted { calls, .. } = extract(
             "<|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>1<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"command_output\" index=\"2\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
             &tools,
         );
@@ -724,7 +784,7 @@ mod tests {
 
     #[test]
     fn kimi_k3_response_is_unwrapped_and_think_is_hidden() {
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "a<|open|>think<|sep|>private<|close|>think<|sep|>b<|open|>response<|sep|>visible<|close|>response<|sep|>c",
             &[],
         );
@@ -735,7 +795,7 @@ mod tests {
     #[test]
     fn kimi_k3_response_content_is_scanned_for_nested_tool_calls() {
         let tools = vec![command_output_spec()];
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "<|open|>response<|sep|>before <|open|>think<|sep|>private<|close|>think<|sep|><|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|> after<|close|>response<|sep|>",
             &tools,
         );
@@ -753,26 +813,41 @@ mod tests {
     }
 
     #[test]
-    fn malformed_kimi_k3_tools_block_is_left_alone() {
+    fn unterminated_kimi_k3_tools_block_is_dropped() {
         let text = "<|open|>tools<|sep|><|open|>call tool=\"run_command\" index=\"1\"<|sep|><|open|>argument key=\"command\" type=\"string\"<|sep|>echo hi<|close|>argument<|sep|>";
-        let (out, calls) = extract(text, &[run_command_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn unknown_kimi_k3_tool_block_is_left_alone() {
+    fn unknown_kimi_k3_tool_block_is_dropped() {
         let text = "<|open|>tools<|sep|><|open|>call tool=\"delete_everything\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|>";
-        let (out, calls) = extract(text, &[run_command_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
     #[test]
-    fn invalid_kimi_k3_non_string_argument_is_left_alone() {
+    fn invalid_kimi_k3_non_string_argument_is_dropped() {
         let text = "<|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>not-json<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>";
-        let (out, calls) = extract(text, &[command_output_spec()]);
-        assert_eq!(out, text);
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[command_output_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
         assert!(calls.is_empty());
     }
 
@@ -795,10 +870,11 @@ mod tests {
                 match event {
                     ScanEvent::Text(t) => text.push_str(&t),
                     ScanEvent::ToolCall(c) => calls.push(c),
+                    ScanEvent::Malformed(block) => panic!("unexpected malformed block: {block}"),
                 }
             }
         }
-        if let Some(rest) = scanner.take_pending() {
+        if let Some(ScanEvent::Text(rest)) = scanner.finish() {
             text.push_str(&rest);
         }
 
@@ -824,10 +900,11 @@ mod tests {
                 match event {
                     ScanEvent::Text(value) => text.push_str(&value),
                     ScanEvent::ToolCall(call) => calls.push(call),
+                    ScanEvent::Malformed(block) => panic!("unexpected malformed block: {block}"),
                 }
             }
         }
-        if let Some(rest) = scanner.take_pending() {
+        if let Some(ScanEvent::Text(rest)) = scanner.finish() {
             text.push_str(&rest);
         }
 
@@ -855,10 +932,11 @@ mod tests {
                 match event {
                     ScanEvent::Text(value) => text.push_str(&value),
                     ScanEvent::ToolCall(call) => calls.push(call),
+                    ScanEvent::Malformed(block) => panic!("unexpected malformed block: {block}"),
                 }
             }
         }
-        if let Some(rest) = scanner.take_pending() {
+        if let Some(ScanEvent::Text(rest)) = scanner.finish() {
             text.push_str(&rest);
         }
 
@@ -886,10 +964,11 @@ mod tests {
                 match event {
                     ScanEvent::Text(t) => text.push_str(&t),
                     ScanEvent::ToolCall(c) => calls.push(c),
+                    ScanEvent::Malformed(block) => panic!("unexpected malformed block: {block}"),
                 }
             }
         }
-        if let Some(rest) = scanner.take_pending() {
+        if let Some(ScanEvent::Text(rest)) = scanner.finish() {
             text.push_str(&rest);
         }
 
@@ -913,10 +992,11 @@ mod tests {
                 match event {
                     ScanEvent::Text(chunk) => text.push_str(&chunk),
                     ScanEvent::ToolCall(call) => calls.push(call),
+                    ScanEvent::Malformed(block) => panic!("unexpected malformed block: {block}"),
                 }
             }
         }
-        if let Some(rest) = scanner.take_pending() {
+        if let Some(ScanEvent::Text(rest)) = scanner.finish() {
             text.push_str(&rest);
         }
 
@@ -928,7 +1008,7 @@ mod tests {
     #[test]
     fn scanner_recovers_tools_after_an_unclosed_k3_think_wrapper() {
         let tools = vec![command_output_spec()];
-        let (text, calls) = extract(
+        let Extracted { text, calls, .. } = extract(
             "<|open|>think<|sep|>broken <|open|>tools<|sep|><|open|>call tool=\"command_output\" index=\"1\"<|sep|><|open|>argument key=\"task_id\" type=\"integer\"<|sep|>2<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
             &tools,
         );
@@ -945,7 +1025,7 @@ mod tests {
             events,
             vec![ScanEvent::Text("a normal streamed answer".to_string())]
         );
-        assert!(scanner.take_pending().is_none());
+        assert!(scanner.finish().is_none());
     }
 
     #[test]
@@ -959,18 +1039,96 @@ mod tests {
             scanner.push("box for details"),
             vec![ScanEvent::Text("<toolbox for details".to_string())]
         );
-        assert!(scanner.take_pending().is_none());
+        assert!(scanner.finish().is_none());
     }
 
     #[test]
-    fn scanner_hands_back_an_unclosed_tag_at_stream_end() {
+    fn scanner_reports_an_unclosed_tag_at_stream_end_as_malformed() {
         let tools = vec![run_command_spec()];
         let mut scanner = StreamScanner::new(&tools);
         let events = scanner.push("partial <tool_call>run_command<arg_key>cmd");
         assert_eq!(events, vec![ScanEvent::Text("partial ".to_string())]);
         assert_eq!(
-            scanner.take_pending().as_deref(),
-            Some("<tool_call>run_command<arg_key>cmd")
+            scanner.finish(),
+            Some(ScanEvent::Malformed(
+                "<tool_call>run_command<arg_key>cmd".to_string()
+            ))
         );
+    }
+
+    #[test]
+    fn scanner_hands_back_a_partial_marker_prefix_at_stream_end_as_text() {
+        let mut scanner = StreamScanner::new(&[]);
+        assert_eq!(
+            scanner.push("see <tool_"),
+            vec![ScanEvent::Text("see ".to_string())]
+        );
+        assert_eq!(
+            scanner.finish(),
+            Some(ScanEvent::Text("<tool_".to_string()))
+        );
+    }
+
+    /// Issue #105: a GLM-family reply that opened a call, then wrote an
+    /// invented invoke/result transcript instead of closing it. None of that
+    /// may reach the editor, and it must not count as a recovered call.
+    #[test]
+    fn a_hallucinated_invoke_transcript_is_dropped() {
+        let tools = vec![command_output_spec()];
+        let reply = "Checking.<tool_call>command_output\n\n<invokeID>reply_A</invokeID>\n\
+                     <parameter_name>task_id</parameter_name>\n<parameter>6</parameter>\n\
+                     </invoke>\n\n<function_results>PyPI and NuGet are queued.\n\
+                     <tool_call>command_output<arg_key>task_id</arg_key><arg_value>5</task_id>\n\
+                     </invoke>\n</function_results>";
+        let Extracted {
+            text,
+            calls,
+            malformed,
+        } = extract(reply, &tools);
+        assert_eq!(text, "Checking.");
+        assert!(calls.is_empty());
+        assert_eq!(malformed, 1);
+    }
+
+    /// Issue #97: the well-formed blocks from that thread are recovered as
+    /// real calls, multi-line argument values included.
+    #[test]
+    fn well_formed_blocks_from_issue_97_are_recovered() {
+        let tools = vec![
+            run_command_spec(),
+            spec(
+                "edit_file",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "old_text": { "type": "string" },
+                        "new_text": { "type": "string" }
+                    }
+                }),
+            ),
+        ];
+        let reply = "Now wire `body_path` into the step:<tool_call>edit_file<arg_key>new_text</arg_key><arg_value>      - name: Release\n        with:\n          body_path: release_notes.md</arg_value><arg_key>old_text</arg_key><arg_value>      - name: Release\n        with:</arg_value><arg_key>path</arg_key><arg_value>/repo/.github/workflows/release-github.yml</arg_value></tool_call>";
+        let Extracted {
+            text,
+            calls,
+            malformed,
+        } = extract(reply, &tools);
+        assert_eq!(text, "Now wire `body_path` into the step:");
+        assert_eq!(malformed, 0);
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(
+            args["new_text"],
+            "      - name: Release\n        with:\n          body_path: release_notes.md"
+        );
+        assert_eq!(args["path"], "/repo/.github/workflows/release-github.yml");
+
+        let Extracted { calls, .. } = extract(
+            "<tool_call>run_command<arg_key>command</arg_key><arg_value>sleep 90</arg_value><arg_key>cwd</arg_key><arg_value>/repo</arg_value></tool_call>",
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
     }
 }
