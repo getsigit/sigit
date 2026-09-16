@@ -565,10 +565,9 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
 fn todos_arguments_to_plan(arguments: &str) -> Option<Plan> {
     let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let todos = args.get("todos")?.as_array()?;
-    if todos.is_empty() {
-        return None;
-    }
 
+    // An empty list still yields a plan: ACP plan updates replace the whole
+    // plan, so an update with no entries is what clears it in the client.
     let mut entries = Vec::with_capacity(todos.len());
     for todo in todos {
         let content = todo.get("content")?.as_str()?.trim();
@@ -5026,6 +5025,12 @@ mod tests {
             }
             other => panic!("expected one plan update, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_empty_todo_list_becomes_an_empty_plan_that_clears_the_client() {
+        let plan = todos_arguments_to_plan(r#"{"todos":[]}"#).expect("empty list is a plan");
+        assert!(plan.entries.is_empty());
     }
 
     #[test]
