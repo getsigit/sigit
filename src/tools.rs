@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::backend::{InferenceBackend, ToolResult, ToolSpec};
 use crate::subagents;
@@ -472,15 +472,20 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
             let tool = name.to_owned();
             let arguments = arguments.to_owned();
             let running = tool.clone();
-            tokio::task::spawn_blocking(move || execute_sync_tool(&running, &arguments))
-                .await
-                // A `JoinError` means the tool panicked (or the runtime is
-                // shutting down). Report it as the tool's result rather than
-                // propagating: a panicking tool should cost the model one bad
-                // tool result, not the whole turn. Note this is strictly safer
-                // than running the tool inline, where the panic would unwind
-                // through the turn and take the ACP connection with it.
-                .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}"))
+            // Read on this side of the thread hop, while the caller's session
+            // is still the live one.
+            let owner = active_session();
+            tokio::task::spawn_blocking(move || {
+                execute_sync_tool(&running, &arguments, owner.as_deref())
+            })
+            .await
+            // A `JoinError` means the tool panicked (or the runtime is
+            // shutting down). Report it as the tool's result rather than
+            // propagating: a panicking tool should cost the model one bad
+            // tool result, not the whole turn. Note this is strictly safer
+            // than running the tool inline, where the panic would unwind
+            // through the turn and take the ACP connection with it.
+            .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}"))
         }
     }
 }
@@ -492,7 +497,9 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
 /// async context belongs in [`execute_tool_impl`] alongside `task` and
 /// `web_search` instead — and then owes its own answer to the question this
 /// dispatch exists for: not blocking the caller's task for its whole run.
-fn execute_sync_tool(name: &str, arguments: &str) -> String {
+///
+/// `owner` is the session the call runs for; background tasks are scoped to it.
+fn execute_sync_tool(name: &str, arguments: &str, owner: Option<&str>) -> String {
     match name {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
@@ -506,9 +513,9 @@ fn execute_sync_tool(name: &str, arguments: &str) -> String {
         "write_todos" => exec_write_todos(arguments),
         "remember" => exec_remember(arguments),
         "delete_file" => exec_delete_file(arguments),
-        "run_command" => exec_run_command(arguments),
-        "command_output" => exec_command_output(arguments),
-        "kill_command" => exec_kill_command(arguments),
+        "run_command" => exec_run_command(arguments, owner),
+        "command_output" => exec_command_output(arguments, owner),
+        "kill_command" => exec_kill_command(arguments, owner),
         "skill" => crate::skills::activate_skill(arguments),
         _ => format!("Unknown tool: {name}"),
     }
@@ -2071,7 +2078,7 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
 /// `run_in_background` is set, in which case the child is registered as a
 /// background task and polled with `command_output` / stopped with
 /// `kill_command`.
-fn exec_run_command(arguments: &str) -> String {
+fn exec_run_command(arguments: &str, owner: Option<&str>) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(err) => return format!("Error: failed to parse arguments: {err}"),
@@ -2102,7 +2109,7 @@ fn exec_run_command(arguments: &str) -> String {
     log::info!("run_command: `{command_str}` in `{cwd_str}` (background: {run_in_background})");
 
     if run_in_background {
-        return start_background_task(command_str, &cwd_path);
+        return start_background_task(command_str, &cwd_path, owner.map(str::to_string));
     }
 
     // Co-author attribution: note where HEAD is before a command that looks
@@ -2228,6 +2235,9 @@ struct BackgroundTask {
     exit_code: Option<i32>,
     /// Set when the task was stopped via `kill_command`.
     killed: bool,
+    /// The session that started the task (see [`set_active_session`]). Only
+    /// that session can poll or kill it.
+    owner: Option<String>,
 }
 
 /// Output accumulated for a background task since the last poll.
@@ -2236,6 +2246,27 @@ struct TaskOutput {
     buf: String,
     /// Whether the oldest output was dropped because `buf` hit the cap.
     dropped: bool,
+}
+
+/// The ACP session whose turn is running, or `None` outside ACP. One process
+/// serves every thread an editor has open, and task ids are small sequential
+/// numbers, so without an owner check a thread can poll or kill a task another
+/// thread started just by guessing its id.
+static ACTIVE_SESSION: RwLock<Option<String>> = RwLock::new(None);
+
+/// Record which session the next tool calls run for.
+pub fn set_active_session(session: Option<&str>) {
+    let mut guard = ACTIVE_SESSION
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = session.map(str::to_string);
+}
+
+fn active_session() -> Option<String> {
+    ACTIVE_SESSION
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// Process-global background task table (same pattern as `mcp::MCP`).
@@ -2287,7 +2318,7 @@ fn spawn_output_reader<R: std::io::Read + Send + 'static>(
 }
 
 /// Background branch of `run_command`: spawn, register, return immediately.
-fn start_background_task(command_str: &str, cwd_path: &Path) -> String {
+fn start_background_task(command_str: &str, cwd_path: &Path, owner: Option<String>) -> String {
     let mut child = match spawn_shell(command_str, cwd_path) {
         Ok(c) => c,
         Err(err) => return format!("Error: failed to spawn command: {err}"),
@@ -2310,6 +2341,7 @@ fn start_background_task(command_str: &str, cwd_path: &Path) -> String {
             output,
             exit_code: None,
             killed: false,
+            owner,
         },
     );
 
@@ -2368,14 +2400,17 @@ fn dropped_note(dropped: bool) -> &'static str {
 }
 
 /// `command_output` tool: output since the last poll + running/exited status.
-fn exec_command_output(arguments: &str) -> String {
+fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
     let task_id = match parse_task_id(arguments) {
         Ok(id) => id,
         Err(err) => return err,
     };
 
     let mut map = lock_tasks();
-    let Some(task) = map.get_mut(&task_id) else {
+    let Some(task) = map
+        .get_mut(&task_id)
+        .filter(|task| task.owner.as_deref() == owner)
+    else {
         return unknown_task(task_id);
     };
 
@@ -2409,14 +2444,17 @@ fn exec_command_output(arguments: &str) -> String {
 }
 
 /// `kill_command` tool: stop a background task and report its output tail.
-fn exec_kill_command(arguments: &str) -> String {
+fn exec_kill_command(arguments: &str, owner: Option<&str>) -> String {
     let task_id = match parse_task_id(arguments) {
         Ok(id) => id,
         Err(err) => return err,
     };
 
     let mut map = lock_tasks();
-    let Some(task) = map.get_mut(&task_id) else {
+    let Some(task) = map
+        .get_mut(&task_id)
+        .filter(|task| task.owner.as_deref() == owner)
+    else {
         return unknown_task(task_id);
     };
 
@@ -3109,7 +3147,7 @@ mod tests {
 
     #[test]
     fn test_run_command_missing_command() {
-        let result = exec_run_command("{}");
+        let result = exec_run_command("{}", None);
         assert!(
             result.contains("missing required parameter"),
             "got: {result}"
@@ -3118,7 +3156,7 @@ mod tests {
 
     #[test]
     fn test_run_command_success() {
-        let result = exec_run_command(r#"{"command": "echo hello"}"#);
+        let result = exec_run_command(r#"{"command": "echo hello"}"#, None);
         assert!(result.contains("hello"), "got: {result}");
         assert!(result.contains("Exit code 0"), "got: {result}");
     }
@@ -3173,7 +3211,7 @@ mod tests {
         let args = json!({"command": command, "cwd": dir.to_str().unwrap()}).to_string();
 
         let started = std::time::Instant::now();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
@@ -3198,7 +3236,7 @@ mod tests {
         let args = json!({"command": "cat", "cwd": dir.to_str().unwrap()}).to_string();
 
         let started = std::time::Instant::now();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
@@ -3220,7 +3258,7 @@ mod tests {
         })
         .to_string();
 
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("co-author trailer"), "got: {result}");
 
         let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
@@ -3260,7 +3298,7 @@ mod tests {
         })
         .to_string();
 
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(
             !result.contains("[siGit Code]"),
             "no amend expected: {result}"
@@ -3294,7 +3332,7 @@ mod tests {
         })
         .to_string();
 
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(
             !result.contains("[siGit Code]"),
             "no amend expected: {result}"
@@ -3318,7 +3356,7 @@ mod tests {
         let command = "exit /b 1";
 
         let args = serde_json::json!({ "command": command }).to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("failed"), "got: {result}");
     }
 
@@ -3338,7 +3376,7 @@ mod tests {
             "cwd": dir
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         // The output should contain the temp dir path.
         assert!(
             result.contains(&dir.to_string_lossy().to_string()),
@@ -3358,7 +3396,7 @@ mod tests {
             "cwd": missing_dir
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("does not exist"), "got: {result}");
     }
 
@@ -3370,7 +3408,7 @@ mod tests {
         let command = "echo err 1>&2";
 
         let args = serde_json::json!({ "command": command }).to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("err"), "got: {result}");
     }
 
@@ -3422,7 +3460,7 @@ mod tests {
         })
         .to_string();
         let spawned = std::time::Instant::now();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         // Spawning must return immediately, not wait the ~2s the command takes.
         assert!(
             spawned.elapsed() < std::time::Duration::from_secs(1),
@@ -3434,14 +3472,14 @@ mod tests {
 
         // Polling while the command is still sleeping reports it as running.
         let poll_args = serde_json::json!({ "task_id": task_id }).to_string();
-        let poll = exec_command_output(&poll_args);
+        let poll = exec_command_output(&poll_args, None);
         assert!(poll.contains("still running"), "got: {poll}");
         let mut combined = poll;
 
         wait_for_background_exit(task_id);
         // Grace period so the reader threads finish draining the pipes.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let final_poll = exec_command_output(&poll_args);
+        let final_poll = exec_command_output(&poll_args, None);
         assert!(
             final_poll.contains("exited with code 0"),
             "got: {final_poll}"
@@ -3466,12 +3504,12 @@ mod tests {
             "run_in_background": true
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         let task_id = background_task_id(&result);
 
         let kill_args = serde_json::json!({ "task_id": task_id }).to_string();
         let killed_at = std::time::Instant::now();
-        let kill_result = exec_kill_command(&kill_args);
+        let kill_result = exec_kill_command(&kill_args, None);
         assert!(
             kill_result.contains(&format!("Killed task {task_id}")),
             "got: {kill_result}"
@@ -3484,13 +3522,42 @@ mod tests {
         );
 
         // A later poll reports the task as killed, not still running.
-        let poll = exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string());
+        let poll =
+            exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string(), None);
         assert!(poll.contains("was killed"), "got: {poll}");
     }
 
     #[test]
+    fn background_tasks_are_only_visible_to_the_session_that_started_them() {
+        #[cfg(unix)]
+        let command = "sleep 30";
+        #[cfg(windows)]
+        let command = "ping -n 31 127.0.0.1 > nul";
+
+        let result = start_background_task(command, &std::env::temp_dir(), Some("thread-a".into()));
+        let task_id = background_task_id(&result);
+        let args = serde_json::json!({ "task_id": task_id }).to_string();
+
+        // Another thread (or no thread at all) can't see it, let alone kill it.
+        for other in [Some("thread-b"), None] {
+            let poll = exec_command_output(&args, other);
+            assert!(poll.contains("no background task with id"), "got: {poll}");
+            let kill = exec_kill_command(&args, other);
+            assert!(kill.contains("no background task with id"), "got: {kill}");
+        }
+
+        let poll = exec_command_output(&args, Some("thread-a"));
+        assert!(poll.contains("still running"), "got: {poll}");
+        let kill = exec_kill_command(&args, Some("thread-a"));
+        assert!(
+            kill.contains(&format!("Killed task {task_id}")),
+            "got: {kill}"
+        );
+    }
+
+    #[test]
     fn test_command_output_unknown_task() {
-        let result = exec_command_output(r#"{"task_id": 9999999}"#);
+        let result = exec_command_output(r#"{"task_id": 9999999}"#, None);
         assert!(
             result.contains("no background task with id"),
             "got: {result}"
@@ -3558,7 +3625,7 @@ mod tests {
 
     #[test]
     fn test_kill_command_unknown_task() {
-        let result = exec_kill_command(r#"{"task_id": 9999999}"#);
+        let result = exec_kill_command(r#"{"task_id": 9999999}"#, None);
         assert!(
             result.contains("no background task with id"),
             "got: {result}"
@@ -3619,7 +3686,7 @@ mod tests {
 
     #[test]
     fn test_command_output_missing_task_id() {
-        let result = exec_command_output("{}");
+        let result = exec_command_output("{}", None);
         assert!(
             result.contains("missing required parameter"),
             "got: {result}"
@@ -3653,14 +3720,15 @@ mod tests {
             "run_in_background": true
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         let task_id = background_task_id(&result);
 
         wait_for_background_exit(task_id);
         // Grace period so the reader threads finish draining the pipes.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let poll = exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string());
+        let poll =
+            exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string(), None);
         assert!(poll.contains("exited with code 0"), "got: {poll}");
         assert!(
             poll.contains("earlier output was dropped"),

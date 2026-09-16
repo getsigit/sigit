@@ -1200,21 +1200,6 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
     carried
 }
 
-/// Drop everything from `backend`'s history except the system messages it
-/// seeded for itself. Used at a session boundary: a remote backend keeps its own
-/// history, so clearing the on-device engine alone leaves the previous thread
-/// (compaction summary included) live there, and the next model switch or
-/// startup routing carries it into the new session.
-pub async fn clear_conversation(backend: &dyn InferenceBackend) {
-    let seeded: Vec<serde_json::Value> = backend
-        .history_snapshot()
-        .await
-        .into_iter()
-        .take_while(|message| message["role"] == "system")
-        .collect();
-    backend.restore_history(seeded).await;
-}
-
 /// Replay `carried` (from [`carryover_history`]) into `backend`, on top of the
 /// system messages `backend` seeded for itself. Used when a model switch
 /// installs a new backend — or reloads the on-device engine, which wipes its
@@ -1491,28 +1476,6 @@ mod tests {
         let history = new_backend.history_snapshot().await;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["content"], "new prompt");
-    }
-
-    #[tokio::test]
-    async fn clear_conversation_keeps_only_the_seeded_system_prompt() {
-        let backend = OpenAiBackend::new("http://localhost", "", "m", Some("prompt".into()));
-        adopt_carryover(
-            &backend,
-            vec![
-                serde_json::json!({ "role": "user", "content": "[Conversation summary]\nold" }),
-                serde_json::json!({ "role": "assistant", "content": "ok" }),
-            ],
-        )
-        .await;
-
-        clear_conversation(&backend).await;
-
-        let history = backend.history_snapshot().await;
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0]["role"], "system");
-        assert_eq!(history[0]["content"], "prompt");
-        // Nothing left for a later backend switch to carry over.
-        assert!(carryover_history(history).is_empty());
     }
 
     #[test]

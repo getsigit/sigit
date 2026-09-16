@@ -593,6 +593,13 @@ const CLOUD_LOGIN_PROMPT: &str = "siGit Code Cloud needs an account. Sign in wit
 /// `additional_roots` is empty for an ordinary project and non-empty for a
 /// multi-root one, where the editor opened several directories at once (see
 /// `workspace.rs`).
+/// The single system message a remote backend gets: the full agent prompt
+/// followed by the session context. One message rather than two, because
+/// `compact_history` keeps only the first system message.
+fn remote_system_prompt(session_context: &str) -> String {
+    format!("{}\n\n{session_context}", system_prompt_for_model(true))
+}
+
 fn session_context_message(cwd: &std::path::Path, additional_roots: &[PathBuf]) -> String {
     let mut message = if additional_roots.is_empty() {
         format!(
@@ -745,13 +752,38 @@ fn initialize_meta() -> Meta {
     meta
 }
 
+/// What one ACP session owns, kept per session id.
+///
+/// An editor runs a single sigit process for every thread it has open, but the
+/// process has one working directory, one set of workspace roots, and one
+/// backend conversation. Only one session can be live at a time (turns are
+/// serialized by `turn_lock`), so each session's roots and conversation are
+/// parked here while another session holds the process, and swapped back in
+/// by `activate_session` before its next request runs.
+#[derive(Clone, Debug, Default)]
+struct SessionState {
+    cwd: PathBuf,
+    additional_roots: Vec<PathBuf>,
+    /// The conversation without its system messages (see
+    /// `backend::carryover_history`). Those are rebuilt from the roots each
+    /// time the session is installed, so they always name this session's
+    /// project. Stale while the session is live: the backend holds the
+    /// current copy then.
+    conversation: Vec<serde_json::Value>,
+}
+
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     /// The active inference backend. `LocalBackend` by default; swapped to an
     /// `OpenAiBackend` when the user selects a siGit Code Cloud tier in the panel.
     backend: tokio::sync::Mutex<Arc<dyn InferenceBackend>>,
-    /// cwd from the editor — tool calls run here, not where the process started
+    /// cwd from the editor — tool calls run here, not where the process started.
+    /// Always the live session's `cwd`.
     session_cwd: std::sync::Mutex<Option<PathBuf>>,
+    /// Every session this process has opened, by id.
+    sessions: std::sync::Mutex<std::collections::HashMap<String, SessionState>>,
+    /// The session whose roots and conversation are installed right now.
+    active_session: std::sync::Mutex<Option<String>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
@@ -793,6 +825,8 @@ impl SiGitAgent {
             engine,
             backend: tokio::sync::Mutex::new(backend),
             session_cwd: std::sync::Mutex::new(None),
+            sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_session: std::sync::Mutex::new(None),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
             startup_model_load_started,
@@ -1421,48 +1455,169 @@ impl SiGitAgent {
         }
     }
 
-    /// Record the session's roots and move the process into the primary one.
-    ///
-    /// The editor sends `cwd` plus, for a multi-root project, the other
-    /// directories it has open. Tool calls may use relative paths, so the
-    /// process follows `cwd`; the extra roots go to `workspace`, which is where
-    /// project-local discovery picks them up. Returns the roots that were kept.
-    fn enter_session_roots(&self, cwd: &std::path::Path, additional: &[PathBuf]) -> Vec<PathBuf> {
-        if let Ok(mut guard) = self.session_cwd.lock() {
-            *guard = Some(cwd.to_path_buf());
+    /// Build the state for a session request: its primary `cwd` plus the extra
+    /// roots worth keeping (see `workspace::set_additional_roots`).
+    fn session_state(cwd: &std::path::Path, additional: &[PathBuf]) -> SessionState {
+        SessionState {
+            cwd: cwd.to_path_buf(),
+            additional_roots: workspace::filter_additional_roots(cwd, additional),
+            conversation: Vec::new(),
         }
-        let additional_roots = workspace::set_additional_roots(cwd, additional);
-        if cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(cwd)
-        {
-            log::warn!("could not set cwd to {}: {err}", cwd.display());
-        }
-        additional_roots
     }
 
-    /// Start a clean conversation for a session entry point (new/load/fork):
-    /// wipe the previous thread from the engine *and* the active backend, seed
-    /// the session context, then route inference per the Local Inference mode.
-    ///
-    /// The backend has to be cleared too. A cloud tier or provider override
-    /// keeps its own history, and `switch_to_cloud_tier` carries whatever it
-    /// finds there into the backend it installs — so a new thread would open
-    /// holding the last one's conversation.
-    async fn begin_conversation(&self, cwd: &std::path::Path, additional_roots: &[PathBuf]) {
-        self.engine.clear_history().await;
-        self.engine
-            .push_history(onde::inference::ChatMessage::system(
-                session_context_message(cwd, additional_roots),
-            ))
-            .await;
-
-        let backend = self.backend.lock().await.clone();
-        if backend.is_remote() {
-            backend::clear_conversation(backend.as_ref()).await;
+    /// Move the live conversation into the state of the session that owns it,
+    /// so installing another session can't lose or leak it.
+    async fn park_active_session(&self) {
+        let Some(active) = self.active_session.lock().unwrap().clone() else {
+            return;
+        };
+        let snapshot = self.backend.lock().await.history_snapshot().await;
+        if let Some(state) = self.sessions.lock().unwrap().get_mut(&active) {
+            state.conversation = backend::carryover_history(snapshot);
         }
+    }
+
+    /// Register `state` under `session_id` and make it the live session.
+    ///
+    /// Used by the session entry points (new/load/fork). The outgoing session
+    /// is parked first, and the Local Inference routing runs last, so a cloud
+    /// backend installed here starts from this session's conversation and
+    /// system prompt and nobody else's.
+    async fn open_session(&self, session_id: &SessionId, state: SessionState) {
+        let key = session_id.to_string();
+        self.park_active_session().await;
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), state.clone());
+        self.install_session(&key, state).await;
 
         // Honor the persisted Local Inference toggle (off + signed in → cloud).
         self.apply_startup_inference_mode().await;
+    }
+
+    /// Make `session_id` the live session before one of its requests runs.
+    ///
+    /// A no-op when it already is. Otherwise the live session is parked and
+    /// this one's roots and conversation are installed in its place. An id this
+    /// process has never seen (the editor kept a thread open across a sigit
+    /// restart) is rebuilt from the session store when it can be.
+    async fn activate_session(&self, session_id: &SessionId) {
+        let key = session_id.to_string();
+        if self.active_session.lock().unwrap().as_deref() == Some(key.as_str()) {
+            return;
+        }
+
+        let known = self.sessions.lock().unwrap().get(&key).cloned();
+        let state = match known {
+            Some(state) => state,
+            None => {
+                let state = self.recover_session(&key);
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), state.clone());
+                state
+            }
+        };
+
+        log::info!(
+            "session({key}): activating (cwd={}, {} extra root(s), {} message(s))",
+            state.cwd.display(),
+            state.additional_roots.len(),
+            state.conversation.len()
+        );
+        self.park_active_session().await;
+        self.install_session(&key, state).await;
+    }
+
+    /// State for a session id this process didn't open: the saved conversation
+    /// and roots when the store has them, otherwise an empty conversation in the
+    /// current directory. Never the live session's conversation.
+    fn recover_session(&self, key: &str) -> SessionState {
+        let entry = session_store::list()
+            .into_iter()
+            .find(|entry| entry.id == key);
+        let cwd = entry
+            .as_ref()
+            .and_then(|entry| entry.cwd.clone())
+            .or_else(|| self.session_cwd.lock().ok().and_then(|guard| guard.clone()))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let additional = entry
+            .map(|entry| entry.additional_directories)
+            .unwrap_or_default();
+        let mut state = Self::session_state(&cwd, &additional);
+        state.conversation = session_store::load(key)
+            .map(backend::carryover_history)
+            .unwrap_or_default();
+        log::warn!(
+            "session({key}) was not opened by this process; recovered {} message(s) in {}",
+            state.conversation.len(),
+            cwd.display()
+        );
+        state
+    }
+
+    /// Point the process at `state`'s roots and load its conversation.
+    ///
+    /// The process follows `cwd` because tool calls may use relative paths; the
+    /// extra roots go to `workspace`, where project-local discovery reads them.
+    /// Background tasks are scoped to the live session too (see
+    /// `tools::set_active_session`).
+    async fn install_session(&self, key: &str, state: SessionState) {
+        let SessionState {
+            cwd,
+            additional_roots,
+            conversation,
+        } = state;
+
+        if let Ok(mut guard) = self.session_cwd.lock() {
+            *guard = Some(cwd.clone());
+        }
+        workspace::replace_additional_roots(additional_roots.clone());
+        if cwd.is_dir()
+            && let Err(err) = std::env::set_current_dir(&cwd)
+        {
+            log::warn!("could not set cwd to {}: {err}", cwd.display());
+        }
+        *self.active_session.lock().unwrap() = Some(key.to_string());
+        tools::set_active_session(Some(key));
+
+        self.seed_conversation(&cwd, &additional_roots, conversation)
+            .await;
+    }
+
+    /// Replace the conversation on the engine and the active backend with
+    /// `conversation`, under system context naming `cwd` and `additional_roots`.
+    ///
+    /// Both are seeded even when only one serves inference: switching between
+    /// on-device and cloud carries the conversation across and keeps the target's
+    /// own system messages, so each has to name the live session's project.
+    async fn seed_conversation(
+        &self,
+        cwd: &std::path::Path,
+        additional_roots: &[PathBuf],
+        conversation: Vec<serde_json::Value>,
+    ) {
+        let context = session_context_message(cwd, additional_roots);
+        let backend = self.backend.lock().await.clone();
+
+        if backend.is_remote() {
+            self.engine.clear_history().await;
+            self.engine
+                .push_history(onde::inference::ChatMessage::system(context.clone()))
+                .await;
+        }
+
+        let system_prompt = if backend.is_remote() {
+            remote_system_prompt(&context)
+        } else {
+            context
+        };
+        let mut history = vec![serde_json::json!({ "role": "system", "content": system_prompt })];
+        history.extend(conversation);
+        backend.restore_history(history).await;
     }
 
     /// Save a session's history plus the sidecar that says where it ran.
@@ -1479,8 +1634,9 @@ impl SiGitAgent {
             log::warn!("session({session_id}) save failed: {error}");
             return;
         }
-        match self.session_cwd.lock().ok().and_then(|guard| guard.clone()) {
-            Some(cwd) => session_store::save_meta(&key, &cwd, &workspace::additional_roots()),
+        let state = self.sessions.lock().unwrap().get(&key).cloned();
+        match state {
+            Some(state) => session_store::save_meta(&key, &state.cwd, &state.additional_roots),
             None => log::warn!(
                 "session({session_id}) has no recorded cwd — saved, but it won't be listed"
             ),
@@ -1544,26 +1700,21 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
+        let mut state = Self::session_state(&args.cwd, &args.additional_directories);
 
         // A session boundary: grants and plan mode from the previous life of
-        // this session id must not carry over — and since one shared engine
-        // means one live conversation, state for every other id is dead too.
-        permissions::reset_all();
-
-        // start from a clean slate; a stored session (below) replaces it
-        self.begin_conversation(&args.cwd, &additional_roots).await;
+        // this session id must not carry over. Other sessions keep theirs; the
+        // editor may still have them open.
+        permissions::reset_session(&args.session_id.to_string());
 
         // Durable sessions: when this session id was saved before, restore its
-        // history into the active backend. The snapshot includes the system
-        // messages that were live when it was saved, so restore replaces the
-        // freshly seeded state wholesale.
+        // conversation. The saved system messages are dropped; they are rebuilt
+        // from the roots the editor sent now, which may differ from last time.
         if let Some(history) = session_store::load(&args.session_id.to_string()) {
             let restored = history.len();
 
-            // Replay before restoring: the client draws the reopened thread
-            // from these notifications alone, and `restore_history` consumes
-            // the snapshot.
+            // The client draws the reopened thread from these notifications
+            // alone.
             let updates = history_replay_updates(&history);
             let replayed = updates.len();
             for update in updates {
@@ -1571,13 +1722,14 @@ impl SiGitAgent {
                     .ok();
             }
 
-            let backend = self.backend.lock().await.clone();
-            backend.restore_history(history).await;
+            state.conversation = backend::carryover_history(history);
             log::info!(
                 "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
                 args.session_id
             );
         }
+
+        self.open_session(&args.session_id, state).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1601,9 +1753,6 @@ impl SiGitAgent {
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        // Session boundary: permission grants and plan mode never cross it
-        // (see handle_load_session), so a fork starts with a clean slate.
-        permissions::reset_all();
         log::info!(
             "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
             args.session_id,
@@ -1614,10 +1763,24 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
-
-        // no persistence, so fork == fresh session
-        self.begin_conversation(&args.cwd, &additional_roots).await;
+        // The fork continues the source thread's conversation under the roots
+        // it was forked into. Permission grants and plan mode stay behind: the
+        // new id has none. The source's conversation is current only after
+        // parking when the source is the live session.
+        self.park_active_session().await;
+        let source = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&args.session_id.to_string())
+            .map(|source| source.conversation.clone())
+            .or_else(|| {
+                session_store::load(&args.session_id.to_string()).map(backend::carryover_history)
+            })
+            .unwrap_or_default();
+        let mut state = Self::session_state(&args.cwd, &args.additional_directories);
+        state.conversation = source;
+        self.open_session(&new_id, state).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1641,9 +1804,6 @@ impl SiGitAgent {
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        // Session boundary: permission grants and plan mode never cross it
-        // (see handle_load_session), so stale ids stop accumulating state.
-        permissions::reset_all();
         log::info!(
             "new_session: id={session_id}, cwd={}, additional_directories={:?}",
             args.cwd.display(),
@@ -1653,9 +1813,8 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        let additional_roots = self.enter_session_roots(&args.cwd, &args.additional_directories);
-
-        self.begin_conversation(&args.cwd, &additional_roots).await;
+        let state = Self::session_state(&args.cwd, &args.additional_directories);
+        self.open_session(&session_id, state).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1679,6 +1838,10 @@ impl SiGitAgent {
         args: PromptRequest,
     ) -> agent_client_protocol::Result<PromptResponse> {
         let session_id = args.session_id.clone();
+
+        // Everything below (slash commands included) acts on the live session,
+        // so it has to be this one. Resource links are read relative to its cwd.
+        self.activate_session(&session_id).await;
 
         // log every block so we can debug @ references and file context
         for (i, block) in args.prompt.iter().enumerate() {
@@ -2283,16 +2446,15 @@ impl SiGitAgent {
     /// for login). Shared by the panel picker and the `/models` slash command.
     async fn switch_to_cloud_tier(&self, tier: &str) -> Option<String> {
         let cfg = crate::provider::cloud_tier_provider(tier)?;
-        let mut system_prompt = system_prompt_for_model(true).to_string();
         // Mirror the cwd guidance and project instruction files the local engine
         // gets at session load, so the cloud model shares the same project context.
-        if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&session_context_message(
+        let system_prompt = match self.session_cwd.lock().ok().and_then(|g| g.clone()) {
+            Some(cwd) => remote_system_prompt(&session_context_message(
                 &cwd,
                 &workspace::additional_roots(),
-            ));
-        }
+            )),
+            None => system_prompt_for_model(true).to_string(),
+        };
         let cloud_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
             cfg.base_url,
             cfg.api_key,
@@ -2450,6 +2612,10 @@ impl SiGitAgent {
             args.config_id,
             args.value
         );
+
+        // A model switch carries the live conversation onto the new backend, so
+        // the live conversation has to be the one whose picker changed.
+        self.activate_session(&args.session_id).await;
 
         // ── Local Inference toggle ──────────────────────────────────────────
         if args.config_id.0.as_ref() == LOCAL_INFERENCE_CONFIG_ID {
@@ -3247,7 +3413,24 @@ async fn exec_slash_acp(
                 .ok();
         }
         SlashCommand::Clear => {
-            let cleared = agent.engine.clear_history().await;
+            // Wipe the conversation on whichever backend holds it, keeping the
+            // session context. Clearing only the engine left a cloud thread intact.
+            let snapshot = agent.backend.lock().await.history_snapshot().await;
+            let cleared = snapshot
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count();
+            let (cwd, roots) = {
+                let sessions = agent.sessions.lock().unwrap();
+                match sessions.get(&session_id.to_string()) {
+                    Some(state) => (state.cwd.clone(), state.additional_roots.clone()),
+                    None => (
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                        workspace::additional_roots(),
+                    ),
+                }
+            };
+            agent.seed_conversation(&cwd, &roots, Vec::new()).await;
             permissions::reset_session(&session_id.to_string());
             // The saved session must not resurrect what the user just wiped.
             session_store::delete(&session_id.to_string());
@@ -4287,6 +4470,128 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         assert!(same_dir(&real, &real));
         assert!(!same_dir(&link, &real));
+    }
+
+    /// Text of every message in `history`, for containment checks.
+    fn history_text(history: &[serde_json::Value]) -> String {
+        history
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Append a user message to the live conversation.
+    async fn say(agent: &SiGitAgent, text: &str) {
+        let backend = agent.backend.lock().await.clone();
+        let mut history = backend.history_snapshot().await;
+        history.push(serde_json::json!({ "role": "user", "content": text }));
+        backend.restore_history(history).await;
+    }
+
+    async fn live(agent: &SiGitAgent) -> Vec<serde_json::Value> {
+        agent.backend.lock().await.history_snapshot().await
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global cwd/env for the whole test
+    async fn each_session_keeps_its_own_roots_and_conversation() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!("sigit-sessions-{}", uuid::Uuid::new_v4()));
+        let (repo_a, repo_b, extra_b) = (
+            temp.join("repo-a"),
+            temp.join("repo-b"),
+            temp.join("extra-b"),
+        );
+        for dir in [&repo_a, &repo_b, &extra_b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let prev_cwd = std::env::current_dir().unwrap();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored below.
+        unsafe {
+            std::env::set_var("SIGIT_CONFIG_DIR", temp.join("config"));
+            std::env::set_var("SIGIT_LOCAL_INFERENCE", "on");
+        }
+
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        // A remote backend keeps its own history, which is where threads used
+        // to bleed into each other. No request is ever sent.
+        *agent.backend.lock().await = Arc::new(OpenAiBackend::new(
+            "http://127.0.0.1:9",
+            "",
+            "m",
+            Some("base prompt".into()),
+        ));
+        let thread_a = SessionId::new("thread-a");
+        let thread_b = SessionId::new("thread-b");
+        agent
+            .open_session(&thread_a, SiGitAgent::session_state(&repo_a, &[]))
+            .await;
+        say(&agent, "working on repo a").await;
+
+        agent
+            .open_session(
+                &thread_b,
+                SiGitAgent::session_state(&repo_b, std::slice::from_ref(&extra_b)),
+            )
+            .await;
+        let history = history_text(&live(&agent).await);
+        assert!(!history.contains("working on repo a"), "{history}");
+        assert!(history.contains(&repo_b.display().to_string()), "{history}");
+        assert!(
+            history.contains(&extra_b.display().to_string()),
+            "{history}"
+        );
+        assert_eq!(workspace::additional_roots(), vec![extra_b.clone()]);
+        say(&agent, "working on repo b").await;
+
+        // Prompting thread A again puts its roots and conversation back.
+        agent.activate_session(&thread_a).await;
+        let history = history_text(&live(&agent).await);
+        assert!(history.contains("working on repo a"), "{history}");
+        assert!(!history.contains("working on repo b"), "{history}");
+        assert!(
+            !history.contains(&repo_b.display().to_string()),
+            "{history}"
+        );
+        assert!(workspace::additional_roots().is_empty());
+        assert_eq!(
+            workspace::canonical_key(&std::env::current_dir().unwrap()),
+            workspace::canonical_key(&repo_a)
+        );
+
+        agent.activate_session(&thread_b).await;
+        let history = history_text(&live(&agent).await);
+        assert!(history.contains("working on repo b"), "{history}");
+        assert!(!history.contains("working on repo a"), "{history}");
+
+        // The system prompt is rebuilt, not stacked, on every switch.
+        let systems = live(&agent)
+            .await
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .count();
+        assert_eq!(systems, 1);
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        tools::set_active_session(None);
+        workspace::replace_additional_roots(Vec::new());
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SIGIT_CONFIG_DIR");
+            std::env::remove_var("SIGIT_LOCAL_INFERENCE");
+        }
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
