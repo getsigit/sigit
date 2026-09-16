@@ -249,6 +249,15 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   any session exists, so a second root's `.sigit/mcp.toml` has nobody to tell.
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
+- **`src/session_store.rs`** — durable conversations: one JSON-lines history file per session at
+  `$SIGIT_CONFIG_DIR/sessions/<id>.jsonl`, written atomically, restorable into either backend.
+  Each save also writes a `<id>.meta.json` sidecar naming the session's `cwd` and the extra roots
+  of a multi-root project. That sidecar is what makes a thread *listable*: ACP's `session/list`
+  (advertised as `sessionCapabilities.list`, handled by `handle_list_sessions` in `main.rs` — the
+  editor's "Import Threads" picker) must report an absolute `cwd` per session and may filter on
+  it, so a session without one is skipped there while still reopening by id through
+  `session/load`. Sidecars are written at save time, not at session start, so a thread nobody
+  spoke in leaves nothing behind.
 - **`src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
   Must run (`setup_shared_model_cache`) *before* anything touches `ChatEngine`/`hf-hub`, since
   those read env vars once at init.

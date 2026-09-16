@@ -73,16 +73,16 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind, UnstructuredCommandInput,
+    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Meta,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -443,6 +443,12 @@ fn history_message_text(message: &serde_json::Value) -> String {
             .join(""),
         _ => String::new(),
     }
+}
+
+/// Compare directories the way `session/list` filtering needs: resolve symlinks
+/// and `..` when the path exists, otherwise fall back to the path as given.
+fn normalize_dir(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Rebuild the `session/update` notifications that re-draw a saved conversation
@@ -1342,6 +1348,11 @@ impl SiGitAgent {
                     .session_capabilities(
                     SessionCapabilities::new()
                         .fork(SessionForkCapabilities::new())
+                        // Durable sessions (`session_store`) are what makes
+                        // listing meaningful: without this the editor's
+                        // "Import Threads" picker reports that the agent
+                        // doesn't support ACP's session/list capability.
+                        .list(SessionListCapabilities::new())
                         // Without this, a client that has several directories
                         // open never sends the extra ones: Zed drops every root
                         // but the first and tells the user the agent has no
@@ -1416,6 +1427,70 @@ impl SiGitAgent {
             log::warn!("could not set cwd to {}: {err}", cwd.display());
         }
         additional_roots
+    }
+
+    /// Save a session's history plus the sidecar that says where it ran.
+    ///
+    /// The sidecar is written here rather than at session start so a thread the
+    /// user never spoke in doesn't leave one behind, and so a listed session
+    /// always has history to import.
+    async fn persist_session(&self, session_id: &SessionId, snapshot: &[serde_json::Value]) {
+        let key = session_id.to_string();
+        if let Err(error) = session_store::save(&key, snapshot) {
+            log::warn!("session({session_id}) save failed: {error}");
+            return;
+        }
+        let cwd = self
+            .session_cwd
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = cwd {
+            session_store::save_meta(&key, &cwd, &workspace::additional_roots());
+        }
+    }
+
+    /// ACP `session/list`: the saved threads an editor can reopen.
+    ///
+    /// Only sessions with a recorded working directory qualify — `SessionInfo`
+    /// must carry an absolute `cwd`, and the request may filter on it. Threads
+    /// saved before sidecars existed have none and are skipped; they still load
+    /// by id. Everything is returned in one page, so there is no cursor.
+    async fn handle_list_sessions(
+        &self,
+        args: ListSessionsRequest,
+    ) -> agent_client_protocol::Result<ListSessionsResponse> {
+        let filter = args.cwd.as_ref().map(|cwd| normalize_dir(cwd));
+        let sessions: Vec<SessionInfo> = session_store::list()
+            .into_iter()
+            .filter(|entry| entry.message_count > 0)
+            .filter_map(|entry| {
+                let cwd = entry.cwd?;
+                if let Some(filter) = &filter
+                    && normalize_dir(&cwd) != *filter
+                {
+                    return None;
+                }
+                Some(
+                    SessionInfo::new(SessionId::new(entry.id), cwd)
+                        .additional_directories(entry.additional_directories)
+                        .title(entry.title)
+                        .updated_at(session_store::iso8601(entry.modified)),
+                )
+            })
+            .collect();
+
+        log::info!(
+            "list_sessions: {} session(s){}",
+            sessions.len(),
+            args.cwd
+                .as_ref()
+                .map(|cwd| format!(" for cwd={}", cwd.display()))
+                .unwrap_or_default()
+        );
+
+        Ok(ListSessionsResponse::new(sessions))
     }
 
     async fn handle_load_session(
@@ -2101,9 +2176,7 @@ impl SiGitAgent {
         // Persist the completed turn so a restart (or session/load) can pick
         // the conversation back up.
         let snapshot = backend.history_snapshot().await;
-        if let Err(error) = session_store::save(&session_id.to_string(), &snapshot) {
-            log::warn!("prompt({}) session save failed: {error}", session_id);
-        }
+        self.persist_session(&session_id, &snapshot).await;
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
         Ok(PromptResponse::new(StopReason::EndTurn))
@@ -3228,9 +3301,7 @@ async fn exec_slash_acp(
                     let snapshot = backend.history_snapshot().await;
                     let after = backend::estimate_tokens(&snapshot);
                     // Keep the saved session in step with the compacted state.
-                    if let Err(error) = session_store::save(&session_id.to_string(), &snapshot) {
-                        log::warn!("session save after /compact failed: {error}");
-                    }
+                    agent.persist_session(&session_id, &snapshot).await;
                     format!("Compacted history: ~{before} → ~{after} tokens (estimated).")
                 }
                 Err(error) => format!("Compaction failed: {error}"),
@@ -3861,6 +3932,15 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                 let state = Arc::clone(&state);
                 async move |req: AuthenticateRequest, responder, _cx: ConnectionTo<Client>| {
                     handle_response(responder, state.handle_authenticate(req).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: ListSessionsRequest, responder, _cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_list_sessions(req).await)
                 }
             },
             agent_client_protocol::on_receive_request!(),
