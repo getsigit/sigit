@@ -200,6 +200,12 @@ fn message_text(message: &Value) -> String {
 
 /// A human-readable title for a session: the first line of its first user
 /// message, trimmed and cut to [`TITLE_MAX_CHARS`].
+///
+/// A user message with no text at all — one that carried only an attachment,
+/// say — is passed over for the next one rather than producing a blank title;
+/// a message with any text, however short, wins. When no user message has text
+/// there is no title, and the client falls back to whatever it shows for an
+/// untitled thread.
 fn session_title(contents: &str) -> Option<String> {
     for line in contents.lines() {
         if line.trim().is_empty() {
@@ -269,14 +275,19 @@ pub fn list() -> Vec<SessionEntry> {
     sessions
 }
 
-/// Format a timestamp as an ISO 8601 UTC instant (`2026-09-16T10:08:15Z`),
-/// which is what ACP's `SessionInfo.updatedAt` expects. Hand-rolled rather than
-/// pulling in a date crate for one field; pre-epoch times clamp to the epoch.
+/// Format a timestamp as an ISO 8601 UTC instant with milliseconds
+/// (`2026-09-16T10:08:15.123Z`), which is what ACP's `SessionInfo.updatedAt`
+/// expects. The sub-second part is not decoration: two sessions saved in the
+/// same second would otherwise carry identical timestamps and a client sorting
+/// its import list by `updatedAt` could not tell which thread is the recent
+/// one. Hand-rolled rather than pulling in a date crate for one field;
+/// pre-epoch times clamp to the epoch.
 pub fn iso8601(time: std::time::SystemTime) -> String {
-    let secs = time
+    let since_epoch = time
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let secs = since_epoch.as_secs();
+    let millis = since_epoch.subsec_millis();
     let days = (secs / 86_400) as i64;
     let seconds_of_day = secs % 86_400;
     let (hour, minute, second) = (
@@ -298,7 +309,7 @@ pub fn iso8601(time: std::time::SystemTime) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
 
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 #[cfg(test)]
@@ -456,22 +467,37 @@ mod tests {
             None
         );
         assert_eq!(session_title(""), None);
+
+        // A user message with no text of its own — an attachment-only turn —
+        // hands the title to the next one rather than coming back blank.
+        let attachment_only = "{\"role\":\"user\",\"content\":\"   \"}\n\
+             {\"role\":\"user\",\"content\":\"the real question\"}\n";
+        assert_eq!(
+            session_title(attachment_only).as_deref(),
+            Some("the real question")
+        );
+        // However short, any text wins.
+        assert_eq!(
+            session_title("{\"role\":\"user\",\"content\":\"?\"}\n").as_deref(),
+            Some("?")
+        );
     }
 
     #[test]
     fn iso8601_formats_utc_instants() {
         use std::time::{Duration, UNIX_EPOCH};
 
-        assert_eq!(iso8601(UNIX_EPOCH), "1970-01-01T00:00:00Z");
-        // 2026-09-16T10:08:15Z
+        assert_eq!(iso8601(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        // 2026-09-16T10:08:15.123Z — milliseconds keep two saves in the same
+        // second apart when a client sorts its import list.
         assert_eq!(
-            iso8601(UNIX_EPOCH + Duration::from_secs(1_789_553_295)),
-            "2026-09-16T10:08:15Z"
+            iso8601(UNIX_EPOCH + Duration::from_millis(1_789_553_295_123)),
+            "2026-09-16T10:08:15.123Z"
         );
         // A leap day, to exercise the civil-date arithmetic.
         assert_eq!(
             iso8601(UNIX_EPOCH + Duration::from_secs(1_709_164_800)),
-            "2024-02-29T00:00:00Z"
+            "2024-02-29T00:00:00.000Z"
         );
     }
 }

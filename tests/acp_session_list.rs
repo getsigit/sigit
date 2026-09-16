@@ -228,8 +228,8 @@ fn saved_sessions_are_listed_for_their_project() {
     );
     let updated_at = info["updatedAt"].as_str().unwrap_or_default();
     assert!(
-        updated_at.len() == 20 && updated_at.ends_with('Z'),
-        "updatedAt should be an ISO 8601 UTC instant, got {updated_at:?}"
+        updated_at.len() == 24 && updated_at.ends_with('Z') && updated_at.contains('.'),
+        "updatedAt should be an ISO 8601 UTC instant with milliseconds, got {updated_at:?}"
     );
 
     // … and not for a different one.

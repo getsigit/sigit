@@ -445,10 +445,21 @@ fn history_message_text(message: &serde_json::Value) -> String {
     }
 }
 
-/// Compare directories the way `session/list` filtering needs: resolve symlinks
-/// and `..` when the path exists, otherwise fall back to the path as given.
-fn normalize_dir(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// Do two paths name the same directory, for `session/list` filtering?
+///
+/// Canonicalizing resolves the symlinks and `..` segments that make a client's
+/// `cwd` and a stored one differ while naming the same place (`/tmp` vs
+/// `/private/tmp` on macOS). It only works on a directory that still exists,
+/// though, so a plain equality check runs first and keeps a session listed
+/// after its project directory has been moved or removed.
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Rebuild the `session/update` notifications that re-draw a saved conversation
@@ -1433,21 +1444,21 @@ impl SiGitAgent {
     ///
     /// The sidecar is written here rather than at session start so a thread the
     /// user never spoke in doesn't leave one behind, and so a listed session
-    /// always has history to import.
+    /// always has history to import. Only the directory the client named on the
+    /// session request is recorded — never the process cwd, which a later
+    /// session in the same process may have moved: a thread listed under the
+    /// wrong project is worse than one that isn't listed at all.
     async fn persist_session(&self, session_id: &SessionId, snapshot: &[serde_json::Value]) {
         let key = session_id.to_string();
         if let Err(error) = session_store::save(&key, snapshot) {
             log::warn!("session({session_id}) save failed: {error}");
             return;
         }
-        let cwd = self
-            .session_cwd
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .or_else(|| std::env::current_dir().ok());
-        if let Some(cwd) = cwd {
-            session_store::save_meta(&key, &cwd, &workspace::additional_roots());
+        match self.session_cwd.lock().ok().and_then(|guard| guard.clone()) {
+            Some(cwd) => session_store::save_meta(&key, &cwd, &workspace::additional_roots()),
+            None => log::warn!(
+                "session({session_id}) has no recorded cwd — saved, but it won't be listed"
+            ),
         }
     }
 
@@ -1461,14 +1472,14 @@ impl SiGitAgent {
         &self,
         args: ListSessionsRequest,
     ) -> agent_client_protocol::Result<ListSessionsResponse> {
-        let filter = args.cwd.as_ref().map(|cwd| normalize_dir(cwd));
+        let filter = args.cwd.clone();
         let sessions: Vec<SessionInfo> = session_store::list()
             .into_iter()
             .filter(|entry| entry.message_count > 0)
             .filter_map(|entry| {
                 let cwd = entry.cwd?;
                 if let Some(filter) = &filter
-                    && normalize_dir(&cwd) != *filter
+                    && !same_dir(&cwd, filter)
                 {
                     return None;
                 }
@@ -4252,6 +4263,33 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_dir_matches_through_symlinks_and_survives_a_missing_directory() {
+        let root = std::env::temp_dir().join(format!("sigit_same_dir_{}", std::process::id()));
+        let real = root.join("real");
+        let link = root.join("link");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&real).unwrap();
+
+        assert!(same_dir(&real, &real));
+        assert!(!same_dir(&real, &root.join("elsewhere")));
+
+        // A stored path that reaches the same directory by another route still
+        // matches the client's.
+        assert!(same_dir(&root.join("real/../real"), &real));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(same_dir(&link, &real));
+        }
+
+        // A project that has since been deleted can't be canonicalized; an
+        // exact path still matches, so its threads stay listable.
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(same_dir(&real, &real));
+        assert!(!same_dir(&link, &real));
+    }
 
     #[test]
     fn session_context_message_lists_every_root_of_a_multi_root_project() {
