@@ -529,12 +529,52 @@ impl OpenAiBackend {
     /// `tools` is always the known catalog, while `allow_tool_calls` determines
     /// whether it is advertised to the model and whether returned calls may run.
     /// Streams via SSE when `sink` is set; otherwise reads a single JSON response.
+    ///
+    /// A reply whose only attempt at a tool call was a block that couldn't be
+    /// parsed gets one retry: the model is told the call didn't run and asked
+    /// to make it again through the structured interface. Without that the
+    /// turn ends on whatever prose preceded the broken block, and the call is
+    /// silently lost.
     async fn complete(
         &self,
         tools: &[ToolSpec],
         allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        let (result, malformed) = self.request(tools, allow_tool_calls, sink).await?;
+        if malformed == 0 || !allow_tool_calls || !result.tool_calls.is_empty() {
+            return Ok(result);
+        }
+
+        log::warn!(
+            "dropped {malformed} unparseable inline tool call(s); asking the model to retry"
+        );
+        self.history.lock().await.push(serde_json::json!({
+            "role": "user",
+            "content": MALFORMED_TOOL_CALL_RETRY,
+        }));
+        if let Some(sink) = sink
+            && !result.text.trim().is_empty()
+        {
+            // The retry's text follows what already streamed; keep it from
+            // running on into the previous sentence.
+            let _ = sink.send("\n\n".to_string());
+        }
+        let (retry, _) = self.request(tools, allow_tool_calls, sink).await?;
+        Ok(TurnResult {
+            text: join_reply_text(&result.text, &retry.text),
+            tool_calls: retry.tool_calls,
+        })
+    }
+
+    /// One chat-completion round trip. Returns the turn plus how many inline
+    /// tool-call blocks were dropped because they couldn't be parsed.
+    async fn request(
+        &self,
+        tools: &[ToolSpec],
+        allow_tool_calls: bool,
+        sink: Option<&TokenSink>,
+    ) -> Result<(TurnResult, usize), BackendError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let streaming = sink.is_some();
 
@@ -582,7 +622,7 @@ impl OpenAiBackend {
         response: reqwest::Response,
         tools: &[ToolSpec],
         allow_tool_calls: bool,
-    ) -> Result<TurnResult, BackendError> {
+    ) -> Result<(TurnResult, usize), BackendError> {
         let parsed: ChatCompletion = response
             .json()
             .await
@@ -607,9 +647,12 @@ impl OpenAiBackend {
             })
             .collect();
 
+        let extracted = crate::inline_tool_calls::extract(&text, tools);
+        let malformed = extracted.malformed;
+
         if !allow_tool_calls {
-            let (cleaned, recovered) = crate::inline_tool_calls::extract(&text, tools);
-            text = cleaned;
+            let recovered = extracted.calls;
+            text = extracted.text;
             let suppressed = tool_calls.len() + recovered.len();
             if suppressed > 0 {
                 let names = tool_calls
@@ -626,10 +669,13 @@ impl OpenAiBackend {
                 .lock()
                 .await
                 .push(streamed_assistant_history(&text, &[]));
-            return Ok(TurnResult {
-                text,
-                tool_calls: Vec::new(),
-            });
+            return Ok((
+                TurnResult {
+                    text,
+                    tool_calls: Vec::new(),
+                },
+                malformed,
+            ));
         }
 
         // Some models write a tool call out as literal `<tool_call>` text
@@ -637,7 +683,8 @@ impl OpenAiBackend {
         // Recover it, or the turn ends with the tag rendered as prose and
         // whatever the model meant to do is dropped.
         if tool_calls.is_empty() {
-            let (cleaned, recovered) = crate::inline_tool_calls::extract(&text, tools);
+            let cleaned = extracted.text;
+            let recovered = extracted.calls;
             if !recovered.is_empty() {
                 log::warn!(
                     "recovered {} tool call(s) the model emitted as text instead of a structured call",
@@ -660,17 +707,44 @@ impl OpenAiBackend {
                     .lock()
                     .await
                     .push(streamed_assistant_history(&cleaned, &tool_calls));
-                return Ok(TurnResult {
-                    text: cleaned,
-                    tool_calls,
-                });
+                return Ok((
+                    TurnResult {
+                        text: cleaned,
+                        tool_calls,
+                    },
+                    malformed,
+                ));
+            }
+            if malformed > 0 {
+                // Keep the broken block out of history as well as the reply;
+                // see `inline_tool_calls` for why it poisons later turns.
+                self.push_reply_without_calls(&cleaned).await;
+                return Ok((
+                    TurnResult {
+                        text: cleaned,
+                        tool_calls,
+                    },
+                    malformed,
+                ));
             }
         }
 
         // Record the assistant turn so later tool results have context.
         self.history.lock().await.push(message.into_history_value());
 
-        Ok(TurnResult { text, tool_calls })
+        Ok((TurnResult { text, tool_calls }, 0))
+    }
+
+    /// Record a text-only assistant reply. An empty one is skipped: strict
+    /// endpoints reject an assistant message with neither content nor tool
+    /// calls, and there is nothing in it worth replaying.
+    async fn push_reply_without_calls(&self, text: &str) {
+        if !text.is_empty() {
+            self.history
+                .lock()
+                .await
+                .push(streamed_assistant_history(text, &[]));
+        }
     }
 
     /// Consume an OpenAI Server-Sent Events stream, forwarding content deltas to
@@ -682,7 +756,7 @@ impl OpenAiBackend {
         sink: &TokenSink,
         tools: &[ToolSpec],
         allow_tool_calls: bool,
-    ) -> Result<TurnResult, BackendError> {
+    ) -> Result<(TurnResult, usize), BackendError> {
         use futures::StreamExt;
 
         let mut stream = response.bytes_stream();
@@ -699,6 +773,7 @@ impl OpenAiBackend {
         // already been rendered. See `inline_tool_calls`.
         let mut scanner = crate::inline_tool_calls::StreamScanner::new(tools);
         let mut recovered: Vec<ToolCall> = Vec::new();
+        let mut malformed = 0usize;
 
         while let Some(item) = stream.next().await {
             let bytes = item.map_err(|error| format!("stream read error: {error}"))?;
@@ -768,6 +843,10 @@ impl OpenAiBackend {
                                     arguments: call.arguments,
                                 });
                             }
+                            crate::inline_tool_calls::ScanEvent::Malformed(block) => {
+                                log_malformed_block(&block);
+                                malformed += 1;
+                            }
                         }
                     }
                     if cancelled {
@@ -800,10 +879,19 @@ impl OpenAiBackend {
             }
         }
 
-        // Text held back waiting on a tag that never closed is just text.
-        if let Some(leftover) = scanner.take_pending() {
-            text.push_str(&leftover);
-            let _ = sink.send(leftover);
+        // Flush what was held back. A partial marker is just text; a
+        // tool-call block that never closed is dropped like any other
+        // unparseable one.
+        match scanner.finish() {
+            Some(crate::inline_tool_calls::ScanEvent::Text(leftover)) => {
+                text.push_str(&leftover);
+                let _ = sink.send(leftover);
+            }
+            Some(crate::inline_tool_calls::ScanEvent::Malformed(block)) => {
+                log_malformed_block(&block);
+                malformed += 1;
+            }
+            Some(crate::inline_tool_calls::ScanEvent::ToolCall(_)) | None => {}
         }
 
         let mut tool_calls: Vec<ToolCall> = tool_accum
@@ -836,12 +924,40 @@ impl OpenAiBackend {
         }
 
         // Record the assistant turn so later tool results have context.
-        self.history
-            .lock()
-            .await
-            .push(streamed_assistant_history(&text, &tool_calls));
+        if malformed > 0 && tool_calls.is_empty() {
+            self.push_reply_without_calls(&text).await;
+        } else {
+            self.history
+                .lock()
+                .await
+                .push(streamed_assistant_history(&text, &tool_calls));
+        }
 
-        Ok(TurnResult { text, tool_calls })
+        Ok((TurnResult { text, tool_calls }, malformed))
+    }
+}
+
+/// Sent as a user turn after a reply whose tool call couldn't be parsed.
+const MALFORMED_TOOL_CALL_RETRY: &str = "[siGit Code] Your last reply tried to call a tool by \
+    writing the call out as text, and it could not be parsed, so nothing ran and the user did \
+    not see it. Do not write tool calls or tool results as text. Make the call again using the \
+    tool-calling interface, or answer in plain prose if no tool is needed.";
+
+fn log_malformed_block(block: &str) {
+    log::warn!(
+        "dropped an unparseable inline tool call ({} chars): {}",
+        block.len(),
+        block.chars().take(200).collect::<String>()
+    );
+}
+
+/// Join the visible text of a reply and its retry the way the stream showed
+/// them: as separate paragraphs.
+fn join_reply_text(first: &str, retry: &str) -> String {
+    match (first.trim().is_empty(), retry.trim().is_empty()) {
+        (true, _) => retry.to_string(),
+        (false, true) => first.to_string(),
+        (false, false) => format!("{first}\n\n{retry}"),
     }
 }
 
