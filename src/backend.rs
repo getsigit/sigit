@@ -883,6 +883,24 @@ impl InferenceBackend for OpenAiBackend {
     async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>) {
         let mut history = self.history.lock().await;
         for result in results {
+            // Cancellation races the in-flight continuation request. That
+            // request appends its tool results before awaiting HTTP, so cleanup
+            // must be safe whether cancellation won just before or just after
+            // the append.
+            let matching_call = history.iter().rposition(|message| {
+                message["role"] == "assistant"
+                    && message["tool_calls"].as_array().is_some_and(|calls| {
+                        calls.iter().any(|call| call["id"] == result.tool_call_id)
+                    })
+            });
+            let already_recorded = matching_call.is_some_and(|call_index| {
+                history[call_index + 1..].iter().any(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == result.tool_call_id
+                })
+            });
+            if already_recorded {
+                continue;
+            }
             history.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": result.tool_call_id,
@@ -1357,6 +1375,22 @@ mod tests {
         assert_eq!(last["role"], "tool");
         assert_eq!(last["tool_call_id"], "call_9");
         assert_eq!(last["content"], "cancelled by the user");
+
+        drop(history);
+        backend
+            .record_cancelled_tool_results(vec![ToolResult {
+                tool_call_id: "call_9".to_string(),
+                content: "duplicate cleanup".to_string(),
+            }])
+            .await;
+        let history = backend.history.lock().await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message["tool_call_id"] == "call_9")
+                .count(),
+            1
+        );
     }
 
     #[test]

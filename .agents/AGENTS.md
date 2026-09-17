@@ -111,9 +111,13 @@ The agent loop is backend-agnostic. The flow: a turn (messages + tool specs) goe
 feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete backend.
 
 - **`src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
-  new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`
-  (note: it bakes in smbCloud-specific context the agent should use when the repo is clearly
-  smbCloud, and stay general otherwise).
+  new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`.
+  ACP session state owns its roots, conversation, and selected model even though the process has
+  one live backend; activating a thread parks and restores all three. Unknown session ids are
+  rejected instead of silently borrowing the active thread's cwd. Prompt cancellation is routed
+  outside `turn_lock`, which lets a client cancel the turn currently holding that lock. The
+  `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
+  smbCloud, and stay general otherwise.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
   `ToolResult`, `TurnResult`). Two impls: `LocalBackend` (on-device via `onde::ChatEngine`) and
   `OpenAiBackend` (any OpenAI-compatible HTTP endpoint). A `BackendError` is user-facing: the

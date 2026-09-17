@@ -323,6 +323,17 @@ impl StreamedReply {
     }
 }
 
+#[derive(Default)]
+struct PromptCancellation {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+enum DrainTurnError {
+    Backend(backend::BackendError),
+    Cancelled,
+}
+
 /// Outcome of asking the client for permission to run one tool call.
 enum PermissionVerdict {
     /// Run the tool.
@@ -760,10 +771,14 @@ fn initialize_meta() -> Meta {
 /// serialized by `turn_lock`), so each session's roots and conversation are
 /// parked here while another session holds the process, and swapped back in
 /// by `activate_session` before its next request runs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct SessionState {
     cwd: PathBuf,
     additional_roots: Vec<PathBuf>,
+    /// The model/backend selection that belongs to this session. ACP config
+    /// options are session-scoped, so switching threads must restore it along
+    /// with the conversation rather than leaving the last thread's model live.
+    model_id: String,
     /// The conversation without its system messages (see
     /// `backend::carryover_history`). Those are rebuilt from the roots each
     /// time the session is installed, so they always name this session's
@@ -784,6 +799,11 @@ struct SiGitAgent {
     sessions: std::sync::Mutex<std::collections::HashMap<String, SessionState>>,
     /// The session whose roots and conversation are installed right now.
     active_session: std::sync::Mutex<Option<String>>,
+    /// Cancellation signals for prompts currently waiting on inference. The
+    /// notification handler runs outside `turn_lock`, so it can interrupt the
+    /// turn that currently owns that lock and let another session proceed.
+    prompt_cancellations:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<PromptCancellation>>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
@@ -827,6 +847,7 @@ impl SiGitAgent {
             session_cwd: std::sync::Mutex::new(None),
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_session: std::sync::Mutex::new(None),
+            prompt_cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
             startup_model_load_started,
@@ -1117,14 +1138,24 @@ impl SiGitAgent {
         fut: F,
         sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
         reply: &mut StreamedReply,
-    ) -> Result<TurnResult, backend::BackendError>
+        cancellation: &PromptCancellation,
+    ) -> Result<TurnResult, DrainTurnError>
     where
         F: std::future::Future<Output = Result<TurnResult, backend::BackendError>>,
     {
+        if cancellation.cancelled.load(Ordering::Acquire) {
+            return Err(DrainTurnError::Cancelled);
+        }
+
         tokio::pin!(fut);
         let result = loop {
             tokio::select! {
-                done = &mut fut => break done,
+                done = &mut fut => break done.map_err(DrainTurnError::Backend),
+                _ = cancellation.notify.notified() => {
+                    if cancellation.cancelled.load(Ordering::Acquire) {
+                        break Err(DrainTurnError::Cancelled);
+                    }
+                }
                 Some(piece) = sink_rx.recv() => {
                     self.emit_visible_chunk(cx, session_id, &piece, reply);
                 }
@@ -1345,6 +1376,7 @@ impl SiGitAgent {
             let mut guard = self.current_model.lock().unwrap();
             *guard = new_config.clone();
         }
+        self.record_active_model();
 
         if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
             self.engine
@@ -1457,11 +1489,31 @@ impl SiGitAgent {
 
     /// Build the state for a session request: its primary `cwd` plus the extra
     /// roots worth keeping (see `workspace::set_additional_roots`).
-    fn session_state(cwd: &std::path::Path, additional: &[PathBuf]) -> SessionState {
+    fn session_state(&self, cwd: &std::path::Path, additional: &[PathBuf]) -> SessionState {
+        let current_model = self.current_model.lock().unwrap().model_id.clone();
+        let model_id =
+            if !settings::local_inference_enabled() && provider::active_provider().is_none() {
+                format!("sigit-cloud:{}", provider::DEFAULT_CLOUD_TIER)
+            } else {
+                current_model
+            };
         SessionState {
             cwd: cwd.to_path_buf(),
             additional_roots: workspace::filter_additional_roots(cwd, additional),
+            model_id,
             conversation: Vec::new(),
+        }
+    }
+
+    /// Keep the active session's parked metadata in step with a successful
+    /// model/backend switch. Its conversation remains stale while active.
+    fn record_active_model(&self) {
+        let Some(active) = self.active_session.lock().unwrap().clone() else {
+            return;
+        };
+        let model_id = self.current_model.lock().unwrap().model_id.clone();
+        if let Some(state) = self.sessions.lock().unwrap().get_mut(&active) {
+            state.model_id = model_id;
         }
     }
 
@@ -1474,6 +1526,7 @@ impl SiGitAgent {
         let snapshot = self.backend.lock().await.history_snapshot().await;
         if let Some(state) = self.sessions.lock().unwrap().get_mut(&active) {
             state.conversation = backend::carryover_history(snapshot);
+            state.model_id = self.current_model.lock().unwrap().model_id.clone();
         }
     }
 
@@ -1493,7 +1546,7 @@ impl SiGitAgent {
         self.install_session(&key, state).await;
 
         // Honor the persisted Local Inference toggle (off + signed in → cloud).
-        self.apply_startup_inference_mode().await;
+        self.restore_session_model(&key).await;
     }
 
     /// Make `session_id` the live session before one of its requests runs.
@@ -1502,23 +1555,19 @@ impl SiGitAgent {
     /// this one's roots and conversation are installed in its place. An id this
     /// process has never seen (the editor kept a thread open across a sigit
     /// restart) is rebuilt from the session store when it can be.
-    async fn activate_session(&self, session_id: &SessionId) {
+    async fn activate_session(&self, session_id: &SessionId) -> agent_client_protocol::Result<()> {
         let key = session_id.to_string();
         if self.active_session.lock().unwrap().as_deref() == Some(key.as_str()) {
-            return;
+            return Ok(());
         }
 
-        let known = self.sessions.lock().unwrap().get(&key).cloned();
-        let state = match known {
-            Some(state) => state,
-            None => {
-                let state = self.recover_session(&key);
-                self.sessions
-                    .lock()
-                    .unwrap()
-                    .insert(key.clone(), state.clone());
-                state
-            }
+        let Some(state) = self.sessions.lock().unwrap().get(&key).cloned() else {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!(
+                    "unknown session {key}; create it with session/new or restore it with session/load"
+                ),
+            ));
         };
 
         log::info!(
@@ -1529,34 +1578,8 @@ impl SiGitAgent {
         );
         self.park_active_session().await;
         self.install_session(&key, state).await;
-    }
-
-    /// State for a session id this process didn't open: the saved conversation
-    /// and roots when the store has them, otherwise an empty conversation in the
-    /// current directory. Never the live session's conversation.
-    fn recover_session(&self, key: &str) -> SessionState {
-        let entry = session_store::list()
-            .into_iter()
-            .find(|entry| entry.id == key);
-        let cwd = entry
-            .as_ref()
-            .and_then(|entry| entry.cwd.clone())
-            .or_else(|| self.session_cwd.lock().ok().and_then(|guard| guard.clone()))
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let additional = entry
-            .map(|entry| entry.additional_directories)
-            .unwrap_or_default();
-        let mut state = Self::session_state(&cwd, &additional);
-        state.conversation = session_store::load(key)
-            .map(backend::carryover_history)
-            .unwrap_or_default();
-        log::warn!(
-            "session({key}) was not opened by this process; recovered {} message(s) in {}",
-            state.conversation.len(),
-            cwd.display()
-        );
-        state
+        self.restore_session_model(&key).await;
+        Ok(())
     }
 
     /// Point the process at `state`'s roots and load its conversation.
@@ -1569,6 +1592,7 @@ impl SiGitAgent {
         let SessionState {
             cwd,
             additional_roots,
+            model_id: _,
             conversation,
         } = state;
 
@@ -1586,6 +1610,52 @@ impl SiGitAgent {
 
         self.seed_conversation(&cwd, &additional_roots, conversation)
             .await;
+    }
+
+    /// Restore the active session's model/backend after its conversation has
+    /// been installed on the currently live backend. Model switches carry that
+    /// freshly installed conversation across to the target backend.
+    async fn restore_session_model(&self, key: &str) {
+        // Explicit OpenAI-compatible provider overrides are process-wide and
+        // intentionally take precedence over the editor's model picker.
+        if provider::active_provider().is_some() {
+            return;
+        }
+
+        let Some(target) = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|state| state.model_id.clone())
+        else {
+            return;
+        };
+        let current = self.current_model.lock().unwrap().model_id.clone();
+        if current == target {
+            return;
+        }
+
+        if let Some(tier) = target.strip_prefix("sigit-cloud:") {
+            if self.switch_to_cloud_tier(tier).await.is_none() {
+                log::warn!(
+                    "session({key}): cannot restore cloud model without a signed-in account"
+                );
+                self.record_active_model();
+            }
+            return;
+        }
+
+        match self.switch_model_by_id(&target).await {
+            Ok(_) => {
+                self.reset_to_local_backend().await;
+                let _ = settings::set_local_inference(true);
+            }
+            Err(error) => {
+                log::warn!("session({key}): could not restore model {target}: {error}");
+                self.record_active_model();
+            }
+        }
     }
 
     /// Replace the conversation on the engine and the active backend with
@@ -1630,13 +1700,21 @@ impl SiGitAgent {
     /// wrong project is worse than one that isn't listed at all.
     async fn persist_session(&self, session_id: &SessionId, snapshot: &[serde_json::Value]) {
         let key = session_id.to_string();
+        if self.active_session.lock().unwrap().as_deref() == Some(key.as_str()) {
+            self.record_active_model();
+        }
         if let Err(error) = session_store::save(&key, snapshot) {
             log::warn!("session({session_id}) save failed: {error}");
             return;
         }
         let state = self.sessions.lock().unwrap().get(&key).cloned();
         match state {
-            Some(state) => session_store::save_meta(&key, &state.cwd, &state.additional_roots),
+            Some(state) => session_store::save_meta(
+                &key,
+                &state.cwd,
+                &state.additional_roots,
+                Some(&state.model_id),
+            ),
             None => log::warn!(
                 "session({session_id}) has no recorded cwd — saved, but it won't be listed"
             ),
@@ -1700,17 +1778,25 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        let mut state = Self::session_state(&args.cwd, &args.additional_directories);
+        let session_key = args.session_id.to_string();
+        let mut state = self.session_state(&args.cwd, &args.additional_directories);
+        if let Some(model_id) = session_store::list()
+            .into_iter()
+            .find(|entry| entry.id == session_key)
+            .and_then(|entry| entry.model_id)
+        {
+            state.model_id = model_id;
+        }
 
         // A session boundary: grants and plan mode from the previous life of
         // this session id must not carry over. Other sessions keep theirs; the
         // editor may still have them open.
-        permissions::reset_session(&args.session_id.to_string());
+        permissions::reset_session(&session_key);
 
         // Durable sessions: when this session id was saved before, restore its
         // conversation. The saved system messages are dropped; they are rebuilt
         // from the roots the editor sent now, which may differ from last time.
-        if let Some(history) = session_store::load(&args.session_id.to_string()) {
+        if let Some(history) = session_store::load(&session_key) {
             let restored = history.len();
 
             // The client draws the reopened thread from these notifications
@@ -1768,25 +1854,31 @@ impl SiGitAgent {
         // new id has none. The source's conversation is current only after
         // parking when the source is the live session.
         self.park_active_session().await;
-        let source = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&args.session_id.to_string())
-            .map(|source| source.conversation.clone())
-            .or_else(|| {
-                session_store::load(&args.session_id.to_string()).map(backend::carryover_history)
-            })
-            .unwrap_or_default();
-        let copied = source.len();
-        let updates = history_replay_updates(&source);
+        let source_key = args.session_id.to_string();
+        let source_state = self.sessions.lock().unwrap().get(&source_key).cloned();
+        let mut state = self.session_state(&args.cwd, &args.additional_directories);
+        if let Some(source) = source_state {
+            state.conversation = source.conversation;
+            state.model_id = source.model_id;
+        } else {
+            state.conversation = session_store::load(&source_key)
+                .map(backend::carryover_history)
+                .unwrap_or_default();
+            if let Some(model_id) = session_store::list()
+                .into_iter()
+                .find(|entry| entry.id == source_key)
+                .and_then(|entry| entry.model_id)
+            {
+                state.model_id = model_id;
+            }
+        }
+        let copied = state.conversation.len();
+        let updates = history_replay_updates(&state.conversation);
         let replayed = updates.len();
         for update in updates {
             cx.send_notification(SessionNotification::new(new_id.clone(), update))
                 .ok();
         }
-        let mut state = Self::session_state(&args.cwd, &args.additional_directories);
-        state.conversation = source;
         self.open_session(&new_id, state).await;
         log::info!(
             "fork_session: copied {copied} message(s), replayed {replayed} update(s) for {new_id}"
@@ -1823,7 +1915,7 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        let state = Self::session_state(&args.cwd, &args.additional_directories);
+        let state = self.session_state(&args.cwd, &args.additional_directories);
         self.open_session(&session_id, state).await;
 
         let config_options = {
@@ -1851,7 +1943,7 @@ impl SiGitAgent {
 
         // Everything below (slash commands included) acts on the live session,
         // so it has to be this one. Resource links are read relative to its cwd.
-        self.activate_session(&session_id).await;
+        self.activate_session(&session_id).await?;
 
         // log every block so we can debug @ references and file context
         for (i, block) in args.prompt.iter().enumerate() {
@@ -2058,6 +2150,12 @@ impl SiGitAgent {
             }
         }
 
+        let cancellation = Arc::new(PromptCancellation::default());
+        self.prompt_cancellations
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), Arc::clone(&cancellation));
+
         // ── tool-calling loop ────────────────────────────────────────────
         // send message → execute any tool calls → feed results back
         // repeat up to MAX_TOOL_ROUNDS, then force a text reply
@@ -2073,27 +2171,40 @@ impl SiGitAgent {
         let mut reply = StreamedReply::default();
         let mut repeated_tool_calls = std::collections::HashMap::<String, usize>::new();
 
-        let mut result = self
+        let mut result = match self
             .drain_turn(
                 cx,
                 &session_id,
                 backend.send_message_with_tools(&user_text, &tools, Some(&sink)),
                 &mut sink_rx,
                 &mut reply,
+                &cancellation,
             )
             .await
-            .map_err(|error| {
+        {
+            Ok(result) => result,
+            Err(DrainTurnError::Cancelled) => {
+                self.finish_prompt(&session_id, &cancellation);
+                return Ok(PromptResponse::new(StopReason::Cancelled));
+            }
+            Err(DrainTurnError::Backend(error)) => {
                 log::error!("send_message_with_tools failed: {error}");
                 // Verbatim, no prefix: the backend has already turned this into
                 // something worth reading (see `describe_api_error`), and it is
                 // what the editor puts in its error banner. The context a
                 // prefix would add is in the log line above.
-                agent_client_protocol::Error::new(-32603, error)
-            })?;
+                self.finish_prompt(&session_id, &cancellation);
+                return Err(agent_client_protocol::Error::new(-32603, error));
+            }
+        };
 
         let mut round = 0;
 
         while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+            if cancellation.cancelled.load(Ordering::Acquire) {
+                self.finish_prompt(&session_id, &cancellation);
+                return Ok(PromptResponse::new(StopReason::Cancelled));
+            }
             round += 1;
             log::info!(
                 "prompt({}) tool round {} — {} call(s)",
@@ -2121,13 +2232,14 @@ impl SiGitAgent {
                         log::warn!("prompt({}) compaction failed: {error}", session_id);
                         self.send_assistant_message(
                             cx,
-                            session_id,
+                            session_id.clone(),
                             format!(
                                 "This session is too large, and siGit Code could not compact it: \
                                  {error}. Start a new thread or run `/clear`, then retry."
                             ),
                         )
                         .ok();
+                        self.finish_prompt(&session_id, &cancellation);
                         return Ok(PromptResponse::new(StopReason::EndTurn));
                     }
                 }
@@ -2271,6 +2383,7 @@ impl SiGitAgent {
                                     )
                                     .ok();
                                     backend.record_cancelled_tool_results(tool_results).await;
+                                    self.finish_prompt(&session_id, &cancellation);
                                     return Ok(PromptResponse::new(StopReason::Cancelled));
                                 }
                             }
@@ -2299,6 +2412,20 @@ impl SiGitAgent {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
+                if cancellation.cancelled.load(Ordering::Acquire) {
+                    for pending in &result.tool_calls[call_index + 1..] {
+                        tool_results.push(BackendToolResult {
+                            tool_call_id: pending.id.clone(),
+                            content: format!(
+                                "`{}` was not executed: the user cancelled the turn.",
+                                pending.name
+                            ),
+                        });
+                    }
+                    backend.record_cancelled_tool_results(tool_results).await;
+                    self.finish_prompt(&session_id, &cancellation);
+                    return Ok(PromptResponse::new(StopReason::Cancelled));
+                }
             }
 
             let allow_tool_calls = round < MAX_TOOL_ROUNDS && !force_text;
@@ -2307,19 +2434,32 @@ impl SiGitAgent {
             // continuing the sentence the tool calls interrupted.
             reply.interrupt();
 
-            result = self
+            let cancelled_results = tool_results.clone();
+            result = match self
                 .drain_turn(
                     cx,
                     &session_id,
                     backend.send_tool_results(tool_results, &tools, allow_tool_calls, Some(&sink)),
                     &mut sink_rx,
                     &mut reply,
+                    &cancellation,
                 )
                 .await
-                .map_err(|error| {
+            {
+                Ok(result) => result,
+                Err(DrainTurnError::Cancelled) => {
+                    backend
+                        .record_cancelled_tool_results(cancelled_results)
+                        .await;
+                    self.finish_prompt(&session_id, &cancellation);
+                    return Ok(PromptResponse::new(StopReason::Cancelled));
+                }
+                Err(DrainTurnError::Backend(error)) => {
                     log::error!("send_tool_results failed: {error}");
-                    agent_client_protocol::Error::new(-32603, error)
-                })?;
+                    self.finish_prompt(&session_id, &cancellation);
+                    return Err(agent_client_protocol::Error::new(-32603, error));
+                }
+            };
         }
 
         // ── Final text response ───────────────────────────────────────────
@@ -2359,6 +2499,7 @@ impl SiGitAgent {
         // the conversation back up.
         let snapshot = backend.history_snapshot().await;
         self.persist_session(&session_id, &snapshot).await;
+        self.finish_prompt(&session_id, &cancellation);
 
         log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
         Ok(PromptResponse::new(StopReason::EndTurn))
@@ -2445,8 +2586,29 @@ impl SiGitAgent {
         }
     }
 
+    fn finish_prompt(&self, session_id: &SessionId, cancellation: &Arc<PromptCancellation>) {
+        let key = session_id.to_string();
+        let mut active = self.prompt_cancellations.lock().unwrap();
+        if active
+            .get(&key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, cancellation))
+        {
+            active.remove(&key);
+        }
+    }
+
     async fn handle_cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
         log::info!("cancel requested for session {}", args.session_id);
+        if let Some(cancellation) = self
+            .prompt_cancellations
+            .lock()
+            .unwrap()
+            .get(&args.session_id.to_string())
+            .cloned()
+        {
+            cancellation.cancelled.store(true, Ordering::Release);
+            cancellation.notify.notify_one();
+        }
         Ok(())
     }
 
@@ -2456,6 +2618,22 @@ impl SiGitAgent {
     /// for login). Shared by the panel picker and the `/models` slash command.
     async fn switch_to_cloud_tier(&self, tier: &str) -> Option<String> {
         let cfg = crate::provider::cloud_tier_provider(tier)?;
+        let display_name = cfg.display_name.clone();
+        self.install_remote_backend(cfg, format!("sigit-cloud:{tier}"))
+            .await;
+
+        // Explicitly choosing a cloud tier puts us in cloud mode.
+        let _ = settings::set_local_inference(false);
+
+        log::info!("switched to cloud tier {tier}");
+        Some(display_name)
+    }
+
+    /// Install a remote provider under `selection_id`, carrying only the live
+    /// session's non-system conversation. Kept separate from cloud credential
+    /// lookup so the session-boundary regression can be tested without an
+    /// account or network request.
+    async fn install_remote_backend(&self, cfg: provider::ProviderConfig, selection_id: String) {
         // Mirror the cwd guidance and project instruction files the local engine
         // gets at session load, so the cloud model shares the same project context.
         let system_prompt = match self.session_cwd.lock().ok().and_then(|g| g.clone()) {
@@ -2477,8 +2655,8 @@ impl SiGitAgent {
         backend::adopt_carryover(cloud_backend.as_ref(), carried).await;
         *self.backend.lock().await = cloud_backend;
 
-        let cloud_config = GgufModelConfig {
-            model_id: format!("sigit-cloud:{tier}"),
+        let remote_config = GgufModelConfig {
+            model_id: selection_id,
             files: Vec::new(),
             tok_model_id: None,
             display_name: cfg.display_name.clone(),
@@ -2487,37 +2665,9 @@ impl SiGitAgent {
         };
         {
             let mut guard = self.current_model.lock().unwrap();
-            *guard = cloud_config;
+            *guard = remote_config;
         }
-
-        // Explicitly choosing a cloud tier puts us in cloud mode.
-        let _ = settings::set_local_inference(false);
-
-        log::info!("switched to cloud tier {tier}");
-        Some(cfg.display_name)
-    }
-
-    /// Apply the persisted Local Inference mode at session start. When local
-    /// inference is off and an account is signed in, route to a cloud tier so the
-    /// on-device model is never loaded; otherwise leave the on-device backend in
-    /// place. Call after the session cwd is set so the cloud system prompt picks
-    /// it up. Does not flip the stored setting on the not-signed-in fallback.
-    async fn apply_startup_inference_mode(&self) {
-        if settings::local_inference_enabled() {
-            return;
-        }
-        if self
-            .switch_to_cloud_tier(provider::DEFAULT_CLOUD_TIER)
-            .await
-            .is_some()
-        {
-            log::info!("startup: local inference off; routing inference to siGit Code Cloud");
-        } else {
-            log::warn!(
-                "local inference is off but no account is signed in; staying on-device. \
-                 Run /login or set Local Inference on."
-            );
-        }
+        self.record_active_model();
     }
 
     /// Route inference back on-device. Used after leaving a cloud tier for a
@@ -2542,6 +2692,7 @@ impl SiGitAgent {
             Arc::new(LocalBackend::new(Arc::clone(&self.engine)));
         backend::adopt_carryover(local_backend.as_ref(), carried).await;
         *self.backend.lock().await = local_backend;
+        self.record_active_model();
     }
 
     /// Re-attempt the lazy startup model load if the previous attempt failed.
@@ -2579,7 +2730,9 @@ impl SiGitAgent {
             Some(tier) => match self.switch_to_cloud_tier(&tier).await {
                 Some(name) => format!("Active: {name}."),
                 None => {
+                    *self.current_model.lock().unwrap() = default_local_model_config();
                     self.reset_to_local_backend().await;
+                    let _ = settings::set_local_inference(true);
                     "Signed out — back to on-device. Pick a model with /models.".to_string()
                 }
             },
@@ -2625,7 +2778,7 @@ impl SiGitAgent {
 
         // A model switch carries the live conversation onto the new backend, so
         // the live conversation has to be the one whose picker changed.
-        self.activate_session(&args.session_id).await;
+        self.activate_session(&args.session_id).await?;
 
         // ── Local Inference toggle ──────────────────────────────────────────
         if args.config_id.0.as_ref() == LOCAL_INFERENCE_CONFIG_ID {
@@ -3726,7 +3879,9 @@ async fn exec_slash_acp(
             };
             let message = account::end_session().await;
             if on_cloud {
+                *agent.current_model.lock().unwrap() = default_local_model_config();
                 agent.reset_to_local_backend().await;
+                let _ = settings::set_local_inference(true);
             }
             agent.send_assistant_message(cx, session_id, message).ok();
         }
@@ -4504,6 +4659,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_session_is_rejected_instead_of_borrowing_live_cwd() {
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+
+        let error = agent
+            .activate_session(&SessionId::new("not-opened"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert!(error.message.contains("session/new"));
+        assert!(agent.active_session.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_signals_only_the_matching_active_prompt() {
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        let first = Arc::new(PromptCancellation::default());
+        let second = Arc::new(PromptCancellation::default());
+        {
+            let mut prompts = agent.prompt_cancellations.lock().unwrap();
+            prompts.insert("first".into(), Arc::clone(&first));
+            prompts.insert("second".into(), Arc::clone(&second));
+        }
+
+        agent
+            .handle_cancel(CancelNotification::new(SessionId::new("first")))
+            .await
+            .unwrap();
+
+        assert!(first.cancelled.load(Ordering::Acquire));
+        assert!(!second.cancelled.load(Ordering::Acquire));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            first.notify.notified(),
+        )
+        .await
+        .expect("cancel notification should remain available to the prompt task");
+    }
+
+    #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the lock guards process-global cwd/env for the whole test
     async fn each_session_keeps_its_own_roots_and_conversation() {
         let _guard = crate::ENV_TEST_LOCK
@@ -4542,17 +4752,37 @@ mod tests {
             "m",
             Some("base prompt".into()),
         ));
+        say(&agent, "[Conversation summary]\nold thread").await;
         let thread_a = SessionId::new("thread-a");
         let thread_b = SessionId::new("thread-b");
         agent
-            .open_session(&thread_a, SiGitAgent::session_state(&repo_a, &[]))
+            .open_session(&thread_a, agent.session_state(&repo_a, &[]))
             .await;
+        let history = history_text(&live(&agent).await);
+        assert!(!history.contains("old thread"), "{history}");
+
+        // Startup cloud routing creates another remote backend after the new
+        // session was seeded. It must carry the new session (empty here), not
+        // resurrect the summary that was live before session/new.
+        agent
+            .install_remote_backend(
+                provider::ProviderConfig {
+                    display_name: "test cloud".into(),
+                    base_url: "http://127.0.0.1:9".into(),
+                    api_key: String::new(),
+                    model: "test".into(),
+                },
+                "sigit-cloud:test".into(),
+            )
+            .await;
+        let history = history_text(&live(&agent).await);
+        assert!(!history.contains("old thread"), "{history}");
         say(&agent, "working on repo a").await;
 
         agent
             .open_session(
                 &thread_b,
-                SiGitAgent::session_state(&repo_b, std::slice::from_ref(&extra_b)),
+                agent.session_state(&repo_b, std::slice::from_ref(&extra_b)),
             )
             .await;
         let history = history_text(&live(&agent).await);
@@ -4566,7 +4796,7 @@ mod tests {
         say(&agent, "working on repo b").await;
 
         // Prompting thread A again puts its roots and conversation back.
-        agent.activate_session(&thread_a).await;
+        agent.activate_session(&thread_a).await.unwrap();
         let history = history_text(&live(&agent).await);
         assert!(history.contains("working on repo a"), "{history}");
         assert!(!history.contains("working on repo b"), "{history}");
@@ -4580,7 +4810,7 @@ mod tests {
             workspace::canonical_key(&repo_a)
         );
 
-        agent.activate_session(&thread_b).await;
+        agent.activate_session(&thread_b).await.unwrap();
         let history = history_text(&live(&agent).await);
         assert!(history.contains("working on repo b"), "{history}");
         assert!(!history.contains("working on repo a"), "{history}");
@@ -4592,6 +4822,25 @@ mod tests {
             .filter(|message| message["role"] == "system")
             .count();
         assert_eq!(systems, 1);
+
+        // Model changes update only the live session's parked state. Editors
+        // such as Zed and JetBrains can keep several threads open in one agent
+        // process, so a picker change in B must not rewrite A's selection.
+        agent
+            .install_remote_backend(
+                provider::ProviderConfig {
+                    display_name: "second test cloud".into(),
+                    base_url: "http://127.0.0.1:9".into(),
+                    api_key: String::new(),
+                    model: "test-b".into(),
+                },
+                "sigit-cloud:test-b".into(),
+            )
+            .await;
+        let sessions = agent.sessions.lock().unwrap();
+        assert_eq!(sessions["thread-a"].model_id, "sigit-cloud:test");
+        assert_eq!(sessions["thread-b"].model_id, "sigit-cloud:test-b");
+        drop(sessions);
 
         std::env::set_current_dir(prev_cwd).unwrap();
         tools::set_active_session(None);
