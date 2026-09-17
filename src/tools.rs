@@ -336,13 +336,14 @@ pub fn all_tools() -> Vec<AgentTool> {
                            call it once up front with all the steps as `pending`, then call it \
                            again whenever a step's status changes. Mark exactly one step \
                            `in_progress` at a time and `completed` as soon as it is done. \
-                           Keep the list short and outcome-focused.",
+                           Keep the list short and outcome-focused. Pass an empty list to \
+                           clear the checklist once the task is finished.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
                     "todos": {
                         "type": "array",
-                        "description": "The full, current checklist (replaces any previous list).",
+                        "description": "The full, current checklist (replaces any previous list). An empty list clears it.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1795,10 +1796,15 @@ fn exec_write_todos(arguments: &str) -> String {
     };
 
     let todos = match args.get("todos").and_then(Value::as_array) {
-        Some(t) if !t.is_empty() => t,
-        Some(_) => return "Error: \"todos\" must contain at least one item".to_string(),
+        Some(t) => t,
         None => return "Error: missing required parameter \"todos\"".to_string(),
     };
+    // An empty list is how the model clears a finished checklist. Rejecting
+    // it left the last plan on screen for good, since every other call has to
+    // restate at least one step.
+    if todos.is_empty() {
+        return "Task list cleared.".to_string();
+    }
 
     let mut lines = Vec::with_capacity(todos.len());
     let mut completed = 0usize;
@@ -2784,6 +2790,12 @@ mod tests {
         assert!(result.contains("[x] Read code"), "{result}");
         assert!(result.contains("[~] Make change"), "{result}");
         assert!(result.contains("[ ] Run tests"), "{result}");
+    }
+
+    #[test]
+    fn test_write_todos_accepts_an_empty_list_to_clear() {
+        let result = exec_write_todos(r#"{"todos":[]}"#);
+        assert_eq!(result, "Task list cleared.");
     }
 
     #[test]
