@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use onde::inference::{ChatEngine, ChatMessage, ChatRole, ToolDefinition};
+use onde::inference::{ChatEngine, ChatMessage, ChatRole, EngineStatus, ToolDefinition};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -207,11 +207,54 @@ pub trait InferenceBackend: Send + Sync {
 /// On-device inference. A thin adapter over `onde::ChatEngine`.
 pub struct LocalBackend {
     engine: Arc<ChatEngine>,
+    /// History restored before an on-device model is loaded. Onde ignores
+    /// `push_history` while unloaded, so keep the snapshot here until the
+    /// engine can accept it instead of silently dropping a loaded session.
+    pending_history: Mutex<Option<Vec<serde_json::Value>>>,
 }
 
 impl LocalBackend {
     pub fn new(engine: Arc<ChatEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            pending_history: Mutex::new(None),
+        }
+    }
+
+    async fn apply_pending_history(&self) -> Result<(), BackendError> {
+        if self.pending_history.lock().await.is_none() {
+            return Ok(());
+        }
+        let status = self.engine.info().await.status;
+        if status != EngineStatus::Ready {
+            return Err(format!(
+                "on-device model is not ready to restore session history (status: {status})"
+            ));
+        }
+        let Some(history) = self.pending_history.lock().await.take() else {
+            return Ok(());
+        };
+
+        self.engine.clear_history().await;
+        for entry in history {
+            let role = entry["role"].as_str().unwrap_or("");
+            let content = entry["content"].as_str().unwrap_or("").to_string();
+            // Tool-call-only assistant entries and empty tool results carry no
+            // text a plain chat history can replay; drop them.
+            if content.is_empty() && role != "user" && role != "system" {
+                continue;
+            }
+            let message = match role {
+                "system" => ChatMessage::system(content),
+                "user" => ChatMessage::user(content),
+                "assistant" => ChatMessage::assistant(content),
+                // Tool results flatten to plain text (MVP; acceptable loss).
+                "tool" => ChatMessage::user(format!("[tool result]\n{content}")),
+                _ => continue,
+            };
+            self.engine.push_history(message).await;
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +277,7 @@ impl InferenceBackend for LocalBackend {
         tools: &[ToolSpec],
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        self.apply_pending_history().await?;
         // onde's tool-aware path is non-streaming: it has to buffer the whole
         // reply to detect tool calls. We can only stream when no tools are on
         // offer (a plain answer), which is exactly the tools-disabled case.
@@ -264,6 +308,7 @@ impl InferenceBackend for LocalBackend {
         allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        self.apply_pending_history().await?;
         let onde_results: Vec<onde::inference::ToolResult> = results
             .into_iter()
             .map(|result| onde::inference::ToolResult {
@@ -306,6 +351,9 @@ impl InferenceBackend for LocalBackend {
     }
 
     async fn history_snapshot(&self) -> Vec<serde_json::Value> {
+        if let Some(history) = self.pending_history.lock().await.as_ref() {
+            return history.clone();
+        }
         // onde's `history()` already flattens tool entries: assistant tool
         // calls become plain assistant text and tool results are omitted, so
         // the snapshot is lossy for tool-heavy turns (acceptable in this MVP).
@@ -323,28 +371,16 @@ impl InferenceBackend for LocalBackend {
     }
 
     async fn restore_history(&self, history: Vec<serde_json::Value>) {
-        self.engine.clear_history().await;
-        for entry in history {
-            let role = entry["role"].as_str().unwrap_or("");
-            let content = entry["content"].as_str().unwrap_or("").to_string();
-            // Tool-call-only assistant entries and empty tool results carry no
-            // text a plain chat history can replay; drop them.
-            if content.is_empty() && role != "user" && role != "system" {
-                continue;
-            }
-            let message = match role {
-                "system" => ChatMessage::system(content),
-                "user" => ChatMessage::user(content),
-                "assistant" => ChatMessage::assistant(content),
-                // Tool results flatten to plain text (MVP; acceptable loss).
-                "tool" => ChatMessage::user(format!("[tool result]\n{content}")),
-                _ => continue,
-            };
-            self.engine.push_history(message).await;
+        *self.pending_history.lock().await = Some(history);
+        if self.engine.info().await.status == EngineStatus::Ready {
+            // Ready was just observed, so failure here can only mean a status
+            // transition; keep the pending copy for the next inference call.
+            let _ = self.apply_pending_history().await;
         }
     }
 
     async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
+        self.apply_pending_history().await?;
         let snapshot = self.engine.history().await;
         // One plain (tool-free) inference round produces the summary. On error
         // history is untouched — send_message only mutates it on success, and
@@ -883,6 +919,24 @@ impl InferenceBackend for OpenAiBackend {
     async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>) {
         let mut history = self.history.lock().await;
         for result in results {
+            // Cancellation races the in-flight continuation request. That
+            // request appends its tool results before awaiting HTTP, so cleanup
+            // must be safe whether cancellation won just before or just after
+            // the append.
+            let matching_call = history.iter().rposition(|message| {
+                message["role"] == "assistant"
+                    && message["tool_calls"].as_array().is_some_and(|calls| {
+                        calls.iter().any(|call| call["id"] == result.tool_call_id)
+                    })
+            });
+            let already_recorded = matching_call.is_some_and(|call_index| {
+                history[call_index + 1..].iter().any(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == result.tool_call_id
+                })
+            });
+            if already_recorded {
+                continue;
+            }
             history.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": result.tool_call_id,
@@ -1197,22 +1251,18 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
         }
     }
 
-    carried
-}
+    // Session switches happen only after the serialized turn has ended. A
+    // trailing user message therefore belongs to a cancelled/failed inference
+    // request with no answer; carrying it would make the next activation feed
+    // the model an orphaned prompt that the client considers cancelled.
+    while carried
+        .last()
+        .is_some_and(|message| message["role"] == "user")
+    {
+        carried.pop();
+    }
 
-/// Drop everything from `backend`'s history except the system messages it
-/// seeded for itself. Used at a session boundary: a remote backend keeps its own
-/// history, so clearing the on-device engine alone leaves the previous thread
-/// (compaction summary included) live there, and the next model switch or
-/// startup routing carries it into the new session.
-pub async fn clear_conversation(backend: &dyn InferenceBackend) {
-    let seeded: Vec<serde_json::Value> = backend
-        .history_snapshot()
-        .await
-        .into_iter()
-        .take_while(|message| message["role"] == "system")
-        .collect();
-    backend.restore_history(seeded).await;
+    carried
 }
 
 /// Replay `carried` (from [`carryover_history`]) into `backend`, on top of the
@@ -1372,6 +1422,22 @@ mod tests {
         assert_eq!(last["role"], "tool");
         assert_eq!(last["tool_call_id"], "call_9");
         assert_eq!(last["content"], "cancelled by the user");
+
+        drop(history);
+        backend
+            .record_cancelled_tool_results(vec![ToolResult {
+                tool_call_id: "call_9".to_string(),
+                content: "duplicate cleanup".to_string(),
+            }])
+            .await;
+        let history = backend.history.lock().await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message["tool_call_id"] == "call_9")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1387,6 +1453,19 @@ mod tests {
         assert_eq!(carried.len(), 2);
         assert_eq!(carried[0]["role"], "user");
         assert_eq!(carried[1]["content"], "hi");
+    }
+
+    #[test]
+    fn carryover_drops_a_cancelled_trailing_user_message() {
+        let carried = carryover_history(vec![
+            serde_json::json!({ "role": "system", "content": "prompt" }),
+            serde_json::json!({ "role": "user", "content": "completed question" }),
+            serde_json::json!({ "role": "assistant", "content": "completed answer" }),
+            serde_json::json!({ "role": "user", "content": "cancelled question" }),
+        ]);
+
+        assert_eq!(carried.len(), 2, "{carried:#?}");
+        assert_eq!(carried.last().unwrap()["content"], "completed answer");
     }
 
     #[test]
@@ -1493,28 +1572,6 @@ mod tests {
         assert_eq!(history[0]["content"], "new prompt");
     }
 
-    #[tokio::test]
-    async fn clear_conversation_keeps_only_the_seeded_system_prompt() {
-        let backend = OpenAiBackend::new("http://localhost", "", "m", Some("prompt".into()));
-        adopt_carryover(
-            &backend,
-            vec![
-                serde_json::json!({ "role": "user", "content": "[Conversation summary]\nold" }),
-                serde_json::json!({ "role": "assistant", "content": "ok" }),
-            ],
-        )
-        .await;
-
-        clear_conversation(&backend).await;
-
-        let history = backend.history_snapshot().await;
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0]["role"], "system");
-        assert_eq!(history[0]["content"], "prompt");
-        // Nothing left for a later backend switch to carry over.
-        assert!(carryover_history(history).is_empty());
-    }
-
     #[test]
     fn estimate_tokens_scales_with_serialized_size() {
         assert_eq!(estimate_tokens(&[]), 0);
@@ -1560,6 +1617,44 @@ mod tests {
         let restored = OpenAiBackend::new("http://localhost", "", "m", Some("other seed".into()));
         restored.restore_history(snapshot.clone()).await;
         assert_eq!(restored.history_snapshot().await, snapshot);
+    }
+
+    #[tokio::test]
+    async fn local_restore_replaces_engine_history_and_system_context() {
+        let engine = Arc::new(ChatEngine::new());
+        let backend = LocalBackend::new(Arc::clone(&engine));
+        backend
+            .restore_history(vec![
+                serde_json::json!({ "role": "system", "content": "thread A context" }),
+                serde_json::json!({ "role": "user", "content": "thread A question" }),
+            ])
+            .await;
+
+        backend
+            .restore_history(vec![
+                serde_json::json!({ "role": "system", "content": "thread B context" }),
+                serde_json::json!({ "role": "user", "content": "thread B question" }),
+            ])
+            .await;
+
+        let restored = backend.history_snapshot().await;
+        assert_eq!(restored.len(), 2, "{restored:#?}");
+        assert_eq!(restored[0]["content"], "thread B context");
+        assert_eq!(restored[1]["content"], "thread B question");
+        assert!(
+            restored.iter().all(|message| !message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("thread A")),
+            "restore_history must replace, not append to, the local engine: {restored:#?}"
+        );
+
+        let error = backend
+            .send_message_with_tools("must not run", &[], None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not ready"), "{error}");
+        assert_eq!(backend.history_snapshot().await, restored);
     }
 
     /// Minimal scripted OpenAI-compatible endpoint: accepts one HTTP request on

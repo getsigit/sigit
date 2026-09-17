@@ -20,11 +20,18 @@ use std::sync::RwLock;
 static ADDITIONAL_ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
 /// Record the session's extra roots, returning the ones that were kept.
+pub fn set_additional_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let kept = filter_additional_roots(cwd, roots);
+    replace_additional_roots(kept.clone());
+    kept
+}
+
+/// The extra roots worth keeping out of what an editor sent.
 ///
 /// Entries that aren't directories, repeat, or just name `cwd` again are
 /// dropped — an editor is free to send any of those, and every consumer here
 /// would either scan nothing or do the same work twice.
-pub fn set_additional_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+pub fn filter_additional_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut seen: Vec<PathBuf> = vec![canonical_key(cwd)];
     let mut kept: Vec<PathBuf> = Vec::new();
 
@@ -43,11 +50,15 @@ pub fn set_additional_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
         seen.push(key);
         kept.push(root.clone());
     }
-
-    if let Ok(mut guard) = ADDITIONAL_ROOTS.write() {
-        *guard = kept.clone();
-    }
     kept
+}
+
+/// Install already-filtered extra roots, replacing the previous session's.
+/// The ACP agent calls this each time it switches the live session.
+pub fn replace_additional_roots(roots: Vec<PathBuf>) {
+    if let Ok(mut guard) = ADDITIONAL_ROOTS.write() {
+        *guard = roots;
+    }
 }
 
 /// The extra roots recorded for the session.

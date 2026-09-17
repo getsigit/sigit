@@ -92,17 +92,26 @@ pub struct SessionMeta {
     /// Extra workspace roots of a multi-root project, in order.
     #[serde(default)]
     pub additional_directories: Vec<PathBuf>,
+    /// Model selection last used by this session. Older sidecars omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 /// Record where `session_id` is running so it can be listed later. Cheap enough
 /// to call on every save; the sidecar is a few hundred bytes.
-pub fn save_meta(session_id: &str, cwd: &Path, additional_directories: &[PathBuf]) {
+pub fn save_meta(
+    session_id: &str,
+    cwd: &Path,
+    additional_directories: &[PathBuf],
+    model_id: Option<&str>,
+) {
     let Some(path) = meta_path(session_id) else {
         return;
     };
     let meta = SessionMeta {
         cwd: cwd.to_path_buf(),
         additional_directories: additional_directories.to_vec(),
+        model_id: model_id.map(str::to_string),
     };
     let Ok(body) = serde_json::to_string(&meta) else {
         return;
@@ -177,6 +186,8 @@ pub struct SessionEntry {
     pub cwd: Option<PathBuf>,
     /// Extra workspace roots recorded alongside `cwd`.
     pub additional_directories: Vec<PathBuf>,
+    /// Model selection saved alongside the session, when available.
+    pub model_id: Option<String>,
     /// A one-line title taken from the first user message, when there is one.
     pub title: Option<String>,
 }
@@ -257,9 +268,9 @@ pub fn list() -> Vec<SessionEntry> {
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(std::time::UNIX_EPOCH);
             let meta = load_meta(&id);
-            let (cwd, additional_directories) = match meta {
-                Some(meta) => (Some(meta.cwd), meta.additional_directories),
-                None => (None, Vec::new()),
+            let (cwd, additional_directories, model_id) = match meta {
+                Some(meta) => (Some(meta.cwd), meta.additional_directories, meta.model_id),
+                None => (None, Vec::new(), None),
             };
             Some(SessionEntry {
                 id,
@@ -267,6 +278,7 @@ pub fn list() -> Vec<SessionEntry> {
                 message_count,
                 cwd,
                 additional_directories,
+                model_id,
                 title,
             })
         })
@@ -414,12 +426,22 @@ mod tests {
         assert_eq!(listed[0].cwd, None);
         assert!(listed[0].additional_directories.is_empty());
 
+        // Sidecars written before model persistence remain readable.
+        std::fs::write(
+            sessions.join("newer.meta.json"),
+            r#"{"cwd":"/tmp/project","additional_directories":["/tmp/lib"]}"#,
+        )
+        .unwrap();
+        let listed = list();
+        assert_eq!(listed[0].model_id, None);
+
         // A sidecar makes the session listable with its directories, and
         // deleting the session takes the sidecar with it.
         save_meta(
             "newer",
             Path::new("/tmp/project"),
             &[PathBuf::from("/tmp/lib")],
+            Some("test-model"),
         );
         let listed = list();
         assert_eq!(listed[0].cwd.as_deref(), Some(Path::new("/tmp/project")));
@@ -427,6 +449,7 @@ mod tests {
             listed[0].additional_directories,
             vec![PathBuf::from("/tmp/lib")]
         );
+        assert_eq!(listed[0].model_id.as_deref(), Some("test-model"));
         assert!(sessions.join("newer.meta.json").is_file());
         delete("newer");
         assert!(!sessions.join("newer.meta.json").exists());
