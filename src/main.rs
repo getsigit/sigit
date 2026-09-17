@@ -1778,9 +1778,19 @@ impl SiGitAgent {
                 session_store::load(&args.session_id.to_string()).map(backend::carryover_history)
             })
             .unwrap_or_default();
+        let copied = source.len();
+        let updates = history_replay_updates(&source);
+        let replayed = updates.len();
+        for update in updates {
+            cx.send_notification(SessionNotification::new(new_id.clone(), update))
+                .ok();
+        }
         let mut state = Self::session_state(&args.cwd, &args.additional_directories);
         state.conversation = source;
         self.open_session(&new_id, state).await;
+        log::info!(
+            "fork_session: copied {copied} message(s), replayed {replayed} update(s) for {new_id}"
+        );
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -4688,6 +4698,25 @@ mod tests {
             other => panic!("expected the tool call, got {other:?}"),
         }
         assert!(matches!(updates[3], SessionUpdate::AgentMessageChunk(_)));
+    }
+
+    #[test]
+    fn history_replay_redraws_a_forked_conversation_without_system_context() {
+        let source = backend::carryover_history(vec![
+            serde_json::json!({ "role": "system", "content": "source project context" }),
+            serde_json::json!({ "role": "user", "content": "continue this thread" }),
+            serde_json::json!({ "role": "assistant", "content": "Ready to continue." }),
+        ]);
+
+        let updates = history_replay_updates(&source);
+
+        assert_eq!(updates.len(), 2, "{updates:#?}");
+        assert!(matches!(updates[0], SessionUpdate::UserMessageChunk(_)));
+        assert!(matches!(updates[1], SessionUpdate::AgentMessageChunk(_)));
+        assert!(
+            !format!("{updates:#?}").contains("source project context"),
+            "fork replay must not expose backend-only system context"
+        );
     }
 
     #[test]
