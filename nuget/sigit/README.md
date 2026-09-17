@@ -21,8 +21,14 @@ dotnet tool update --global SiGit.Code
 sigit
 ```
 
-In a terminal that opens the chat UI. When stdin is a pipe, the same binary speaks the Agent
-Client Protocol (ACP) over stdio instead, which is how editors such as Zed and VS Code drive it.
+In a terminal that opens the chat UI. Run it with `--acp` and the same binary speaks the Agent
+Client Protocol (ACP) over stdio instead, which is how editors such as Zed and VS Code drive it:
+
+```sh
+sigit --acp
+```
+
+Configure that argument in the editor's agent settings; `--acp` takes no other arguments.
 
 First run downloads a GGUF model, so expect a wait of a gigabyte or two before the first reply.
 On macOS the model cache is shared with the siGit Code desktop app, so a model either app has
@@ -36,8 +42,8 @@ This .NET tool bundles native `sigit` binaries for:
 - Linux `arm64`, `x64` (glibc)
 - Windows `arm64`, `x64`
 
-The terminal chat UI is Unix-only. On Windows the binary runs in ACP mode, so use it through an
-editor rather than directly.
+The terminal chat UI is Unix-only. On Windows the binary runs in ACP mode (`sigit --acp`), so use
+it through an editor rather than directly.
 
 Because all six binaries ship in one package, the install is large. If that matters, the Homebrew,
 npm, and PyPI packages each download only the binary for your platform.

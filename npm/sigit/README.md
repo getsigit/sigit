@@ -50,7 +50,8 @@ Supported targets:
 sigit
 ```
 
-That starts the local terminal UI.
+That starts the local terminal UI. To run it as an editor agent instead, launch it
+with `--acp`, which every ACP client must pass.
 
 ### Zed
 
@@ -61,7 +62,8 @@ Add this to `~/.config/zed/settings.json`:
   "agent_servers": {
     "siGit Code": {
       "type": "custom",
-      "command": "sigit"
+      "command": "sigit",
+      "args": ["--acp"]
     }
   }
 }
@@ -78,7 +80,7 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
   "acp.agents": {
     "siGit Code": {
       "command": "sigit",
-      "args": [],
+      "args": ["--acp"],
       "env": {}
     }
   }

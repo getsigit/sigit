@@ -30,7 +30,8 @@ This installs a native `sigit` binary for your platform. You do not need a compi
 sigit
 ```
 
-That opens the local chat UI.
+That opens the local chat UI. Editors drive the same binary in ACP mode, which
+needs the `--acp` argument.
 
 ### Zed
 
@@ -41,7 +42,8 @@ siGit Code works as an [ACP-compatible](https://github.com/nicobailon/agent-clie
   "agent_servers": {
     "siGit Code": {
       "type": "custom",
-      "command": "/absolute/path/to/sigit"
+      "command": "/absolute/path/to/sigit",
+      "args": ["--acp"]
     }
   }
 }
