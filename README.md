@@ -16,8 +16,12 @@ It works in any codebase. In smbCloud repos it is more useful out of the box bec
 
 You can use it in two ways:
 
-- **ACP mode:** Zed or another ACP-compatible editor starts it over stdio
+- **ACP mode:** Zed or another ACP-compatible editor starts it over stdio with the `--acp` argument
 - **Terminal mode:** run `sigit` for the interactive chat UI
+
+Every ACP client must pass `--acp`. It takes no other arguments, and it is what
+tells the binary to speak the Agent Client Protocol instead of opening the
+terminal UI.
 
 | Platform | ACP mode | Terminal mode |
 |----------|----------|---------------|
@@ -59,7 +63,8 @@ Add this to `~/.config/zed/settings.json`:
   "agent_servers": {
     "siGit Code": {
       "type": "custom",
-      "command": "/absolute/path/to/sigit"
+      "command": "/absolute/path/to/sigit",
+      "args": ["--acp"]
     }
   }
 }
@@ -74,8 +79,8 @@ In Xcode, open **Settings > Intelligence > Agents**, add a custom agent, and set
 - **Executable:** the absolute path to `sigit`
 - **Arguments:** `--acp`
 
-The explicit `--acp` mode is designed for Xcode: it loads the selected on-device
-model on the first prompt, so you do not need to send `/load` from the Xcode chat.
+In Xcode the `--acp` mode also loads the selected on-device model on the first
+prompt, so you do not need to send `/load` from the Xcode chat.
 
 To let siGit use Xcode's build, test, and project tools, enable **Allow external
 agents to use Xcode tools** in Xcode's Intelligence settings, keep the project
@@ -100,7 +105,7 @@ Install from the [Visual Studio Code Marketplace](https://marketplace.visualstud
     "sigit": {
       "name": "siGit (on-device)",
       "command": "sigit",
-      "args": [],
+      "args": ["--acp"],
       "env": {}
     },
   },
@@ -117,7 +122,7 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
   "acp.agents": {
     "siGit Code": {
       "command": "sigit",
-      "args": [],
+      "args": ["--acp"],
       "env": {}
     }
   }
