@@ -1205,6 +1205,63 @@ fn write_todos_reaches_the_client_as_an_acp_plan() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// An empty `write_todos` is how the model clears a finished checklist. It has
+/// to reach the client as a plan with no entries, since ACP plan updates
+/// replace the whole plan, rather than as an error card that leaves the old
+/// list on screen.
+#[test]
+fn an_empty_write_todos_clears_the_acp_plan() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "write_todos", &json!({"todos": []}).to_string()),
+        sse_text("Checklist cleared."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_plan_clear_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "clear the checklist"}],
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let plan = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "plan")
+        .expect("an empty write_todos should still send a plan update");
+    assert_eq!(plan["entries"], json!([]));
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "tool_call"),
+        "clearing the plan must not show a tool-call card: {updates:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// An off-enum status must not make the whole call vanish. `exec_write_todos`
 /// renders it as pending and reports success, so the plan has to carry it the
 /// same way; dropping the plan here would leave the client showing a stale list.
