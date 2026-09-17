@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use onde::inference::{ChatEngine, ChatMessage, ChatRole, ToolDefinition};
+use onde::inference::{ChatEngine, ChatMessage, ChatRole, EngineStatus, ToolDefinition};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -207,11 +207,47 @@ pub trait InferenceBackend: Send + Sync {
 /// On-device inference. A thin adapter over `onde::ChatEngine`.
 pub struct LocalBackend {
     engine: Arc<ChatEngine>,
+    /// History restored before an on-device model is loaded. Onde ignores
+    /// `push_history` while unloaded, so keep the snapshot here until the
+    /// engine can accept it instead of silently dropping a loaded session.
+    pending_history: Mutex<Option<Vec<serde_json::Value>>>,
 }
 
 impl LocalBackend {
     pub fn new(engine: Arc<ChatEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            pending_history: Mutex::new(None),
+        }
+    }
+
+    async fn apply_pending_history(&self) {
+        if self.engine.info().await.status != EngineStatus::Ready {
+            return;
+        }
+        let Some(history) = self.pending_history.lock().await.take() else {
+            return;
+        };
+
+        self.engine.clear_history().await;
+        for entry in history {
+            let role = entry["role"].as_str().unwrap_or("");
+            let content = entry["content"].as_str().unwrap_or("").to_string();
+            // Tool-call-only assistant entries and empty tool results carry no
+            // text a plain chat history can replay; drop them.
+            if content.is_empty() && role != "user" && role != "system" {
+                continue;
+            }
+            let message = match role {
+                "system" => ChatMessage::system(content),
+                "user" => ChatMessage::user(content),
+                "assistant" => ChatMessage::assistant(content),
+                // Tool results flatten to plain text (MVP; acceptable loss).
+                "tool" => ChatMessage::user(format!("[tool result]\n{content}")),
+                _ => continue,
+            };
+            self.engine.push_history(message).await;
+        }
     }
 }
 
@@ -234,6 +270,7 @@ impl InferenceBackend for LocalBackend {
         tools: &[ToolSpec],
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        self.apply_pending_history().await;
         // onde's tool-aware path is non-streaming: it has to buffer the whole
         // reply to detect tool calls. We can only stream when no tools are on
         // offer (a plain answer), which is exactly the tools-disabled case.
@@ -264,6 +301,7 @@ impl InferenceBackend for LocalBackend {
         allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        self.apply_pending_history().await;
         let onde_results: Vec<onde::inference::ToolResult> = results
             .into_iter()
             .map(|result| onde::inference::ToolResult {
@@ -306,6 +344,9 @@ impl InferenceBackend for LocalBackend {
     }
 
     async fn history_snapshot(&self) -> Vec<serde_json::Value> {
+        if let Some(history) = self.pending_history.lock().await.as_ref() {
+            return history.clone();
+        }
         // onde's `history()` already flattens tool entries: assistant tool
         // calls become plain assistant text and tool results are omitted, so
         // the snapshot is lossy for tool-heavy turns (acceptable in this MVP).
@@ -323,28 +364,12 @@ impl InferenceBackend for LocalBackend {
     }
 
     async fn restore_history(&self, history: Vec<serde_json::Value>) {
-        self.engine.clear_history().await;
-        for entry in history {
-            let role = entry["role"].as_str().unwrap_or("");
-            let content = entry["content"].as_str().unwrap_or("").to_string();
-            // Tool-call-only assistant entries and empty tool results carry no
-            // text a plain chat history can replay; drop them.
-            if content.is_empty() && role != "user" && role != "system" {
-                continue;
-            }
-            let message = match role {
-                "system" => ChatMessage::system(content),
-                "user" => ChatMessage::user(content),
-                "assistant" => ChatMessage::assistant(content),
-                // Tool results flatten to plain text (MVP; acceptable loss).
-                "tool" => ChatMessage::user(format!("[tool result]\n{content}")),
-                _ => continue,
-            };
-            self.engine.push_history(message).await;
-        }
+        *self.pending_history.lock().await = Some(history);
+        self.apply_pending_history().await;
     }
 
     async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
+        self.apply_pending_history().await;
         let snapshot = self.engine.history().await;
         // One plain (tool-free) inference round produces the summary. On error
         // history is untouched — send_message only mutates it on success, and
@@ -1557,6 +1582,37 @@ mod tests {
         let restored = OpenAiBackend::new("http://localhost", "", "m", Some("other seed".into()));
         restored.restore_history(snapshot.clone()).await;
         assert_eq!(restored.history_snapshot().await, snapshot);
+    }
+
+    #[tokio::test]
+    async fn local_restore_replaces_engine_history_and_system_context() {
+        let engine = Arc::new(ChatEngine::new());
+        let backend = LocalBackend::new(Arc::clone(&engine));
+        backend
+            .restore_history(vec![
+                serde_json::json!({ "role": "system", "content": "thread A context" }),
+                serde_json::json!({ "role": "user", "content": "thread A question" }),
+            ])
+            .await;
+
+        backend
+            .restore_history(vec![
+                serde_json::json!({ "role": "system", "content": "thread B context" }),
+                serde_json::json!({ "role": "user", "content": "thread B question" }),
+            ])
+            .await;
+
+        let restored = backend.history_snapshot().await;
+        assert_eq!(restored.len(), 2, "{restored:#?}");
+        assert_eq!(restored[0]["content"], "thread B context");
+        assert_eq!(restored[1]["content"], "thread B question");
+        assert!(
+            restored.iter().all(|message| !message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("thread A")),
+            "restore_history must replace, not append to, the local engine: {restored:#?}"
+        );
     }
 
     /// Minimal scripted OpenAI-compatible endpoint: accepts one HTTP request on

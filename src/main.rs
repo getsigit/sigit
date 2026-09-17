@@ -1535,7 +1535,9 @@ impl SiGitAgent {
     /// Used by the session entry points (new/load/fork). The outgoing session
     /// is parked first, and the Local Inference routing runs last, so a cloud
     /// backend installed here starts from this session's conversation and
-    /// system prompt and nobody else's.
+    /// system prompt and nobody else's. Reopening an existing id deliberately
+    /// replaces its parked state (notably `session/load`); every caller holds
+    /// `turn_lock`, so parking and replacement cannot race another turn.
     async fn open_session(&self, session_id: &SessionId, state: SessionState) {
         let key = session_id.to_string();
         self.park_active_session().await;
@@ -3583,25 +3585,32 @@ async fn exec_slash_acp(
                 .iter()
                 .filter(|message| message["role"] == "user")
                 .count();
+            let session_key = session_id.to_string();
+            debug_assert_eq!(
+                agent.active_session.lock().unwrap().as_deref(),
+                Some(session_key.as_str()),
+                "slash commands run only after handle_prompt activates their session"
+            );
             let (cwd, roots) = {
-                let sessions = agent.sessions.lock().unwrap();
-                match sessions.get(&session_id.to_string()) {
-                    Some(state) => (state.cwd.clone(), state.additional_roots.clone()),
-                    None => (
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                        workspace::additional_roots(),
-                    ),
-                }
+                let mut sessions = agent.sessions.lock().unwrap();
+                let state = sessions.get_mut(&session_key).ok_or_else(|| {
+                    agent_client_protocol::Error::new(
+                        -32602,
+                        format!("cannot clear unknown session {session_key}"),
+                    )
+                })?;
+                state.conversation.clear();
+                (state.cwd.clone(), state.additional_roots.clone())
             };
             agent.seed_conversation(&cwd, &roots, Vec::new()).await;
-            permissions::reset_session(&session_id.to_string());
+            permissions::reset_session(&session_key);
             // The saved session must not resurrect what the user just wiped.
-            session_store::delete(&session_id.to_string());
+            session_store::delete(&session_key);
             // The wipe drops the session's Permissions override too; push the
             // refreshed chip so it doesn't keep showing a stale pick.
             let config_options = {
                 let current = agent.current_model.lock().unwrap();
-                build_config_options(&current, &session_id.to_string())
+                build_config_options(&current, &session_key)
             };
             agent
                 .send_tool_call_update(
