@@ -221,12 +221,18 @@ impl LocalBackend {
         }
     }
 
-    async fn apply_pending_history(&self) {
-        if self.engine.info().await.status != EngineStatus::Ready {
-            return;
+    async fn apply_pending_history(&self) -> Result<(), BackendError> {
+        if self.pending_history.lock().await.is_none() {
+            return Ok(());
+        }
+        let status = self.engine.info().await.status;
+        if status != EngineStatus::Ready {
+            return Err(format!(
+                "on-device model is not ready to restore session history (status: {status})"
+            ));
         }
         let Some(history) = self.pending_history.lock().await.take() else {
-            return;
+            return Ok(());
         };
 
         self.engine.clear_history().await;
@@ -248,6 +254,7 @@ impl LocalBackend {
             };
             self.engine.push_history(message).await;
         }
+        Ok(())
     }
 }
 
@@ -270,7 +277,7 @@ impl InferenceBackend for LocalBackend {
         tools: &[ToolSpec],
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
-        self.apply_pending_history().await;
+        self.apply_pending_history().await?;
         // onde's tool-aware path is non-streaming: it has to buffer the whole
         // reply to detect tool calls. We can only stream when no tools are on
         // offer (a plain answer), which is exactly the tools-disabled case.
@@ -301,7 +308,7 @@ impl InferenceBackend for LocalBackend {
         allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
-        self.apply_pending_history().await;
+        self.apply_pending_history().await?;
         let onde_results: Vec<onde::inference::ToolResult> = results
             .into_iter()
             .map(|result| onde::inference::ToolResult {
@@ -365,11 +372,15 @@ impl InferenceBackend for LocalBackend {
 
     async fn restore_history(&self, history: Vec<serde_json::Value>) {
         *self.pending_history.lock().await = Some(history);
-        self.apply_pending_history().await;
+        if self.engine.info().await.status == EngineStatus::Ready {
+            // Ready was just observed, so failure here can only mean a status
+            // transition; keep the pending copy for the next inference call.
+            let _ = self.apply_pending_history().await;
+        }
     }
 
     async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
-        self.apply_pending_history().await;
+        self.apply_pending_history().await?;
         let snapshot = self.engine.history().await;
         // One plain (tool-free) inference round produces the summary. On error
         // history is untouched — send_message only mutates it on success, and
@@ -1240,6 +1251,17 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
         }
     }
 
+    // Session switches happen only after the serialized turn has ended. A
+    // trailing user message therefore belongs to a cancelled/failed inference
+    // request with no answer; carrying it would make the next activation feed
+    // the model an orphaned prompt that the client considers cancelled.
+    while carried
+        .last()
+        .is_some_and(|message| message["role"] == "user")
+    {
+        carried.pop();
+    }
+
     carried
 }
 
@@ -1434,6 +1456,19 @@ mod tests {
     }
 
     #[test]
+    fn carryover_drops_a_cancelled_trailing_user_message() {
+        let carried = carryover_history(vec![
+            serde_json::json!({ "role": "system", "content": "prompt" }),
+            serde_json::json!({ "role": "user", "content": "completed question" }),
+            serde_json::json!({ "role": "assistant", "content": "completed answer" }),
+            serde_json::json!({ "role": "user", "content": "cancelled question" }),
+        ]);
+
+        assert_eq!(carried.len(), 2, "{carried:#?}");
+        assert_eq!(carried.last().unwrap()["content"], "completed answer");
+    }
+
+    #[test]
     fn carryover_strips_a_tool_call_that_never_got_a_result() {
         // Switching mid-turn: the assistant asked for a tool, nothing answered.
         let snapshot = vec![
@@ -1613,6 +1648,13 @@ mod tests {
                 .contains("thread A")),
             "restore_history must replace, not append to, the local engine: {restored:#?}"
         );
+
+        let error = backend
+            .send_message_with_tools("must not run", &[], None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not ready"), "{error}");
+        assert_eq!(backend.history_snapshot().await, restored);
     }
 
     /// Minimal scripted OpenAI-compatible endpoint: accepts one HTTP request on

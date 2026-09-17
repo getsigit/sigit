@@ -1526,7 +1526,6 @@ impl SiGitAgent {
         let snapshot = self.backend.lock().await.history_snapshot().await;
         if let Some(state) = self.sessions.lock().unwrap().get_mut(&active) {
             state.conversation = backend::carryover_history(snapshot);
-            state.model_id = self.current_model.lock().unwrap().model_id.clone();
         }
     }
 
@@ -1539,8 +1538,15 @@ impl SiGitAgent {
     /// replaces its parked state (notably `session/load`); every caller holds
     /// `turn_lock`, so parking and replacement cannot race another turn.
     async fn open_session(&self, session_id: &SessionId, state: SessionState) {
-        let key = session_id.to_string();
         self.park_active_session().await;
+        self.open_parked_session(session_id, state).await;
+    }
+
+    /// Install a new session after the caller has already parked the live one.
+    /// Fork needs this split so it can read an up-to-date source state without
+    /// making `open_session` snapshot the same live backend a second time.
+    async fn open_parked_session(&self, session_id: &SessionId, state: SessionState) {
+        let key = session_id.to_string();
         self.sessions
             .lock()
             .unwrap()
@@ -1643,7 +1649,6 @@ impl SiGitAgent {
                 log::warn!(
                     "session({key}): cannot restore cloud model without a signed-in account"
                 );
-                self.record_active_model();
             }
             return;
         }
@@ -1655,7 +1660,6 @@ impl SiGitAgent {
             }
             Err(error) => {
                 log::warn!("session({key}): could not restore model {target}: {error}");
-                self.record_active_model();
             }
         }
     }
@@ -1702,9 +1706,6 @@ impl SiGitAgent {
     /// wrong project is worse than one that isn't listed at all.
     async fn persist_session(&self, session_id: &SessionId, snapshot: &[serde_json::Value]) {
         let key = session_id.to_string();
-        if self.active_session.lock().unwrap().as_deref() == Some(key.as_str()) {
-            self.record_active_model();
-        }
         if let Err(error) = session_store::save(&key, snapshot) {
             log::warn!("session({session_id}) save failed: {error}");
             return;
@@ -1881,7 +1882,7 @@ impl SiGitAgent {
             cx.send_notification(SessionNotification::new(new_id.clone(), update))
                 .ok();
         }
-        self.open_session(&new_id, state).await;
+        self.open_parked_session(&new_id, state).await;
         log::info!(
             "fork_session: copied {copied} message(s), replayed {replayed} update(s) for {new_id}"
         );
@@ -2414,6 +2415,9 @@ impl SiGitAgent {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
+                // Cancellation cannot preempt a synchronous foreground tool:
+                // it is observed here as soon as that tool exits. Background
+                // commands remain cancellable through `kill_command`.
                 if cancellation.cancelled.load(Ordering::Acquire) {
                     for pending in &result.tool_calls[call_index + 1..] {
                         tool_results.push(BackendToolResult {
@@ -2892,6 +2896,12 @@ impl SiGitAgent {
                     "set_session_config_option: {} is already the active selection, skipping",
                     current.display_name
                 );
+                // A restored preferred model may have fallen back temporarily.
+                // Explicitly picking the live model adopts that fallback as the
+                // session's new preference even though no backend switch runs.
+                drop(current);
+                self.record_active_model();
+                let current = self.current_model.lock().unwrap();
                 let config_options = build_config_options(&current, &args.session_id.to_string());
                 return Ok(SetSessionConfigOptionResponse::new(config_options));
             }
@@ -4655,11 +4665,12 @@ mod tests {
             .join("\n")
     }
 
-    /// Append a user message to the live conversation.
+    /// Append one completed exchange to the live conversation.
     async fn say(agent: &SiGitAgent, text: &str) {
         let backend = agent.backend.lock().await.clone();
         let mut history = backend.history_snapshot().await;
         history.push(serde_json::json!({ "role": "user", "content": text }));
+        history.push(serde_json::json!({ "role": "assistant", "content": "acknowledged" }));
         backend.restore_history(history).await;
     }
 
@@ -4850,6 +4861,22 @@ mod tests {
         assert_eq!(sessions["thread-a"].model_id, "sigit-cloud:test");
         assert_eq!(sessions["thread-b"].model_id, "sigit-cloud:test-b");
         drop(sessions);
+
+        // A transient restore failure may leave another model live, but parking
+        // must not erase the session's desired selection; its next activation
+        // should retry that preference.
+        agent
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut("thread-b")
+            .unwrap()
+            .model_id = "sigit-cloud:preferred".into();
+        agent.park_active_session().await;
+        assert_eq!(
+            agent.sessions.lock().unwrap()["thread-b"].model_id,
+            "sigit-cloud:preferred"
+        );
 
         std::env::set_current_dir(prev_cwd).unwrap();
         tools::set_active_session(None);
