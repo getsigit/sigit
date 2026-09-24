@@ -8,7 +8,8 @@
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
-siGit Code is a local coding agent. It runs on your machine, not someone else's. No API keys, no cloud round-trips, no subscription.
+siGit Code is the local agent runtime for **siGit Factory**. It runs on your machine by default,
+with optional cloud inference and remote automation when you choose them.
 
 Its home is [code.sigit.si](https://code.sigit.si). You can run it yourself, as below, or use the hosted version (siGit Code Cloud) there if you would rather not run a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
 
@@ -134,6 +135,34 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 Run `sigit` in a terminal and you get the same model and system prompt as the editor integration, just in a full-screen chat UI.
 
 Terminal mode currently needs Unix terminal behavior, so it works on macOS and Linux only.
+
+## Headless and CI mode
+
+Use `sigit run` to execute the same agent from scripts, CI, or another siGit Factory client:
+
+```sh
+sigit run "Review this repository and run the focused tests" --cwd .
+```
+
+Every run receives a durable session ID. The ID is printed to stderr in text mode and included
+in every event in JSONL mode. Resume the same conversation from a later command—or import it in
+an ACP client—by passing that ID:
+
+```sh
+sigit run "Continue with the next issue" --resume <session-id>
+```
+
+For automation, JSONL output provides session, assistant-delta, tool-call, tool-result, result,
+and error events on stdout. Logs remain on stderr.
+
+```sh
+sigit run "Run the checks" --output jsonl --allow-tool run_command
+```
+
+Mutating tools still follow siGit's permission policy. Because a headless run cannot answer an
+interactive permission prompt, approve only the tools the run needs with repeatable
+`--allow-tool` flags. The legacy `sigit -p "<prompt>"` form remains supported. See the
+[headless execution reference](docs/headless.md) for the event contract and exit codes.
 
 ## Platform support
 

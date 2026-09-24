@@ -4525,10 +4525,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Headless programmatic mode: `sigit -p "<prompt>"` runs one prompt and
-    // exits. Plain stdio and cross-platform (unlike the Unix-only TUI), so it
-    // is dispatched here, before the TTY/ACP split, like the account
-    // subcommands above.
+    // Headless programmatic mode: `sigit run "<prompt>"` (or the legacy
+    // `sigit -p "<prompt>"`) runs one prompt and exits. Plain stdio and
+    // cross-platform (unlike the Unix-only TUI), so it is dispatched here,
+    // before the TTY/ACP split, like the account subcommands above.
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     // Xcode's custom-agent UI launches ACP agents with an explicit `--acp`
     // argument. Honor it even when Xcode gives the child a terminal-like stdin.

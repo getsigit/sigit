@@ -1,8 +1,8 @@
-//! End-to-end headless (`sigit -p`) runs against the real binary.
+//! End-to-end headless (`sigit run`, with legacy `sigit -p`) runs against the real binary.
 //!
 //! Same harness idea as `tests/acp_permissions.rs`: a scripted OpenAI-compatible
 //! SSE endpoint stands in for the model via the `OPENAI_BASE_URL` override, and
-//! the BUILT binary is driven like CI would drive it — one `-p` invocation, then
+//! the BUILT binary is driven like CI would drive it — one headless invocation, then
 //! assertions on the exit code, stdout, and what the endpoint saw.
 //!
 //! 1. With `--allow-tool run_command`, the scripted tool call executes and its
@@ -175,6 +175,14 @@ fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn session_id_from(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find_map(|line| line.strip_prefix("Session: "))
+        .expect("headless text output should report its session id")
+        .to_string()
+}
+
 // ── The runs ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -242,15 +250,169 @@ fn allowed_tool_runs_and_result_reaches_the_endpoint() {
         "the command's output should reach the endpoint: {result}"
     );
 
-    // The conversation is saved under the "headless" session id for resume.
+    // The conversation and ACP-importable metadata are saved under the run's
+    // unique session id.
+    let session_id = session_id_from(&output);
     assert!(
         scratch
             .config_dir
             .join("sessions")
-            .join("headless.jsonl")
+            .join(format!("{session_id}.jsonl"))
             .is_file(),
         "headless session must be persisted"
     );
+    assert!(
+        scratch
+            .config_dir
+            .join("sessions")
+            .join(format!("{session_id}.meta.json"))
+            .is_file(),
+        "headless session metadata must be persisted"
+    );
+}
+
+#[test]
+fn run_subcommand_emits_structured_jsonl_events() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo structured"}"#),
+        sse_text("structured result"),
+    ]);
+    let scratch = scratch("jsonl");
+    let cwd = scratch.cwd.to_str().unwrap().to_string();
+
+    let output = run_headless(
+        endpoint.port,
+        &scratch,
+        &[
+            "run",
+            "exercise the event stream",
+            "--output",
+            "jsonl",
+            "--allow-tool",
+            "run_command",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = stdout_of(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every stdout line must be JSON"))
+        .collect();
+    let session_id = events[0]["session_id"].as_str().expect("session id");
+    assert_eq!(events[0]["type"], "session");
+    assert!(events.iter().all(|event| event["session_id"] == session_id));
+    assert!(events.iter().any(|event| event["type"] == "tool_call"));
+    assert!(events.iter().any(|event| {
+        event["type"] == "tool_result"
+            && event["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("structured"))
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "result" && event["text"] == "structured result" })
+    );
+}
+
+#[test]
+fn resume_continues_the_saved_conversation() {
+    let endpoint = start_fake_endpoint(vec![sse_text("first answer"), sse_text("second answer")]);
+    let scratch = scratch("resume");
+    let cwd = scratch.cwd.to_str().unwrap().to_string();
+
+    let first = run_headless(
+        endpoint.port,
+        &scratch,
+        &["run", "first question", "--cwd", &cwd],
+    );
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let session_id = session_id_from(&first);
+
+    let second = run_headless(
+        endpoint.port,
+        &scratch,
+        &[
+            "run",
+            "second question",
+            "--resume",
+            &session_id,
+            "--cwd",
+            &cwd,
+        ],
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(session_id_from(&second), session_id);
+    assert!(stdout_of(&second).contains("second answer"));
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let resumed_messages = requests[1]["messages"].as_array().expect("messages");
+    assert!(
+        resumed_messages
+            .iter()
+            .any(|message| { message["role"] == "user" && message["content"] == "first question" })
+    );
+    assert!(
+        resumed_messages.iter().any(|message| {
+            message["role"] == "assistant" && message["content"] == "first answer"
+        })
+    );
+    assert!(
+        resumed_messages.iter().any(|message| {
+            message["role"] == "user" && message["content"] == "second question"
+        })
+    );
+}
+
+#[test]
+fn missing_resume_session_is_a_structured_error() {
+    let endpoint = start_fake_endpoint(vec![]);
+    let scratch = scratch("missing-resume");
+    let cwd = scratch.cwd.to_str().unwrap().to_string();
+
+    let output = run_headless(
+        endpoint.port,
+        &scratch,
+        &[
+            "run",
+            "continue",
+            "--resume",
+            "missing-session",
+            "--output",
+            "jsonl",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let events: Vec<Value> = stdout_of(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("error output must be JSONL"))
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "error");
+    assert_eq!(events[0]["session_id"], "missing-session");
+    assert_eq!(events[0]["message"], "saved session not found");
+    assert!(endpoint.requests.lock().unwrap().is_empty());
 }
 
 #[test]
