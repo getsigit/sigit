@@ -28,11 +28,11 @@
 //! inventing `<function_results>` blocks of their own. The backend tells the
 //! model the call didn't run and asks for it again instead.
 //!
-//! A `<tool_call>` tag the model merely mentions in prose, say while explaining
-//! this very scanner, is not a call. So a legacy block that fails to parse is
-//! only treated as malformed when what follows the tag looks like the start of
-//! a call (see [`looks_like_xml_call`]); otherwise it stays text, as it always
-//! did.
+//! A marker the model merely mentions in prose, say while explaining this very
+//! scanner, is not a call. So a block that fails to parse is only treated as
+//! malformed when what follows the marker looks like the start of a call (see
+//! [`looks_like_xml_call`] and [`looks_like_k3_call`]); otherwise it stays
+//! text, as it always did.
 
 use std::collections::HashMap;
 
@@ -376,7 +376,9 @@ impl<'a> StreamScanner<'a> {
         }
         let rest = std::mem::take(&mut self.pending);
         Some(
-            if rest.starts_with(K3_TOOLS_OPEN)
+            if rest
+                .strip_prefix(K3_TOOLS_OPEN)
+                .is_some_and(looks_like_k3_call)
                 || rest
                     .strip_prefix(XML_OPEN_TAG)
                     .is_some_and(looks_like_xml_call)
@@ -467,7 +469,8 @@ impl<'a> StreamScanner<'a> {
 
         Some(match parse_k3_tools_block(inner, self.tools) {
             Some(calls) => calls.into_iter().map(ScanEvent::ToolCall).collect(),
-            None => vec![ScanEvent::Malformed(block)],
+            None if looks_like_k3_call(inner) => vec![ScanEvent::Malformed(block)],
+            None => vec![ScanEvent::Text(block)],
         })
     }
 
@@ -522,6 +525,14 @@ fn looks_like_xml_call(after_tag: &str) -> bool {
     }
     let rest = after_newlines.trim_start();
     rest.is_empty() || rest.starts_with(['{', '<'])
+}
+
+/// Whether the text after a Kimi `<|open|>tools<|sep|>` marker reads as the
+/// start of a call: another `<|open|>call` marker after any whitespace, or
+/// nothing at all. A quoted marker, like the constant in this file, fails.
+fn looks_like_k3_call(after_marker: &str) -> bool {
+    let rest = after_marker.trim_start();
+    rest.is_empty() || rest.starts_with(K3_CALL_OPEN)
 }
 
 fn scan_complete_text(text: &str, tools: &[ToolSpec]) -> Vec<ScanEvent> {
@@ -1115,6 +1126,24 @@ mod tests {
             "Wrap it in `<tool_call>` and `</tool_call>` tags.",
             "The scanner holds <tool_call> and </tool_call> blocks back.",
             "The model opens with `<tool_call>` and never closes it.",
+        ] {
+            assert_eq!(
+                extract(text, &tools),
+                Extracted {
+                    text: text.to_string(),
+                    ..Extracted::default()
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kimi_marker_mentioned_in_prose_stays_text() {
+        let tools = vec![run_command_spec()];
+        for text in [
+            "The marker is `<|open|>tools<|sep|>` and it never closes here.",
+            "Quote `<|open|>tools<|sep|>` then `<|close|>tools<|sep|>` in docs.",
         ] {
             assert_eq!(
                 extract(text, &tools),
