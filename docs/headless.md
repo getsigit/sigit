@@ -19,6 +19,8 @@ sigit run "Continue with the fixes" --resume <id>
 
 The saved metadata includes the primary working directory, additional project roots, and model.
 This makes the same session discoverable through ACP `session/list` and loadable by an editor.
+Each run rewrites that metadata with its own `--cwd` and `--add-dir` values, so a resume records
+where the session last ran. Pass the same `--add-dir` flags again to keep extra roots attached.
 
 Use repeatable `--add-dir <path>` flags for multi-root workspaces. Mutating tools that would ask
 for interactive permission are denied in headless mode unless granted with
@@ -33,7 +35,10 @@ Pass `--output jsonl` for a machine-readable stdout stream:
 sigit run "Run the focused tests" --output jsonl --allow-tool run_command
 ```
 
-Each line is one JSON object. Every event includes `type` and `session_id`.
+Each line is one JSON object. Every event includes `type` and `session_id`. A run that gets as far
+as inference starts with a `session` event. A run that fails before that, because no remote
+provider is configured or the `--resume` session doesn't exist, emits a single `error` event and
+nothing else.
 
 | Type | Additional fields | Meaning |
 |---|---|---|
