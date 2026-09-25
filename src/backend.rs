@@ -736,11 +736,11 @@ impl OpenAiBackend {
                     malformed,
                 ));
             }
-        } else if malformed > 0 {
-            // Structured calls arrived with a broken inline block beside
-            // them. The structured calls run and the block is kept out of
-            // the reply and history, as the streaming path does. That path
-            // also runs inline calls that did parse, so this one does too.
+        } else if malformed > 0 || !extracted.calls.is_empty() {
+            // Structured calls arrived with inline blocks beside them. As on
+            // the streaming path, inline calls that parse run alongside the
+            // structured ones, broken blocks are dropped, and neither kind of
+            // block is left in the reply or the history.
             let offset = tool_calls.len();
             tool_calls.extend(
                 extracted
@@ -1906,6 +1906,43 @@ mod tests {
         let reply = history.last().unwrap();
         assert_eq!(reply["content"], "Checking.");
         assert_eq!(reply["tool_calls"][0]["id"], "call_1");
+    }
+
+    /// A structured call plus a well-formed inline block: both run, and the
+    /// inline markup leaves the reply and history, as on the streaming path.
+    #[tokio::test]
+    async fn a_well_formed_inline_block_beside_a_structured_call_also_runs() {
+        let (addr, _requests) = spawn_message_stub(serde_json::json!({
+            "role": "assistant",
+            "content": "Checking.<tool_call>run_command<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "run_command", "arguments": "{\"command\":\"pwd\"}" },
+            }],
+        }));
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+        let tools = vec![ToolSpec {
+            name: "run_command".to_string(),
+            description: "Run a command".to_string(),
+            parameters_schema: r#"{"type":"object","properties":{"command":{"type":"string"}}}"#
+                .to_string(),
+        }];
+
+        let result = backend
+            .send_message_with_tools("where am I", &tools, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "Checking.");
+        let ids: Vec<&str> = result.tool_calls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["call_1", "call_recovered_1"]);
+        assert_eq!(result.tool_calls[1].arguments, r#"{"command":"ls"}"#);
+        let history = backend.history_snapshot().await;
+        let reply = history.last().unwrap();
+        assert_eq!(reply["content"], "Checking.");
+        assert_eq!(reply["tool_calls"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
