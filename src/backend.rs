@@ -642,7 +642,7 @@ impl OpenAiBackend {
             .ok_or_else(|| "endpoint returned no choices".to_string())?;
 
         let mut text = message.content.clone().unwrap_or_default();
-        let tool_calls: Vec<ToolCall> = message
+        let mut tool_calls: Vec<ToolCall> = message
             .tool_calls
             .iter()
             .flatten()
@@ -736,6 +736,34 @@ impl OpenAiBackend {
                     malformed,
                 ));
             }
+        } else if malformed > 0 {
+            // Structured calls arrived with a broken inline block beside
+            // them. The structured calls run and the block is kept out of
+            // the reply and history, as the streaming path does. That path
+            // also runs inline calls that did parse, so this one does too.
+            let offset = tool_calls.len();
+            tool_calls.extend(
+                extracted
+                    .calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCall {
+                        id: format!("call_recovered_{}", offset + index),
+                        name: call.name,
+                        arguments: call.arguments,
+                    }),
+            );
+            self.history
+                .lock()
+                .await
+                .push(streamed_assistant_history(&extracted.text, &tool_calls));
+            return Ok((
+                TurnResult {
+                    text: extracted.text,
+                    tool_calls,
+                },
+                malformed,
+            ));
         }
 
         // Record the assistant turn so later tool results have context.
@@ -1788,15 +1816,19 @@ mod tests {
     fn spawn_completion_stub(
         summary: &str,
     ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        spawn_message_stub(serde_json::json!({ "role": "assistant", "content": summary }))
+    }
+
+    /// Like [`spawn_completion_stub`], answering with an arbitrary message.
+    fn spawn_message_stub(
+        message: serde_json::Value,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let body = serde_json::json!({
-            "choices": [{ "message": { "role": "assistant", "content": summary } }]
-        })
-        .to_string();
+        let body = serde_json::json!({ "choices": [{ "message": message }] }).to_string();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             // Read until the full request (headers + content-length body) is in.
@@ -1837,6 +1869,43 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (addr, receiver)
+    }
+
+    /// A structured call can come back with a broken inline block in the same
+    /// message. The call runs; the block reaches neither the reply nor the
+    /// history, where the model would read back a call that never ran.
+    #[tokio::test]
+    async fn a_broken_inline_block_beside_a_structured_call_is_dropped() {
+        let (addr, _requests) = spawn_message_stub(serde_json::json!({
+            "role": "assistant",
+            "content": "Checking.<tool_call>run_command CheckStatus=nope</tool_call>",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "run_command", "arguments": "{\"command\":\"pwd\"}" },
+            }],
+        }));
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+        let tools = vec![ToolSpec {
+            name: "run_command".to_string(),
+            description: "Run a command".to_string(),
+            parameters_schema: r#"{"type":"object","properties":{"command":{"type":"string"}}}"#
+                .to_string(),
+        }];
+
+        let result = backend
+            .send_message_with_tools("where am I", &tools, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "Checking.");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        let history = backend.history_snapshot().await;
+        let reply = history.last().unwrap();
+        assert_eq!(reply["content"], "Checking.");
+        assert_eq!(reply["tool_calls"][0]["id"], "call_1");
     }
 
     #[tokio::test]
