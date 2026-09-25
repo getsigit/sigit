@@ -560,7 +560,13 @@ impl OpenAiBackend {
             // running on into the previous sentence.
             let _ = sink.send("\n\n".to_string());
         }
-        let (retry, _) = self.request(tools, allow_tool_calls, sink).await?;
+        let (retry, retry_malformed) = self.request(tools, allow_tool_calls, sink).await?;
+        if retry_malformed > 0 && retry.tool_calls.is_empty() {
+            log::warn!(
+                "the retry also wrote {retry_malformed} unparseable inline tool call(s); \
+                 ending the turn without them"
+            );
+        }
         Ok(TurnResult {
             text: join_reply_text(&result.text, &retry.text),
             tool_calls: retry.tool_calls,
@@ -649,6 +655,9 @@ impl OpenAiBackend {
 
         let extracted = crate::inline_tool_calls::extract(&text, tools);
         let malformed = extracted.malformed;
+        if malformed > 0 {
+            log::warn!("dropped {malformed} unparseable inline tool call(s) from the reply");
+        }
 
         if !allow_tool_calls {
             let recovered = extracted.calls;

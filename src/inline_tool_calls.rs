@@ -27,6 +27,12 @@
 //! reads back a call it "made" with no result attached, and later turns start
 //! inventing `<function_results>` blocks of their own. The backend tells the
 //! model the call didn't run and asks for it again instead.
+//!
+//! A `<tool_call>` tag the model merely mentions in prose, say while explaining
+//! this very scanner, is not a call. So a legacy block that fails to parse is
+//! only treated as malformed when what follows the tag looks like the start of
+//! a call (see [`looks_like_xml_call`]); otherwise it stays text, as it always
+//! did.
 
 use std::collections::HashMap;
 
@@ -370,7 +376,11 @@ impl<'a> StreamScanner<'a> {
         }
         let rest = std::mem::take(&mut self.pending);
         Some(
-            if rest.starts_with(XML_OPEN_TAG) || rest.starts_with(K3_TOOLS_OPEN) {
+            if rest.starts_with(K3_TOOLS_OPEN)
+                || rest
+                    .strip_prefix(XML_OPEN_TAG)
+                    .is_some_and(looks_like_xml_call)
+            {
                 ScanEvent::Malformed(rest)
             } else {
                 ScanEvent::Text(rest)
@@ -441,7 +451,8 @@ impl<'a> StreamScanner<'a> {
         let inner = &block[XML_OPEN_TAG.len()..block.len() - XML_CLOSE_TAG.len()];
         Some(match parse_xml_block(inner, self.tools) {
             Some(call) => ScanEvent::ToolCall(call),
-            None => ScanEvent::Malformed(block),
+            None if looks_like_xml_call(inner) => ScanEvent::Malformed(block),
+            None => ScanEvent::Text(block),
         })
     }
 
@@ -495,6 +506,24 @@ impl<'a> StreamScanner<'a> {
 
 /// Scan text from a wrapper whose closing marker has already arrived. This
 /// preserves event order when a response body itself contains an inline block.
+/// Whether the text after a `<tool_call>` tag reads as the start of a call:
+/// a tool name straight after the tag or on the next line, a JSON object or
+/// another tag after any whitespace, or nothing at all (a reply cut off right
+/// after the tag). Prose that mentions the tag, like "`<tool_call>` wraps..."
+/// or "<tool_call> and </tool_call> tags", fails every one of those.
+fn looks_like_xml_call(after_tag: &str) -> bool {
+    let after_newlines = after_tag.trim_start_matches(['\n', '\r']);
+    if after_newlines
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return true;
+    }
+    let rest = after_newlines.trim_start();
+    rest.is_empty() || rest.starts_with(['{', '<'])
+}
+
 fn scan_complete_text(text: &str, tools: &[ToolSpec]) -> Vec<ScanEvent> {
     let mut scanner = StreamScanner::new(tools);
     let mut events = scanner.push(text);
@@ -1067,6 +1096,48 @@ mod tests {
             scanner.finish(),
             Some(ScanEvent::Text("<tool_".to_string()))
         );
+
+        let mut scanner = StreamScanner::new(&[]);
+        assert_eq!(
+            scanner.push("see <|open|>to"),
+            vec![ScanEvent::Text("see ".to_string())]
+        );
+        assert_eq!(
+            scanner.finish(),
+            Some(ScanEvent::Text("<|open|>to".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_tag_mentioned_in_prose_stays_text() {
+        let tools = vec![run_command_spec()];
+        for text in [
+            "Wrap it in `<tool_call>` and `</tool_call>` tags.",
+            "The scanner holds <tool_call> and </tool_call> blocks back.",
+            "The model opens with `<tool_call>` and never closes it.",
+        ] {
+            assert_eq!(
+                extract(text, &tools),
+                Extracted {
+                    text: text.to_string(),
+                    ..Extracted::default()
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_shaped_block_is_dropped() {
+        let text = "<tool_call>\n{\"name\": \"run_command\", \"arguments\": {}}\n</tool_call>";
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
+        assert!(calls.is_empty());
     }
 
     /// Issue #105: a GLM-family reply that opened a call, then wrote an
