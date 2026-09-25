@@ -94,7 +94,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
                     .next()
                     .ok_or_else(|| format!("{arg} requires a prompt argument"))?;
                 if prompt.is_some() {
-                    return Err(format!("{arg} was given more than once"));
+                    return Err("the prompt was given more than once".to_string());
                 }
                 prompt = Some(value.clone());
             }
@@ -143,14 +143,28 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
                     .ok_or_else(|| "--deny-tool requires a tool name".to_string())?;
                 deny_tools.push(value.clone());
             }
+            // A mistyped flag must not become the prompt. A prompt that
+            // really starts with '-' can still go through -p.
+            other if other.starts_with('-') => return Err(format!("unknown argument: {other}")),
             other if run_command && prompt.is_none() => prompt = Some(other.to_string()),
+            other if run_command => {
+                return Err(format!(
+                    "unexpected extra argument: {other} (quote the prompt as one argument)"
+                ));
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
 
     // Reaching this without a prompt means `run` had no positional prompt, or
     // a legacy prompt flag was consumed as another flag's value.
-    let prompt = prompt.ok_or_else(|| "missing -p/--prompt".to_string())?;
+    let prompt = prompt.ok_or_else(|| {
+        if run_command {
+            "missing prompt".to_string()
+        } else {
+            "missing -p/--prompt".to_string()
+        }
+    })?;
     if prompt.trim().is_empty() {
         return Err("the prompt must not be empty".to_string());
     }
@@ -680,6 +694,30 @@ mod tests {
     #[test]
     fn duplicate_prompt_is_a_usage_error() {
         assert!(parse_args(&args(&["-p", "a", "--prompt", "b"])).is_err());
+    }
+
+    #[test]
+    fn run_rejects_a_second_prompt_from_either_source() {
+        let error = parse_args(&args(&["run", "a", "b"])).unwrap_err();
+        assert!(error.contains("unexpected extra argument: b"), "{error}");
+        let error = parse_args(&args(&["run", "a", "-p", "b"])).unwrap_err();
+        assert!(error.contains("more than once"), "{error}");
+        let error = parse_args(&args(&["run", "-p", "a", "b"])).unwrap_err();
+        assert!(error.contains("unexpected extra argument: b"), "{error}");
+    }
+
+    #[test]
+    fn run_does_not_take_a_mistyped_flag_as_the_prompt() {
+        let error = parse_args(&args(&["run", "--quite", "fix it"])).unwrap_err();
+        assert!(error.contains("unknown argument: --quite"), "{error}");
+    }
+
+    #[test]
+    fn bare_run_reports_a_missing_prompt() {
+        assert_eq!(
+            parse_args(&args(&["run"])),
+            Err("missing prompt".to_string())
+        );
     }
 
     #[test]
