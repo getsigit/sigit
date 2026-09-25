@@ -127,6 +127,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
   the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
   explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
+  Some models write tool calls into content as text; `src/inline_tool_calls.rs` recovers the
+  well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
+  and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
+  didn't run. Leaving the raw block in history makes the model invent `<function_results>` later.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
