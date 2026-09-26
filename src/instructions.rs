@@ -61,7 +61,9 @@ const MAX_TOTAL_BYTES: usize = 64 * 1024;
 
 /// Load and combine project instruction files for `cwd`, returning a single
 /// block ready to append to the session's system context, or `None` if none are
-/// found.
+/// found. The single-root shorthand the tests use; every live caller goes
+/// through [`load_workspace_instructions`].
+#[cfg(test)]
 pub fn load_project_instructions(cwd: &Path) -> Option<String> {
     load_workspace_instructions(cwd, &[])
 }

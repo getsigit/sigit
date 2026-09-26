@@ -610,6 +610,22 @@ fn remote_system_prompt(session_context: &str) -> String {
     format!("{}\n\n{session_context}", system_prompt_for_model(true))
 }
 
+/// `base` followed by the session context for the directory sigit was launched
+/// in. The terminal UI has no ACP session to carry a cwd, so it uses this for
+/// every system prompt it builds. Without the working directory the model has no
+/// idea where the project is, and a small on-device model will happily invent
+/// one (`/path/to/repo/AGENTS.md` on `/init`).
+#[cfg(unix)]
+pub(crate) fn with_launch_context(base: &str) -> String {
+    match std::env::current_dir() {
+        Ok(cwd) => format!(
+            "{base}\n\n{}",
+            session_context_message(&cwd, &workspace::additional_roots())
+        ),
+        Err(_) => base.to_string(),
+    }
+}
+
 fn session_context_message(cwd: &std::path::Path, additional_roots: &[PathBuf]) -> String {
     let mut message = if additional_roots.is_empty() {
         format!(
@@ -4066,16 +4082,10 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
     // channel so the loading-phase plumbing in `chat::run_with` is unchanged.
     let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    // Project instruction files (AGENTS.md / CLAUDE.md) for the launch directory,
-    // injected into the system prompt so the TUI shares the same always-on
-    // project context the ACP sessions get.
-    let project_instructions = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| instructions::load_project_instructions(&cwd));
-    let with_instructions = |base: String| match &project_instructions {
-        Some(extra) => format!("{base}\n\n{extra}"),
-        None => base,
-    };
+    // The launch directory and its project instruction files, injected into the
+    // system prompt so the TUI shares the same always-on project context the
+    // ACP sessions get.
+    let with_instructions = |base: String| with_launch_context(&base);
 
     // Pick the inference backend: a configured provider if present, else on-device.
     let (inference_backend, startup_model_name): (Arc<dyn InferenceBackend>, String) =
@@ -4904,6 +4914,18 @@ mod tests {
         // Relative paths only resolve against the primary root, so the model is
         // told to address the others absolutely.
         assert!(multi.contains("absolute paths"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_context_tells_the_tui_model_where_the_project_is() {
+        // The TUI has no ACP session carrying a cwd; without this the model
+        // guesses paths like `/path/to/repo/AGENTS.md`. Only assert on the
+        // guidance, not the path: the cwd is process-global and other tests
+        // move it briefly.
+        let prompt = with_launch_context("BASE PROMPT");
+        assert!(prompt.starts_with("BASE PROMPT\n\n"));
+        assert!(prompt.contains("absolute paths"));
     }
 
     #[test]
