@@ -205,6 +205,7 @@ the connection and the agent anymore. Don't reintroduce the mpsc forwarder patte
 | `ListSessionsRequest` | `handle_list_sessions` | the editor's "Import Threads" picker; gated by `SessionListCapabilities` |
 | `PromptRequest` | `handle_prompt` | the turn: parse blocks → slash commands or tool-calling loop |
 | `SetSessionConfigOptionRequest` | `handle_set_session_config_option` | the Zed model picker — switches/downloads models |
+| `SetSessionModeRequest` | `handle_set_session_mode` | legacy mode selector; same Manual/Auto/Plan state as the Permissions config option |
 | `CancelNotification` | `handle_cancel` | notification, no response |
 
 Everything else is left to the SDK default (method not found).

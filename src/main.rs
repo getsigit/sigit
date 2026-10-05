@@ -73,8 +73,8 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResourceResource,
+    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
@@ -82,8 +82,9 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigValueId, SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
+    SessionMode, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
     WriteTextFileRequest,
 };
@@ -1352,6 +1353,20 @@ impl SiGitAgent {
         cx.send_notification(SessionNotification::new(session_id, update))
     }
 
+    /// Tell a client that renders the legacy mode selector which mode is live.
+    /// Sent wherever the Permissions config option is refreshed for a reason
+    /// other than that client's own `session/set_mode`, so the two views of the
+    /// same state never disagree.
+    fn send_current_mode(&self, cx: &ConnectionTo<Client>, session_id: SessionId) {
+        let mode = current_permission_mode(&session_id.to_string());
+        self.send_tool_call_update(
+            cx,
+            session_id,
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode)),
+        )
+        .ok();
+    }
+
     fn send_plan_update(
         &self,
         cx: &ConnectionTo<Client>,
@@ -2195,7 +2210,9 @@ impl SiGitAgent {
             hooks::run_session_start_hooks(&hook_settings, &args.cwd, &args.session_id.to_string());
         }
 
-        Ok(LoadSessionResponse::new().config_options(config_options))
+        Ok(LoadSessionResponse::new()
+            .config_options(config_options)
+            .modes(build_session_modes(&args.session_id.to_string())))
     }
 
     async fn handle_fork_session(
@@ -2267,7 +2284,10 @@ impl SiGitAgent {
             hooks::run_session_start_hooks(&hook_settings, &args.cwd, &new_id.to_string());
         }
 
-        Ok(ForkSessionResponse::new(new_id).config_options(config_options))
+        let modes = build_session_modes(&new_id.to_string());
+        Ok(ForkSessionResponse::new(new_id)
+            .config_options(config_options)
+            .modes(modes))
     }
 
     async fn handle_new_session(
@@ -2305,7 +2325,10 @@ impl SiGitAgent {
             hooks::run_session_start_hooks(&hook_settings, &args.cwd, &session_id.to_string());
         }
 
-        Ok(NewSessionResponse::new(session_id).config_options(config_options))
+        let modes = build_session_modes(&session_id.to_string());
+        Ok(NewSessionResponse::new(session_id)
+            .config_options(config_options)
+            .modes(modes))
     }
 
     async fn handle_prompt(
@@ -3304,6 +3327,8 @@ impl SiGitAgent {
             SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
         )
         .ok();
+        // A reload rereads settings.toml, which can move the default mode.
+        self.send_current_mode(cx, session_id.clone());
         self.advertise_commands(cx, session_id.clone());
 
         self.send_assistant_message(
@@ -3312,6 +3337,45 @@ impl SiGitAgent {
             format!("Reloaded. {signed_in} {backend_note}"),
         )
         .ok();
+    }
+
+    /// `session/set_mode`, the selector ACP had before config options. The
+    /// modes are the Permissions dropdown under another name, so this changes
+    /// the same state and then refreshes the dropdown for a client that shows
+    /// both.
+    async fn handle_set_session_mode(
+        &self,
+        cx: &ConnectionTo<Client>,
+        args: SetSessionModeRequest,
+    ) -> agent_client_protocol::Result<SetSessionModeResponse> {
+        log::info!(
+            "set_session_mode: session={}, mode_id={}",
+            args.session_id,
+            args.mode_id
+        );
+
+        self.activate_session(&args.session_id).await?;
+
+        let session_key = args.session_id.to_string();
+        let Some(message) = apply_permission_mode(&session_key, args.mode_id.0.as_ref()) else {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!("unknown session mode: {}", args.mode_id),
+            ));
+        };
+        self.send_system_status(cx, args.session_id.clone(), message)
+            .ok();
+        let config_options = {
+            let current = self.current_model.lock().unwrap();
+            build_config_options(&current, &session_key)
+        };
+        self.send_tool_call_update(
+            cx,
+            args.session_id,
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+        )
+        .ok();
+        Ok(SetSessionModeResponse::new())
     }
 
     async fn handle_set_session_config_option(
@@ -3363,35 +3427,15 @@ impl SiGitAgent {
         // ── Permissions dropdown (issue #76) ────────────────────────────────
         if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
             let session_key = args.session_id.to_string();
-            let message = match args.value.as_value_id().map(|v| v.0.as_ref()) {
-                Some(PERMISSION_MODE_MANUAL) => {
-                    permissions::set_plan_mode(&session_key, false);
-                    permissions::set_session_mode(
-                        &session_key,
-                        Some(settings::PermissionMode::Ask),
-                    );
-                    "Permissions: Manual — the agent asks before running mutating tools."
-                }
-                Some(PERMISSION_MODE_AUTO) => {
-                    permissions::set_plan_mode(&session_key, false);
-                    permissions::set_session_mode(
-                        &session_key,
-                        Some(settings::PermissionMode::Allow),
-                    );
-                    "Permissions: Auto — tools run without asking, subject to settings.toml rules."
-                }
-                Some(PERMISSION_MODE_PLAN) => {
-                    permissions::set_plan_mode(&session_key, true);
-                    "Permissions: Plan — the agent researches with read-only tools and presents \
-                     a plan; edits and commands are blocked."
-                }
-                other => {
-                    return Err(agent_client_protocol::Error::new(
-                        -32602,
-                        format!("unknown Permissions value: {other:?}"),
-                    ));
-                }
+            let picked = args.value.as_value_id().map(|v| v.0.as_ref());
+            let Some(message) = picked.and_then(|id| apply_permission_mode(&session_key, id))
+            else {
+                return Err(agent_client_protocol::Error::new(
+                    -32602,
+                    format!("unknown Permissions value: {picked:?}"),
+                ));
             };
+            self.send_current_mode(cx, args.session_id.clone());
             self.send_system_status(cx, args.session_id.clone(), message)
                 .ok();
             let current = self.current_model.lock().unwrap().clone();
@@ -3762,6 +3806,78 @@ const PERMISSION_MODE_MANUAL: &str = "permission-mode-manual";
 const PERMISSION_MODE_AUTO: &str = "permission-mode-auto";
 const PERMISSION_MODE_PLAN: &str = "permission-mode-plan";
 
+/// The Permissions modes as `(id, name, description)`, in display order. Both
+/// the config option and the legacy `modes` selector are built from this, so
+/// a client sees the same three entries whichever one it renders.
+const PERMISSION_MODES: [(&str, &str, &str); 3] = [
+    (
+        PERMISSION_MODE_MANUAL,
+        "Manual",
+        "Ask before running mutating tools",
+    ),
+    (
+        PERMISSION_MODE_AUTO,
+        "Auto",
+        "Run tools without asking, subject to settings.toml rules",
+    ),
+    (
+        PERMISSION_MODE_PLAN,
+        "Plan",
+        "Research only; no edits or commands",
+    ),
+];
+
+/// The Permissions mode governing a session right now. Derived, never
+/// stored — see `permissions.rs`.
+fn current_permission_mode(session_key: &str) -> &'static str {
+    if permissions::plan_mode(session_key) {
+        return PERMISSION_MODE_PLAN;
+    }
+    match permissions::effective_mode(session_key) {
+        settings::PermissionMode::Allow => PERMISSION_MODE_AUTO,
+        settings::PermissionMode::Ask | settings::PermissionMode::Deny => PERMISSION_MODE_MANUAL,
+    }
+}
+
+/// Switch a session to one of [`PERMISSION_MODES`]. Returns the status line
+/// to show the user, or `None` for an id that is not a mode.
+fn apply_permission_mode(session_key: &str, mode_id: &str) -> Option<&'static str> {
+    match mode_id {
+        PERMISSION_MODE_MANUAL => {
+            permissions::set_plan_mode(session_key, false);
+            permissions::set_session_mode(session_key, Some(settings::PermissionMode::Ask));
+            Some("Permissions: Manual — the agent asks before running mutating tools.")
+        }
+        PERMISSION_MODE_AUTO => {
+            permissions::set_plan_mode(session_key, false);
+            permissions::set_session_mode(session_key, Some(settings::PermissionMode::Allow));
+            Some("Permissions: Auto — tools run without asking, subject to settings.toml rules.")
+        }
+        PERMISSION_MODE_PLAN => {
+            permissions::set_plan_mode(session_key, true);
+            Some(
+                "Permissions: Plan — the agent researches with read-only tools and presents \
+                 a plan; edits and commands are blocked.",
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The same three modes as the Permissions config option, in the shape ACP
+/// had before config options existed. The spec is retiring it, and a client
+/// that reads config options is told to ignore it, so this is here for
+/// clients that only render the mode selector (issue #148).
+fn build_session_modes(session_key: &str) -> SessionModeState {
+    let modes = PERMISSION_MODES
+        .iter()
+        .map(|&(id, name, description)| {
+            SessionMode::new(id, name).description(description.to_string())
+        })
+        .collect();
+    SessionModeState::new(current_permission_mode(session_key), modes)
+}
+
 /// Replace non-ASCII chars so a downstream byte-index truncation can't split a
 /// multi-byte char. Zed slices the model-picker label at a fixed byte offset
 /// (`agent_ui/src/config_options.rs`) and panics — crashing the whole editor —
@@ -3877,34 +3993,15 @@ fn build_config_options(
     .description("Toggle on-device inference; changes which models are highlighted");
 
     // Permissions dropdown (issue #76): Manual (ask), Auto (run unattended),
-    // Plan (research only). Derived, never stored — see `permissions.rs`.
-    let permission_current = SessionConfigValueId::new(if permissions::plan_mode(session_key) {
-        PERMISSION_MODE_PLAN
-    } else {
-        match permissions::effective_mode(session_key) {
-            settings::PermissionMode::Allow => PERMISSION_MODE_AUTO,
-            settings::PermissionMode::Ask | settings::PermissionMode::Deny => {
-                PERMISSION_MODE_MANUAL
-            }
-        }
-    });
-    let permission_options = vec![
-        SessionConfigSelectOption::new(
-            SessionConfigValueId::new(PERMISSION_MODE_MANUAL),
-            "Manual".to_string(),
-        )
-        .description("Ask before running mutating tools".to_string()),
-        SessionConfigSelectOption::new(
-            SessionConfigValueId::new(PERMISSION_MODE_AUTO),
-            "Auto".to_string(),
-        )
-        .description("Run tools without asking, subject to settings.toml rules".to_string()),
-        SessionConfigSelectOption::new(
-            SessionConfigValueId::new(PERMISSION_MODE_PLAN),
-            "Plan".to_string(),
-        )
-        .description("Research only; no edits or commands".to_string()),
-    ];
+    // Plan (research only).
+    let permission_current = SessionConfigValueId::new(current_permission_mode(session_key));
+    let permission_options: Vec<_> = PERMISSION_MODES
+        .iter()
+        .map(|&(id, name, description)| {
+            SessionConfigSelectOption::new(SessionConfigValueId::new(id), name.to_string())
+                .description(description.to_string())
+        })
+        .collect();
     let permission_option = SessionConfigOption::select(
         PERMISSION_MODE_CONFIG_ID,
         "Permissions",
@@ -4182,6 +4279,7 @@ async fn exec_slash_acp(
                     SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
                 )
                 .ok();
+            agent.send_current_mode(cx, session_id.clone());
             agent
                 .send_assistant_message(
                     cx,
@@ -4214,6 +4312,7 @@ async fn exec_slash_acp(
                     SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
                 )
                 .ok();
+            agent.send_current_mode(cx, session_id.clone());
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Permissions => {
@@ -4942,6 +5041,23 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                         handle_response(
                             responder,
                             state.handle_set_session_config_option(&task_cx, req).await,
+                        )
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: SetSessionModeRequest, responder, cx: ConnectionTo<Client>| {
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let _turn = state.turn_lock.lock().await;
+                        handle_response(
+                            responder,
+                            state.handle_set_session_mode(&task_cx, req).await,
                         )
                     })
                 }

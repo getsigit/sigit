@@ -1668,3 +1668,141 @@ fn unconvertible_write_todos_falls_back_to_a_tool_call_card() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+// ── Session modes (issue #148) ──────────────────────────────────────────────
+
+/// The Permissions dropdown is also offered as ACP session modes, for a client
+/// that draws the mode selector and not config options. Both are the same
+/// state, so a change made through either has to show up in the other.
+#[test]
+fn session_modes_mirror_the_permissions_config_option() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", "{\"command\":\"echo sigit-mode\"}"),
+        sse_text("planned"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_modes_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let response = agent.wait_for_response(id);
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let modes = &response["result"]["modes"];
+    assert_eq!(modes["currentModeId"], "permission-mode-manual");
+    let mode_ids: Vec<&str> = modes["availableModes"]
+        .as_array()
+        .expect("available modes")
+        .iter()
+        .filter_map(|mode| mode["id"].as_str())
+        .collect();
+    assert_eq!(
+        mode_ids,
+        [
+            "permission-mode-manual",
+            "permission-mode-auto",
+            "permission-mode-plan"
+        ]
+    );
+
+    // set_mode changes the session and refreshes the config option.
+    let id = agent.request(
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "permission-mode-plan"}),
+    );
+    let (_response, updates) = agent.wait_for_response_with_updates(id);
+    let refreshed = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "config_option_update")
+        .expect("set_mode refreshes the config options");
+    let permissions = refreshed["configOptions"]
+        .as_array()
+        .expect("config options")
+        .iter()
+        .find(|option| option["id"] == "sigit-permission-mode")
+        .expect("permissions config option");
+    assert_eq!(permissions["currentValue"], "permission-mode-plan");
+
+    // Plan mode is really on: the mutating call is denied, not asked about.
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    {
+        let requests = endpoint.requests.lock().unwrap();
+        let messages = requests[1]["messages"].as_array().expect("messages");
+        let result = messages
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_1")
+            .expect("tool result for the blocked call");
+        assert!(
+            !result["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sigit-mode"),
+            "plan mode must not run the command: {result}"
+        );
+    }
+
+    // The config option changes the mode, and says so to the mode selector.
+    let id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-permission-mode",
+            "value": "permission-mode-auto",
+        }),
+    );
+    let (_response, updates) = agent.wait_for_response_with_updates(id);
+    let current = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "current_mode_update")
+        .expect("a config option change announces the new mode");
+    assert_eq!(current["currentModeId"], "permission-mode-auto");
+
+    // So does /plan.
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "/plan on"}],
+        }),
+    );
+    let (_response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    let current = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "current_mode_update")
+        .expect("/plan announces the new mode");
+    assert_eq!(current["currentModeId"], "permission-mode-plan");
+
+    // An id that is not a mode is an invalid-params error, and changes nothing.
+    let id = agent.request(
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "permission-mode-yolo"}),
+    );
+    let response = agent.wait_for("the set_mode error", |message| {
+        message["id"] == id && message.get("method").is_none()
+    });
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

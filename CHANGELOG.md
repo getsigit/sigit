@@ -8,6 +8,14 @@
   print `sigit <version>` on stdout and exit 0. Before, the flag was not
   recognized and siGit Code started a session, which left a script that asked
   for the version waiting.
+- **The permission modes are also offered as ACP session modes.** Manual, Auto
+  and Plan were only reachable as a config option, which is what the protocol
+  now recommends and what Zed reads. A client that draws the older mode
+  selector saw nothing. `session/new`, `session/load` and `session/fork` now
+  return the same three in `modes`, `session/set_mode` switches between them,
+  and a change made any other way (the config option, `/plan`, `/clear`,
+  `/reload`) is announced with `current_mode_update`. A client that reads
+  config options ignores `modes`, so nothing changes there (#148).
 
 ## 1.6.1
 

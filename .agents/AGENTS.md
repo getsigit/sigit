@@ -268,7 +268,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   announced, because it sets the announced status: a call that will ask starts `pending`, the
   permission request carries that call's own id, and an `in_progress` update follows approval.
   That update also puts the card's title back, since the permission request overwrites it
-  with the full arguments. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
+  with the full arguments. The Manual/Auto/Plan choice reaches an ACP client twice: as the
+  `sigit-permission-mode` config option, and as session `modes` with `session/set_mode`, which
+  the spec is retiring but some clients still render instead. Both are built from
+  `PERMISSION_MODES` in `main.rs` and read the same state, so whatever changes the mode has to
+  refresh both (`ConfigOptionUpdate` and `send_current_mode`). Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
   serialized by `SiGitAgent::turn_lock` so the dispatch loop can route the client's permission
   answer mid-turn — don't move them back inline, and don't await client requests from inline
   handlers (deadlock).
