@@ -401,3 +401,173 @@ fn loading_an_unknown_session_is_an_error() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+fn prompt(agent: &mut AgentUnderTest, session_id: &str, text: &str) -> Value {
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": text}],
+        }),
+    );
+    agent.wait_for_raw_response(id)
+}
+
+/// `session/resume` is for a client that kept the thread on screen while the
+/// agent went away. The model has to remember the conversation, and the client
+/// must not be sent it again (issue #149).
+#[test]
+fn resuming_a_session_restores_it_without_a_replay() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_resume_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("First answer."), sse_text("Second answer.")]);
+
+    let mut agent = spawn_agent(port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let (initialize, _) = agent.wait_for_response_with_updates(id);
+    let capabilities = &initialize["result"]["agentCapabilities"]["sessionCapabilities"];
+    assert!(
+        capabilities["resume"].is_object() && capabilities["close"].is_object(),
+        "a client only calls session/resume and session/close on an agent that advertises          them: {initialize}"
+    );
+
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let (new_session, _) = agent.wait_for_response_with_updates(id);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    prompt(&mut agent, &session_id, "first question");
+
+    // The agent restarts under the editor, which still shows the thread.
+    drop(agent);
+    let mut agent = spawn_agent(port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response_with_updates(id);
+
+    let id = agent.request(
+        "session/resume",
+        json!({"sessionId": session_id, "cwd": project, "mcpServers": []}),
+    );
+    let (resumed, updates) = agent.wait_for_response_with_updates(id);
+    assert!(
+        resumed["result"]["configOptions"].is_array(),
+        "the resumed session reports its config options like a loaded one: {resumed}"
+    );
+    for update in &updates {
+        assert_eq!(
+            update["sessionUpdate"], "available_commands_update",
+            "nothing of the conversation may be replayed on resume: {update}"
+        );
+    }
+
+    // The conversation is there all the same: the next turn is saved on top of
+    // the first, so a load brings both back. A resume that opened a blank
+    // session would have saved the second turn alone.
+    prompt(&mut agent, &session_id, "second question");
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": project, "mcpServers": []}),
+    );
+    let (_, replay) = agent.wait_for_response_with_updates(id);
+    let user: Vec<&str> = replay
+        .iter()
+        .filter(|update| update["sessionUpdate"] == "user_message_chunk")
+        .map(text_of)
+        .collect();
+    assert_eq!(user, vec!["first question", "second question"]);
+
+    // Like a load, a resume of an id that names nothing is an error.
+    let id = agent.request(
+        "session/resume",
+        json!({"sessionId": "does-not-exist", "cwd": project, "mcpServers": []}),
+    );
+    let response = agent.wait_for_raw_response(id);
+    assert_eq!(
+        response["error"]["code"], -32002,
+        "an unknown id must be reported as not found: {response}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `session/close` frees what the process holds for a thread. The saved copy
+/// is not part of that: the thread still lists and reopens (issue #149).
+#[test]
+fn closing_a_session_forgets_it_but_keeps_the_saved_history() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_close_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("An answer.")]);
+    let mut agent = spawn_agent(port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response_with_updates(id);
+
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let (new_session, _) = agent.wait_for_response_with_updates(id);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    prompt(&mut agent, &session_id, "a question");
+
+    let id = agent.request("session/close", json!({"sessionId": session_id}));
+    let closed = agent.wait_for_raw_response(id);
+    assert!(
+        closed.get("error").is_none() && closed["result"].is_object(),
+        "close answers with an empty result: {closed}"
+    );
+
+    // The id is no longer a session this process serves.
+    let response = prompt(&mut agent, &session_id, "/help");
+    assert!(
+        response.get("error").is_some(),
+        "a closed session must not take prompts: {response}"
+    );
+
+    // Closing it again is harmless.
+    let id = agent.request("session/close", json!({"sessionId": session_id}));
+    let closed = agent.wait_for_raw_response(id);
+    assert!(closed.get("error").is_none(), "{closed}");
+
+    // The history on disk was left alone.
+    let id = agent.request("session/list", json!({}));
+    let (listed, _) = agent.wait_for_response_with_updates(id);
+    let ids: Vec<&str> = listed["result"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .filter_map(|session| session["sessionId"].as_str())
+        .collect();
+    assert_eq!(ids, vec![session_id.as_str()]);
+
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": project, "mcpServers": []}),
+    );
+    let (_, replay) = agent.wait_for_response_with_updates(id);
+    assert!(
+        replay.iter().any(|update| text_of(update) == "a question"),
+        "the closed thread must reopen with its history: {replay:#?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

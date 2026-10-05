@@ -73,21 +73,22 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
     AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate,
-    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
-    PromptRequest, PromptResponse, ReadTextFileRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionMode, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-    WriteTextFileRequest,
+    CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
+    ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResourceResource, ForkSessionRequest,
+    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionMode, SessionModeState, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -922,6 +923,24 @@ impl client_fs::ClientFileSystem for AcpClientFs {
     }
 }
 
+/// Which request is bringing a saved session back (see `restore_session`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreKind {
+    /// `session/load`: the client draws the thread from a replay.
+    Load,
+    /// `session/resume`: the client kept the thread, so nothing is replayed.
+    Resume,
+}
+
+impl RestoreKind {
+    fn method(self) -> &'static str {
+        match self {
+            RestoreKind::Load => "load_session",
+            RestoreKind::Resume => "resume_session",
+        }
+    }
+}
+
 /// What one ACP session owns, kept per session id.
 ///
 /// An editor runs a single sigit process for every thread it has open, but the
@@ -1021,6 +1040,9 @@ struct SiGitAgent {
     /// that turn is holding.
     prompt_cancellations:
         std::sync::Mutex<std::collections::HashMap<String, Arc<PromptCancellation>>>,
+    /// Sessions a `session/close` is waiting to tear down. A prompt for one of
+    /// these that reaches the front of its session lock first is cancelled.
+    closing_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
@@ -1072,6 +1094,7 @@ impl SiGitAgent {
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_session: std::sync::Mutex::new(None),
             prompt_cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            closing_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
             startup_model_load_started,
@@ -1815,47 +1838,49 @@ impl SiGitAgent {
                 .description("Opens sigit.si in your browser to authorize this device."),
         )];
 
-        Ok(
-            InitializeResponse::new(ProtocolVersion::V1)
-                .agent_info(
-                    Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
-                        .title("siGit Code - AI Coding Agent"),
-                )
-                .auth_methods(auth_methods)
-                .agent_capabilities(
-                    AgentCapabilities::default()
-                        .load_session(true)
-                        // Gates the editor's sign out button. Without it the
-                        // only way out of an account is typing `/logout`.
-                        .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
-                        // Lets the editor attach images to a prompt. The capability is fixed
-                        // for the connection while the model is not, so a prompt that
-                        // brings an image to a model that cannot read one is answered with
-                        // a note instead (see `images_for_turn`).
-                        .prompt_capabilities(PromptCapabilities::new().image(true))
-                        // Clients only pass HTTP MCP servers in `mcpServers` to an
-                        // agent that says it can reach them. SSE stays off: the
-                        // MCP spec deprecated that transport.
-                        .mcp_capabilities(McpCapabilities::new().http(true))
-                        .session_capabilities(
-                            SessionCapabilities::new()
-                                .fork(SessionForkCapabilities::new())
-                                // Durable sessions (`session_store`) are what makes
-                                // listing meaningful: without this the editor's
-                                // "Import Threads" picker reports that the agent
-                                // doesn't support ACP's session/list capability.
-                                .list(SessionListCapabilities::new())
-                                // Without this, a client that has several directories
-                                // open never sends the extra ones: Zed drops every root
-                                // but the first and tells the user the agent has no
-                                // multi-root support. See `workspace.rs`.
-                                .additional_directories(
-                                    SessionAdditionalDirectoriesCapabilities::new(),
-                                ),
-                        ),
-                )
-                .meta(initialize_meta()),
-        )
+        Ok(InitializeResponse::new(ProtocolVersion::V1)
+            .agent_info(
+                Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
+                    .title("siGit Code - AI Coding Agent"),
+            )
+            .auth_methods(auth_methods)
+            .agent_capabilities(
+                AgentCapabilities::default()
+                    .load_session(true)
+                    // Gates the editor's sign out button. Without it the
+                    // only way out of an account is typing `/logout`.
+                    .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+                    // Lets the editor attach images to a prompt. The capability is fixed
+                    // for the connection while the model is not, so a prompt that
+                    // brings an image to a model that cannot read one is answered with
+                    // a note instead (see `images_for_turn`).
+                    .prompt_capabilities(PromptCapabilities::new().image(true))
+                    // Clients only pass HTTP MCP servers in `mcpServers` to an
+                    // agent that says it can reach them. SSE stays off: the
+                    // MCP spec deprecated that transport.
+                    .mcp_capabilities(McpCapabilities::new().http(true))
+                    .session_capabilities(
+                        SessionCapabilities::new()
+                            .fork(SessionForkCapabilities::new())
+                            // Durable sessions (`session_store`) are what makes
+                            // listing meaningful: without this the editor's
+                            // "Import Threads" picker reports that the agent
+                            // doesn't support ACP's session/list capability.
+                            .list(SessionListCapabilities::new())
+                            // Without this, a client that has several directories
+                            // open never sends the extra ones: Zed drops every root
+                            // but the first and tells the user the agent has no
+                            // multi-root support. See `workspace.rs`.
+                            .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
+                            // Reconnect to a thread the client still has on
+                            // screen, without the replay `session/load` sends.
+                            .resume(SessionResumeCapabilities::new())
+                            // Lets the client say a thread is gone, so its
+                            // state does not sit here until the process exits.
+                            .close(SessionCloseCapabilities::new()),
+                    ),
+            )
+            .meta(initialize_meta()))
     }
 
     async fn handle_authenticate(
@@ -2320,26 +2345,78 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         args: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
-        validate_session_roots(&args.cwd, &args.additional_directories)?;
+        let config_options = self
+            .restore_session(
+                cx,
+                RestoreKind::Load,
+                &args.session_id,
+                &args.cwd,
+                &args.additional_directories,
+                &args.mcp_servers,
+            )
+            .await?;
+        Ok(LoadSessionResponse::new()
+            .config_options(config_options)
+            .modes(build_session_modes(&args.session_id.to_string())))
+    }
 
+    /// ACP `session/resume`: `session/load` without the replay.
+    ///
+    /// The client still has the thread on screen (the agent restarted under
+    /// it, say) and only needs the model to remember it. The spec forbids
+    /// sending the history back as `session/update` here.
+    async fn handle_resume_session(
+        &self,
+        cx: &ConnectionTo<Client>,
+        args: ResumeSessionRequest,
+    ) -> agent_client_protocol::Result<ResumeSessionResponse> {
+        let config_options = self
+            .restore_session(
+                cx,
+                RestoreKind::Resume,
+                &args.session_id,
+                &args.cwd,
+                &args.additional_directories,
+                &args.mcp_servers,
+            )
+            .await?;
+        Ok(ResumeSessionResponse::new()
+            .config_options(config_options)
+            .modes(build_session_modes(&args.session_id.to_string())))
+    }
+
+    /// Bring a saved session back as the live one, for `session/load` and
+    /// `session/resume`. The two differ only in whether the conversation is
+    /// replayed to the client.
+    async fn restore_session(
+        &self,
+        cx: &ConnectionTo<Client>,
+        kind: RestoreKind,
+        session_id: &SessionId,
+        cwd: &std::path::Path,
+        additional_directories: &[PathBuf],
+        mcp_servers: &[McpServer],
+    ) -> agent_client_protocol::Result<Vec<SessionConfigOption>> {
+        validate_session_roots(cwd, additional_directories)?;
+
+        let method = kind.method();
         log::info!(
-            "load_session: id={}, cwd={}, additional_directories={:?}",
-            args.session_id,
-            args.cwd.display(),
-            args.additional_directories
+            "{method}: id={session_id}, cwd={}, additional_directories={:?}",
+            cwd.display(),
+            additional_directories
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
         );
 
-        let session_key = args.session_id.to_string();
+        let session_key = session_id.to_string();
 
         // The saved copy is the thread; failing that, this process may still
         // hold one nobody has spoken in yet (nothing is written until a turn
         // completes). An id found in neither place names no session, and
         // answering with an empty one would hand the client a blank thread it
         // cannot tell from a restored one. Parking first makes the in-memory
-        // copy current when the id being loaded is the live session.
+        // copy current when the id being restored is the live session.
         self.park_active_session().await;
         let in_memory = self
             .sessions
@@ -2348,14 +2425,14 @@ impl SiGitAgent {
             .get(&session_key)
             .map(|state| state.conversation.clone());
         let Some(history) = session_store::load(&session_key).or(in_memory) else {
-            log::warn!("load_session: no session {session_key}");
+            log::warn!("{method}: no session {session_key}");
             return Err(agent_client_protocol::Error::new(
                 -32002,
                 format!("session {session_key} not found"),
             ));
         };
 
-        let mut state = self.session_state(&args.cwd, &args.additional_directories);
+        let mut state = self.session_state(cwd, additional_directories);
         if let Some(model_id) = session_store::list()
             .into_iter()
             .find(|entry| entry.id == session_key)
@@ -2374,40 +2451,105 @@ impl SiGitAgent {
         // from last time.
         let restored = history.len();
 
-        // The client draws the reopened thread from these notifications alone.
-        let updates = history_replay_updates(&history);
-        let replayed = updates.len();
-        for update in updates {
-            cx.send_notification(SessionNotification::new(args.session_id.clone(), update))
-                .ok();
+        // On a load the client draws the reopened thread from these
+        // notifications alone. On a resume it already has the thread.
+        let mut replayed = 0;
+        if kind == RestoreKind::Load {
+            let updates = history_replay_updates(&history);
+            replayed = updates.len();
+            for update in updates {
+                cx.send_notification(SessionNotification::new(session_id.clone(), update))
+                    .ok();
+            }
         }
 
         state.conversation = backend::carryover_history(history);
-        state.mcp_servers =
-            mcp::connect_session_servers(client_mcp_servers(&args.mcp_servers)).await;
+        state.mcp_servers = mcp::connect_session_servers(client_mcp_servers(mcp_servers)).await;
         log::info!(
-            "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
-            args.session_id
+            "{method}: restored {restored} message(s), replayed {replayed} update(s) for {session_id}"
         );
 
-        self.open_parked_session(&args.session_id, state).await;
+        self.open_parked_session(session_id, state).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
-            build_config_options(&guard, &args.session_id.to_string())
+            build_config_options(&guard, &session_key)
         };
 
-        self.advertise_commands(cx, args.session_id.clone());
+        self.advertise_commands(cx, session_id.clone());
 
         // Run SessionStart hooks
         let hook_settings = settings::load().hooks;
         if hook_settings.has_hooks() {
-            hooks::run_session_start_hooks(&hook_settings, &args.cwd, &args.session_id.to_string());
+            hooks::run_session_start_hooks(&hook_settings, cwd, &session_key);
         }
 
-        Ok(LoadSessionResponse::new()
-            .config_options(config_options)
-            .modes(build_session_modes(&args.session_id.to_string())))
+        Ok(config_options)
+    }
+
+    /// ACP `session/close`: the client is done with a thread.
+    ///
+    /// Drops everything this process holds for it: the parked state (and with
+    /// it the MCP servers the client named), its permission grants and plan
+    /// mode, and the background commands it started. The saved history stays,
+    /// so the thread still lists and reopens. The caller has already signalled
+    /// the session's running turn (see `begin_close`) and holds the session's
+    /// lock and `workspace_lock`, so that turn has ended by the time this runs.
+    ///
+    /// An id this process does not hold is answered with success. The spec
+    /// allows an error there, but the client wants the session gone and it is.
+    async fn handle_close_session(
+        &self,
+        args: CloseSessionRequest,
+    ) -> agent_client_protocol::Result<CloseSessionResponse> {
+        let key = args.session_id.to_string();
+        let known = self.sessions.lock().unwrap().remove(&key).is_some();
+
+        let was_live = {
+            let mut active = self.active_session.lock().unwrap();
+            let was_live = active.as_deref() == Some(key.as_str());
+            if was_live {
+                *active = None;
+            }
+            was_live
+        };
+        if was_live {
+            // Nothing owns the live conversation or roots any more. Clearing
+            // them here means the next session to open cannot inherit them,
+            // and lets go of the last handle on this session's MCP servers.
+            *self.session_cwd.lock().unwrap() = None;
+            tools::set_active_session(None);
+            workspace::replace_additional_roots(Vec::new());
+            mcp::set_session_servers(mcp::SessionServers::default());
+            self.engine.clear_history().await;
+            let backend = self.backend.lock().await.clone();
+            backend.restore_history(Vec::new()).await;
+        }
+
+        permissions::reset_session(&key);
+        let killed = tools::kill_session_tasks(&key);
+        self.closing_sessions.lock().unwrap().remove(&key);
+
+        log::info!(
+            "close_session: id={key} (known={known}, live={was_live}, {killed} background task(s) stopped)"
+        );
+        Ok(CloseSessionResponse::new())
+    }
+
+    /// First half of `session/close`, run before waiting for any lock.
+    ///
+    /// The turn to cancel is the one holding the session's lock, so the signal has to
+    /// go out first. Marking the session as closing covers the other case: a
+    /// prompt for it that is still queued behind another thread's turn has
+    /// registered nothing to cancel yet, and `handle_prompt` turns it away
+    /// when it reaches the front.
+    fn begin_close(&self, session_id: &SessionId) {
+        let key = session_id.to_string();
+        self.closing_sessions.lock().unwrap().insert(key.clone());
+        if let Some(cancellation) = self.prompt_cancellations.lock().unwrap().get(&key).cloned() {
+            cancellation.cancelled.store(true, Ordering::Release);
+            cancellation.notify.notify_one();
+        }
     }
 
     async fn handle_fork_session(
@@ -2532,6 +2674,17 @@ impl SiGitAgent {
         args: PromptRequest,
     ) -> agent_client_protocol::Result<PromptResponse> {
         let session_id = args.session_id.clone();
+
+        // `session/close` arrived while this prompt was waiting its turn.
+        // Closing cancels the session's work, and this is part of it.
+        if self
+            .closing_sessions
+            .lock()
+            .unwrap()
+            .contains(&session_id.to_string())
+        {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
 
         // Everything below (slash commands included) acts on the live session,
         // so it has to be this one. Resource links are read relative to its cwd.
@@ -5229,6 +5382,40 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |req: ResumeSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let session = state.session_lock(&req.session_id);
+                        let _session = session.lock().await;
+                        let _workspace = state.workspace_lock.lock().await;
+                        handle_response(responder, state.handle_resume_session(&task_cx, req).await)
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: CloseSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    // Signalled here, before taking any lock: the turn to
+                    // cancel is the one holding the session's.
+                    state.begin_close(&req.session_id);
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let session = state.session_lock(&req.session_id);
+                        let _session = session.lock().await;
+                        let _workspace = state.workspace_lock.lock().await;
+                        handle_response(responder, state.handle_close_session(req).await)
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |req: ForkSessionRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
@@ -6079,6 +6266,117 @@ mod tests {
         let history = history_text(&live(&agent).await);
         assert!(history.contains("first turn in b"), "{history}");
         assert!(!history.contains("mid-turn in a"), "{history}");
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        tools::set_active_session(None);
+        workspace::replace_additional_roots(Vec::new());
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SIGIT_CONFIG_DIR");
+            std::env::remove_var("SIGIT_LOCAL_INFERENCE");
+        }
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global cwd/env for the whole test
+    async fn closing_a_session_drops_its_state_and_leaves_the_others() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!("sigit-close-{}", uuid::Uuid::new_v4()));
+        let (repo_a, repo_b) = (temp.join("repo-a"), temp.join("repo-b"));
+        for dir in [&repo_a, &repo_b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let prev_cwd = std::env::current_dir().unwrap();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored below.
+        unsafe {
+            std::env::set_var("SIGIT_CONFIG_DIR", temp.join("config"));
+            std::env::set_var("SIGIT_LOCAL_INFERENCE", "on");
+        }
+
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        *agent.backend.lock().await = Arc::new(OpenAiBackend::new(
+            "http://127.0.0.1:9",
+            "",
+            "m",
+            Some("base prompt".into()),
+        ));
+        let thread_a = SessionId::new("close-thread-a");
+        let thread_b = SessionId::new("close-thread-b");
+        agent
+            .open_session(&thread_a, agent.session_state(&repo_a, &[]))
+            .await;
+        say(&agent, "said in thread a").await;
+        permissions::set_plan_mode("close-thread-a", true);
+        agent
+            .open_session(&thread_b, agent.session_state(&repo_b, &[]))
+            .await;
+        say(&agent, "said in thread b").await;
+
+        // Thread A is parked with a turn in flight when the close arrives.
+        let turn = Arc::new(PromptCancellation::default());
+        agent
+            .prompt_cancellations
+            .lock()
+            .unwrap()
+            .insert("close-thread-a".into(), Arc::clone(&turn));
+        agent.begin_close(&thread_a);
+        assert!(turn.cancelled.load(Ordering::Acquire));
+        assert!(
+            agent
+                .closing_sessions
+                .lock()
+                .unwrap()
+                .contains("close-thread-a")
+        );
+
+        agent
+            .handle_close_session(CloseSessionRequest::new(thread_a.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !agent
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key("close-thread-a")
+        );
+        assert!(!permissions::plan_mode("close-thread-a"));
+        assert!(agent.closing_sessions.lock().unwrap().is_empty());
+        assert!(agent.activate_session(&thread_a).await.is_err());
+
+        // The live thread is untouched.
+        assert_eq!(
+            agent.active_session.lock().unwrap().as_deref(),
+            Some("close-thread-b")
+        );
+        assert!(history_text(&live(&agent).await).contains("said in thread b"));
+
+        // Closing the live one leaves no session installed and no conversation
+        // for the next one to inherit.
+        agent
+            .handle_close_session(CloseSessionRequest::new(thread_b.clone()))
+            .await
+            .unwrap();
+        assert!(agent.active_session.lock().unwrap().is_none());
+        assert!(live(&agent).await.is_empty());
+        assert!(agent.sessions.lock().unwrap().is_empty());
+
+        // A second close, or one for an id nobody opened, is not an error.
+        agent
+            .handle_close_session(CloseSessionRequest::new(thread_b))
+            .await
+            .unwrap();
 
         std::env::set_current_dir(prev_cwd).unwrap();
         tools::set_active_session(None);

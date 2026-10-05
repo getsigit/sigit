@@ -4,6 +4,16 @@
 
 ### Added
 
+- **A client can resume a session and close one.** siGit Code now advertises
+  `sessionCapabilities.resume` and `sessionCapabilities.close`.
+  `session/resume` restores a saved thread the way `session/load` does, but
+  sends none of it back: it is for a client that still has the thread on
+  screen, after an agent restart for example. `session/close` cancels the
+  session's running turn and drops what the process held for it, which is its
+  state, its permission grants and plan mode, the MCP servers the client named
+  for it, and the background commands it started. The saved history is left
+  alone, so a closed thread still lists and reopens (#149).
+
 - **`sigit --version` prints the release.** `sigit --version` and `sigit -V`
   print `sigit <version>` on stdout and exit 0. Before, the flag was not
   recognized and siGit Code started a session, which left a script that asked

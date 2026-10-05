@@ -117,7 +117,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   three. A thread on an HTTP backend keeps a backend of its own (`InferenceBackend::fresh`,
   `SessionState::remote`), so its turn can wait on the endpoint while another thread is
   installed. Unknown session ids are rejected instead of silently borrowing the active thread's
-  cwd. Prompt cancellation takes no lock, which lets a client cancel a turn whatever it holds. The
+  cwd. Prompt cancellation takes no lock, which lets a client cancel a turn whatever it holds.
+  `session/load` and `session/resume` share `restore_session`; the only difference is that
+  resume must not replay the history as `session/update`. `session/close` is the one place a
+  `SessionState` is dropped. It runs in two halves: `begin_close` signals the session's turn
+  from the dispatch loop (the turn holds the session's lock, so the signal cannot wait for it) and
+  marks the id in `closing_sessions`, which makes `handle_prompt` cancel a prompt that was
+  still queued; `handle_close_session` then runs under the session and workspace locks and
+  removes the state, the permission grants and the background commands
+  (`tools::kill_session_tasks`). It leaves `session_store` alone, so a closed thread still lists
+  and reopens. The
   `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
   smbCloud, and stay general otherwise.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,

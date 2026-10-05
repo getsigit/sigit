@@ -2855,6 +2855,30 @@ async fn exec_command_output_wait(arguments: &str, owner: Option<String>) -> Str
     }
 }
 
+/// Stop and forget every background task `owner` started. Called when its
+/// session closes: nobody is left who could poll or kill them. Returns how
+/// many were still running.
+pub fn kill_session_tasks(owner: &str) -> usize {
+    let mut map = lock_tasks();
+    let ids: Vec<u64> = map
+        .iter()
+        .filter(|(_, task)| task.owner.as_deref() == Some(owner))
+        .map(|(id, _)| *id)
+        .collect();
+
+    let mut running = 0;
+    for id in ids {
+        let Some(mut task) = map.remove(&id) else {
+            continue;
+        };
+        if poll_exit_code(&mut task).is_none() {
+            running += 1;
+            kill_shell_tree(&mut task.child);
+        }
+    }
+    running
+}
+
 /// `kill_command` tool: stop a background task and report its output tail.
 fn exec_kill_command(arguments: &str, owner: Option<&str>) -> String {
     let task_id = match parse_task_id(arguments) {
@@ -4263,6 +4287,31 @@ mod tests {
             kill.contains(&format!("Killed task {task_id}")),
             "got: {kill}"
         );
+    }
+
+    #[test]
+    fn closing_a_session_stops_its_background_tasks_and_no_one_elses() {
+        #[cfg(unix)]
+        let command = "sleep 30";
+        #[cfg(windows)]
+        let command = "ping -n 31 127.0.0.1 > nul";
+
+        let cwd = std::env::temp_dir();
+        let closed = start_background_task(command, &cwd, Some("thread-closing".into()));
+        let kept = start_background_task(command, &cwd, Some("thread-staying".into()));
+        let closed_args = serde_json::json!({ "task_id": background_task_id(&closed) }).to_string();
+        let kept_args = serde_json::json!({ "task_id": background_task_id(&kept) }).to_string();
+
+        assert_eq!(kill_session_tasks("thread-closing"), 1);
+
+        // The task is gone from the table, not just stopped.
+        let poll = exec_command_output(&closed_args, Some("thread-closing"));
+        assert!(poll.contains("no background task with id"), "got: {poll}");
+        let poll = exec_command_output(&kept_args, Some("thread-staying"));
+        assert!(poll.contains("still running"), "got: {poll}");
+
+        assert_eq!(kill_session_tasks("thread-closing"), 0);
+        exec_kill_command(&kept_args, Some("thread-staying"));
     }
 
     #[test]
