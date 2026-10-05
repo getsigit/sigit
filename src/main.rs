@@ -71,11 +71,12 @@ use onde::inference::SamplingConfig;
 // schema types moved under `schema::v1` in agent-client-protocol 1.0.
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResourceResource,
-    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
+    AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate,
+    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
     PromptRequest, PromptResponse, ReadTextFileRequest, RequestPermissionOutcome,
@@ -1824,6 +1825,9 @@ impl SiGitAgent {
                 .agent_capabilities(
                     AgentCapabilities::default()
                         .load_session(true)
+                        // Gates the editor's sign out button. Without it the
+                        // only way out of an account is typing `/logout`.
+                        .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
                         // Lets the editor attach images to a prompt. The capability is fixed
                         // for the connection while the model is not, so a prompt that
                         // brings an image to a model that cannot read one is answered with
@@ -1899,6 +1903,69 @@ impl SiGitAgent {
                 ),
             )),
         }
+    }
+
+    /// ACP `logout`, the editor's sign out button. It names no session: the
+    /// account belongs to the process, so every open thread is signed out.
+    async fn handle_logout(
+        &self,
+        cx: &ConnectionTo<Client>,
+        _req: LogoutRequest,
+    ) -> agent_client_protocol::Result<LogoutResponse> {
+        let message = self.sign_out(cx).await;
+        log::info!("logout: {message}");
+        Ok(LogoutResponse::new())
+    }
+
+    /// Clear the account session, move every thread off the cloud tiers, and
+    /// push a fresh picker to each thread whose model changed. Returns the
+    /// message to show. Shared by ACP `logout` and the `/logout` command.
+    async fn sign_out(&self, cx: &ConnectionTo<Client>) -> String {
+        let message = account::end_session().await;
+        let local = default_local_model_config();
+        for key in self.leave_cloud(&local).await {
+            let config_options = build_config_options(&local, &key);
+            self.send_tool_call_update(
+                cx,
+                SessionId::new(key),
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+            )
+            .ok();
+        }
+        message
+    }
+
+    /// Put every session that was on a siGit Code Cloud tier on `local`
+    /// instead, and return their ids. The token is gone, so the tiers cannot
+    /// serve them.
+    ///
+    /// Parked sessions are moved along with the live one. Left on a tier, a
+    /// parked thread would fail to restore it on its next prompt and run on
+    /// whatever model the previous thread left live.
+    async fn leave_cloud(&self, local: &GgufModelConfig) -> Vec<String> {
+        let on_cloud = |model_id: &str| model_id.starts_with("sigit-cloud:");
+
+        // Collected before the live backend moves: `reset_to_local_backend`
+        // records the live session's new model, which would hide it here.
+        let mut moved = Vec::new();
+        for (key, state) in self.sessions.lock().unwrap().iter_mut() {
+            if on_cloud(&state.model_id) {
+                state.model_id = local.model_id.clone();
+                moved.push(key.clone());
+            }
+        }
+
+        let live_on_cloud = on_cloud(&self.current_model.lock().unwrap().model_id);
+        if live_on_cloud {
+            *self.current_model.lock().unwrap() = local.clone();
+            self.reset_to_local_backend().await;
+        }
+
+        // A new thread opened in cloud mode would ask for the default tier.
+        if live_on_cloud || !moved.is_empty() || !settings::local_inference_enabled() {
+            let _ = settings::set_local_inference(true);
+        }
+        moved
     }
 
     /// Build the state for a session request: its primary `cwd` plus the extra
@@ -4708,17 +4775,7 @@ async fn exec_slash_acp(
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Logout => {
-            // If we're on a cloud tier, drop back to local — the token is gone.
-            let on_cloud = {
-                let guard = agent.current_model.lock().unwrap();
-                guard.model_id.starts_with("sigit-cloud:")
-            };
-            let message = account::end_session().await;
-            if on_cloud {
-                *agent.current_model.lock().unwrap() = default_local_model_config();
-                agent.reset_to_local_backend().await;
-                let _ = settings::set_local_inference(true);
-            }
+            let message = agent.sign_out(cx).await;
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Whoami => {
@@ -5139,6 +5196,20 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
         // while the handler blocks it. Requests on one session keep their
         // order through that session's lock; whatever touches process-wide
         // state takes `workspace_lock` (a prompt does so itself, in pieces).
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: LogoutRequest, responder, cx: ConnectionTo<Client>| {
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    cx.spawn(async move {
+                        let _workspace = state.workspace_lock.lock().await;
+                        handle_response(responder, state.handle_logout(&task_cx, req).await)
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
@@ -5672,6 +5743,101 @@ mod tests {
         )
         .await
         .expect("cancel notification should remain available to the prompt task");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global cwd/env for the whole test
+    async fn signing_out_moves_every_cloud_session_on_device() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!("sigit-logout-{}", uuid::Uuid::new_v4()));
+        let (repo_a, repo_b, repo_c) = (
+            temp.join("repo-a"),
+            temp.join("repo-b"),
+            temp.join("repo-c"),
+        );
+        for dir in [&repo_a, &repo_b, &repo_c] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let prev_cwd = std::env::current_dir().unwrap();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored below.
+        unsafe {
+            std::env::set_var("SIGIT_CONFIG_DIR", temp.join("config"));
+            std::env::set_var("SIGIT_LOCAL_INFERENCE", "on");
+        }
+
+        let local = default_local_model_config();
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            local.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        let cloud = || provider::ProviderConfig {
+            display_name: "test cloud".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: String::new(),
+            model: "test".into(),
+        };
+
+        // Thread A is parked on a cloud tier, thread B stays on-device, and
+        // thread C is live on a cloud tier with a turn in its history.
+        for (id, repo) in [
+            ("thread-a", &repo_a),
+            ("thread-b", &repo_b),
+            ("thread-c", &repo_c),
+        ] {
+            agent
+                .open_session(&SessionId::new(id), agent.session_state(repo, &[]))
+                .await;
+        }
+        agent
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut("thread-a")
+            .unwrap()
+            .model_id = "sigit-cloud:a".into();
+        agent
+            .install_remote_backend(cloud(), "sigit-cloud:c".into())
+            .await;
+        say(&agent, "working on repo c").await;
+        // The cloud tiers are in use, so the stored toggle reads "cloud".
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SIGIT_LOCAL_INFERENCE");
+        }
+        settings::set_local_inference(false).unwrap();
+
+        let mut moved = agent.leave_cloud(&local).await;
+        moved.sort();
+        assert_eq!(moved, ["thread-a", "thread-c"]);
+
+        assert!(!agent.backend.lock().await.is_remote());
+        assert_eq!(agent.current_model.lock().unwrap().model_id, local.model_id);
+        for state in agent.sessions.lock().unwrap().values() {
+            assert_eq!(state.model_id, local.model_id);
+        }
+        assert!(settings::local_inference_enabled());
+        // The thread carries on where the cloud tier left it.
+        let history = history_text(&live(&agent).await);
+        assert!(history.contains("working on repo c"), "{history}");
+
+        // Nothing is left to move the second time.
+        assert!(agent.leave_cloud(&local).await.is_empty());
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        tools::set_active_session(None);
+        workspace::replace_additional_roots(Vec::new());
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SIGIT_CONFIG_DIR");
+        }
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[tokio::test]

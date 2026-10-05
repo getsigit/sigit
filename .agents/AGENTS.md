@@ -350,6 +350,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   those read env vars once at init.
 - **`src/account.rs`** — siGit Code Cloud auth (`/login`, `/logout`, `/whoami`); authenticates
   against the account API and stores a session token. Performs no console I/O.
+  ACP `logout` (the editor's sign out button, shown only because `handle_initialize` advertises
+  `agentCapabilities.auth.logout`) and `/logout` both go through `SiGitAgent::sign_out` in
+  `main.rs`. The request names no session, so `leave_cloud` moves the parked threads off their
+  cloud tier along with the live one and each of them gets a fresh model picker.
 - **`src/browser_auth.rs`** — browser sign-in, the path the editor's "Sign in to siGit Code"
   button takes. sigit is a public OAuth client (client id `sigit-code-cli`, no secret, PKCE
   S256) against the authorization server at `$SIGIT_API_URL/oauth`. Two ways the code gets
