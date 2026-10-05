@@ -1956,7 +1956,10 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
 /// so the history keeps it too and a model switch carries it over.
 pub async fn forget_trailing_user_message(backend: &dyn InferenceBackend) {
     let mut history = backend.history_snapshot().await;
-    if history.last().is_some_and(|message| message["role"] == "user") {
+    if history
+        .last()
+        .is_some_and(|message| message["role"] == "user")
+    {
         history.pop();
         backend.restore_history(history).await;
     }
