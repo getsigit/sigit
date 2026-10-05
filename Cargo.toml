@@ -60,6 +60,11 @@ base64 = "0.22"
 rand = "0.9"
 sha2 = "0.10"
 
+# ACP `resource_link` blocks carry file URIs. Parsing them with `url` decodes
+# percent escapes and maps Windows drive paths, which hand-stripping `file://`
+# did not. Already in the graph through reqwest.
+url = "2"
+
 # Release binaries ship to five registries, and the NuGet package bundles all
 # six targets in a single archive, so binary size is a distribution constraint
 # rather than a nicety. Stripping symbols takes the macOS arm64 binary from

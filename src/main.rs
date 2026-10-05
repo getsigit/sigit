@@ -2339,24 +2339,8 @@ impl SiGitAgent {
                     // reference without content; read the file ourselves
                     let label = link.name.clone();
 
-                    if let Some(raw_path) = link.uri.strip_prefix("file://") {
-                        let (file_path, line_range) = if let Some(hash_pos) = raw_path.rfind('#') {
-                            let fragment = &raw_path[hash_pos + 1..];
-                            let path = &raw_path[..hash_pos];
-                            // Parse "L207:219" or "L207-219" → (207, 219)
-                            let range = fragment.strip_prefix('L').and_then(|rest| {
-                                let sep = if rest.contains(':') { ':' } else { '-' };
-                                let mut parts = rest.splitn(2, sep);
-                                let start = parts.next()?.parse::<usize>().ok()?;
-                                let end = parts.next()?.parse::<usize>().ok()?;
-                                Some((start, end))
-                            });
-                            (path, range)
-                        } else {
-                            (raw_path, None)
-                        };
-
-                        match std::fs::read_to_string(file_path) {
+                    if let Some((file_path, line_range)) = parse_file_link(&link.uri) {
+                        match std::fs::read_to_string(&file_path) {
                             Ok(contents) => {
                                 let extracted = if let Some((start, end)) = line_range {
                                     let selected: Vec<&str> = contents
@@ -2369,19 +2353,24 @@ impl SiGitAgent {
                                         .map(|(_, line)| line)
                                         .collect();
                                     format!(
-                                        "\n--- {label} ({file_path} lines {start}-{end}) ---\n{}\n--- end {label} ---",
+                                        "\n--- {label} ({} lines {start}-{end}) ---\n{}\n--- end {label} ---",
+                                        file_path.display(),
                                         selected.join("\n")
                                     )
                                 } else {
                                     format!(
-                                        "\n--- {label} ({file_path}) ---\n{contents}\n--- end {label} ---"
+                                        "\n--- {label} ({}) ---\n{contents}\n--- end {label} ---",
+                                        file_path.display()
                                     )
                                 };
                                 parts.push(extracted);
                             }
                             Err(err) => {
                                 log::warn!("could not read ResourceLink {}: {err}", link.uri);
-                                parts.push(format!("[referenced file: {label} ({file_path})]"));
+                                parts.push(format!(
+                                    "[referenced file: {label} ({})]",
+                                    file_path.display()
+                                ));
                             }
                         }
                     } else {
@@ -3953,6 +3942,31 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
     })
 }
 
+/// Resolves an ACP `resource_link` URI to a local path and an optional line
+/// range. Parsing with `url` decodes percent escapes (`%20`, non-ASCII names),
+/// maps Windows drive URIs, and reads `#` only as the fragment separator, so a
+/// `#` inside a file name stays part of the path. `None` for anything that is
+/// not a local `file:` URI.
+fn parse_file_link(uri: &str) -> Option<(PathBuf, Option<(usize, usize)>)> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    let range = url.fragment().and_then(parse_line_range);
+    Some((path, range))
+}
+
+/// Parses a `L207:219` or `L207-219` fragment into `(207, 219)`.
+fn parse_line_range(fragment: &str) -> Option<(usize, usize)> {
+    let rest = fragment.strip_prefix('L')?;
+    let sep = if rest.contains(':') { ':' } else { '-' };
+    let mut parts = rest.splitn(2, sep);
+    let start = parts.next()?.parse::<usize>().ok()?;
+    let end = parts.next()?.parse::<usize>().ok()?;
+    Some((start, end))
+}
+
 /// ACP clients may prepend context as separate text blocks before the user's
 /// input. Search from the end so a standalone slash command in the final user
 /// block is still dispatched locally instead of being buried in joined context.
@@ -5116,6 +5130,33 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_links_decode_percent_escapes_and_non_ascii_names() {
+        let (path, range) = parse_file_link("file:///Users/me/My%20Project/a.rs").unwrap();
+        assert_eq!(path, PathBuf::from("/Users/me/My Project/a.rs"));
+        assert_eq!(range, None);
+
+        let (path, _) = parse_file_link("file:///Users/me/%C3%A9t%C3%A9/notes.md").unwrap();
+        assert_eq!(path, PathBuf::from("/Users/me/été/notes.md"));
+    }
+
+    #[test]
+    fn file_links_keep_a_hash_in_the_file_name_and_read_the_line_fragment() {
+        let (path, range) = parse_file_link("file:///tmp/c%23/a%23b.rs#L207:219").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/c#/a#b.rs"));
+        assert_eq!(range, Some((207, 219)));
+
+        let (path, range) = parse_file_link("file:///tmp/a.rs#L3-5").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/a.rs"));
+        assert_eq!(range, Some((3, 5)));
+    }
+
+    #[test]
+    fn file_links_reject_non_file_uris() {
+        assert!(parse_file_link("https://example.com/a.rs").is_none());
+        assert!(parse_file_link("not a uri").is_none());
+    }
 
     #[test]
     fn stop_reasons_follow_the_round_cap_then_the_finish_reason() {
