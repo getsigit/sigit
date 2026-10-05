@@ -3,7 +3,7 @@ owner = "getsigit"
 name = "sigit"
 slug = "getsigit-sigit"
 
-[bot]
+[agent]
 login = "sigit-code-review"
 display_name = "siGit Code Review"
 
@@ -11,7 +11,12 @@ display_name = "siGit Code Review"
 state = "closed"
 limit = 50
 since = "2026-09-01"
-bot = "sigit-code-review"
+agent = "sigit-code-review"
+cadence = "weekly"
+day_of_week = "Mon"
+runs_dir = "~/.agents/skills/sigit-code-review-outer-loop/runs"
+report_format = "markdown"
+compare_previous = true
 
 [review.reviewer_skill]
 name = "sigit-code-review-outer-loop"
@@ -26,13 +31,6 @@ branch_rules = "{fix,feature,release}/*"
 ci_gate = "CI"
 watch_paths = ["src/**"]
 ignore_paths = ["**/*.md", "**/*.txt", "docs/**", "vendor/**", ".github/**", "*.lock"]
-
-[outer_loop]
-cadence = "weekly"
-day_of_week = "Mon"
-runs_dir = "~/.agents/skills/sigit-code-review-outer-loop/runs"
-report_format = "markdown"
-compare_previous = true
 
 [[guardrails.known_issues]]
 pattern = "all_zero_summary"
@@ -49,17 +47,17 @@ action = "flag_in_report"
 [[guardrails.known_issues]]
 pattern = "approval_on_disagree"
 source = "getsigit-sigit"
-description = "Bot approves within 30-45s of an author disagreement without processing the correction. Compounds with confident false positives: wrong claim, author corrects, bot approves without re-reading."
+description = "Agent approves within 30-45s of an author disagreement without processing the correction. Compounds with confident false positives: wrong claim, author corrects, agent approves without re-reading."
 action = "flag_in_report"
 
 [[guardrails.known_issues]]
 pattern = "repeat_findings_high"
 source = "getsigit-sigit-si"
-description = "Repeat findings above 30% indicate the bot is re-raising issues the author already addressed."
+description = "Repeat findings above 30% indicate the agent is re-raising issues the author already addressed."
 action = "flag_in_report"
 
 [[guardrails.known_issues]]
 pattern = "force_pushes_inflate_rounds"
 source = "smbcloudXYZ-smbcloud"
-description = "Force pushes cause one-for-one review round inflation; the bot re-reads unchanged diffs."
+description = "Force pushes cause one-for-one review round inflation; the agent re-reads unchanged diffs."
 action = "note_in_report"
