@@ -5131,24 +5131,32 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// Compares path components so the tests pass on both Unix (forward slashes)
+    /// and Windows (`to_file_path` yields backslashes).
+    fn assert_path_components(actual: &std::path::Path, expected: &str) {
+        let expected: Vec<_> = std::path::Path::new(expected).components().collect();
+        let actual: Vec<_> = actual.components().collect();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn file_links_decode_percent_escapes_and_non_ascii_names() {
         let (path, range) = parse_file_link("file:///Users/me/My%20Project/a.rs").unwrap();
-        assert_eq!(path, PathBuf::from("/Users/me/My Project/a.rs"));
+        assert_path_components(&path, "/Users/me/My Project/a.rs");
         assert_eq!(range, None);
 
         let (path, _) = parse_file_link("file:///Users/me/%C3%A9t%C3%A9/notes.md").unwrap();
-        assert_eq!(path, PathBuf::from("/Users/me/été/notes.md"));
+        assert_path_components(&path, "/Users/me/été/notes.md");
     }
 
     #[test]
     fn file_links_keep_a_hash_in_the_file_name_and_read_the_line_fragment() {
         let (path, range) = parse_file_link("file:///tmp/c%23/a%23b.rs#L207:219").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/c#/a#b.rs"));
+        assert_path_components(&path, "/tmp/c#/a#b.rs");
         assert_eq!(range, Some((207, 219)));
 
         let (path, range) = parse_file_link("file:///tmp/a.rs#L3-5").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/a.rs"));
+        assert_path_components(&path, "/tmp/a.rs");
         assert_eq!(range, Some((3, 5)));
     }
 
