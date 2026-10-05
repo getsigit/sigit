@@ -2540,6 +2540,7 @@ impl SiGitAgent {
         {
             Ok(result) => result,
             Err(DrainTurnError::Cancelled) => {
+                backend::forget_trailing_user_message(backend.as_ref()).await;
                 self.finish_prompt(&session_id, &cancellation);
                 return Ok(PromptResponse::new(StopReason::Cancelled));
             }
@@ -2555,6 +2556,10 @@ impl SiGitAgent {
                 // something worth reading (see `describe_api_error`), and it is
                 // what the editor puts in its error banner. The context a
                 // prefix would add is in the log line above.
+                // The client keeps this prompt in its thread after the error,
+                // so keep it in the saved conversation too.
+                let snapshot = backend.history_snapshot().await;
+                self.persist_session(&session_id, &snapshot).await;
                 self.finish_prompt(&session_id, &cancellation);
                 return Err(agent_client_protocol::Error::new(-32603, error));
             }
