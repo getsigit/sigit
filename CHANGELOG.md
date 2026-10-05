@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`sigit --version` prints the release.** `sigit --version` and `sigit -V`
+  print `sigit <version>` on stdout and exit 0. Before, the flag was not
+  recognized and siGit Code started a session, which left a script that asked
+  for the version waiting.
+
 ## 1.6.1
 
 ### Added

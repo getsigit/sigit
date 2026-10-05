@@ -4975,6 +4975,12 @@ async fn main() -> anyhow::Result<()> {
     // directly from a shell. These must be handled before the TTY/ACP split.
     if let Some(verb) = std::env::args().nth(1) {
         match verb.as_str() {
+            // Printed before logging or any model setup, so a script can ask
+            // which release it has without starting a session.
+            "--version" | "-V" => {
+                println!("sigit {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "login" => {
                 init_logging(true);
                 // `--password` keeps the old email/password prompt for anyone
