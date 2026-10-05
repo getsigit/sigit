@@ -95,7 +95,7 @@ pub fn canonical_key(path: &Path) -> PathBuf {
 
 /// Absolute + lexically normalized: `.` dropped, `..` folded into the previous
 /// segment. Purely textual, so it never touches the filesystem.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

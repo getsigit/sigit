@@ -32,6 +32,7 @@ mod account;
 mod backend;
 mod browser_auth;
 mod chat;
+mod client_fs;
 mod commands;
 mod credentials;
 mod frontmatter;
@@ -77,13 +78,14 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
-    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    PromptRequest, PromptResponse, ReadTextFileRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -878,6 +880,46 @@ fn initialize_meta() -> Meta {
     meta
 }
 
+/// The editor's file system, reached over the ACP connection. Registered with
+/// `client_fs` at `initialize` when the client advertises `fs` capabilities.
+struct AcpClientFs {
+    cx: ConnectionTo<Client>,
+}
+
+#[async_trait::async_trait]
+impl client_fs::ClientFileSystem for AcpClientFs {
+    async fn read_text_file(
+        &self,
+        session_id: &str,
+        path: &std::path::Path,
+    ) -> Result<String, String> {
+        self.cx
+            .send_request(ReadTextFileRequest::new(session_id.to_string(), path))
+            .block_task()
+            .await
+            .map(|response| response.content)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn write_text_file(
+        &self,
+        session_id: &str,
+        path: &std::path::Path,
+        content: &str,
+    ) -> Result<(), String> {
+        self.cx
+            .send_request(WriteTextFileRequest::new(
+                session_id.to_string(),
+                path,
+                content,
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// What one ACP session owns, kept per session id.
 ///
 /// An editor runs a single sigit process for every thread it has open, but the
@@ -1659,9 +1701,30 @@ fn validate_session_roots(
 impl SiGitAgent {
     async fn handle_initialize(
         &self,
-        _req: InitializeRequest,
+        cx: &ConnectionTo<Client>,
+        req: InitializeRequest,
     ) -> agent_client_protocol::Result<InitializeResponse> {
         log::info!("initialize");
+
+        // A client that serves files from its buffers gets the file tools'
+        // reads and writes (see `client_fs`). Only the connection is kept
+        // here: asking the client for anything from this handler would
+        // deadlock, and the tools ask from inside a spawned prompt turn.
+        let fs = &req.client_capabilities.fs;
+        if client_fs::disabled_by_env() {
+            log::info!("client file system: off (SIGIT_CLIENT_FS)");
+        } else {
+            log::info!(
+                "client file system: read={}, write={}",
+                fs.read_text_file,
+                fs.write_text_file
+            );
+            client_fs::register(
+                Arc::new(AcpClientFs { cx: cx.clone() }),
+                fs.read_text_file,
+                fs.write_text_file,
+            );
+        }
 
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
         // like Zed advertise terminal-auth capability but don't actually spawn the
@@ -4781,8 +4844,8 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: InitializeRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_initialize(req).await)
+                async move |req: InitializeRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_initialize(&cx, req).await)
                 }
             },
             agent_client_protocol::on_receive_request!(),

@@ -462,6 +462,12 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
 }
 
 async fn execute_tool_impl(name: &str, arguments: &str) -> String {
+    // An editor that serves files from its buffers gets the file tools' reads
+    // and writes for paths in the session's roots (see `client_fs`).
+    if let Some(route) = client_file_route(name, arguments) {
+        return exec_file_tool_via_client(name, arguments, &route).await;
+    }
+
     match name {
         TASK_TOOL_NAME => exec_task(arguments).await,
         WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await,
@@ -996,65 +1002,85 @@ fn absolute_path_string(path: &Path) -> String {
 
 // ── read_file ────────────────────────────────────────────────────────────────
 
-fn exec_read_file(arguments: &str) -> String {
-    let args: Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(err) => return format!("Error: failed to parse arguments: {err}"),
-    };
+/// A parsed `read_file` call whose path is known to name a file on disk.
+struct ReadFileCall {
+    path: PathBuf,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+}
 
-    let path_str = match args.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return "Error: missing required parameter \"path\"".to_string(),
-    };
+impl ReadFileCall {
+    fn parse(arguments: &str) -> Result<Self, String> {
+        let args: Value = serde_json::from_str(arguments)
+            .map_err(|err| format!("Error: failed to parse arguments: {err}"))?;
 
-    let start_line = args
-        .get("start_line")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize);
-    let end_line = args
-        .get("end_line")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize);
+        let path_str = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Error: missing required parameter \"path\"".to_string())?;
 
-    let path = Path::new(path_str);
-    let absolute_path = absolute_path(path);
-    let absolute_path_str = absolute_path.display().to_string();
+        let start_line = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let end_line = args
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
 
-    if !absolute_path.exists() {
-        return format!("Error: path does not exist: {absolute_path_str}");
-    }
+        let path = absolute_path(Path::new(path_str));
+        let absolute_path_str = path.display().to_string();
 
-    if !absolute_path.is_file() {
-        return format!("Error: path is not a file: {absolute_path_str}");
-    }
-
-    match fs::read_to_string(&absolute_path) {
-        Ok(contents) => {
-            if start_line.is_some() || end_line.is_some() {
-                let lines: Vec<&str> = contents.lines().collect();
-                let total = lines.len();
-                let start = start_line.unwrap_or(1).max(1);
-                let end = end_line.unwrap_or(total).min(total);
-
-                if start > total {
-                    return format!(
-                        "Error: start_line {start} is beyond end of file ({total} lines)"
-                    );
-                }
-
-                let selected: Vec<&str> = lines[(start - 1)..end].to_vec();
-                let range_text = selected.join("\n");
-                format!("Lines {start}-{end} of {total} in {absolute_path_str}:\n{range_text}")
-            } else if contents.len() > READ_FILE_CHAR_LIMIT {
-                let truncated: String = contents.chars().take(READ_FILE_CHAR_LIMIT).collect();
-                format!(
-                    "{truncated}\n\n--- truncated (showing {READ_FILE_CHAR_LIMIT} of {} characters) ---",
-                    contents.len()
-                )
-            } else {
-                contents
-            }
+        if !path.exists() {
+            return Err(format!("Error: path does not exist: {absolute_path_str}"));
         }
+
+        if !path.is_file() {
+            return Err(format!("Error: path is not a file: {absolute_path_str}"));
+        }
+
+        Ok(Self {
+            path,
+            start_line,
+            end_line,
+        })
+    }
+
+    /// The tool result for the file's `contents`, wherever they were read from.
+    fn render(&self, contents: String) -> String {
+        let absolute_path_str = self.path.display().to_string();
+        if self.start_line.is_some() || self.end_line.is_some() {
+            let lines: Vec<&str> = contents.lines().collect();
+            let total = lines.len();
+            let start = self.start_line.unwrap_or(1).max(1);
+            let end = self.end_line.unwrap_or(total).min(total);
+
+            if start > total {
+                return format!("Error: start_line {start} is beyond end of file ({total} lines)");
+            }
+
+            let selected: Vec<&str> = lines[(start - 1)..end].to_vec();
+            let range_text = selected.join("\n");
+            format!("Lines {start}-{end} of {total} in {absolute_path_str}:\n{range_text}")
+        } else if contents.len() > READ_FILE_CHAR_LIMIT {
+            let truncated: String = contents.chars().take(READ_FILE_CHAR_LIMIT).collect();
+            format!(
+                "{truncated}\n\n--- truncated (showing {READ_FILE_CHAR_LIMIT} of {} characters) ---",
+                contents.len()
+            )
+        } else {
+            contents
+        }
+    }
+}
+
+fn exec_read_file(arguments: &str) -> String {
+    let call = match ReadFileCall::parse(arguments) {
+        Ok(call) => call,
+        Err(error) => return error,
+    };
+    match fs::read_to_string(&call.path) {
+        Ok(contents) => call.render(contents),
         Err(err) => format!("Error: could not read file: {err}"),
     }
 }
@@ -1404,46 +1430,68 @@ fn exec_create_directory(arguments: &str) -> String {
     }
 }
 
+/// A parsed `create_file` call, ready to write: the path is free and its
+/// parent directories exist.
+struct CreateFileCall {
+    path: PathBuf,
+    content: String,
+}
+
+impl CreateFileCall {
+    fn parse(arguments: &str) -> Result<Self, String> {
+        let args: Value = serde_json::from_str(arguments)
+            .map_err(|err| format!("Error: failed to parse arguments: {err}"))?;
+
+        let path_str = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Error: missing required parameter \"path\"".to_string())?;
+
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Error: missing required parameter \"content\"".to_string())?;
+
+        let path = absolute_path(Path::new(path_str));
+
+        if path.exists() {
+            return Err(format!(
+                "Error: file already exists: {} — use edit_file to modify existing files",
+                path.display()
+            ));
+        }
+
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            return Err(format!("Error: could not create parent directories: {err}"));
+        }
+
+        Ok(Self {
+            path,
+            content: content.to_string(),
+        })
+    }
+
+    fn written(&self) -> String {
+        format!(
+            "Created file: {} ({} bytes)",
+            self.path.display(),
+            self.content.len()
+        )
+    }
+}
+
 /// fails if file exists so the LLM is forced to use `edit_file` for modifications.
 fn exec_create_file(arguments: &str) -> String {
-    let args: Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    let call = match CreateFileCall::parse(arguments) {
+        Ok(call) => call,
+        Err(error) => return error,
     };
-
-    let path_str = match args.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return "Error: missing required parameter \"path\"".to_string(),
-    };
-
-    let content = match args.get("content").and_then(Value::as_str) {
-        Some(c) => c,
-        None => return "Error: missing required parameter \"content\"".to_string(),
-    };
-
-    let path = Path::new(path_str);
-    let absolute_path = absolute_path(path);
-    let absolute_path_str = absolute_path.display().to_string();
-
-    if absolute_path.exists() {
-        return format!(
-            "Error: file already exists: {absolute_path_str} — use edit_file to modify existing files"
-        );
-    }
-
-    if let Some(parent) = absolute_path.parent()
-        && !parent.as_os_str().is_empty()
-        && !parent.exists()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        return format!("Error: could not create parent directories: {err}");
-    }
-
-    match fs::write(&absolute_path, content) {
-        Ok(()) => format!(
-            "Created file: {absolute_path_str} ({} bytes)",
-            content.len()
-        ),
+    match fs::write(&call.path, &call.content) {
+        Ok(()) => call.written(),
         Err(err) => format!("Error: could not write file: {err}"),
     }
 }
@@ -1510,136 +1558,235 @@ fn nearest_line_hint(contents: &str, old_text: &str) -> String {
     String::new()
 }
 
-fn exec_edit_file(arguments: &str) -> String {
-    let args: Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(err) => return format!("Error: failed to parse arguments: {err}"),
-    };
+/// What an edit call does to the file's text.
+enum EditOps {
+    /// `edit_file`: one replacement.
+    Single {
+        old_text: String,
+        new_text: String,
+        replace_all: bool,
+    },
+    /// `multi_edit`: the raw edit objects, checked one at a time as they are
+    /// applied so a malformed one is reported by its position.
+    Batch(Vec<Value>),
+}
 
-    let path_str = match args.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return "Error: missing required parameter \"path\"".to_string(),
-    };
+/// A parsed `edit_file` or `multi_edit` call whose path is known to name a
+/// file on disk.
+struct EditCall {
+    path: PathBuf,
+    ops: EditOps,
+}
 
-    let old_text = match args.get("old_text").and_then(Value::as_str) {
-        Some(t) => t,
-        None => return "Error: missing required parameter \"old_text\"".to_string(),
-    };
+impl EditCall {
+    fn parse(tool: &str, arguments: &str) -> Result<Self, String> {
+        let args: Value = serde_json::from_str(arguments)
+            .map_err(|err| format!("Error: failed to parse arguments: {err}"))?;
 
-    let new_text = match args.get("new_text").and_then(Value::as_str) {
-        Some(t) => t,
-        None => return "Error: missing required parameter \"new_text\"".to_string(),
-    };
+        let path_str = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Error: missing required parameter \"path\"".to_string())?;
 
-    let replace_all = args
-        .get("replace_all")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        let ops = if tool == "multi_edit" {
+            match args.get("edits").and_then(Value::as_array) {
+                Some(edits) if !edits.is_empty() => EditOps::Batch(edits.clone()),
+                Some(_) => {
+                    return Err("Error: \"edits\" must contain at least one edit".to_string());
+                }
+                None => return Err("Error: missing required parameter \"edits\"".to_string()),
+            }
+        } else {
+            let text = |name: &str| {
+                args.get(name)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("Error: missing required parameter \"{name}\""))
+            };
+            EditOps::Single {
+                old_text: text("old_text")?,
+                new_text: text("new_text")?,
+                replace_all: args
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }
+        };
 
-    let path = Path::new(path_str);
-    let absolute_path = absolute_path(path);
-    let absolute_path_str = absolute_path.display().to_string();
+        let path = absolute_path(Path::new(path_str));
+        let absolute_path_str = path.display().to_string();
 
-    if !absolute_path.exists() {
-        return format!(
-            "Error: file does not exist: {absolute_path_str} — use create_file for new files"
-        );
+        if !path.exists() {
+            return Err(format!(
+                "Error: file does not exist: {absolute_path_str} — use create_file for new files"
+            ));
+        }
+
+        if !path.is_file() {
+            return Err(format!("Error: path is not a file: {absolute_path_str}"));
+        }
+
+        Ok(Self { path, ops })
     }
 
-    if !absolute_path.is_file() {
-        return format!("Error: path is not a file: {absolute_path_str}");
+    /// The file's text after the edits, or the tool result explaining which
+    /// one did not match. A batch is all-or-nothing: each edit is applied to
+    /// the result of the previous one and a failure leaves nothing to write.
+    fn apply(&self, contents: &str) -> Result<String, String> {
+        let absolute_path_str = self.path.display().to_string();
+        match &self.ops {
+            EditOps::Single {
+                old_text,
+                new_text,
+                replace_all,
+            } => apply_edit(contents, old_text, new_text, *replace_all)
+                .map_err(|why| format!("Error: {why} (in {absolute_path_str})")),
+            EditOps::Batch(edits) => {
+                let mut working = contents.to_string();
+                for (idx, edit) in edits.iter().enumerate() {
+                    let old_text =
+                        edit.get("old_text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                format!("Error: edit #{} is missing \"old_text\"", idx + 1)
+                            })?;
+                    let new_text =
+                        edit.get("new_text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                format!("Error: edit #{} is missing \"new_text\"", idx + 1)
+                            })?;
+                    let replace_all = edit
+                        .get("replace_all")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+
+                    working =
+                        apply_edit(&working, old_text, new_text, replace_all).map_err(|why| {
+                            format!(
+                                "Error: edit #{} failed: {why}. No changes were written to {absolute_path_str}.",
+                                idx + 1
+                            )
+                        })?;
+                }
+                Ok(working)
+            }
+        }
     }
 
-    let contents = match fs::read_to_string(&absolute_path) {
+    fn written(&self, updated: &str) -> String {
+        let absolute_path_str = self.path.display().to_string();
+        match &self.ops {
+            EditOps::Single { .. } => format!(
+                "Edited file: {absolute_path_str} ({} bytes written)",
+                updated.len()
+            ),
+            EditOps::Batch(edits) => format!(
+                "Applied {} edits to {absolute_path_str} ({} bytes written)",
+                edits.len(),
+                updated.len()
+            ),
+        }
+    }
+}
+
+/// `edit_file` and `multi_edit` against the disk.
+fn exec_edit(tool: &str, arguments: &str) -> String {
+    let call = match EditCall::parse(tool, arguments) {
+        Ok(call) => call,
+        Err(error) => return error,
+    };
+
+    let contents = match fs::read_to_string(&call.path) {
         Ok(c) => c,
         Err(err) => return format!("Error: could not read file: {err}"),
     };
 
-    let updated = match apply_edit(&contents, old_text, new_text, replace_all) {
+    let updated = match call.apply(&contents) {
         Ok(updated) => updated,
-        Err(why) => return format!("Error: {why} (in {absolute_path_str})"),
+        Err(error) => return error,
     };
 
-    match fs::write(&absolute_path, &updated) {
-        Ok(()) => format!(
-            "Edited file: {absolute_path_str} ({} bytes written)",
-            updated.len()
-        ),
+    match fs::write(&call.path, &updated) {
+        Ok(()) => call.written(&updated),
         Err(err) => format!("Error: could not write file: {err}"),
     }
+}
+
+fn exec_edit_file(arguments: &str) -> String {
+    exec_edit("edit_file", arguments)
 }
 
 /// Apply a batch of edits to one file atomically: each edit is applied to the
 /// result of the previous one, and the file is only written if *every* edit
 /// matches. A failure leaves the file untouched.
 fn exec_multi_edit(arguments: &str) -> String {
-    let args: Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(err) => return format!("Error: failed to parse arguments: {err}"),
-    };
+    exec_edit("multi_edit", arguments)
+}
 
-    let path_str = match args.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return "Error: missing required parameter \"path\"".to_string(),
-    };
+// ── File tools through the ACP client ────────────────────────────────────────
 
-    let edits = match args.get("edits").and_then(Value::as_array) {
-        Some(e) if !e.is_empty() => e,
-        Some(_) => return "Error: \"edits\" must contain at least one edit".to_string(),
-        None => return "Error: missing required parameter \"edits\"".to_string(),
-    };
+/// The file tools whose reads and writes can go through the editor.
+const CLIENT_FILE_TOOLS: &[&str] = &["read_file", "create_file", "edit_file", "multi_edit"];
 
-    let path = Path::new(path_str);
-    let absolute_path = absolute_path(path);
-    let absolute_path_str = absolute_path.display().to_string();
-
-    if !absolute_path.exists() {
-        return format!(
-            "Error: file does not exist: {absolute_path_str} — use create_file for new files"
-        );
+/// The route through the client for a file tool call, when the path it names
+/// should take one (see [`crate::client_fs::route_for`]).
+fn client_file_route(name: &str, arguments: &str) -> Option<crate::client_fs::Route> {
+    if !CLIENT_FILE_TOOLS.contains(&name) {
+        return None;
     }
+    let args: Value = serde_json::from_str(arguments).ok()?;
+    let path = absolute_path(Path::new(args.get("path")?.as_str()?));
+    crate::client_fs::route_for(active_session().as_deref(), &path)
+}
 
-    if !absolute_path.is_file() {
-        return format!("Error: path is not a file: {absolute_path_str}");
-    }
-
-    let mut working = match fs::read_to_string(&absolute_path) {
-        Ok(c) => c,
-        Err(err) => return format!("Error: could not read file: {err}"),
-    };
-
-    for (idx, edit) in edits.iter().enumerate() {
-        let old_text = match edit.get("old_text").and_then(Value::as_str) {
-            Some(t) => t,
-            None => return format!("Error: edit #{} is missing \"old_text\"", idx + 1),
-        };
-        let new_text = match edit.get("new_text").and_then(Value::as_str) {
-            Some(t) => t,
-            None => return format!("Error: edit #{} is missing \"new_text\"", idx + 1),
-        };
-        let replace_all = edit
-            .get("replace_all")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        match apply_edit(&working, old_text, new_text, replace_all) {
-            Ok(updated) => working = updated,
-            Err(why) => {
-                return format!(
-                    "Error: edit #{} failed: {why}. No changes were written to {absolute_path_str}.",
-                    idx + 1
-                );
+/// A file tool with its reads and writes sent to the client. Everything else
+/// about the call (argument checks, edit matching, the result text) is the
+/// disk version's, so the model cannot tell the two apart.
+async fn exec_file_tool_via_client(
+    name: &str,
+    arguments: &str,
+    route: &crate::client_fs::Route,
+) -> String {
+    match name {
+        "read_file" => {
+            let call = match ReadFileCall::parse(arguments) {
+                Ok(call) => call,
+                Err(error) => return error,
+            };
+            match route.read(&call.path).await {
+                Ok(contents) => call.render(contents),
+                Err(err) => format!("Error: could not read file: {err}"),
             }
         }
-    }
-
-    match fs::write(&absolute_path, &working) {
-        Ok(()) => format!(
-            "Applied {} edits to {absolute_path_str} ({} bytes written)",
-            edits.len(),
-            working.len()
-        ),
-        Err(err) => format!("Error: could not write file: {err}"),
+        "create_file" => {
+            let call = match CreateFileCall::parse(arguments) {
+                Ok(call) => call,
+                Err(error) => return error,
+            };
+            match route.write(&call.path, &call.content).await {
+                Ok(()) => call.written(),
+                Err(err) => format!("Error: could not write file: {err}"),
+            }
+        }
+        _ => {
+            let call = match EditCall::parse(name, arguments) {
+                Ok(call) => call,
+                Err(error) => return error,
+            };
+            let contents = match route.read(&call.path).await {
+                Ok(c) => c,
+                Err(err) => return format!("Error: could not read file: {err}"),
+            };
+            let updated = match call.apply(&contents) {
+                Ok(updated) => updated,
+                Err(error) => return error,
+            };
+            match route.write(&call.path, &updated).await {
+                Ok(()) => call.written(&updated),
+                Err(err) => format!("Error: could not write file: {err}"),
+            }
+        }
     }
 }
 

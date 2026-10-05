@@ -299,6 +299,23 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   every root. MCP is deliberately not on that list — `mcp::init` runs once at startup, before
   any session exists, so a second root's `.sigit/mcp.toml` has nobody to tell. (The servers a
   client names in `mcpServers` are a different thing and are per session; see `src/mcp.rs`.)
+- **`src/client_fs.rs`** — file reads and writes through the ACP client. A client that
+  advertises `fs.readTextFile` / `fs.writeTextFile` in `initialize` serves `fs/read_text_file`
+  and `fs/write_text_file` from its buffers, so `read_file` sees unsaved changes and
+  `edit_file` lands in the open buffer instead of underneath it. `tools.rs` has no access to the
+  connection, so this is a seam like the one `mcp::call_tool` gives MCP: `handle_initialize`
+  registers a `ClientFileSystem` (`AcpClientFs` in `main.rs`, holding the connection), and
+  `execute_tool_impl` asks `route_for` before it dispatches `read_file`, `create_file`,
+  `edit_file` or `multi_edit`. Each of those tools is split into a parse step and a pure
+  render/apply step (`ReadFileCall`, `CreateFileCall`, `EditCall`) that the disk path and the
+  client path share, so the model gets the same result text either way. The two capabilities are
+  independent: a client that only reads still gets its edits written to disk. The disk is the
+  fallback throughout: nothing is registered in the TUI or headless modes, a path outside the
+  session's roots is not routed, and a request the client fails or leaves unanswered for 30
+  seconds is retried on disk with a warning in the log. The client is only ever asked from
+  inside a spawned prompt turn, never from `handle_initialize` itself (deadlock, same as
+  permission requests). Existence checks and `create_file`'s parent directories still use the
+  disk. `SIGIT_CLIENT_FS=off` turns the routing off. Covered by `tests/acp_client_fs.rs`.
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
 - **`src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory
@@ -363,7 +380,8 @@ verbosity with `RUST_LOG`.
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
 `SIGIT_MODEL`, `SIGIT_MAX_TOOL_ROUNDS` (1 to 500, default 24; the tool-round cap of a
-headless run or an ACP prompt turn), `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
+headless run or an ACP prompt turn), `SIGIT_MCP` (`off` disables MCP), `SIGIT_CLIENT_FS` (`off` keeps the file tools on disk even when the
+ACP client offers `fs/read_text_file` / `fs/write_text_file`), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
 smbCloud CLI server), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
 server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),
