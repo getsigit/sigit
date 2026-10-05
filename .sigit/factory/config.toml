@@ -11,7 +11,6 @@ display_name = "siGit Code Review"
 state = "closed"
 limit = 50
 since = "2026-09-01"
-agent = "sigit-code-review"
 cadence = "weekly"
 day_of_week = "Mon"
 runs_dir = "~/.agents/skills/sigit-code-review-outer-loop/runs"
