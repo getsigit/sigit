@@ -445,6 +445,15 @@ pub trait InferenceBackend: Send + Sync {
     /// local model while requests actually go to the cloud.
     fn is_remote(&self) -> bool;
 
+    /// A backend for the same endpoint and model with an empty conversation,
+    /// or `None` when the conversation cannot be separated from the backend
+    /// (on-device, the engine holds it). An editor keeps several threads open
+    /// in one process; this is what lets each of them own its history instead
+    /// of taking turns on a shared one.
+    fn fresh(&self) -> Option<Arc<dyn InferenceBackend>> {
+        None
+    }
+
     /// A serializable snapshot of the conversation history, one JSON object per
     /// message (`{"role": ..., "content": ...}` at minimum). The snapshot is
     /// what the session store persists; it includes any seeded system message
@@ -1552,6 +1561,19 @@ impl InferenceBackend for OpenAiBackend {
 
     fn is_remote(&self) -> bool {
         true
+    }
+
+    fn fresh(&self) -> Option<Arc<dyn InferenceBackend>> {
+        Some(Arc::new(Self {
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            // The client is a handle on one connection pool; sharing it keeps
+            // connections to the endpoint warm across sessions.
+            http: self.http.clone(),
+            history: Mutex::new(Vec::new()),
+            accepts_images: self.accepts_images,
+        }))
     }
 
     async fn history_snapshot(&self) -> Vec<serde_json::Value> {

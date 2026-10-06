@@ -113,9 +113,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
   new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`.
   ACP session state owns its roots, conversation, and selected model even though the process has
-  one live backend; activating a thread parks and restores all three. Unknown session ids are
-  rejected instead of silently borrowing the active thread's cwd. Prompt cancellation is routed
-  outside `turn_lock`, which lets a client cancel the turn currently holding that lock. The
+  one working directory and one live backend slot; activating a thread parks and restores all
+  three. A thread on an HTTP backend keeps a backend of its own (`InferenceBackend::fresh`,
+  `SessionState::remote`), so its turn can wait on the endpoint while another thread is
+  installed. Unknown session ids are rejected instead of silently borrowing the active thread's
+  cwd. Prompt cancellation takes no lock, which lets a client cancel a turn whatever it holds. The
   `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
   smbCloud, and stay general otherwise.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
@@ -273,9 +275,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   the spec is retiring but some clients still render instead. Both are built from
   `PERMISSION_MODES` in `main.rs` and read the same state, so whatever changes the mode has to
   refresh both (`ConfigOptionUpdate` and `send_current_mode`). Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
-  serialized by `SiGitAgent::turn_lock` so the dispatch loop can route the client's permission
-  answer mid-turn — don't move them back inline, and don't await client requests from inline
-  handlers (deadlock).
+  so the dispatch loop can route the client's permission answer mid-turn — don't move them back
+  inline, and don't await client requests from inline handlers (deadlock). Two locks order them.
+  A per-session lock (`SiGitAgent::session_lock`) is held for a whole request, so requests on one
+  thread keep their order. `SiGitAgent::workspace_lock` guards what a session installs
+  process-wide (cwd, workspace roots, session MCP servers, the live backend slot, the engine's
+  conversation); lifecycle and config handlers hold it throughout, and `handle_prompt` holds it
+  through a `WorkspaceHold` that it releases while waiting on an HTTP endpoint or a permission
+  answer and retakes (reinstalling its session via `resume_workspace`) before any tool runs. An
+  on-device turn never releases it. Take the session lock first, never the other way round. Tool
+  execution, subagents included, still runs one session at a time.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),

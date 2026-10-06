@@ -924,11 +924,15 @@ impl client_fs::ClientFileSystem for AcpClientFs {
 /// What one ACP session owns, kept per session id.
 ///
 /// An editor runs a single sigit process for every thread it has open, but the
-/// process has one working directory, one set of workspace roots, and one
-/// backend conversation. Only one session can be live at a time (turns are
-/// serialized by `turn_lock`), so each session's roots and conversation are
-/// parked here while another session holds the process, and swapped back in
-/// by `activate_session` before its next request runs.
+/// process has one working directory and one set of workspace roots. Only one
+/// session can be installed at a time (see `workspace_lock`), so each session's
+/// roots are parked here while another session holds the process, and swapped
+/// back in by `activate_session` before its next request runs.
+///
+/// The conversation is parked the same way on-device, where the engine holds
+/// it. A session on an HTTP backend keeps a backend of its own instead (see
+/// `remote`), which is what lets its turn wait on the endpoint while another
+/// session is installed.
 #[derive(Clone, Debug)]
 struct SessionState {
     cwd: PathBuf,
@@ -946,6 +950,57 @@ struct SessionState {
     /// The MCP servers the client passed in `mcpServers` for this session,
     /// connected. Installed as the live set along with the roots.
     mcp_servers: mcp::SessionServers,
+    /// This session's own HTTP backend, set while the session is parked and
+    /// was last served by one. `None` for a session that has not run yet, was
+    /// last on-device, or is the installed session (the agent's `backend`
+    /// holds it then).
+    remote: Option<RemoteBackend>,
+}
+
+/// An HTTP backend that belongs to one session, with the model selection that
+/// was live when the session was parked.
+#[derive(Clone)]
+struct RemoteBackend {
+    backend: Arc<dyn InferenceBackend>,
+    model: GgufModelConfig,
+}
+
+impl std::fmt::Debug for RemoteBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteBackend")
+            .field("model", &self.model.model_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Holds `workspace_lock` for a prompt turn, which gives it up while it waits
+/// on an HTTP endpoint or on the user and takes it back before touching
+/// anything process-wide.
+struct WorkspaceHold {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl WorkspaceHold {
+    async fn acquire(lock: &Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self {
+            lock: Arc::clone(lock),
+            guard: Some(Arc::clone(lock).lock_owned().await),
+        }
+    }
+
+    fn release(&mut self) {
+        self.guard = None;
+    }
+
+    /// Whether the lock was given up since it was last held.
+    async fn reacquire(&mut self) -> bool {
+        if self.guard.is_some() {
+            return false;
+        }
+        self.guard = Some(Arc::clone(&self.lock).lock_owned().await);
+        true
+    }
 }
 
 struct SiGitAgent {
@@ -961,8 +1016,8 @@ struct SiGitAgent {
     /// The session whose roots and conversation are installed right now.
     active_session: std::sync::Mutex<Option<String>>,
     /// Cancellation signals for prompts currently waiting on inference. The
-    /// notification handler runs outside `turn_lock`, so it can interrupt the
-    /// turn that currently owns that lock and let another session proceed.
+    /// notification handler takes no lock, so it can interrupt a turn whatever
+    /// that turn is holding.
     prompt_cancellations:
         std::sync::Mutex<std::collections::HashMap<String, Arc<PromptCancellation>>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
@@ -981,12 +1036,19 @@ struct SiGitAgent {
     startup_model_name: String,
     /// for download-progress polling
     startup_model_id: String,
-    /// Serializes turn-affecting handlers (prompt, session lifecycle, config
-    /// changes). They run in `cx.spawn`ed tasks so the JSON-RPC dispatch loop
-    /// stays free to route client responses (e.g. permission answers) mid-turn;
-    /// this lock reproduces the strict ordering the dispatch loop used to give
-    /// them for free.
-    turn_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Guards everything one session installs process-wide: the working
+    /// directory, workspace roots, session MCP servers, the live `backend`
+    /// slot and the on-device engine's conversation. Session lifecycle and
+    /// config handlers hold it throughout. A prompt turn holds it while it
+    /// prepares and while its tools run, and gives it up while it waits on an
+    /// HTTP endpoint or on a permission answer, so another session can be
+    /// installed in the meantime. An on-device turn never gives it up: the
+    /// engine serves one conversation at a time.
+    workspace_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One lock per session id, held for a whole request on that session, so
+    /// two requests on the same thread keep the order they arrived in. Always
+    /// taken before `workspace_lock`, never while holding it.
+    session_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SiGitAgent {
@@ -1017,7 +1079,8 @@ impl SiGitAgent {
             auto_load_local_model,
             startup_model_name,
             startup_model_id,
-            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            workspace_lock: Arc::new(tokio::sync::Mutex::new(())),
+            session_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1854,7 +1917,19 @@ impl SiGitAgent {
             model_id,
             conversation: Vec::new(),
             mcp_servers: mcp::SessionServers::default(),
+            remote: None,
         }
+    }
+
+    /// The lock that orders requests on one session (see `session_locks`).
+    fn session_lock(&self, session_id: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.session_locks
+                .lock()
+                .unwrap()
+                .entry(session_id.to_string())
+                .or_default(),
+        )
     }
 
     /// Keep the active session's parked metadata in step with a successful
@@ -1870,14 +1945,22 @@ impl SiGitAgent {
     }
 
     /// Move the live conversation into the state of the session that owns it,
-    /// so installing another session can't lose or leak it.
+    /// so installing another session can't lose or leak it. An HTTP backend
+    /// goes with it: the session may be waiting on that backend right now, and
+    /// its next request has to find the same one.
     async fn park_active_session(&self) {
         let Some(active) = self.active_session.lock().unwrap().clone() else {
             return;
         };
-        let snapshot = self.backend.lock().await.history_snapshot().await;
+        let live = self.backend.lock().await.clone();
+        let snapshot = live.history_snapshot().await;
+        let remote = live.is_remote().then(|| RemoteBackend {
+            backend: live,
+            model: self.current_model.lock().unwrap().clone(),
+        });
         if let Some(state) = self.sessions.lock().unwrap().get_mut(&active) {
             state.conversation = backend::carryover_history(snapshot);
+            state.remote = remote;
         }
     }
 
@@ -1888,7 +1971,8 @@ impl SiGitAgent {
     /// backend installed here starts from this session's conversation and
     /// system prompt and nobody else's. Reopening an existing id deliberately
     /// replaces its parked state (notably `session/load`); every caller holds
-    /// `turn_lock`, so parking and replacement cannot race another turn.
+    /// `workspace_lock`, so parking and replacement cannot race another
+    /// session being installed.
     async fn open_session(&self, session_id: &SessionId, state: SessionState) {
         self.park_active_session().await;
         self.open_parked_session(session_id, state).await;
@@ -1942,6 +2026,19 @@ impl SiGitAgent {
         Ok(())
     }
 
+    /// Take `workspace_lock` back after a turn gave it up, and make the turn's
+    /// session the installed one again if another was installed meanwhile.
+    async fn resume_workspace(&self, workspace: &mut WorkspaceHold, session_id: &SessionId) {
+        if workspace.reacquire().await
+            && let Err(error) = self.activate_session(session_id).await
+        {
+            log::warn!(
+                "session({session_id}): could not reinstall mid-turn: {}",
+                error.message
+            );
+        }
+    }
+
     /// Point the process at `state`'s roots and load its conversation.
     ///
     /// The process follows `cwd` because tool calls may use relative paths; the
@@ -1952,9 +2049,10 @@ impl SiGitAgent {
         let SessionState {
             cwd,
             additional_roots,
-            model_id: _,
+            model_id,
             conversation,
             mcp_servers,
+            remote,
         } = state;
 
         if let Ok(mut guard) = self.session_cwd.lock() {
@@ -1969,8 +2067,41 @@ impl SiGitAgent {
         }
         *self.active_session.lock().unwrap() = Some(key.to_string());
         tools::set_active_session(Some(key));
+        if let Some(parked) = self.sessions.lock().unwrap().get_mut(key) {
+            parked.remote = None;
+        }
 
+        // A session that already has its own HTTP backend goes back onto it
+        // untouched. Its conversation lives there and may be mid-turn, so it
+        // is not reseeded from the parked copy. The engine still gets this
+        // session's context, for a later switch to an on-device model.
+        if let Some(RemoteBackend { backend, model }) = remote
+            && model.model_id == model_id
+        {
+            self.seed_engine_context(&session_context_message(&cwd, &additional_roots))
+                .await;
+            *self.backend.lock().await = backend;
+            *self.current_model.lock().unwrap() = model;
+            return;
+        }
+
+        // Otherwise the session starts from its parked conversation. The live
+        // HTTP backend belongs to whichever session was installed before, and
+        // that session may still be waiting on it, so this one gets a backend
+        // of its own for the same endpoint.
+        let fresh = self.backend.lock().await.fresh();
+        if let Some(fresh) = fresh {
+            *self.backend.lock().await = fresh;
+        }
         self.seed_conversation(&cwd, &additional_roots, conversation)
+            .await;
+    }
+
+    /// Reset the on-device engine's conversation to just `context`.
+    async fn seed_engine_context(&self, context: &str) {
+        self.engine.clear_history().await;
+        self.engine
+            .push_history(onde::inference::ChatMessage::system(context.to_string()))
             .await;
     }
 
@@ -2034,10 +2165,7 @@ impl SiGitAgent {
         let backend = self.backend.lock().await.clone();
 
         if backend.is_remote() {
-            self.engine.clear_history().await;
-            self.engine
-                .push_history(onde::inference::ChatMessage::system(context.clone()))
-                .await;
+            self.seed_engine_context(&context).await;
         }
 
         let system_prompt = if backend.is_remote() {
@@ -2340,6 +2468,7 @@ impl SiGitAgent {
 
         // Everything below (slash commands included) acts on the live session,
         // so it has to be this one. Resource links are read relative to its cwd.
+        let mut workspace = WorkspaceHold::acquire(&self.workspace_lock).await;
         self.activate_session(&session_id).await?;
 
         // log every block so we can debug @ references and file context
@@ -2520,6 +2649,10 @@ impl SiGitAgent {
         // The active backend drives the turn. Snapshot it once so a mid-turn
         // model switch doesn't split the conversation across backends.
         let backend = self.backend.lock().await.clone();
+        // Waiting on an HTTP endpoint uses nothing process-wide, so another
+        // session may be installed meanwhile. The on-device engine holds one
+        // conversation, so an on-device turn keeps the workspace throughout.
+        let release_while_waiting = backend.is_remote();
 
         // Only on-device inference needs a local model in memory. Cloud tiers run
         // over the network, so they never need a local model. Xcode's explicit
@@ -2602,7 +2735,10 @@ impl SiGitAgent {
             None
         };
 
-        let mut result = match self
+        if release_while_waiting {
+            workspace.release();
+        }
+        let outcome = self
             .drain_turn(
                 cx,
                 &session_id,
@@ -2611,8 +2747,9 @@ impl SiGitAgent {
                 &mut reply,
                 &cancellation,
             )
-            .await
-        {
+            .await;
+        self.resume_workspace(&mut workspace, &session_id).await;
+        let mut result = match outcome {
             Ok(result) => result,
             Err(DrainTurnError::Cancelled) => {
                 backend::forget_trailing_user_message(backend.as_ref()).await;
@@ -2796,7 +2933,11 @@ impl SiGitAgent {
                             reason
                         }
                         permissions::Decision::Ask => {
-                            match self
+                            // The answer can take as long as the user likes.
+                            if release_while_waiting {
+                                workspace.release();
+                            }
+                            let verdict = self
                                 .request_tool_permission(
                                     cx,
                                     &session_id,
@@ -2804,8 +2945,9 @@ impl SiGitAgent {
                                     &tc.name,
                                     &tc.arguments,
                                 )
-                                .await
-                            {
+                                .await;
+                            self.resume_workspace(&mut workspace, &session_id).await;
+                            match verdict {
                                 PermissionVerdict::Approved => {
                                     // The call the user just approved leaves
                                     // `pending` here. The title goes back to
@@ -2932,7 +3074,10 @@ impl SiGitAgent {
             sent_before_last_round = reply.sent.len();
 
             let cancelled_results = tool_results.clone();
-            result = match self
+            if release_while_waiting {
+                workspace.release();
+            }
+            let outcome = self
                 .drain_turn(
                     cx,
                     &session_id,
@@ -2941,8 +3086,9 @@ impl SiGitAgent {
                     &mut reply,
                     &cancellation,
                 )
-                .await
-            {
+                .await;
+            self.resume_workspace(&mut workspace, &session_id).await;
+            result = match outcome {
                 Ok(result) => result,
                 Err(DrainTurnError::Cancelled) => {
                     backend
@@ -4986,11 +5132,13 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
-        // Turn-affecting handlers below run in spawned tasks, serialized by
-        // `turn_lock`, so the dispatch loop stays free to route client
-        // responses (permission answers) while a turn is in flight. Awaiting a
-        // client request from *inside* a handler would deadlock: the dispatch
-        // loop can't read the response while the handler blocks it.
+        // Turn-affecting handlers below run in spawned tasks, so the dispatch
+        // loop stays free to route client responses (permission answers) while
+        // a turn is in flight. Awaiting a client request from *inside* a
+        // handler would deadlock: the dispatch loop can't read the response
+        // while the handler blocks it. Requests on one session keep their
+        // order through that session's lock; whatever touches process-wide
+        // state takes `workspace_lock` (a prompt does so itself, in pieces).
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
@@ -4998,7 +5146,9 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let _turn = state.turn_lock.lock().await;
+                        let session = state.session_lock(&req.session_id);
+                        let _session = session.lock().await;
+                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_load_session(&task_cx, req).await)
                     })
                 }
@@ -5012,7 +5162,11 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let _turn = state.turn_lock.lock().await;
+                        // The source's lock: a fork copies its conversation,
+                        // which has to be between turns.
+                        let session = state.session_lock(&req.session_id);
+                        let _session = session.lock().await;
+                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_fork_session(&task_cx, req).await)
                     })
                 }
@@ -5026,7 +5180,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let _turn = state.turn_lock.lock().await;
+                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_new_session(&task_cx, req).await)
                     })
                 }
@@ -5040,7 +5194,8 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let _turn = state.turn_lock.lock().await;
+                        let session = state.session_lock(&req.session_id);
+                        let _session = session.lock().await;
                         handle_response(responder, state.handle_prompt(&task_cx, req).await)
                     })
                 }
@@ -5056,7 +5211,9 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let _turn = state.turn_lock.lock().await;
+                        let session = state.session_lock(&req.session_id);
+                        let _session = session.lock().await;
+                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
                             state.handle_set_session_config_option(&task_cx, req).await,
@@ -5073,7 +5230,9 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let _turn = state.turn_lock.lock().await;
+                        let session = state.session_lock(&req.session_id);
+                        let _session = session.lock().await;
+                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
                             state.handle_set_session_mode(&task_cx, req).await,
@@ -5659,6 +5818,101 @@ mod tests {
             agent.sessions.lock().unwrap()["thread-b"].model_id,
             "sigit-cloud:preferred"
         );
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        tools::set_active_session(None);
+        workspace::replace_additional_roots(Vec::new());
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SIGIT_CONFIG_DIR");
+            std::env::remove_var("SIGIT_LOCAL_INFERENCE");
+        }
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A turn that is waiting on its endpoint holds on to its backend while
+    /// another session is installed. Coming back, the session has to find that
+    /// same backend, with whatever the turn added to it, and the other session
+    /// must never have been given it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global cwd/env for the whole test
+    async fn a_session_on_an_http_backend_keeps_that_backend_across_other_sessions() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!("sigit-own-backend-{}", uuid::Uuid::new_v4()));
+        let (repo_a, repo_b) = (temp.join("repo-a"), temp.join("repo-b"));
+        for dir in [&repo_a, &repo_b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let prev_cwd = std::env::current_dir().unwrap();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored below.
+        unsafe {
+            std::env::set_var("SIGIT_CONFIG_DIR", temp.join("config"));
+            std::env::set_var("SIGIT_LOCAL_INFERENCE", "on");
+        }
+
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        // No request is ever sent.
+        *agent.backend.lock().await = Arc::new(OpenAiBackend::new(
+            "http://127.0.0.1:9",
+            "",
+            "m",
+            Some("base prompt".into()),
+        ));
+        let thread_a = SessionId::new("thread-a");
+        let thread_b = SessionId::new("thread-b");
+
+        agent
+            .open_session(&thread_a, agent.session_state(&repo_a, &[]))
+            .await;
+        say(&agent, "first turn in a").await;
+        let backend_a = agent.backend.lock().await.clone();
+
+        agent
+            .open_session(&thread_b, agent.session_state(&repo_b, &[]))
+            .await;
+        let backend_b = agent.backend.lock().await.clone();
+        assert!(
+            !Arc::ptr_eq(&backend_a, &backend_b),
+            "thread B was handed thread A's backend"
+        );
+        let history = history_text(&live(&agent).await);
+        assert!(!history.contains("first turn in a"), "{history}");
+        say(&agent, "first turn in b").await;
+
+        // Thread A's turn, still in flight, adds to its own backend while
+        // thread B is the installed session.
+        let mut in_flight = backend_a.history_snapshot().await;
+        in_flight.push(serde_json::json!({ "role": "assistant", "content": "mid-turn in a" }));
+        backend_a.restore_history(in_flight).await;
+        let history = history_text(&live(&agent).await);
+        assert!(!history.contains("mid-turn in a"), "{history}");
+
+        agent.activate_session(&thread_a).await.unwrap();
+        assert!(Arc::ptr_eq(&*agent.backend.lock().await, &backend_a));
+        let history = history_text(&live(&agent).await);
+        assert!(history.contains("first turn in a"), "{history}");
+        assert!(history.contains("mid-turn in a"), "{history}");
+        assert!(!history.contains("first turn in b"), "{history}");
+        assert_eq!(
+            workspace::canonical_key(&std::env::current_dir().unwrap()),
+            workspace::canonical_key(&repo_a)
+        );
+
+        agent.activate_session(&thread_b).await.unwrap();
+        assert!(Arc::ptr_eq(&*agent.backend.lock().await, &backend_b));
+        let history = history_text(&live(&agent).await);
+        assert!(history.contains("first turn in b"), "{history}");
+        assert!(!history.contains("mid-turn in a"), "{history}");
 
         std::env::set_current_dir(prev_cwd).unwrap();
         tools::set_active_session(None);
