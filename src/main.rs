@@ -308,7 +308,8 @@ fn stop_reason_for(round_cap_reached: bool, finish: backend::FinishReason) -> St
 /// when nothing follows it (issue #120).
 fn round_cap_stop_message(max_tool_rounds: usize) -> String {
     format!(
-        "I stopped here because this turn used all {max_tool_rounds} of its tool rounds,          so the task may not be finished. Reply \"continue\" to pick it back up."
+        "I stopped here because this turn used all {max_tool_rounds} of its tool rounds, \
+         so the task may not be finished. Reply \"continue\" to pick it back up."
     )
 }
 
