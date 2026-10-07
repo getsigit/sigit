@@ -1,0 +1,6 @@
+[pull_request]
+base = "development"
+branch_prefix = "feature"
+
+[agent]
+max_tool_rounds = 60
