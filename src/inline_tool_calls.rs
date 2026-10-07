@@ -53,7 +53,20 @@ const K3_THINK_OPEN: &str = "<|open|>think<|sep|>";
 const K3_THINK_CLOSE: &str = "<|close|>think<|sep|>";
 const K3_SEP: &str = "<|sep|>";
 
-const START_MARKERS: &[&str] = &[XML_OPEN_TAG, K3_TOOLS_OPEN, K3_RESPONSE_OPEN, K3_THINK_OPEN];
+const DSML_TOOL_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
+const DSML_TOOL_CALLS_CLOSE: &str = "<｜DSML｜/tool_calls>";
+const DSML_INVOKE_OPEN: &str = "<｜DSML｜invoke";
+const DSML_INVOKE_CLOSE: &str = "<｜DSML｜/invoke>";
+const DSML_PARAMETER_OPEN: &str = "<｜DSML｜parameter";
+const DSML_PARAMETER_CLOSE: &str = "<｜DSML｜/parameter>";
+
+const START_MARKERS: &[&str] = &[
+    XML_OPEN_TAG,
+    K3_TOOLS_OPEN,
+    K3_RESPONSE_OPEN,
+    K3_THINK_OPEN,
+    DSML_TOOL_CALLS_OPEN,
+];
 
 /// One tool call recovered from inline text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +288,78 @@ fn decode_k3_attribute(value: &str) -> String {
     value.replace("&quot;", "\"").replace("&amp;", "&")
 }
 
+/// Parse a DeepSeek DSML `<｜DSML｜tool_calls>` envelope's inner text: zero or
+/// more `<｜DSML｜invoke name="$TOOL">...</｜DSML｜invoke>` blocks, each
+/// holding `<｜DSML｜parameter name="$KEY" string="true|false">...` entries.
+fn parse_dsml_block(inner: &str, tools: &[ToolSpec]) -> Option<Vec<Recovered>> {
+    let mut calls = Vec::new();
+    let mut rest = inner;
+
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let header = rest.strip_prefix(DSML_INVOKE_OPEN)?;
+        let (attr_text, after_header) = split_once(header, ">")?;
+        let attrs = parse_k3_attributes(attr_text)?;
+        let name = attrs.get("name")?;
+        if name.is_empty() || !offered_tool(tools, name) {
+            return None;
+        }
+
+        let (call_inner, after_call) = split_once(after_header, DSML_INVOKE_CLOSE)?;
+        let arguments = parse_dsml_parameters(call_inner, tools, name)?;
+        calls.push(Recovered {
+            name: name.to_string(),
+            arguments: serde_json::Value::Object(arguments).to_string(),
+        });
+        rest = after_call;
+    }
+
+    Some(calls)
+}
+
+fn parse_dsml_parameters(
+    mut rest: &str,
+    tools: &[ToolSpec],
+    tool_name: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut args = serde_json::Map::new();
+
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let header = rest.strip_prefix(DSML_PARAMETER_OPEN)?;
+        let (attr_text, after_header) = split_once(header, ">")?;
+        let attrs = parse_k3_attributes(attr_text)?;
+        let key = attrs.get("name")?.trim();
+        if key.is_empty() {
+            return None;
+        }
+        // DSML marks each parameter's encoding with `string="true|false"`. If
+        // an endpoint omits it, fall back to the schema-based typing the
+        // other recovery paths use instead of mistyping the value.
+        let is_string = match attrs.get("string").map(String::as_str) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => {
+                declared_type(tools, tool_name, key)
+                    .as_deref()
+                    .unwrap_or("string")
+                    == "string"
+            }
+        };
+
+        let (raw_value, after_param) = split_once(after_header, DSML_PARAMETER_CLOSE)?;
+        let value = if is_string {
+            serde_json::Value::String(raw_value.to_string())
+        } else {
+            serde_json::from_str(raw_value).ok()?
+        };
+        args.insert(key.to_string(), value);
+        rest = after_param;
+    }
+
+    Some(args)
+}
+
 fn split_once<'a>(s: &'a str, delim: &str) -> Option<(&'a str, &'a str)> {
     let idx = s.find(delim)?;
     Some((&s[..idx], &s[idx + delim.len()..]))
@@ -382,6 +467,9 @@ impl<'a> StreamScanner<'a> {
                 || rest
                     .strip_prefix(XML_OPEN_TAG)
                     .is_some_and(looks_like_xml_call)
+                || rest
+                    .strip_prefix(DSML_TOOL_CALLS_OPEN)
+                    .is_some_and(looks_like_dsml_call)
             {
                 ScanEvent::Malformed(rest)
             } else {
@@ -418,6 +506,10 @@ impl<'a> StreamScanner<'a> {
                     events.push(event);
                 }
                 K3_TOOLS_OPEN => match self.drain_k3_tools() {
+                    Some(mut recovered) => events.append(&mut recovered),
+                    None => break,
+                },
+                DSML_TOOL_CALLS_OPEN => match self.drain_dsml() {
                     Some(mut recovered) => events.append(&mut recovered),
                     None => break,
                 },
@@ -470,6 +562,22 @@ impl<'a> StreamScanner<'a> {
         Some(match parse_k3_tools_block(inner, self.tools) {
             Some(calls) => calls.into_iter().map(ScanEvent::ToolCall).collect(),
             None if looks_like_k3_call(inner) => vec![ScanEvent::Malformed(block)],
+            None => vec![ScanEvent::Text(block)],
+        })
+    }
+
+    fn drain_dsml(&mut self) -> Option<Vec<ScanEvent>> {
+        let close_rel = self.pending[DSML_TOOL_CALLS_OPEN.len()..].find(DSML_TOOL_CALLS_CLOSE)?;
+        let close_idx = DSML_TOOL_CALLS_OPEN.len() + close_rel;
+        let block: String = self
+            .pending
+            .drain(..close_idx + DSML_TOOL_CALLS_CLOSE.len())
+            .collect();
+        let inner = &block[DSML_TOOL_CALLS_OPEN.len()..block.len() - DSML_TOOL_CALLS_CLOSE.len()];
+
+        Some(match parse_dsml_block(inner, self.tools) {
+            Some(calls) => calls.into_iter().map(ScanEvent::ToolCall).collect(),
+            None if looks_like_dsml_call(inner) => vec![ScanEvent::Malformed(block)],
             None => vec![ScanEvent::Text(block)],
         })
     }
@@ -533,6 +641,14 @@ fn looks_like_xml_call(after_tag: &str) -> bool {
 fn looks_like_k3_call(after_marker: &str) -> bool {
     let rest = after_marker.trim_start();
     rest.is_empty() || rest.starts_with(K3_CALL_OPEN)
+}
+
+/// Whether the text after a DeepSeek `<｜DSML｜tool_calls>` marker reads as
+/// the start of a call: a `<｜DSML｜invoke` marker after any whitespace, or
+/// nothing at all. A quoted marker, like the constant in this file, fails.
+fn looks_like_dsml_call(after_marker: &str) -> bool {
+    let rest = after_marker.trim_start();
+    rest.is_empty() || rest.starts_with(DSML_INVOKE_OPEN)
 }
 
 fn scan_complete_text(text: &str, tools: &[ToolSpec]) -> Vec<ScanEvent> {
@@ -1230,5 +1346,150 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "run_command");
+    }
+
+    #[test]
+    fn dsml_multiple_invokes_are_recovered_in_order() {
+        let tools = vec![command_output_spec()];
+        let Extracted { text, calls, .. } = extract(
+            "Working <｜DSML｜tool_calls><｜DSML｜invoke name=\"command_output\"><｜DSML｜parameter name=\"task_id\" string=\"false\">1<｜DSML｜/parameter><｜DSML｜/invoke><｜DSML｜invoke name=\"command_output\"><｜DSML｜parameter name=\"task_id\" string=\"false\">2<｜DSML｜/parameter><｜DSML｜/invoke><｜DSML｜/tool_calls>",
+            &tools,
+        );
+        assert_eq!(text, "Working ");
+        assert_eq!(calls.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(first["task_id"], 1);
+        assert_eq!(second["task_id"], 2);
+    }
+
+    #[test]
+    fn dsml_string_true_is_kept_verbatim_and_string_false_is_json_typed() {
+        let tools = vec![run_command_spec()];
+        let Extracted { calls, .. } = extract(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"run_command\"><｜DSML｜parameter name=\"command\" string=\"true\">echo {\"a\":1}<｜DSML｜/parameter><｜DSML｜parameter name=\"run_in_background\" string=\"false\">true<｜DSML｜/parameter><｜DSML｜/invoke><｜DSML｜/tool_calls>",
+            &tools,
+        );
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "echo {\"a\":1}");
+        assert_eq!(args["run_in_background"], true);
+    }
+
+    #[test]
+    fn dsml_missing_string_attribute_uses_the_tool_schema() {
+        let tools = vec![command_output_spec()];
+        let Extracted { calls, .. } = extract(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"command_output\"><｜DSML｜parameter name=\"task_id\">2<｜DSML｜/parameter><｜DSML｜/invoke><｜DSML｜/tool_calls>",
+            &tools,
+        );
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["task_id"], 2);
+        assert!(args["task_id"].is_number());
+    }
+
+    #[test]
+    fn unterminated_dsml_tool_calls_block_is_dropped() {
+        let text = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"run_command\"><｜DSML｜parameter name=\"command\" string=\"true\">echo hi<｜DSML｜/parameter>";
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn unknown_dsml_tool_is_dropped() {
+        let text = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_everything\"><｜DSML｜/invoke><｜DSML｜/tool_calls>";
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[run_command_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn invalid_dsml_json_typed_parameter_is_dropped() {
+        let text = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"command_output\"><｜DSML｜parameter name=\"task_id\" string=\"false\">not-json<｜DSML｜/parameter><｜DSML｜/invoke><｜DSML｜/tool_calls>";
+        let Extracted {
+            text: out,
+            calls,
+            malformed,
+        } = extract(text, &[command_output_spec()]);
+        assert_eq!(out, "");
+        assert_eq!(malformed, 1);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_dsml_marker_mentioned_in_prose_stays_text() {
+        let tools = vec![run_command_spec()];
+        for text in [
+            "The marker is `<｜DSML｜tool_calls>` and it never closes here.",
+            "Quote `<｜DSML｜tool_calls>` then `<｜DSML｜/tool_calls>` in docs.",
+        ] {
+            assert_eq!(
+                extract(text, &tools),
+                Extracted {
+                    text: text.to_string(),
+                    ..Extracted::default()
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_recovers_dsml_tool_calls_split_across_chunk_boundaries_including_inside_the_marker()
+    {
+        let tools = vec![run_command_spec()];
+        let mut scanner = StreamScanner::new(&tools);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+
+        for chunk in [
+            "pre ",
+            "<｜DSML",
+            "｜tool_calls><｜DSML｜invoke name=\"run_command\"><｜DSML｜paramet",
+            "er name=\"command\" string=\"true\">echo hi<｜DSML｜/parameter><｜DSML｜/invoke><｜DSML｜/tool_calls>",
+            " post",
+        ] {
+            for event in scanner.push(chunk) {
+                match event {
+                    ScanEvent::Text(t) => text.push_str(&t),
+                    ScanEvent::ToolCall(c) => calls.push(c),
+                    ScanEvent::Malformed(block) => panic!("unexpected malformed block: {block}"),
+                }
+            }
+        }
+        if let Some(ScanEvent::Text(rest)) = scanner.finish() {
+            text.push_str(&rest);
+        }
+
+        assert_eq!(text, "pre  post");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "echo hi");
+    }
+
+    #[test]
+    fn scanner_reports_an_unclosed_dsml_tag_at_stream_end_as_malformed() {
+        let tools = vec![run_command_spec()];
+        let mut scanner = StreamScanner::new(&tools);
+        let events =
+            scanner.push("partial <｜DSML｜tool_calls><｜DSML｜invoke name=\"run_command\">");
+        assert_eq!(events, vec![ScanEvent::Text("partial ".to_string())]);
+        assert_eq!(
+            scanner.finish(),
+            Some(ScanEvent::Malformed(
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"run_command\">".to_string()
+            ))
+        );
     }
 }
