@@ -126,7 +126,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   still queued; `handle_close_session` then runs under the session and workspace locks and
   removes the state, the permission grants and the background commands
   (`tools::kill_session_tasks`). It leaves `session_store` alone, so a closed thread still lists
-  and reopens. The
+  and reopens. `session/delete` is the one that removes it from disk: it runs the same two halves
+  (`begin_close`, then `handle_close_session` from `handle_delete_session`) and then
+  `session_store::delete`, and succeeds for an id that is already gone. The
   `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
   smbCloud, and stay general otherwise.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,

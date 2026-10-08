@@ -77,23 +77,24 @@ use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
     AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
-    ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
-    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, KillTerminalRequest, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
-    LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
-    SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput, WaitForTerminalExitRequest, WriteTextFileRequest,
+    ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest,
+    DeleteSessionResponse, Diff, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionMode, SessionModeState, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -2236,7 +2237,11 @@ impl SiGitAgent {
                             .resume(SessionResumeCapabilities::new())
                             // Lets the client say a thread is gone, so its
                             // state does not sit here until the process exits.
-                            .close(SessionCloseCapabilities::new()),
+                            .close(SessionCloseCapabilities::new())
+                            // Without this, a thread the user removes in the
+                            // editor stays on disk and comes back in "Import
+                            // Threads".
+                            .delete(SessionDeleteCapabilities::new()),
                     ),
             )
             .meta(initialize_meta()))
@@ -2911,6 +2916,26 @@ impl SiGitAgent {
             "close_session: id={key} (known={known}, live={was_live}, {killed} background task(s) stopped)"
         );
         Ok(CloseSessionResponse::new())
+    }
+
+    /// ACP `session/delete`: the user removed a thread in the editor.
+    ///
+    /// A live thread is closed first, exactly as `session/close` would (the
+    /// caller has run `begin_close` and holds the same locks), so its turn,
+    /// permission grants and background commands go with it. Then the saved
+    /// history and its sidecar are removed, which is what takes the thread out
+    /// of `session/list`. Deleting an id that was never saved, or is already
+    /// gone, succeeds quietly.
+    async fn handle_delete_session(
+        &self,
+        args: DeleteSessionRequest,
+    ) -> agent_client_protocol::Result<DeleteSessionResponse> {
+        let key = args.session_id.to_string();
+        self.handle_close_session(CloseSessionRequest::new(args.session_id))
+            .await?;
+        session_store::delete(&key);
+        log::info!("delete_session: id={key}");
+        Ok(DeleteSessionResponse::new())
     }
 
     /// First half of `session/close`, run before waiting for any lock.
@@ -5894,6 +5919,23 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_close_session(req).await)
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: DeleteSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    // A delete closes the thread first, so it is signalled the
+                    // same way a close is.
+                    state.begin_close(&req.session_id);
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let _session = state.lock_session(&req.session_id).await;
+                        let _workspace = state.workspace_lock.lock().await;
+                        handle_response(responder, state.handle_delete_session(req).await)
                     })
                 }
             },

@@ -244,3 +244,92 @@ fn saved_sessions_are_listed_for_their_project() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// A thread the user removes in the editor is gone for good: it no longer
+/// lists or reopens, and deleting it again still succeeds (issue #192).
+#[test]
+fn a_deleted_session_no_longer_lists_or_loads() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_delete_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("Done.")]);
+    let mut agent = spawn_agent(port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let initialize = agent.wait_for_response(id);
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["delete"].is_object(),
+        "session/delete is gated on its capability: {initialize}"
+    );
+
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "say done"}],
+        }),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let listed = agent.wait_for_response(id);
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+
+    // The live thread is deleted: closed first, then removed from disk.
+    let id = agent.request("session/delete", json!({"sessionId": session_id}));
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let listed = agent.wait_for_response(id);
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "a deleted thread must not come back in the picker: {listed}"
+    );
+    let saved: Vec<_> = std::fs::read_dir(config_dir.join("sessions"))
+        .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+        .unwrap_or_default();
+    assert!(saved.is_empty(), "history and sidecar removed: {saved:?}");
+
+    // Nothing is left to reopen.
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": project, "mcpServers": []}),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    let load = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = agent
+            .incoming
+            .recv_timeout(remaining)
+            .expect("session/load response");
+        if message["id"] == id && message.get("method").is_none() {
+            break message;
+        }
+    };
+    assert!(load.get("error").is_some(), "{load}");
+
+    // Deleting it again, or an id that never existed, succeeds quietly.
+    let id = agent.request("session/delete", json!({"sessionId": session_id}));
+    agent.wait_for_response(id);
+    let id = agent.request("session/delete", json!({"sessionId": "never-existed"}));
+    agent.wait_for_response(id);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
