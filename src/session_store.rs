@@ -170,6 +170,14 @@ pub fn delete(session_id: &str) {
     }
 }
 
+/// When `session_id` was last saved, as [`list`] reports it.
+pub fn modified(session_id: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(session_path(session_id)?)
+        .ok()?
+        .modified()
+        .ok()
+}
+
 /// One saved session as seen on disk.
 ///
 /// Consumed by the Unix-only TUI (`chat.rs` History tab) and, on every
@@ -218,13 +226,21 @@ fn message_text(message: &Value) -> String {
 /// there is no title, and the client falls back to whatever it shows for an
 /// untitled thread.
 fn session_title(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(message) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    let messages = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok());
+    title_of(messages)
+}
+
+/// The title [`list`] will report for a session holding `history`, worked
+/// out from the history in memory rather than the file it was saved to.
+pub fn history_title(history: &[Value]) -> Option<String> {
+    title_of(history.iter().cloned())
+}
+
+fn title_of(messages: impl Iterator<Item = Value>) -> Option<String> {
+    for message in messages {
         if message["role"] != "user" {
             continue;
         }
@@ -457,6 +473,18 @@ mod tests {
 
         unsafe { std::env::remove_var("SIGIT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_title_matches_the_title_of_the_saved_file() {
+        let history = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "  fix the parser\nmore detail"}),
+        ];
+        let saved: String = history.iter().map(|m| format!("{m}\n")).collect();
+        assert_eq!(history_title(&history), session_title(&saved));
+        assert_eq!(history_title(&history).as_deref(), Some("fix the parser"));
+        assert_eq!(history_title(&history[..1]), None);
     }
 
     #[test]

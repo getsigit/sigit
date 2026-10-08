@@ -89,8 +89,8 @@ use agent_client_protocol::schema::v1::{
     SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeState,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
@@ -1265,6 +1265,9 @@ struct SiGitAgent {
     /// Sessions a `session/close` is waiting to tear down. A prompt for one of
     /// these that reaches the front of its session lock first is cancelled.
     closing_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The title last sent to the client for each session in a
+    /// `session_info_update`, so an unchanged title is not sent again.
+    announced_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
@@ -1318,6 +1321,7 @@ impl SiGitAgent {
             active_session: std::sync::Mutex::new(None),
             prompt_cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             closing_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            announced_titles: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
             startup_model_load_started,
@@ -2660,12 +2664,22 @@ impl SiGitAgent {
     /// session request is recorded — never the process cwd, which a later
     /// session in the same process may have moved: a thread listed under the
     /// wrong project is worse than one that isn't listed at all.
-    async fn persist_session(&self, session_id: &SessionId, snapshot: &[serde_json::Value]) {
+    ///
+    /// Each save is also reported to the client in a `session_info_update`, so
+    /// the thread's title and `updatedAt` reach the editor's sidebar without
+    /// waiting for the next `session/list`.
+    async fn persist_session(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        snapshot: &[serde_json::Value],
+    ) {
         let key = session_id.to_string();
         if let Err(error) = session_store::save(&key, snapshot) {
             log::warn!("session({session_id}) save failed: {error}");
             return;
         }
+        self.send_session_info(cx, session_id, snapshot);
         let state = self.sessions.lock().unwrap().get(&key).cloned();
         match state {
             Some(state) => session_store::save_meta(
@@ -2678,6 +2692,35 @@ impl SiGitAgent {
                 "session({session_id}) has no recorded cwd — saved, but it won't be listed"
             ),
         }
+    }
+
+    /// Tell the client a session was just saved: always a fresh `updatedAt`,
+    /// and the title only when it differs from the one last sent. The update
+    /// names no `sessionId`, `cwd` or `additionalDirectories`; the spec keeps
+    /// those out of it.
+    fn send_session_info(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        snapshot: &[serde_json::Value],
+    ) {
+        let key = session_id.to_string();
+        let mut update = SessionInfoUpdate::new();
+        if let Some(modified) = session_store::modified(&key) {
+            update = update.updated_at(session_store::iso8601(modified));
+        }
+        if let Some(title) = session_store::history_title(snapshot) {
+            let mut announced = self.announced_titles.lock().unwrap();
+            if announced.get(&key) != Some(&title) {
+                announced.insert(key, title.clone());
+                update = update.title(title);
+            }
+        }
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::SessionInfoUpdate(update),
+        ))
+        .ok();
     }
 
     /// ACP `session/list`: the saved threads an editor can reopen.
@@ -2909,6 +2952,7 @@ impl SiGitAgent {
         }
 
         permissions::reset_session(&key);
+        self.announced_titles.lock().unwrap().remove(&key);
         let killed = tools::kill_session_tasks(&key);
         self.closing_sessions.lock().unwrap().remove(&key);
 
@@ -3426,7 +3470,7 @@ impl SiGitAgent {
                 // The client keeps this prompt in its thread after the error,
                 // so keep it in the saved conversation too.
                 let snapshot = backend.history_snapshot().await;
-                self.persist_session(&session_id, &snapshot).await;
+                self.persist_session(cx, &session_id, &snapshot).await;
                 self.finish_prompt(&session_id, &cancellation);
                 return Err(agent_client_protocol::Error::new(-32603, error));
             }
@@ -3910,7 +3954,7 @@ impl SiGitAgent {
         // Persist the completed turn so a restart (or session/load) can pick
         // the conversation back up.
         let snapshot = backend.history_snapshot().await;
-        self.persist_session(&session_id, &snapshot).await;
+        self.persist_session(cx, &session_id, &snapshot).await;
         self.finish_prompt(&session_id, &cancellation);
 
         log::info!(
@@ -5226,7 +5270,7 @@ async fn exec_slash_acp(
                     let snapshot = backend.history_snapshot().await;
                     let after = backend::estimate_tokens(&snapshot);
                     // Keep the saved session in step with the compacted state.
-                    agent.persist_session(&session_id, &snapshot).await;
+                    agent.persist_session(cx, &session_id, &snapshot).await;
                     format!("Compacted history: ~{before} → ~{after} tokens (estimated).")
                 }
                 Err(error) => format!("Compaction failed: {error}"),

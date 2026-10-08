@@ -395,7 +395,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   editor's "Import Threads" picker) must report an absolute `cwd` per session and may filter on
   it, so a session without one is skipped there while still reopening by id through
   `session/load`. Sidecars are written at save time, not at session start, so a thread nobody
-  spoke in leaves nothing behind.
+  spoke in leaves nothing behind. Each ACP save (`persist_session` in `main.rs`) is also sent to
+  the client as a `session_info_update` carrying a fresh `updatedAt`, plus the title when it
+  differs from the last one sent (`announced_titles`), so a new thread gets its title in the
+  sidebar without waiting for the next `session/list`.
 - **`src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
   Must run (`setup_shared_model_cache`) *before* anything touches `ChatEngine`/`hf-hub`, since
   those read env vars once at init.
