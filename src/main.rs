@@ -81,7 +81,7 @@ use agent_client_protocol::schema::v1::{
     DeleteSessionResponse, Diff, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
     Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, MessageId, Meta,
     NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
     PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
     ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
@@ -375,6 +375,10 @@ struct StreamedReply {
     streamed_any: bool,
     /// Whether the next visible text should open a new paragraph.
     paragraph_pending: bool,
+    /// The ACP `messageId` of the model message being streamed. Each
+    /// inference round is its own message in history, so a tool round
+    /// interrupting the prose starts a new one.
+    message_id: Option<MessageId>,
 }
 
 /// What a streamed fragment newly revealed once `<think>` blocks were split:
@@ -392,6 +396,13 @@ impl StreamedReply {
     /// no sentence to break away from, hence the `streamed_any` guard.
     fn interrupt(&mut self) {
         self.paragraph_pending = self.streamed_any;
+        self.message_id = None;
+    }
+
+    /// The id every chunk of the current model message carries, its reply
+    /// text and its reasoning alike.
+    fn message_id(&mut self) -> MessageId {
+        self.message_id.get_or_insert_with(new_message_id).clone()
     }
 
     /// Fold one streamed fragment into the reply and return the text it newly
@@ -447,6 +458,12 @@ impl StreamedReply {
 
         revealed
     }
+}
+
+/// A fresh ACP `messageId`. Ids are opaque and only have to be unique within
+/// a session, so a random one serves both live chunks and replayed ones.
+fn new_message_id() -> MessageId {
+    MessageId::new(format!("msg_{}", uuid::Uuid::new_v4().simple()))
 }
 
 #[derive(Default)]
@@ -671,17 +688,17 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
             "user" => {
                 let text = history_message_text(message);
                 if !text.trim().is_empty() {
-                    updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
-                        ContentBlock::from(text),
-                    )));
+                    updates.push(SessionUpdate::UserMessageChunk(
+                        ContentChunk::new(ContentBlock::from(text)).message_id(new_message_id()),
+                    ));
                 }
             }
             "assistant" => {
                 let (_think, visible) = chat::strip_think_blocks(&history_message_text(message));
                 if !visible.trim().is_empty() {
-                    updates.push(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                        ContentBlock::from(visible),
-                    )));
+                    updates.push(SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(ContentBlock::from(visible)).message_id(new_message_id()),
+                    ));
                 }
                 for call in message["tool_calls"].as_array().into_iter().flatten() {
                     let name = call["function"]["name"].as_str().unwrap_or("tool");
@@ -1569,29 +1586,50 @@ impl SiGitAgent {
         Ok(())
     }
 
+    /// Send a message of its own: a notice, a slash command's answer. It gets
+    /// a fresh `messageId`, so a client never folds it into the reply around
+    /// it. Text that belongs to the model's reply goes through
+    /// [`Self::send_reply_chunk`] instead.
     fn send_assistant_message(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: SessionId,
         text: impl Into<String>,
     ) -> agent_client_protocol::Result<()> {
+        self.send_reply_chunk(cx, session_id, new_message_id(), text)
+    }
+
+    /// Send one chunk of the model message `message_id`.
+    fn send_reply_chunk(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        message_id: MessageId,
+        text: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(
             session_id,
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::from(text.into())).message_id(message_id),
+            ),
         ))
     }
 
     /// Stream a fragment of the model's reasoning as a thought chunk. Clients
     /// render these in a collapsed "thinking" section, separate from the reply.
+    /// It carries the id of the model message it came with.
     fn send_agent_thought(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: SessionId,
+        message_id: MessageId,
         text: impl Into<String>,
     ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(
             session_id,
-            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+            SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(ContentBlock::from(text.into())).message_id(message_id),
+            ),
         ))
     }
 
@@ -1671,16 +1709,20 @@ impl SiGitAgent {
     ) {
         match chunk {
             TokenChunk::Reasoning(text) => {
-                self.send_agent_thought(cx, session_id.clone(), text).ok();
+                let message_id = reply.message_id();
+                self.send_agent_thought(cx, session_id.clone(), message_id, text)
+                    .ok();
             }
             TokenChunk::Visible(piece) => {
                 let revealed = reply.push(&piece);
                 if let Some(reasoning) = revealed.reasoning {
-                    self.send_agent_thought(cx, session_id.clone(), reasoning)
+                    let message_id = reply.message_id();
+                    self.send_agent_thought(cx, session_id.clone(), message_id, reasoning)
                         .ok();
                 }
                 if let Some(visible) = revealed.visible {
-                    self.send_assistant_message(cx, session_id.clone(), visible)
+                    let message_id = reply.message_id();
+                    self.send_reply_chunk(cx, session_id.clone(), message_id, visible)
                         .ok();
                 }
             }
@@ -3894,7 +3936,8 @@ impl SiGitAgent {
             };
 
             if !final_text.is_empty() {
-                self.send_assistant_message(cx, session_id.clone(), final_text)
+                let message_id = reply.message_id();
+                self.send_reply_chunk(cx, session_id.clone(), message_id, final_text)
                     .ok();
             }
         } else if round > 0 && !round_cap_reached && reply.sent.len() == sent_before_last_round {
@@ -3907,9 +3950,11 @@ impl SiGitAgent {
                 session_id,
                 round
             );
-            self.send_assistant_message(
+            let message_id = reply.message_id();
+            self.send_reply_chunk(
                 cx,
                 session_id.clone(),
+                message_id,
                 format!(
                     "{PARAGRAPH_BREAK}{}",
                     silent_stop_message(stopped_repeating.as_deref(), round)
@@ -3924,9 +3969,11 @@ impl SiGitAgent {
                 session_id,
                 max_tool_rounds
             );
-            self.send_assistant_message(
+            let message_id = reply.message_id();
+            self.send_reply_chunk(
                 cx,
                 session_id.clone(),
+                message_id,
                 format!(
                     "{PARAGRAPH_BREAK}{}",
                     round_cap_stop_message(max_tool_rounds)
@@ -7186,6 +7233,26 @@ mod tests {
             other => panic!("expected the tool call, got {other:?}"),
         }
         assert!(matches!(updates[3], SessionUpdate::AgentMessageChunk(_)));
+
+        // Each replayed message has an id of its own.
+        let ids: Vec<_> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UserMessageChunk(chunk)
+                | SessionUpdate::AgentMessageChunk(chunk) => Some(
+                    chunk
+                        .message_id
+                        .clone()
+                        .expect("replayed chunk has a messageId"),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
+            "{ids:?}"
+        );
     }
 
     #[test]

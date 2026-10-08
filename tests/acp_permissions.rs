@@ -1139,6 +1139,92 @@ fn text_from_two_tool_rounds_reaches_the_client_as_separate_paragraphs() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// Every chunk of one model message carries the same `messageId`, its
+/// reasoning included, and the message after a tool round gets a new one
+/// (issue #195).
+#[test]
+fn chunks_of_one_model_message_share_a_message_id() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_body(&[
+            json!({"choices": [{"delta": {"reasoning_content": "Where is it?"}}]}),
+            json!({"choices": [{"delta": {"content": "I'll look "}}]}),
+            json!({"choices": [{"delta": {"content": "around."}}]}),
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "list_directory", "arguments": r#"{"path":"."}"#},
+                }]}}]
+            }),
+        ]),
+        sse_text("Found it."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_msg_ids_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "find it"}],
+        }),
+    );
+    let (_, updates) = agent.wait_for_response_with_updates(prompt_id);
+
+    let chunks: Vec<(&str, &str)> = updates
+        .iter()
+        .filter(|update| {
+            update["sessionUpdate"] == "agent_message_chunk"
+                || update["sessionUpdate"] == "agent_thought_chunk"
+        })
+        .map(|update| {
+            (
+                update["content"]["text"].as_str().unwrap_or_default(),
+                update["messageId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("chunk without a messageId: {update}")),
+            )
+        })
+        .collect();
+    let id_of = |text: &str| {
+        chunks
+            .iter()
+            .find(|(chunk, _)| chunk.contains(text))
+            .unwrap_or_else(|| panic!("no chunk with {text:?} in {chunks:?}"))
+            .1
+    };
+
+    let first = id_of("Where is it?");
+    assert_eq!(id_of("I'll look"), first, "{chunks:?}");
+    assert_eq!(id_of("around."), first, "{chunks:?}");
+    assert_ne!(
+        id_of("Found it."),
+        first,
+        "the round after the tool call is a new message: {chunks:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// A model that writes its tool call out as literal `<tool_call>` text instead
 /// of using the structured field must still drive the loop. Before recovery
 /// the tag was streamed to the client as prose and the turn ended with no tool

@@ -118,6 +118,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `SessionState::remote`), so its turn can wait on the endpoint while another thread is
   installed. Unknown session ids are rejected instead of silently borrowing the active thread's
   cwd. Prompt cancellation takes no lock, which lets a client cancel a turn whatever it holds.
+  Message chunks carry a `messageId`: each inference round is one message, so every chunk of
+  it, reasoning included, shares `StreamedReply::message_id` and a tool round starts a new id.
+  A standalone notice (`send_assistant_message`) gets an id of its own, and replayed messages
+  get fresh ones; ids are random, so none is stored in history.
   `session/load` and `session/resume` share `restore_session`; the only difference is that
   resume must not replay the history as `session/update`. `session/close` is the one place a
   `SessionState` is dropped. It runs in two halves: `begin_close` signals the session's turn
