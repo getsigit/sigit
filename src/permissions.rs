@@ -13,7 +13,9 @@
 //!    picks that option in an approval prompt. For `run_command` the grant is
 //!    scoped to the command's first two whitespace-separated tokens (approving
 //!    `git push origin main` records `run_command(git push)`); other tools
-//!    record the bare tool name.
+//!    record the bare tool name. "Always deny this session" records a rule
+//!    scoped the same way, and a session denial is checked before a session
+//!    grant.
 //! 3. **Rule lists** — `[permissions.rules]` in `settings.toml`: ordered
 //!    `deny` and `allow` lists of rules shaped `tool_name` or
 //!    `tool_name(argument_pattern)`, e.g. `run_command(git status)`,
@@ -134,6 +136,8 @@ pub fn classify(tool_name: &str) -> ToolRisk {
 struct SessionPerms {
     /// Tools the user chose "always allow this session" for.
     always_allow: HashSet<String>,
+    /// Tools the user chose "always deny this session" for.
+    always_deny: HashSet<String>,
     /// When set, every mutating tool is denied with a plan-mode message.
     plan_mode: bool,
     /// Session override picked from the panel Permissions dropdown. `None`
@@ -294,15 +298,26 @@ pub fn decision_for(session: &str, tool_name: &str, arguments: &str) -> Decision
         return Decision::Allow;
     }
 
-    let (plan_mode, granted) = with_session(session, |s| {
+    let (plan_mode, denied, granted) = with_session(session, |s| {
+        let matches = |set: &HashSet<String>| {
+            set.iter()
+                .find(|rule| rule_matches(rule, tool_name, argument.as_deref()))
+                .cloned()
+        };
         (
             s.plan_mode,
-            s.always_allow
-                .iter()
-                .any(|grant| rule_matches(grant, tool_name, argument.as_deref())),
+            matches(&s.always_deny),
+            matches(&s.always_allow).is_some(),
         )
     });
 
+    if let Some(rule) = denied {
+        return Decision::Deny(format!(
+            "The user chose to always deny `{rule}` in this session, so `{tool_name}` \
+             was not executed. Do not retry it; continue with an approach that does \
+             not need this tool, or ask the user how to proceed."
+        ));
+    }
     if plan_mode {
         return Decision::Deny(plan_mode_denial(tool_name));
     }
@@ -342,6 +357,16 @@ pub fn grant_for_session(session: &str, tool_name: &str, arguments: &str) {
     let grant = session_grant_rule(tool_name, arguments);
     with_session(session, |s| {
         s.always_allow.insert(grant);
+    });
+}
+
+/// Record an "always deny this session" choice for a tool call, scoped the
+/// same way as [`grant_for_session`]: denying `git push origin main` stops
+/// every `git push …` for the rest of the session, not every command.
+pub fn deny_for_session(session: &str, tool_name: &str, arguments: &str) {
+    let rule = session_grant_rule(tool_name, arguments);
+    with_session(session, |s| {
+        s.always_deny.insert(rule);
     });
 }
 
@@ -411,16 +436,18 @@ pub fn describe(session: &str) -> String {
         Some(mode) => format!("{mode} (session override)"),
         None => format!("{default} (stored default)"),
     };
-    let granted = with_session(session, |s| {
-        let mut names: Vec<&str> = s.always_allow.iter().map(String::as_str).collect();
-        names.sort_unstable();
-        names.join(", ")
+    let (granted, denied) = with_session(session, |s| {
+        let render = |set: &HashSet<String>| {
+            let mut names: Vec<&str> = set.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        };
+        (render(&s.always_allow), render(&s.always_deny))
     });
-    let granted = if granted.is_empty() {
-        "none".to_string()
-    } else {
-        granted
-    };
     let rules = settings::permission_rules();
     let render = |list: &[String]| {
         if list.is_empty() {
@@ -430,7 +457,8 @@ pub fn describe(session: &str) -> String {
         }
     };
     format!(
-        "permissions: mode={mode} | plan mode: {plan} | session grants: {granted}\n\
+        "permissions: mode={mode} | plan mode: {plan} | session grants: {granted} \
+         | session denials: {denied}\n\
          rules: deny: {} | allow: {}\n\
          read-only tools always run; configure [permissions] in settings.toml",
         render(&rules.deny),
@@ -660,6 +688,34 @@ mod tests {
         );
         reset_session(session);
         assert_ne!(decision_for(session, "edit_file", args), Decision::Allow);
+    }
+
+    #[test]
+    fn session_denial_stops_asking_and_outranks_a_grant() {
+        let _guard = env_guard();
+        let session = "t-deny";
+        reset_session(session);
+        let push = r#"{"command":"git push origin main"}"#;
+        deny_for_session(session, "run_command", push);
+        // Scoped like a grant: the whole `git push …` family, nothing else.
+        assert!(matches!(
+            decision_for(session, "run_command", r#"{"command":"git push --tags"}"#),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            decision_for(session, "run_command", r#"{"command":"git status"}"#),
+            Decision::Ask
+        );
+        // A denial is checked before a grant covering the same call.
+        grant_for_session(session, "run_command", r#"{"command":"git push"}"#);
+        assert!(matches!(
+            decision_for(session, "run_command", push),
+            Decision::Deny(_)
+        ));
+        assert!(describe(session).contains("session denials: run_command(git push)"));
+        // Dropped with the rest of the session's state.
+        reset_session(session);
+        assert_eq!(decision_for(session, "run_command", push), Decision::Ask);
     }
 
     #[test]

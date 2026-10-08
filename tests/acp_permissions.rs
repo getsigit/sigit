@@ -384,7 +384,22 @@ fn permission_round_trip_cancel_then_allow() {
         .iter()
         .map(|option| option["optionId"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(option_ids, ["allow_once", "allow_session", "reject_once"]);
+    assert_eq!(
+        option_ids,
+        [
+            "allow_once",
+            "allow_session",
+            "reject_once",
+            "reject_session"
+        ]
+    );
+    let reject_always = params["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["optionId"] == "reject_session")
+        .unwrap();
+    assert_eq!(reject_always["kind"], "reject_always");
 
     agent.respond(
         permission["id"].clone(),
@@ -622,6 +637,87 @@ fn a_call_denied_at_the_prompt_ends_failed() {
 
     let response = agent.wait_for_response(prompt_id);
     assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// "Deny for this session" answers the call it was picked for and every later
+/// call in the same family without asking again (issue #199).
+#[test]
+fn a_call_denied_for_the_session_is_not_asked_about_again() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo sigit-never"}"#),
+        sse_tool_call(
+            "call_2",
+            "run_command",
+            r#"{"command":"echo sigit-never again"}"#,
+        ),
+        sse_text("ok, I will stop"),
+    ]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_perm_deny_all_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+
+    let permission = agent.wait_for_agent_request("session/request_permission");
+    agent.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "reject_session"}}),
+    );
+
+    // The second call is denied by the recorded choice: no second request,
+    // which `wait_for_response_with_updates` would fail on.
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let second = updates
+        .iter()
+        .rev()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update" && update["toolCallId"] == "call_2"
+        })
+        .expect("the second call closes");
+    assert_eq!(second["status"], "failed", "{second}");
+
+    let requests = endpoint.requests.lock().unwrap();
+    let result = requests[2]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_2")
+        .expect("tool result for the second call");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("always deny"),
+        "the model is told why: {result}"
+    );
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);

@@ -289,11 +289,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
-  mutating tools with a present-a-plan message), session "always allow" grants, per-tool
-  overrides and the default mode from `[permissions]` in `settings.toml` (`allow`/`ask`/`deny`,
-  default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`, the ACP path sends
-  `session/request_permission` (allow once / allow for session / deny) and the TUI pauses the
-  inference task on a y/a/n prompt. On the ACP path the decision is taken *before* the call is
+  mutating tools with a present-a-plan message), session "always deny" and "always allow"
+  choices (deny checked first, both scoped by `session_grant_rule` and dropped with the session),
+  per-tool overrides and the default mode from `[permissions]` in `settings.toml`
+  (`allow`/`ask`/`deny`, default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`,
+  the ACP path sends `session/request_permission` (allow once / allow for session / deny / deny
+  for session) and the TUI pauses the inference task on a y/a/n/d prompt. On the ACP path the decision is taken *before* the call is
   announced, because it sets the announced status: a call that will ask starts `pending`, the
   permission request carries that call's own id, and an `in_progress` update follows approval.
   That update also puts the card's title back, since the permission request overwrites it

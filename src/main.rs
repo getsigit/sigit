@@ -3900,8 +3900,9 @@ impl SiGitAgent {
     /// Ask the ACP client for permission to run one tool call. The request
     /// names the call by `tool_call_id`, the id it was announced under, so the
     /// client updates that one card instead of drawing a second. Presents
-    /// allow-once / allow-for-session / deny; an "always allow" choice is
-    /// recorded via [`permissions::grant_for_session`]. Only safe to call from
+    /// allow-once / allow-for-session / deny / deny-for-session; an "always"
+    /// choice is recorded via [`permissions::grant_for_session`] or
+    /// [`permissions::deny_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
     /// dispatch loop must be free to route the client's answer back to us.
     ///
@@ -3951,6 +3952,11 @@ impl SiGitAgent {
                     PermissionOptionKind::AllowAlways,
                 ),
                 PermissionOption::new("reject_once", "Deny", PermissionOptionKind::RejectOnce),
+                PermissionOption::new(
+                    "reject_session",
+                    "Deny for this session",
+                    PermissionOptionKind::RejectAlways,
+                ),
             ],
         );
 
@@ -3966,6 +3972,14 @@ impl SiGitAgent {
                                 arguments,
                             );
                             PermissionVerdict::Approved
+                        }
+                        "reject_session" => {
+                            permissions::deny_for_session(
+                                &session_id.to_string(),
+                                tool_name,
+                                arguments,
+                            );
+                            PermissionVerdict::Denied(permissions::user_denial(tool_name))
                         }
                         _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
                     }
