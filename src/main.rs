@@ -93,7 +93,7 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
     WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
@@ -3405,6 +3405,7 @@ impl SiGitAgent {
         let max_tool_rounds = headless::max_tool_rounds_from_env();
 
         let model_name = self.current_model.lock().unwrap().display_name.clone();
+        let context_window = self.context_window_tokens();
         let earlier_images = if backend.accepts_images() {
             0
         } else {
@@ -3517,6 +3518,9 @@ impl SiGitAgent {
                 return Err(agent_client_protocol::Error::new(-32603, error));
             }
         };
+
+        self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
+            .await;
 
         let mut round = 0;
         // Set when the repetition guard blocked a call; names the tool.
@@ -3902,6 +3906,8 @@ impl SiGitAgent {
                     return Err(agent_client_protocol::Error::new(-32603, error));
                 }
             };
+            self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
+                .await;
         }
 
         // ── Final text response ───────────────────────────────────────────
@@ -4011,6 +4017,44 @@ impl SiGitAgent {
             stop_reason
         );
         Ok(PromptResponse::new(stop_reason))
+    }
+
+    /// The context window of the session's model, for `usage_update`. A model
+    /// the picker does not list (a provider-supplied name, say) falls back to
+    /// the compaction budget, the same as the TUI's gauge.
+    fn context_window_tokens(&self) -> u64 {
+        let current = self.current_model.lock().unwrap().clone();
+        models::build_model_picker_items()
+            .into_iter()
+            .find(|item| {
+                item.config.model_id == current.model_id
+                    || item.display_name == current.display_name
+            })
+            .map(|item| item.context_window_tokens)
+            .unwrap_or(backend::DEFAULT_CONTEXT_TOKEN_BUDGET as u64)
+    }
+
+    /// Report how much of the context window the session uses after one
+    /// model response. The endpoint's own count is used when it gave one;
+    /// otherwise (always on-device) the history is estimated, the way
+    /// compaction does it.
+    async fn send_usage(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        backend: &dyn InferenceBackend,
+        result: &TurnResult,
+        size: u64,
+    ) {
+        let used = match result.context_tokens {
+            Some(tokens) => tokens,
+            None => backend::estimate_tokens(&backend.history_snapshot().await) as u64,
+        };
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
+        ))
+        .ok();
     }
 
     /// Ask the ACP client for permission to run one tool call. The request

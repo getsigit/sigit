@@ -144,6 +144,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
   the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
   explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
+  `TurnResult::context_tokens` carries the endpoint's token count (prompt plus completion) up
+  to the loop, which sends it as a `usage_update` after each model response, with the
+  model's picker `context_window_tokens` as `size`; with no count (always on-device) the
+  history is estimated instead. A streamed request asks for the count with
+  `stream_options.include_usage`, and an endpoint that rejects the option is asked again
+  without it and never asked again (`stream_usage_refused`).
   `TurnResult::finish` carries the endpoint's `finish_reason` up to the loop, and
   `stop_reason_for` in `main.rs` turns it into the ACP stop reason: the tool-round cap is
   `max_turn_requests`, `length` is `max_tokens`, `content_filter` is `refusal`. ACP defines a

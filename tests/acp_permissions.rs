@@ -1225,6 +1225,65 @@ fn chunks_of_one_model_message_share_a_message_id() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// After each model response the client hears how much of the context window
+/// the session uses: the endpoint's own count when it gives one, an estimate
+/// when it does not (issue #194).
+#[test]
+fn each_model_response_reports_context_usage() {
+    let endpoint = start_fake_endpoint(vec![
+        // No usage on this one.
+        sse_tool_call("call_1", "list_directory", r#"{"path":"."}"#),
+        sse_body(&[
+            json!({"choices": [{"delta": {"content": "Done."}}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 1500, "completion_tokens": 21}}),
+        ]),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_usage_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "look around"}],
+        }),
+    );
+    let (_, updates) = agent.wait_for_response_with_updates(prompt_id);
+
+    let usage: Vec<&Value> = updates
+        .iter()
+        .filter(|update| update["sessionUpdate"] == "usage_update")
+        .collect();
+    assert_eq!(usage.len(), 2, "one per model response: {usage:?}");
+    let estimated = usage[0]["used"].as_u64().expect("used");
+    assert!(estimated > 0, "an estimate stands in for a missing count");
+    assert_eq!(usage[1]["used"], 1521, "the endpoint's own count wins");
+    for update in &usage {
+        assert!(update["size"].as_u64().unwrap_or_default() > 0, "{update}");
+    }
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// A model that writes its tool call out as literal `<tool_call>` text instead
 /// of using the structured field must still drive the loop. Before recovery
 /// the tag was streamed to the client as prose and the turn ended with no tool
