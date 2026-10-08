@@ -2220,6 +2220,18 @@ impl SiGitAgent {
             client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
         }
 
+        // A client that renders boolean config options gets the Inference
+        // switch as a toggle; the rest keep the two-value select.
+        let boolean_options = req
+            .client_capabilities
+            .session
+            .as_ref()
+            .and_then(|session| session.config_options.as_ref())
+            .and_then(|config_options| config_options.boolean.as_ref())
+            .is_some();
+        log::info!("boolean config options: {boolean_options}");
+        CLIENT_BOOLEAN_CONFIG_OPTIONS.store(boolean_options, Ordering::Relaxed);
+
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
         // like Zed advertise terminal-auth capability but don't actually spawn the
         // login terminal for *custom* ACP agents, so the button is a silent no-op.
@@ -4398,10 +4410,15 @@ impl SiGitAgent {
 
         // ── Local Inference toggle ──────────────────────────────────────────
         if args.config_id.0.as_ref() == LOCAL_INFERENCE_CONFIG_ID {
-            let enabled = match args.value.as_value_id().map(|v| v.0.as_ref()) {
-                Some(LOCAL_INFERENCE_ON) => true,
-                Some(LOCAL_INFERENCE_OFF) => false,
-                other => {
+            // A toggle sends a boolean, the select fallback one of its ids.
+            let enabled = match (
+                args.value.as_bool(),
+                args.value.as_value_id().map(|v| v.0.as_ref()),
+            ) {
+                (Some(enabled), _) => enabled,
+                (_, Some(LOCAL_INFERENCE_ON)) => true,
+                (_, Some(LOCAL_INFERENCE_OFF)) => false,
+                (_, other) => {
                     return Err(agent_client_protocol::Error::new(
                         -32602,
                         format!("unknown Local Inference value: {other:?}"),
@@ -4790,10 +4807,15 @@ impl SiGitAgent {
 /// config option ID for the model picker in Zed's agent panel
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
-/// config option ID for the Local Inference on/off toggle. Surfaced as a
-/// two-option `select` so ACP clients without slash-command support (e.g. Xcode)
-/// can still flip the mode from the agent panel.
+/// config option ID for the Local Inference on/off toggle, so ACP clients
+/// without slash-command support (e.g. Xcode) can still flip the mode from the
+/// agent panel. A `boolean` option for clients that advertise
+/// `session.configOptions.boolean`, a two-option `select` for the rest.
 const LOCAL_INFERENCE_CONFIG_ID: &str = "sigit-local-inference";
+
+/// Whether the connected client advertised boolean config options. One
+/// process serves one ACP connection, so this is set once in `initialize`.
+static CLIENT_BOOLEAN_CONFIG_OPTIONS: AtomicBool = AtomicBool::new(false);
 
 /// `select` value ids for the Local Inference toggle.
 const LOCAL_INFERENCE_ON: &str = "local-inference-on";
@@ -4987,12 +5009,16 @@ fn build_config_options(
         )
         .description("Use siGit Code Cloud; cloud tiers are highlighted".to_string()),
     ];
-    let local_option = SessionConfigOption::select(
-        LOCAL_INFERENCE_CONFIG_ID,
-        "Inference",
-        local_current,
-        local_options,
-    )
+    let local_option = if CLIENT_BOOLEAN_CONFIG_OPTIONS.load(Ordering::Relaxed) {
+        SessionConfigOption::boolean(LOCAL_INFERENCE_CONFIG_ID, "Local inference", local_on)
+    } else {
+        SessionConfigOption::select(
+            LOCAL_INFERENCE_CONFIG_ID,
+            "Inference",
+            local_current,
+            local_options,
+        )
+    }
     .description("Toggle on-device inference; changes which models are highlighted");
 
     // Permissions dropdown (issue #76): Manual (ask), Auto (run unattended),

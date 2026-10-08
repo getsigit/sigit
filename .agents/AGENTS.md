@@ -122,6 +122,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   it, reasoning included, shares `StreamedReply::message_id` and a tool round starts a new id.
   A standalone notice (`send_assistant_message`) gets an id of its own, and replayed messages
   get fresh ones; ids are random, so none is stored in history.
+  The Inference (local/cloud) config option is a `boolean` for a client that advertises
+  `session.configOptions.boolean` (read into `CLIENT_BOOLEAN_CONFIG_OPTIONS` in `initialize`)
+  and a two-value select for any other; `handle_set_session_config_option` takes either value.
   `session/load` and `session/resume` share `restore_session`; the only difference is that
   resume must not replay the history as `session/update`. `session/close` is the one place a
   `SessionState` is dropped. It runs in two halves: `begin_close` signals the session's turn

@@ -723,6 +723,74 @@ fn a_call_denied_for_the_session_is_not_asked_about_again() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// A client that renders boolean config options gets the Inference switch as
+/// a toggle, and can flip it with a boolean value; any other client keeps the
+/// two-value select (issue #198).
+#[test]
+fn the_inference_switch_is_a_toggle_for_clients_that_render_one() {
+    let inference_option = |options: &Value| -> Value {
+        options
+            .as_array()
+            .expect("config options")
+            .iter()
+            .find(|option| option["id"] == "sigit-local-inference")
+            .cloned()
+            .expect("inference option")
+    };
+
+    for (capabilities, expected_type) in [
+        (
+            json!({"session": {"configOptions": {"boolean": {}}}}),
+            "boolean",
+        ),
+        (json!({}), "select"),
+    ] {
+        let endpoint = start_fake_endpoint(vec![]);
+        let scratch = std::env::temp_dir().join(format!(
+            "sigit_acp_bool_option_{expected_type}_{}",
+            std::process::id()
+        ));
+        let config_dir = scratch.join("config");
+        let cwd = scratch.join("cwd");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut agent = spawn_agent(endpoint.port, &config_dir);
+        let id = agent.request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": capabilities}),
+        );
+        agent.wait_for_response(id);
+
+        let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+        let created = agent.wait_for_response(id);
+        let session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let option = inference_option(&created["result"]["configOptions"]);
+        assert_eq!(option["type"], expected_type, "{option}");
+
+        if expected_type == "boolean" {
+            let id = agent.request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": "sigit-local-inference",
+                    "type": "boolean",
+                    "value": true,
+                }),
+            );
+            let response = agent.wait_for_response(id);
+            let option = inference_option(&response["result"]["configOptions"]);
+            assert_eq!(option["currentValue"], true, "{option}");
+        }
+
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
 #[test]
 fn successful_config_option_changes_are_rendered_as_system_status_cards() {
     let endpoint = start_fake_endpoint(vec![]);
