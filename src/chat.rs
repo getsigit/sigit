@@ -513,7 +513,9 @@ mod tui {
     use onde::inference::{ChatEngine, SamplingConfig};
 
     use super::{RepoItem, Tab};
-    use crate::backend::{InferenceBackend, LocalBackend, OpenAiBackend, ToolResult, ToolSpec};
+    use crate::backend::{
+        InferenceBackend, LocalBackend, OpenAiBackend, TokenChunk, ToolResult, ToolSpec,
+    };
     use crate::models::{
         InferenceKind, ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items,
     };
@@ -3167,12 +3169,21 @@ mod tui {
             vec![]
         };
 
-        // Bridge the backend's token sink (plain strings) onto the UI update
-        // channel as `Delta` messages. The forwarder lives for the whole turn.
-        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+        // Bridge the backend's token sink onto the UI update channel as `Delta`
+        // messages. The forwarder lives for the whole turn. The TUI's
+        // `push_stream_delta` runs `strip_think_blocks` on its own buffer, so
+        // `Visible` chunks are forwarded raw (any inline `<think>` markers kept
+        // intact) while `Reasoning` chunks — which come from a dedicated field
+        // and carry no markers — are wrapped in `<think>…</think>` so the same
+        // splitter treats them as reasoning rather than visible reply text.
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<TokenChunk>();
         let forward_tx = tx.clone();
         let forwarder = tokio::spawn(async move {
-            while let Some(piece) = delta_rx.recv().await {
+            while let Some(chunk) = delta_rx.recv().await {
+                let piece = match chunk {
+                    TokenChunk::Visible(text) => text,
+                    TokenChunk::Reasoning(text) => format!("<think>{text}</think>"),
+                };
                 if forward_tx
                     .send(InferenceUpdate::Delta(piece))
                     .await
@@ -3411,7 +3422,12 @@ mod tui {
         backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
+        // to be thread-safe.
+        B::Error: Send + Sync + 'static,
+    {
         event_loop(terminal, engine, backend, load_rx, load_model_name).await
     }
 
@@ -3421,7 +3437,12 @@ mod tui {
         backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
+        // to be thread-safe.
+        B::Error: Send + Sync + 'static,
+    {
         let mut app = App::new(load_model_name, backend);
         let mut event_stream = EventStream::new();
 

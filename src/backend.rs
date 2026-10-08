@@ -297,27 +297,59 @@ pub fn message_text(message: &serde_json::Value) -> String {
     }
 }
 
-/// How many images a history message carries as `image_url` content parts.
-pub fn message_image_count(message: &serde_json::Value) -> usize {
+/// How many content parts of `part_type` a history message carries.
+fn message_part_count(message: &serde_json::Value, part_type: &str) -> usize {
     message["content"]
         .as_array()
         .map(|parts| {
             parts
                 .iter()
-                .filter(|part| part["type"] == "image_url")
+                .filter(|part| part["type"] == part_type)
                 .count()
         })
         .unwrap_or(0)
 }
 
-/// A sink for streaming assistant text deltas to the UI as they are produced.
+/// How many images a history message carries as `image_url` content parts.
+pub fn message_image_count(message: &serde_json::Value) -> usize {
+    message_part_count(message, "image_url")
+}
+
+/// How many audio clips a history message carries as `input_audio` content
+/// parts.
+pub fn message_audio_count(message: &serde_json::Value) -> usize {
+    message_part_count(message, "input_audio")
+}
+
+/// One streamed fragment, tagged by whether it is visible prose or the model's
+/// reasoning.
+///
+/// Reasoning reaches a backend two ways: inline `<think>…</think>` tags inside
+/// the ordinary content stream (local models, and some OpenAI-compatible
+/// endpoints), or a separate `reasoning_content` delta field (DeepSeek-style
+/// endpoints). Inline tags can't be classified at the source — a tag may span
+/// chunk boundaries — so they travel as [`TokenChunk::Visible`] and are split
+/// out downstream by `StreamedReply`. The `reasoning_content` field *is*
+/// unambiguous at the source, so the backend tags it [`TokenChunk::Reasoning`]
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenChunk {
+    /// Content-stream text. May still contain inline `<think>` tags that a
+    /// downstream consumer splits into reasoning and prose.
+    Visible(String),
+    /// Text from a dedicated reasoning channel, already known to be reasoning.
+    Reasoning(String),
+}
+
+/// A sink for streaming assistant fragments to the UI as they are produced.
 ///
 /// When a caller passes `Some(sink)`, a streaming-capable backend forwards each
-/// text fragment through it as the model emits it; the returned [`TurnResult`]
-/// still carries the fully assembled text (and any tool calls). When the sink is
-/// `None`, the backend runs in non-streaming mode. Unbounded so the inference
-/// task never blocks on a slow consumer.
-pub type TokenSink = tokio::sync::mpsc::UnboundedSender<String>;
+/// fragment through it as the model emits it, tagged [`TokenChunk::Visible`] or
+/// [`TokenChunk::Reasoning`]; the returned [`TurnResult`] still carries the
+/// fully assembled (visible) text and any tool calls. When the sink is `None`,
+/// the backend runs in non-streaming mode. Unbounded so the inference task
+/// never blocks on a slow consumer.
+pub type TokenSink = tokio::sync::mpsc::UnboundedSender<TokenChunk>;
 
 /// An image attached to a user message: base64 data and its media type, as an
 /// ACP client sends it.
@@ -327,17 +359,49 @@ pub struct ImageInput {
     pub data: String,
 }
 
+/// An audio clip attached to a user message: base64 data and its media type,
+/// as an ACP client sends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioInput {
+    pub mime_type: String,
+    pub data: String,
+}
+
+impl AudioInput {
+    /// The `format` OpenAI's `input_audio` part expects (`wav`, `mp3`, ...),
+    /// from the MIME type an ACP client sends (`audio/wav`, `audio/mpeg`, ...).
+    fn format(&self) -> String {
+        let subtype = self
+            .mime_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        let subtype = subtype.strip_prefix("audio/").unwrap_or(&subtype);
+        match subtype.strip_prefix("x-").unwrap_or(subtype) {
+            "mpeg" | "mp3" => "mp3".to_string(),
+            "wave" | "wav" | "vnd.wave" => "wav".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// What a model that cannot read images is shown in place of one.
 const IMAGE_OMITTED_NOTE: &str = "[image omitted: this model cannot read images]";
 
+/// What a model that cannot take audio is shown in place of a clip.
+const AUDIO_OMITTED_NOTE: &str = "[audio omitted: this model cannot take audio]";
+
 /// A user message in history form. Plain text keeps the string `content` every
-/// other message uses; with images it becomes OpenAI's content-part array,
-/// text first, each image as a base64 `data:` URL.
-fn user_message(text: &str, images: &[ImageInput]) -> serde_json::Value {
-    if images.is_empty() {
+/// other message uses; with attachments it becomes OpenAI's content-part
+/// array, text first, each image as a base64 `data:` URL and each audio clip
+/// as an `input_audio` part.
+fn user_message(text: &str, images: &[ImageInput], audio: &[AudioInput]) -> serde_json::Value {
+    if images.is_empty() && audio.is_empty() {
         return serde_json::json!({ "role": "user", "content": text });
     }
-    let mut parts = Vec::with_capacity(images.len() + 1);
+    let mut parts = Vec::with_capacity(images.len() + audio.len() + 1);
     if !text.is_empty() {
         parts.push(serde_json::json!({ "type": "text", "text": text }));
     }
@@ -349,35 +413,73 @@ fn user_message(text: &str, images: &[ImageInput]) -> serde_json::Value {
             },
         }));
     }
+    for clip in audio {
+        parts.push(serde_json::json!({
+            "type": "input_audio",
+            "input_audio": { "data": clip.data, "format": clip.format() },
+        }));
+    }
     serde_json::json!({ "role": "user", "content": parts })
 }
 
-/// `history` as a text-only model has to receive it: a message that carries
-/// images is flattened back to a string, with a note where each image was.
+/// `history` with every content part of `part_type` replaced by `note`, for a
+/// model that cannot take that kind of attachment. A message left with only
+/// text is flattened back to a plain string.
 ///
-/// History itself keeps the images. A thread can move to a model that reads
-/// them (or back to one), so what was attached is not thrown away just because
-/// the model active right now cannot use it.
-fn without_images(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+/// History itself keeps the attachments. A thread can move to a model that
+/// reads them (or back to one), so what was attached is not thrown away just
+/// because the model active right now cannot use it.
+fn without_parts(
+    history: &[serde_json::Value],
+    part_type: &str,
+    note: &str,
+) -> Vec<serde_json::Value> {
     history
         .iter()
         .map(|message| {
-            let images = message_image_count(message);
-            if images == 0 {
+            let Some(parts) = message["content"].as_array() else {
+                return message.clone();
+            };
+            if !parts.iter().any(|part| part["type"] == part_type) {
                 return message.clone();
             }
-            let mut text = message_text(message);
-            for _ in 0..images {
-                if !text.is_empty() {
-                    text.push('\n');
+            let mut kept: Vec<serde_json::Value> = Vec::with_capacity(parts.len());
+            let mut notes = Vec::new();
+            for part in parts {
+                if part["type"] == part_type {
+                    notes.push(serde_json::json!({ "type": "text", "text": note }));
+                } else {
+                    kept.push(part.clone());
                 }
-                text.push_str(IMAGE_OMITTED_NOTE);
             }
-            let mut flattened = message.clone();
-            flattened["content"] = serde_json::Value::String(text);
-            flattened
+            kept.extend(notes);
+            let mut stripped = message.clone();
+            stripped["content"] = if kept.iter().all(|part| part["type"] == "text") {
+                let text = kept
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::Value::String(text)
+            } else {
+                serde_json::Value::Array(kept)
+            };
+            stripped
         })
         .collect()
+}
+
+/// `history` as a model that cannot read images has to receive it, with a
+/// note where each image was.
+fn without_images(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    without_parts(history, "image_url", IMAGE_OMITTED_NOTE)
+}
+
+/// `history` as a model that cannot take audio has to receive it, with a note
+/// where each clip was.
+fn without_audio(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    without_parts(history, "input_audio", AUDIO_OMITTED_NOTE)
 }
 
 // ── The trait ───────────────────────────────────────────────────────────────────
@@ -418,25 +520,33 @@ pub trait InferenceBackend: Send + Sync {
     /// request in the session.
     async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>);
 
-    /// Start a turn from a user message that carries images.
+    /// Start a turn from a user message that carries images or audio.
     ///
-    /// The default drops the images and sends the text, which is right for a
-    /// backend that cannot read them. Callers check [`Self::accepts_images`]
-    /// first so the user can be told, instead of the image vanishing.
-    async fn send_message_with_images(
+    /// The default drops the attachments and sends the text, which is right
+    /// for a backend that cannot read them. Callers check
+    /// [`Self::accepts_images`] and [`Self::accepts_audio`] first so the user
+    /// can be told, instead of the attachment vanishing.
+    async fn send_message_with_attachments(
         &self,
         text: &str,
         images: &[ImageInput],
+        audio: &[AudioInput],
         tools: &[ToolSpec],
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
-        let _ = images;
+        let _ = (images, audio);
         self.send_message_with_tools(text, tools, sink).await
     }
 
     /// Whether the model behind this backend reads images. On-device models do
     /// not; a remote one answers from its model id.
     fn accepts_images(&self) -> bool {
+        false
+    }
+
+    /// Whether the model behind this backend takes audio. On-device models do
+    /// not; a remote one answers from its model id.
+    fn accepts_audio(&self) -> bool {
         false
     }
 
@@ -781,7 +891,9 @@ async fn drain_onde_stream(
             text.push_str(&chunk.delta);
             // The receiver is the UI; if it's gone the turn is being cancelled,
             // so stop assembling rather than spinning the model to completion.
-            if sink.send(chunk.delta).is_err() {
+            // onde reports reasoning as inline `<think>` tags in `delta`, so it
+            // is visible content that a downstream consumer splits out.
+            if sink.send(TokenChunk::Visible(chunk.delta)).is_err() {
                 break;
             }
         }
@@ -837,6 +949,9 @@ pub struct OpenAiBackend {
     /// When it does not, images already in `history` are left out of each
     /// request rather than sent to an endpoint that would refuse them.
     accepts_images: bool,
+    /// Whether `model` takes audio (see `provider::model_accepts_audio`), with
+    /// the same effect on audio already in `history`.
+    accepts_audio: bool,
 }
 
 impl OpenAiBackend {
@@ -858,6 +973,7 @@ impl OpenAiBackend {
             base_url: base_url.into(),
             api_key: api_key.into(),
             accepts_images: crate::provider::model_accepts_images(&model),
+            accepts_audio: crate::provider::model_accepts_audio(&model),
             model,
             http: reqwest::Client::new(),
             history: Mutex::new(history),
@@ -917,7 +1033,7 @@ impl OpenAiBackend {
         {
             // The retry's text follows what already streamed; keep it from
             // running on into the previous sentence.
-            let _ = sink.send("\n\n".to_string());
+            let _ = sink.send(TokenChunk::Visible("\n\n".to_string()));
         }
         let (retry, retry_malformed) = self.request(tools, allow_tool_calls, sink).await?;
         if retry_malformed > 0 && retry.tool_calls.is_empty() {
@@ -946,10 +1062,15 @@ impl OpenAiBackend {
 
         let messages = {
             let history = self.history.lock().await;
-            if self.accepts_images {
+            let messages = if self.accepts_images {
                 history.clone()
             } else {
                 without_images(&history)
+            };
+            if self.accepts_audio {
+                messages
+            } else {
+                without_audio(&messages)
             }
         };
         let mut body = serde_json::json!({
@@ -1062,9 +1183,9 @@ impl OpenAiBackend {
             .next()
             .ok_or_else(|| "endpoint returned no choices".to_string())?;
         let finish = FinishReason::from_wire(choice.finish_reason.as_deref());
-        let message = choice.message;
+        let mut message = choice.message;
 
-        let mut text = message.content.clone().unwrap_or_default();
+        let text = message.content.clone().unwrap_or_default();
         let mut tool_calls: Vec<ToolCall> = message
             .tool_calls
             .iter()
@@ -1076,7 +1197,10 @@ impl OpenAiBackend {
             })
             .collect();
 
-        let extracted = crate::inline_tool_calls::extract(&text, tools);
+        let mut extracted = crate::inline_tool_calls::extract(&text, tools);
+        // Markup the model made up in the harness's shape goes too, from the
+        // reply and the history alike. See `harness_markup`.
+        extracted.text = crate::harness_markup::strip(&extracted.text);
         let malformed = extracted.malformed;
         if malformed > 0 {
             log::warn!("dropped {malformed} unparseable inline tool call(s) from the reply");
@@ -1084,7 +1208,7 @@ impl OpenAiBackend {
 
         if !allow_tool_calls {
             let recovered = extracted.calls;
-            text = extracted.text;
+            let text = extracted.text;
             let suppressed = tool_calls.len() + recovered.len();
             if suppressed > 0 {
                 let names = tool_calls
@@ -1115,7 +1239,7 @@ impl OpenAiBackend {
         // instead of using the structured field (see `inline_tool_calls`).
         // Recover it, or the turn ends with the tag rendered as prose and
         // whatever the model meant to do is dropped.
-        if tool_calls.is_empty() {
+        if tool_calls.is_empty() && (malformed > 0 || !extracted.calls.is_empty()) {
             let cleaned = extracted.text;
             let recovered = extracted.calls;
             if !recovered.is_empty() {
@@ -1149,19 +1273,18 @@ impl OpenAiBackend {
                     malformed,
                 ));
             }
-            if malformed > 0 {
-                // Keep the broken block out of history as well as the reply;
-                // see `inline_tool_calls` for why it poisons later turns.
-                self.push_reply_without_calls(&cleaned).await;
-                return Ok((
-                    TurnResult {
-                        text: cleaned,
-                        tool_calls,
-                        finish,
-                    },
-                    malformed,
-                ));
-            }
+            // Nothing recovered, so what was found is a broken block. Keep it
+            // out of history as well as the reply; see `inline_tool_calls` for
+            // why it poisons later turns.
+            self.push_reply_without_calls(&cleaned).await;
+            return Ok((
+                TurnResult {
+                    text: cleaned,
+                    tool_calls,
+                    finish,
+                },
+                malformed,
+            ));
         } else if malformed > 0 || !extracted.calls.is_empty() {
             // Structured calls arrived with inline blocks beside them. As on
             // the streaming path, inline calls that parse run alongside the
@@ -1193,7 +1316,13 @@ impl OpenAiBackend {
             ));
         }
 
-        // Record the assistant turn so later tool results have context.
+        // Record the assistant turn so later tool results have context. No
+        // inline block was found, so the only change `extracted.text` can
+        // carry is the stripped markup.
+        let text = extracted.text;
+        if message.content.is_some() {
+            message.content = Some(text.clone());
+        }
         self.history.lock().await.push(message.into_history_value());
 
         Ok((
@@ -1245,6 +1374,10 @@ impl OpenAiBackend {
         // it arrives, so by the time a whole turn is assembled the tag has
         // already been rendered. See `inline_tool_calls`.
         let mut scanner = crate::inline_tool_calls::StreamScanner::new(tools);
+        // What it lets through then loses any markup the model made up in the
+        // harness's shape, like a `<system_warning>` block. See
+        // `harness_markup`.
+        let mut markup = crate::harness_markup::MarkupFilter::new();
         let mut recovered: Vec<ToolCall> = Vec::new();
         let mut malformed = 0usize;
 
@@ -1292,6 +1425,17 @@ impl OpenAiBackend {
                 if let Some(reason) = choice.finish_reason.as_deref() {
                     finish = FinishReason::from_wire(Some(reason));
                 }
+                // Reasoning streamed in its own field is tagged at the source;
+                // it bypasses the inline-tag scanner and is never kept in the
+                // assistant message text.
+                if let Some(reasoning) = choice.delta.reasoning_content
+                    && !reasoning.is_empty()
+                    && sink.send(TokenChunk::Reasoning(reasoning)).is_err()
+                {
+                    // Consumer dropped (turn cancelled).
+                    done = true;
+                    break;
+                }
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
@@ -1299,8 +1443,12 @@ impl OpenAiBackend {
                     for event in scanner.push(&content) {
                         match event {
                             crate::inline_tool_calls::ScanEvent::Text(chunk) => {
+                                let chunk = markup.push(&chunk);
+                                if chunk.is_empty() {
+                                    continue;
+                                }
                                 text.push_str(&chunk);
-                                if sink.send(chunk).is_err() {
+                                if sink.send(TokenChunk::Visible(chunk)).is_err() {
                                     // Consumer dropped (turn cancelled).
                                     cancelled = true;
                                     break;
@@ -1358,16 +1506,21 @@ impl OpenAiBackend {
         // Flush what was held back. A partial marker is just text; a
         // tool-call block that never closed is dropped like any other
         // unparseable one.
+        let mut leftover = String::new();
         match scanner.finish() {
-            Some(crate::inline_tool_calls::ScanEvent::Text(leftover)) => {
-                text.push_str(&leftover);
-                let _ = sink.send(leftover);
+            Some(crate::inline_tool_calls::ScanEvent::Text(rest)) => {
+                leftover = markup.push(&rest);
             }
             Some(crate::inline_tool_calls::ScanEvent::Malformed(block)) => {
                 log_malformed_block(&block);
                 malformed += 1;
             }
             Some(crate::inline_tool_calls::ScanEvent::ToolCall(_)) | None => {}
+        }
+        leftover.push_str(&markup.finish());
+        if !leftover.is_empty() {
+            text.push_str(&leftover);
+            let _ = sink.send(TokenChunk::Visible(leftover));
         }
 
         let mut tool_calls: Vec<ToolCall> = tool_accum
@@ -1544,19 +1697,27 @@ impl InferenceBackend for OpenAiBackend {
         }
     }
 
-    async fn send_message_with_images(
+    async fn send_message_with_attachments(
         &self,
         text: &str,
         images: &[ImageInput],
+        audio: &[AudioInput],
         tools: &[ToolSpec],
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
-        self.history.lock().await.push(user_message(text, images));
+        self.history
+            .lock()
+            .await
+            .push(user_message(text, images, audio));
         self.complete(tools, true, sink).await
     }
 
     fn accepts_images(&self) -> bool {
         self.accepts_images
+    }
+
+    fn accepts_audio(&self) -> bool {
+        self.accepts_audio
     }
 
     fn is_remote(&self) -> bool {
@@ -1573,6 +1734,7 @@ impl InferenceBackend for OpenAiBackend {
             http: self.http.clone(),
             history: Mutex::new(Vec::new()),
             accepts_images: self.accepts_images,
+            accepts_audio: self.accepts_audio,
         }))
     }
 
@@ -1882,6 +2044,11 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+    // Some endpoints stream model reasoning in a dedicated field rather than
+    // inline `<think>` tags. It is unambiguously reasoning at the source, so it
+    // travels as `TokenChunk::Reasoning` and never enters the content scanner.
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
 }
@@ -2344,7 +2511,7 @@ mod tests {
     #[test]
     fn user_message_uses_content_parts_only_when_there_is_an_image() {
         assert_eq!(
-            user_message("hello", &[]),
+            user_message("hello", &[], &[]),
             serde_json::json!({ "role": "user", "content": "hello" })
         );
 
@@ -2353,7 +2520,7 @@ mod tests {
             data: "AAAA".to_string(),
         };
         assert_eq!(
-            user_message("what is this?", std::slice::from_ref(&image)),
+            user_message("what is this?", std::slice::from_ref(&image), &[]),
             serde_json::json!({
                 "role": "user",
                 "content": [
@@ -2363,8 +2530,72 @@ mod tests {
             })
         );
         // An image with no text sends no empty text part.
-        let only_image = user_message("", &[image]);
+        let only_image = user_message("", &[image], &[]);
         assert_eq!(only_image["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn audio_is_sent_as_an_input_audio_part() {
+        let clip = AudioInput {
+            mime_type: "audio/mpeg".to_string(),
+            data: "BBBB".to_string(),
+        };
+        assert_eq!(
+            user_message("transcribe this", &[], &[clip]),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "transcribe this" },
+                    { "type": "input_audio", "input_audio": { "data": "BBBB", "format": "mp3" } },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn audio_format_follows_the_mime_type() {
+        let format = |mime: &str| {
+            AudioInput {
+                mime_type: mime.to_string(),
+                data: String::new(),
+            }
+            .format()
+        };
+        assert_eq!(format("audio/wav"), "wav");
+        assert_eq!(format("audio/x-wav"), "wav");
+        assert_eq!(format("audio/wave"), "wav");
+        assert_eq!(format("audio/mpeg"), "mp3");
+        assert_eq!(format("Audio/MP3; codecs=mp3"), "mp3");
+        assert_eq!(format("audio/flac"), "flac");
+    }
+
+    #[test]
+    fn a_model_without_audio_gets_a_note_and_keeps_the_image() {
+        let history = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "input_audio", "input_audio": { "data": "BBBB", "format": "wav" } },
+            ],
+        })];
+
+        let sent = without_audio(&history);
+        assert_eq!(
+            sent[0]["content"],
+            serde_json::json!([
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "text", "text": AUDIO_OMITTED_NOTE },
+            ])
+        );
+        // With neither, the message is plain text again.
+        assert_eq!(
+            without_images(&sent)[0]["content"],
+            format!("what is this?\n{AUDIO_OMITTED_NOTE}\n{IMAGE_OMITTED_NOTE}")
+        );
+        // History keeps the clip for a model that can take it later.
+        assert_eq!(message_audio_count(&history[0]), 1);
     }
 
     #[test]
@@ -2394,6 +2625,14 @@ mod tests {
         assert!(!text_tier.accepts_images());
         let image_tier = OpenAiBackend::new("http://localhost", "", "onde-large", None);
         assert!(image_tier.accepts_images());
+    }
+
+    #[test]
+    fn a_remote_backend_takes_audio_only_on_the_users_own_endpoint() {
+        let own_endpoint = OpenAiBackend::new("http://localhost", "", "gpt-4o-audio", None);
+        assert!(own_endpoint.accepts_audio());
+        let cloud_tier = OpenAiBackend::new("http://localhost", "", "onde-large", None);
+        assert!(!cloud_tier.accepts_audio());
     }
 
     #[test]

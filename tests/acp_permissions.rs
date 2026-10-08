@@ -551,6 +551,82 @@ fn a_permission_request_is_about_the_tool_call_it_was_announced_as() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// A call the user denies at the prompt did not run, so it ends `failed`
+/// rather than `completed` (issue #139), and gets its own title back from
+/// the permission request's.
+#[test]
+fn a_call_denied_at_the_prompt_ends_failed() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_1",
+            "run_command",
+            r#"{"command":"echo sigit-denied"}"#,
+        ),
+        sse_text("ok, skipped"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_perm_deny_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+
+    let call_update = |message: &Value, kind: &str| {
+        let update = &message["params"]["update"];
+        message["method"] == "session/update"
+            && update["sessionUpdate"] == kind
+            && update["toolCallId"] == "call_1"
+    };
+
+    let announced = agent.wait_for("the tool call announcement", |message| {
+        call_update(message, "tool_call")
+    });
+
+    let permission = agent.wait_for_agent_request("session/request_permission");
+    agent.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "reject_once"}}),
+    );
+
+    let finished = agent.wait_for("the denied call closing", |message| {
+        call_update(message, "tool_call_update")
+    });
+    let finished = &finished["params"]["update"];
+    assert_eq!(finished["status"], "failed", "{finished}");
+    assert_eq!(
+        finished["title"], announced["params"]["update"]["title"],
+        "the card gets its own title back after the approval dialog: {finished}"
+    );
+
+    let response = agent.wait_for_response(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn successful_config_option_changes_are_rendered_as_system_status_cards() {
     let endpoint = start_fake_endpoint(vec![]);
@@ -782,8 +858,20 @@ fn plan_permission_mode_denies_mutating_tools_without_asking() {
             "prompt": [{"type": "text", "text": "run the command"}],
         }),
     );
-    let (response, _updates) = agent.wait_for_response_with_updates(prompt_id);
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
     assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    // The tool never ran, so its card must not end as a success (issue #139).
+    let closed = updates
+        .iter()
+        .rev()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update"
+                && update["toolCallId"] == "call_1"
+                && !update["status"].is_null()
+        })
+        .expect("the blocked call is closed out");
+    assert_eq!(closed["status"], "failed", "{closed}");
 
     let requests = endpoint.requests.lock().unwrap();
     assert_eq!(
@@ -1121,6 +1209,71 @@ fn an_unparseable_tool_call_is_hidden_and_retried() {
         );
     }
     drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// The third identical call is skipped by the repetition guard. It never ran,
+/// so its card ends `failed` while the two that did run end `completed`
+/// (issue #139).
+#[test]
+fn a_call_skipped_by_the_repeat_guard_ends_failed() {
+    let repeated_arguments = json!({"path": "notes.txt"}).to_string();
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "read_file", &repeated_arguments),
+        sse_tool_call("call_2", "read_file", &repeated_arguments),
+        sse_tool_call("call_3", "read_file", &repeated_arguments),
+        sse_text("Stopping here."),
+    ]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_repeat_failed_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("notes.txt"), "hello").unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "read the notes"}],
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let final_status = |call_id: &str| {
+        updates
+            .iter()
+            .rev()
+            .find(|update| {
+                update["sessionUpdate"] == "tool_call_update"
+                    && update["toolCallId"] == call_id
+                    && !update["status"].is_null()
+            })
+            .unwrap_or_else(|| panic!("{call_id} is closed out: {updates:#?}"))["status"]
+            .clone()
+    };
+    assert_eq!(final_status("call_1"), "completed");
+    assert_eq!(final_status("call_2"), "completed");
+    assert_eq!(final_status("call_3"), "failed");
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);

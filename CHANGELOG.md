@@ -1,5 +1,81 @@
 # Changelog
 
+## 1.6.5
+
+### Added
+
+- **An `@file` mention can carry unsaved edits.** siGit Code now advertises
+  `promptCapabilities.embeddedContext`, so a client can put a resource's
+  contents in the prompt instead of sending a link to it. Before, a client
+  that follows the spec only sent `resource_link`, and siGit Code read the
+  file from disk, missing whatever the user had not saved yet (#141).
+- **A prompt can carry audio.** siGit Code now advertises
+  `promptCapabilities.audio` and sends an attached clip to the model as an
+  OpenAI `input_audio` part. It works the way image attachments do: a model on
+  an endpoint you configure yourself gets the clip and decides for itself,
+  while siGit Code Cloud tiers and on-device models, none of which take audio
+  today, get a note in its place and the editor says the clip was left out
+  (#143).
+- **The README says what telemetry is sent.** A new Telemetry section covers
+  the model-timing events Onde Inference can report for on-device models,
+  what they leave out, and how to turn them off with `ONDE_DISABLE_PULSE=1`.
+
+### Changed
+
+- **A turn that cannot get its session back stops.** A turn on an HTTP backend
+  gives up the process-wide working directory while it waits and reinstalls
+  its session before a tool runs. If the reinstall failed, the turn logged a
+  warning and carried on in whichever directory was current. Nothing makes it
+  fail today, since a close waits for the turn, but the turn now ends as
+  cancelled instead of depending on that.
+- **Dependencies match the rest of the Onde stack.** Onde 1.2.2 to 1.3.1,
+  reqwest 0.12 to 0.13 and ratatui 0.29 to 0.30, the versions Ed, OndeCode and
+  SplitFire Agent use. ratatui is built with only its crossterm backend, which
+  drops the second copy of crossterm (0.28) from the build.
+
+### Fixed
+
+- **Tags a model makes up no longer show in the reply.** After a long run of
+  tool rounds, a model could start writing markup that looked like it came
+  from siGit Code: a `<system_warning>` block telling the user the previous
+  turn was injected and should be ignored, or a question wrapped in
+  `<Option_Picker>`. Neither tag means anything to siGit Code or the editor,
+  so both rendered as raw text. A `system_*` block is now dropped from the
+  reply and from the history, and other made-up tags are removed while the
+  text inside them stays. Code blocks are left alone. The system prompt also
+  tells the model to write plain Markdown and to list choices as plain text
+  (#122).
+
+- **Closing a thread that is waiting at a permission prompt no longer hangs.**
+  `session/close` cancels the session's running turn and waits for it to end,
+  but a turn stopped at a permission prompt only went on when the client
+  answered the request. A client that closed the thread without answering
+  left the close, and every later request for that thread, waiting for good.
+  The same held for `session/cancel` with a client that did not send the
+  cancelled outcome the protocol asks for. The permission wait now ends on
+  the cancellation as well, and an approval that arrives after the turn was
+  cancelled runs nothing.
+
+- **A closed thread no longer leaves its request lock behind.** The process
+  kept one lock per session id for as long as it ran, for closed threads and
+  for ids no session ever had. The entry now goes with the last request that
+  used it.
+
+- **A tool call that did not run no longer shows as completed.** When policy
+  or plan mode denied a call, when the user picked Deny at the permission
+  prompt, or when the repeat guard skipped a call the model made three times,
+  the editor's card still ended `completed`. Those cards now end `failed`, the
+  same way a call cancelled at the prompt already did. A call denied at the
+  prompt also gets its own title back instead of keeping the permission
+  request's (#139).
+
+- **On-device inference no longer panics on some non-English text.** siGit Code
+  now builds on Onde 1.3.1, which fixes a panic when a message longer than 100
+  bytes had a multi-byte character (an accented letter, CJK, or an emoji) at
+  byte 100. Onde 1.3 also reports Pulse events for streaming inference, which
+  is the path on-device turns take, so those turns are now reported alongside
+  model loads. `ONDE_DISABLE_PULSE=1` turns Pulse off.
+
 ## 1.6.4
 
 ### Added

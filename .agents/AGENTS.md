@@ -152,6 +152,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
   didn't run. Leaving the raw block in history makes the model invent `<function_results>` later.
+  What that scanner lets through then goes through `src/harness_markup.rs`, which removes
+  markup the model makes up in the harness's shape (issue #122): a `<system_warning>`-style
+  block (any `system_*`/`system-*` tag) is dropped whole, from the reply and the history, and
+  other underscore-named tags like `<Option_Picker>` lose the tags but keep their text. Code is
+  never touched, and an opening tag only counts at the start of a line, since prose writes
+  placeholders like `<repo_url>` the same way. It has to run after the inline-call scanner,
+  because `<tool_call>` matches its underscore rule.
   Image attachments: ACP fixes `promptCapabilities.image` for the whole connection, while the
   model can change on any turn, so the capability is always advertised and the decision is made
   per prompt. `InferenceBackend::accepts_images` answers for the active model (on-device: no;
@@ -163,6 +170,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   when its model cannot read them, which is what makes a mid-thread switch to a text-only tier
   safe. Read history text through `backend::message_text`, never `content.as_str()`.
   `IMAGE_TIERS` mirrors onde-cloud's `IMAGE_CANDIDATES`; update both together.
+  Audio attachments take the same path (`promptCapabilities.audio`, `accepts_audio`,
+  `audio_for_turn`, `without_audio`), sent as OpenAI `input_audio` parts. No cloud tier
+  takes audio, because onde-cloud drops `input_audio` parts when it parses a request, so
+  `provider::model_accepts_audio` says no for every `onde-*` id and yes for a user's own
+  endpoint. If onde-cloud ever routes audio, give it a tier table like `IMAGE_TIERS`.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
@@ -330,7 +342,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `execute_tool_impl` asks `route_for` before it dispatches `read_file`, `create_file`,
   `edit_file` or `multi_edit`. Each of those tools is split into a parse step and a pure
   render/apply step (`ReadFileCall`, `CreateFileCall`, `EditCall`) that the disk path and the
-  client path share, so the model gets the same result text either way. The two capabilities are
+  client path share, so the model gets the same result text either way. The writing tools also
+  hand back the file before and after (`tools::FileChange`, via `execute_tool_with_change`), which
+  `handle_prompt` sends as ACP `diff` content ahead of the result text. A permission request for
+  one of them carries the same diff, worked out by `preview_file_change` without writing anything
+  and before the workspace is released, since a relative path resolves against the session's cwd. The two capabilities are
   independent: a client that only reads still gets its edits written to disk. The disk is the
   fallback throughout: nothing is registered in the TUI or headless modes, a path outside the
   session's roots is not routed, and a request the client fails or leaves unanswered for 30
@@ -338,6 +354,23 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   inside a spawned prompt turn, never from `handle_initialize` itself (deadlock, same as
   permission requests). Existence checks and `create_file`'s parent directories still use the
   disk. `SIGIT_CLIENT_FS=off` turns the routing off. Covered by `tests/acp_client_fs.rs`.
+- **`src/client_terminal.rs`** — `run_command` in the ACP client's terminal. A client that
+  advertises `terminal` in `initialize` runs a foreground command itself (`terminal/create`, with
+  the platform shell as `command` and the whole command line as one argument), and
+  `exec_run_command_via_client` embeds the terminal in the tool call as `terminal` content, so the
+  user watches the output live and can stop the command from the editor. The seam is
+  `client_fs`'s: `handle_initialize` registers `AcpClientTerminal`, and `execute_tool_impl` asks
+  `client_terminal_route` before the blocking path. Embedding needs the tool call's id, which is
+  why `execute_tool_with_change` takes one. What `run_command` promises stays put: the 120 s
+  timeout ends in `terminal/kill`, the output is capped, and `CommitWatch` still amends the
+  co-author trailer, checking HEAD on disk before and after. Background commands stay local
+  (`command_output` and `kill_command` read their pipes), and so does a command whose directory
+  is outside the session's roots, since nothing says the editor's machine can see it. A
+  `terminal/create` the client fails means nothing ran, so the command runs locally; a failure
+  after that is reported as the tool's error instead, because running it again could repeat its
+  effects. The finished card keeps the terminal and drops the result text, which still goes out
+  as `raw_output`. `SIGIT_CLIENT_TERMINAL=off` turns the routing off. Covered by
+  `tests/acp_client_terminal.rs`.
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
 - **`src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory
@@ -407,7 +440,8 @@ verbosity with `RUST_LOG`.
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
 `SIGIT_MODEL`, `SIGIT_MAX_TOOL_ROUNDS` (1 to 500, default 24; the tool-round cap of a
 headless run or an ACP prompt turn), `SIGIT_MCP` (`off` disables MCP), `SIGIT_CLIENT_FS` (`off` keeps the file tools on disk even when the
-ACP client offers `fs/read_text_file` / `fs/write_text_file`), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
+ACP client offers `fs/read_text_file` / `fs/write_text_file`), `SIGIT_CLIENT_TERMINAL` (`off` runs
+`run_command` locally even when the ACP client offers a terminal), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
 smbCloud CLI server), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
 server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),

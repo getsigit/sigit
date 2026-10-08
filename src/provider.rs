@@ -79,6 +79,16 @@ pub fn model_accepts_images(model: &str) -> bool {
         .any(|tier| tier_to_model(tier) == model && tier_accepts_images(tier))
 }
 
+/// Whether the model id sent on the wire takes audio.
+///
+/// No cloud tier does: onde-cloud drops `input_audio` parts when it parses a
+/// request, so a clip sent to an `onde-*` id would vanish without a word. Any
+/// other id is the user's own endpoint and, as with images, gets the audio and
+/// decides for itself.
+pub fn model_accepts_audio(model: &str) -> bool {
+    !model.starts_with("onde-")
+}
+
 /// Base URL of the siGit Code Cloud inference endpoint. Override with
 /// `SIGIT_CLOUD_URL` (dev: `http://localhost:8090/v1`).
 pub fn cloud_base_url() -> String {
@@ -337,5 +347,13 @@ mod tests {
         for tier in IMAGE_TIERS {
             assert!(CLOUD_TIERS.contains(tier), "{tier} is not a cloud tier");
         }
+    }
+
+    #[test]
+    fn audio_goes_only_to_the_users_own_endpoint() {
+        for tier in CLOUD_TIERS {
+            assert!(!model_accepts_audio(&tier_to_model(tier)), "{tier}");
+        }
+        assert!(model_accepts_audio("gpt-4o-audio-preview"));
     }
 }

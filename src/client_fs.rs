@@ -148,8 +148,9 @@ impl Route {
 ///
 /// Both sides are resolved first, so a root reached through a symlink (macOS
 /// spells `/tmp` as `/private/tmp`) still contains its files, and a `..` that
-/// climbs out of a root does not pass as being inside it.
-fn in_roots(path: &Path, roots: &[PathBuf]) -> bool {
+/// climbs out of a root does not pass as being inside it. `client_terminal`
+/// uses the same test for a command's directory.
+pub(crate) fn in_roots(path: &Path, roots: &[PathBuf]) -> bool {
     let path = resolve(path);
     roots
         .iter()

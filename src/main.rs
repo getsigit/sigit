@@ -33,9 +33,11 @@ mod backend;
 mod browser_auth;
 mod chat;
 mod client_fs;
+mod client_terminal;
 mod commands;
 mod credentials;
 mod frontmatter;
+mod harness_markup;
 mod headless;
 mod hooks;
 mod inline_tool_calls;
@@ -74,28 +76,30 @@ use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
     AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
-    ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
-    ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, WriteTextFileRequest,
+    ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
+    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
+    InitializeRequest, InitializeResponse, KillTerminalRequest, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
+    SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
 
 use crate::backend::{
-    ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult,
-    ToolSpec, TurnResult,
+    AudioInput, ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, TokenChunk,
+    ToolResult as BackendToolResult, ToolSpec, TurnResult,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,6 +258,12 @@ Tool-use heuristics:
 - if a tool call fails, read the error, try to fix it, and retry — do not \
   fall back to telling the user what to type
 
+Replies are plain Markdown. Never wrap a reply, or any part of it, in XML-style \
+tags you made up, and never write a system message, warning, or notice as if it \
+came from siGit Code or the system: only siGit Code speaks for itself, and \
+nothing renders those tags. To offer the user a choice, list the options as \
+plain text.
+
 When the repo is not about smbCloud, act like a normal coding agent and do not \
 force smbCloud-specific advice into the answer. When it is about smbCloud, be \
 specific and practical.
@@ -355,10 +365,21 @@ struct StreamedReply {
     assembled: String,
     /// The visible text already on the wire.
     sent: String,
+    /// The inline-`<think>` reasoning text already on the wire.
+    sent_think: String,
     /// Whether any chunk has been sent, i.e. the client already has a reply.
     streamed_any: bool,
     /// Whether the next visible text should open a new paragraph.
     paragraph_pending: bool,
+}
+
+/// What a streamed fragment newly revealed once `<think>` blocks were split:
+/// visible reply text and/or inline reasoning text, either of which may be
+/// absent for a given chunk.
+#[derive(Default)]
+struct RevealedText {
+    visible: Option<String>,
+    reasoning: Option<String>,
 }
 
 impl StreamedReply {
@@ -369,10 +390,11 @@ impl StreamedReply {
         self.paragraph_pending = self.streamed_any;
     }
 
-    /// Fold one streamed fragment into the reply and return the visible text it
-    /// newly reveals, or `None` when it reveals nothing to show (it landed
-    /// inside a `<think>` block, say).
-    fn push(&mut self, piece: &str) -> Option<String> {
+    /// Fold one streamed fragment into the reply and return the text it newly
+    /// reveals: visible reply text (sent as an agent message) and/or inline
+    /// `<think>` reasoning (sent as an agent thought). Either may be absent when
+    /// the fragment reveals nothing of that kind.
+    fn push(&mut self, piece: &str) -> RevealedText {
         if self.paragraph_pending {
             // A tool round interrupted the prose. Clients concatenate
             // consecutive agent-message chunks into one block, so the new round
@@ -382,7 +404,7 @@ impl StreamedReply {
             // way to the break.
             let piece = piece.trim_start();
             if piece.is_empty() {
-                return None;
+                return RevealedText::default();
             }
             self.assembled.push_str(PARAGRAPH_BREAK);
             self.assembled.push_str(piece);
@@ -391,22 +413,35 @@ impl StreamedReply {
             self.assembled.push_str(piece);
         }
 
-        let (_think, visible) = chat::strip_think_blocks(&self.assembled);
+        let (think, visible) = chat::strip_think_blocks(&self.assembled);
+        let mut revealed = RevealedText::default();
+
         match visible.strip_prefix(self.sent.as_str()) {
             Some(extra) if !extra.is_empty() => {
-                let extra = extra.to_string();
+                revealed.visible = Some(extra.to_string());
                 self.sent = visible;
                 self.streamed_any = true;
-                Some(extra)
             }
             // No new visible text, or the visible prefix changed retroactively
             // (rare, e.g. a late-closing think tag): just resync without
             // resending what's already on the wire.
             _ => {
                 self.sent = visible;
-                None
             }
         }
+
+        match think.strip_prefix(self.sent_think.as_str()) {
+            Some(extra) if !extra.is_empty() => {
+                revealed.reasoning = Some(extra.to_string());
+                self.sent_think = think;
+            }
+            // No new reasoning, or it changed retroactively: resync quietly.
+            _ => {
+                self.sent_think = think;
+            }
+        }
+
+        revealed
     }
 }
 
@@ -414,6 +449,17 @@ impl StreamedReply {
 struct PromptCancellation {
     cancelled: AtomicBool,
     notify: tokio::sync::Notify,
+}
+
+impl PromptCancellation {
+    /// Resolves once the turn has been cancelled. `notify_one` leaves a permit
+    /// behind when nobody is waiting, so a signal sent just before this is
+    /// polled is not lost.
+    async fn cancelled(&self) {
+        while !self.cancelled.load(Ordering::Acquire) {
+            self.notify.notified().await;
+        }
+    }
 }
 
 enum DrainTurnError {
@@ -500,6 +546,36 @@ fn tool_output_content(output: &str) -> ToolCallContent {
         return "(no output)".to_string().into();
     }
     fenced_code_block("", &chat::cap_output_preview(output)).into()
+}
+
+/// A file a tool wrote, as ACP `diff` content, which clients render as a real
+/// diff (Zed builds its review UI from it) instead of a line of result text
+/// (issue #145).
+fn file_change_content(change: &tools::FileChange) -> ToolCallContent {
+    Diff::new(change.path.clone(), change.new_text.clone())
+        .old_text(change.old_text.clone())
+        .into()
+}
+
+/// The content of a finished tool call's card: the client terminal the
+/// command ran in, when it ran in one, which already shows its output (the
+/// full result text still travels as `raw_output`); otherwise the diff of the
+/// file it wrote, if it wrote one, then its result text.
+fn tool_result_content(
+    output: &str,
+    change: Option<&tools::FileChange>,
+    terminal: Option<&str>,
+) -> Vec<ToolCallContent> {
+    if let Some(terminal_id) = terminal {
+        return vec![ToolCallContent::Terminal(Terminal::new(
+            terminal_id.to_string(),
+        ))];
+    }
+    change
+        .map(file_change_content)
+        .into_iter()
+        .chain(std::iter::once(tool_output_content(output)))
+        .collect()
 }
 
 /// A single-file location for the path-bearing tools, so ACP clients can
@@ -924,6 +1000,113 @@ impl client_fs::ClientFileSystem for AcpClientFs {
     }
 }
 
+/// The editor's terminal, reached over the ACP connection. Registered with
+/// `client_terminal` at `initialize` when the client advertises `terminal`.
+struct AcpClientTerminal {
+    cx: ConnectionTo<Client>,
+}
+
+#[async_trait::async_trait]
+impl client_terminal::ClientTerminal for AcpClientTerminal {
+    async fn create(
+        &self,
+        session_id: &str,
+        command: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        output_byte_limit: u64,
+    ) -> Result<String, String> {
+        self.cx
+            .send_request(
+                CreateTerminalRequest::new(session_id.to_string(), command)
+                    .args(args.to_vec())
+                    .cwd(cwd.to_path_buf())
+                    .output_byte_limit(output_byte_limit),
+            )
+            .block_task()
+            .await
+            .map(|response| response.terminal_id.to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn embed(&self, session_id: &str, tool_call_id: &str, terminal_id: &str) {
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            ToolCallUpdateFields::new().content(vec![ToolCallContent::Terminal(Terminal::new(
+                terminal_id.to_string(),
+            ))]),
+        ));
+        if let Err(error) = self
+            .cx
+            .send_notification(SessionNotification::new(session_id.to_string(), update))
+        {
+            log::warn!("could not show terminal {terminal_id} in {tool_call_id}: {error}");
+        }
+    }
+
+    async fn wait_for_exit(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<client_terminal::ExitStatus, String> {
+        self.cx
+            .send_request(WaitForTerminalExitRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
+            ))
+            .block_task()
+            .await
+            .map(|response| client_terminal::ExitStatus {
+                exit_code: response.exit_status.exit_code,
+                signal: response.exit_status.signal,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    async fn output(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<client_terminal::Output, String> {
+        self.cx
+            .send_request(TerminalOutputRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
+            ))
+            .block_task()
+            .await
+            .map(|response| client_terminal::Output {
+                output: response.output,
+                truncated: response.truncated,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    async fn kill(&self, session_id: &str, terminal_id: &str) -> Result<(), String> {
+        self.cx
+            .send_request(KillTerminalRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn release(&self, session_id: &str, terminal_id: &str) -> Result<(), String> {
+        self.cx
+            .send_request(ReleaseTerminalRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Which request is bringing a saved session back (see `restore_session`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RestoreKind {
@@ -1024,6 +1207,39 @@ impl WorkspaceHold {
     }
 }
 
+/// One session's lock, held for a request on it.
+///
+/// Dropping it also drops the session's entry in `session_locks` when the
+/// request leaves no such session behind, which is what `session/close` does
+/// and what any request naming an id nobody opened does.
+struct SessionGuard {
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    agent: Arc<SiGitAgent>,
+    key: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if self.agent.sessions.lock().unwrap().contains_key(&self.key) {
+            return;
+        }
+        let held = tokio::sync::OwnedMutexGuard::mutex(&self.guard);
+        let mut locks = self.agent.session_locks.lock().unwrap();
+        // Two handles mean the map's and this guard's. A request still queued
+        // on the lock holds a third, and then the entry stays: taking it out
+        // would give the next request for this id a fresh lock, and the two
+        // would no longer wait for each other. The queued request drops the
+        // entry when its own guard goes. `lock_session` clones under this
+        // mutex, so the count cannot grow before the entry is removed.
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::ptr_eq(lock, held) && Arc::strong_count(lock) == 2)
+        {
+            locks.remove(&self.key);
+        }
+    }
+}
+
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     /// The active inference backend. `LocalBackend` by default; swapped to an
@@ -1071,7 +1287,8 @@ struct SiGitAgent {
     workspace_lock: Arc<tokio::sync::Mutex<()>>,
     /// One lock per session id, held for a whole request on that session, so
     /// two requests on the same thread keep the order they arrived in. Always
-    /// taken before `workspace_lock`, never while holding it.
+    /// taken before `workspace_lock`, never while holding it. A closed
+    /// session's entry is dropped by `SessionGuard`.
     session_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -1355,6 +1572,20 @@ impl SiGitAgent {
         ))
     }
 
+    /// Stream a fragment of the model's reasoning as a thought chunk. Clients
+    /// render these in a collapsed "thinking" section, separate from the reply.
+    fn send_agent_thought(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        text: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+        ))
+    }
+
     fn send_system_status(
         &self,
         cx: &ConnectionTo<Client>,
@@ -1385,7 +1616,7 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
         fut: F,
-        sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TokenChunk>,
         reply: &mut StreamedReply,
         cancellation: &PromptCancellation,
     ) -> Result<TurnResult, DrainTurnError>
@@ -1405,30 +1636,45 @@ impl SiGitAgent {
                         break Err(DrainTurnError::Cancelled);
                     }
                 }
-                Some(piece) = sink_rx.recv() => {
-                    self.emit_visible_chunk(cx, session_id, &piece, reply);
+                Some(chunk) = sink_rx.recv() => {
+                    self.emit_token_chunk(cx, session_id, chunk, reply);
                 }
             }
         };
         // Flush tokens that landed between the last poll and the future resolving.
-        while let Ok(piece) = sink_rx.try_recv() {
-            self.emit_visible_chunk(cx, session_id, &piece, reply);
+        while let Ok(chunk) = sink_rx.try_recv() {
+            self.emit_token_chunk(cx, session_id, chunk, reply);
         }
         result
     }
 
-    /// Fold a streamed fragment into `reply` and send whatever it newly reveals
-    /// as an agent-message chunk.
-    fn emit_visible_chunk(
+    /// Route one streamed token chunk. A `Reasoning` chunk comes from a
+    /// dedicated reasoning field and is unambiguous, so it goes straight to the
+    /// client as a thought. A `Visible` chunk is folded into `reply`, which may
+    /// reveal visible reply text (sent as an agent message) and/or inline
+    /// `<think>` reasoning (sent as a thought).
+    fn emit_token_chunk(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
-        piece: &str,
+        chunk: TokenChunk,
         reply: &mut StreamedReply,
     ) {
-        if let Some(extra) = reply.push(piece) {
-            self.send_assistant_message(cx, session_id.clone(), extra)
-                .ok();
+        match chunk {
+            TokenChunk::Reasoning(text) => {
+                self.send_agent_thought(cx, session_id.clone(), text).ok();
+            }
+            TokenChunk::Visible(piece) => {
+                let revealed = reply.push(&piece);
+                if let Some(reasoning) = revealed.reasoning {
+                    self.send_agent_thought(cx, session_id.clone(), reasoning)
+                        .ok();
+                }
+                if let Some(visible) = revealed.visible {
+                    self.send_assistant_message(cx, session_id.clone(), visible)
+                        .ok();
+                }
+            }
         }
     }
 
@@ -1661,70 +1907,154 @@ impl SiGitAgent {
 /// the note about a model switch is shown once and not on every prompt.
 static IMAGE_GAP_NOTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
-/// Decide what happens to a prompt's images for the model about to answer.
+/// The same for earlier audio clips.
+static AUDIO_GAP_NOTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The wording [`attachments_for_turn`] uses for one kind of attachment.
+struct AttachmentKind {
+    /// "image"
+    noun: &'static str,
+    /// "images"
+    nouns: &'static str,
+    /// "Image", for the notice headings.
+    heading: &'static str,
+    /// "Images", for the notice headings.
+    headings: &'static str,
+    /// "read images"
+    ability: &'static str,
+    /// Where the user can find a model that can.
+    hint: &'static str,
+    /// Session and model pairs already told about earlier attachments.
+    noted: &'static std::sync::Mutex<Vec<(String, String)>>,
+}
+
+const IMAGES: AttachmentKind = AttachmentKind {
+    noun: "image",
+    nouns: "images",
+    heading: "Image",
+    headings: "images",
+    ability: "read images",
+    hint: "Models marked \"reads images\" in the model picker can.",
+    noted: &IMAGE_GAP_NOTED,
+};
+
+const AUDIO: AttachmentKind = AttachmentKind {
+    noun: "audio clip",
+    nouns: "audio clips",
+    heading: "Audio",
+    headings: "audio clips",
+    ability: "take audio",
+    hint: "No siGit Code Cloud or on-device model can; a model on an endpoint you \
+           configure yourself can, if it accepts audio input.",
+    noted: &AUDIO_GAP_NOTED,
+};
+
+/// Decide what happens to a prompt's attachments of one `kind` for the model
+/// about to answer.
 ///
-/// The editor can attach an image whatever model is selected, because ACP
-/// fixes `promptCapabilities.image` for the whole connection. Returns the text
-/// and images to send, plus a note for the user when something is being left
-/// out:
+/// The editor can attach images and audio whatever model is selected, because
+/// ACP fixes `promptCapabilities` for the whole connection. Returns the text
+/// and attachments to send, plus a note for the user when something is being
+/// left out:
 ///
-/// - the model cannot read images and the prompt has some: they are dropped,
+/// - the model cannot take them and the prompt has some: they are dropped,
 ///   the user is told, and the model is told too, so it does not answer as if
 ///   it had seen them;
-/// - the model cannot read images and the thread has some from before a model
-///   switch (`earlier_images`): the user is told once per session and model.
-fn images_for_turn(
+/// - the model cannot take them and the thread has some from before a model
+///   switch (`earlier`): the user is told once per session and model.
+fn attachments_for_turn<T>(
     mut user_text: String,
+    attachments: Vec<T>,
+    accepts: bool,
+    model_name: &str,
+    earlier: usize,
+    session_id: &str,
+    kind: &AttachmentKind,
+) -> (String, Vec<T>, Option<String>) {
+    if accepts {
+        return (user_text, attachments, None);
+    }
+
+    let nouns = |count: usize| if count == 1 { kind.noun } else { kind.nouns };
+    let ability = kind.ability;
+    let hint = kind.hint;
+
+    if !attachments.is_empty() {
+        let count = attachments.len();
+        if !user_text.is_empty() {
+            user_text.push_str("\n\n");
+        }
+        user_text.push_str(&format!(
+            "[The user attached {count} {}. This model cannot {ability}, so it was not \
+             included. Say so if the request depends on it.]",
+            nouns(count)
+        ));
+        let notice = format!(
+            "> **{} not sent.** {model_name} cannot {ability}, so the {count} attached {} {} \
+             left out of this message. {hint}",
+            kind.heading,
+            nouns(count),
+            if count == 1 { "was" } else { "were" }
+        );
+        return (user_text, Vec::new(), Some(notice));
+    }
+
+    if earlier > 0 {
+        let key = (session_id.to_string(), model_name.to_string());
+        let mut noted = kind.noted.lock().unwrap_or_else(|e| e.into_inner());
+        if !noted.contains(&key) {
+            noted.push(key);
+            let notice = format!(
+                "> **Earlier {} are hidden.** {model_name} cannot {ability}, so the \
+                 {earlier} {} attached earlier in this thread {} not sent to it. {hint}",
+                kind.headings,
+                nouns(earlier),
+                if earlier == 1 { "is" } else { "are" }
+            );
+            return (user_text, attachments, Some(notice));
+        }
+    }
+    (user_text, attachments, None)
+}
+
+/// [`attachments_for_turn`] for a prompt's images.
+fn images_for_turn(
+    user_text: String,
     images: Vec<ImageInput>,
     accepts_images: bool,
     model_name: &str,
     earlier_images: usize,
     session_id: &str,
 ) -> (String, Vec<ImageInput>, Option<String>) {
-    if accepts_images {
-        return (user_text, images, None);
-    }
+    attachments_for_turn(
+        user_text,
+        images,
+        accepts_images,
+        model_name,
+        earlier_images,
+        session_id,
+        &IMAGES,
+    )
+}
 
-    const HINT: &str = "Models marked \"reads images\" in the model picker can.";
-    let plural = |count: usize| if count == 1 { "image" } else { "images" };
-
-    if !images.is_empty() {
-        let count = images.len();
-        if !user_text.is_empty() {
-            user_text.push_str("\n\n");
-        }
-        user_text.push_str(&format!(
-            "[The user attached {count} {}. This model cannot read images, so it was not \
-             included. Say so if the request depends on it.]",
-            plural(count)
-        ));
-        let notice = format!(
-            "> **Image not sent.** {model_name} cannot read images, so the {count} attached {} \
-             left out of this message. {HINT}",
-            if count == 1 {
-                "image was"
-            } else {
-                "images were"
-            }
-        );
-        return (user_text, Vec::new(), Some(notice));
-    }
-
-    if earlier_images > 0 {
-        let key = (session_id.to_string(), model_name.to_string());
-        let mut noted = IMAGE_GAP_NOTED.lock().unwrap_or_else(|e| e.into_inner());
-        if !noted.contains(&key) {
-            noted.push(key);
-            let notice = format!(
-                "> **Earlier images are hidden.** {model_name} cannot read images, so the \
-                 {earlier_images} {} attached earlier in this thread {} not sent to it. {HINT}",
-                plural(earlier_images),
-                if earlier_images == 1 { "is" } else { "are" }
-            );
-            return (user_text, images, Some(notice));
-        }
-    }
-    (user_text, images, None)
+/// [`attachments_for_turn`] for a prompt's audio clips.
+fn audio_for_turn(
+    user_text: String,
+    audio: Vec<AudioInput>,
+    accepts_audio: bool,
+    model_name: &str,
+    earlier_audio: usize,
+    session_id: &str,
+) -> (String, Vec<AudioInput>, Option<String>) {
+    attachments_for_turn(
+        user_text,
+        audio,
+        accepts_audio,
+        model_name,
+        earlier_audio,
+        session_id,
+        &AUDIO,
+    )
 }
 
 /// The servers out of a session request's `mcpServers` that siGit Code can
@@ -1829,6 +2159,16 @@ impl SiGitAgent {
             );
         }
 
+        // Likewise a client with a terminal runs foreground commands in it,
+        // so the user sees them live (see `client_terminal`).
+        let terminal = req.client_capabilities.terminal;
+        if client_terminal::disabled_by_env() {
+            log::info!("client terminal: off (SIGIT_CLIENT_TERMINAL)");
+        } else {
+            log::info!("client terminal: {terminal}");
+            client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
+        }
+
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
         // like Zed advertise terminal-auth capability but don't actually spawn the
         // login terminal for *custom* ACP agents, so the button is a silent no-op.
@@ -1855,7 +2195,21 @@ impl SiGitAgent {
                     // for the connection while the model is not, so a prompt that
                     // brings an image to a model that cannot read one is answered with
                     // a note instead (see `images_for_turn`).
-                    .prompt_capabilities(PromptCapabilities::new().image(true))
+                    //
+                    // Embedded context lets the client inline a resource's
+                    // contents, e.g. an `@file` mention with unsaved edits.
+                    // Without it a client sends only a `resource_link`, and
+                    // sigit reads the file from disk.
+                    //
+                    // Audio works the way images do. No cloud tier or on-device
+                    // model takes it today, so in practice only a model on the
+                    // user's own endpoint receives it (see `audio_for_turn`).
+                    .prompt_capabilities(
+                        PromptCapabilities::new()
+                            .image(true)
+                            .audio(true)
+                            .embedded_context(true),
+                    )
                     // Clients only pass HTTP MCP servers in `mcpServers` to an
                     // agent that says it can reach them. SSE stays off: the
                     // MCP spec deprecated that transport.
@@ -2014,15 +2368,21 @@ impl SiGitAgent {
         }
     }
 
-    /// The lock that orders requests on one session (see `session_locks`).
-    fn session_lock(&self, session_id: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(
+    /// Take the lock that orders requests on one session (see `session_locks`).
+    async fn lock_session(self: &Arc<Self>, session_id: &SessionId) -> SessionGuard {
+        let key = session_id.to_string();
+        let lock = Arc::clone(
             self.session_locks
                 .lock()
                 .unwrap()
-                .entry(session_id.to_string())
+                .entry(key.clone())
                 .or_default(),
-        )
+        );
+        SessionGuard {
+            guard: lock.lock_owned().await,
+            agent: Arc::clone(self),
+            key,
+        }
     }
 
     /// Keep the active session's parked metadata in step with a successful
@@ -2121,14 +2481,26 @@ impl SiGitAgent {
 
     /// Take `workspace_lock` back after a turn gave it up, and make the turn's
     /// session the installed one again if another was installed meanwhile.
-    async fn resume_workspace(&self, workspace: &mut WorkspaceHold, session_id: &SessionId) {
+    ///
+    /// A turn whose session cannot be reinstalled is cancelled: whatever it ran
+    /// next would run in another session's directory and roots. The turn holds
+    /// its session's lock, which `session/close` waits for, so nothing takes
+    /// the session away today. The turn does not rely on that.
+    async fn resume_workspace(
+        &self,
+        workspace: &mut WorkspaceHold,
+        session_id: &SessionId,
+        cancellation: &PromptCancellation,
+    ) {
         if workspace.reacquire().await
             && let Err(error) = self.activate_session(session_id).await
         {
             log::warn!(
-                "session({session_id}): could not reinstall mid-turn: {}",
+                "session({session_id}): could not reinstall mid-turn, cancelling the turn: {}",
                 error.message
             );
+            cancellation.cancelled.store(true, Ordering::Release);
+            cancellation.notify.notify_one();
         }
     }
 
@@ -2742,6 +3114,7 @@ impl SiGitAgent {
 
         let mut parts: Vec<String> = Vec::new();
         let mut images: Vec<ImageInput> = Vec::new();
+        let mut audio: Vec<AudioInput> = Vec::new();
 
         for block in &args.prompt {
             match block {
@@ -2752,6 +3125,12 @@ impl SiGitAgent {
                     images.push(ImageInput {
                         mime_type: image.mime_type.clone(),
                         data: image.data.clone(),
+                    });
+                }
+                ContentBlock::Audio(clip) => {
+                    audio.push(AudioInput {
+                        mime_type: clip.mime_type.clone(),
+                        data: clip.data.clone(),
                     });
                 }
                 ContentBlock::Resource(embedded) => {
@@ -2921,7 +3300,7 @@ impl SiGitAgent {
                 .map(backend::message_image_count)
                 .sum()
         };
-        let (user_text, images, notice) = images_for_turn(
+        let (user_text, images, image_notice) = images_for_turn(
             user_text,
             images,
             backend.accepts_images(),
@@ -2929,7 +3308,25 @@ impl SiGitAgent {
             earlier_images,
             &session_id.to_string(),
         );
-        if let Some(notice) = notice {
+        let earlier_audio = if backend.accepts_audio() {
+            0
+        } else {
+            backend
+                .history_snapshot()
+                .await
+                .iter()
+                .map(backend::message_audio_count)
+                .sum()
+        };
+        let (user_text, audio, audio_notice) = audio_for_turn(
+            user_text,
+            audio,
+            backend.accepts_audio(),
+            &model_name,
+            earlier_audio,
+            &session_id.to_string(),
+        );
+        for notice in [image_notice, audio_notice].into_iter().flatten() {
             self.send_assistant_message(
                 cx,
                 session_id.clone(),
@@ -2940,10 +3337,11 @@ impl SiGitAgent {
 
         // Token sink: backends stream assistant text through this while a turn
         // runs. We forward the visible portion to the editor as agent-message
-        // chunks live (see `drain_turn` / `emit_visible_chunk`). The sink stays
-        // alive for the whole prompt so `recv()` only ends when a turn future
-        // resolves, never because every sender was dropped.
-        let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // chunks live, and the reasoning portion as thought chunks (see
+        // `drain_turn` / `emit_token_chunk`). The sink stays alive for the whole
+        // prompt so `recv()` only ends when a turn future resolves, never
+        // because every sender was dropped.
+        let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<TokenChunk>();
         let mut reply = StreamedReply::default();
         let mut repeated_tool_calls = std::collections::HashMap::<String, usize>::new();
 
@@ -2963,13 +3361,20 @@ impl SiGitAgent {
             .drain_turn(
                 cx,
                 &session_id,
-                backend.send_message_with_images(&user_text, &images, &tools, Some(&sink)),
+                backend.send_message_with_attachments(
+                    &user_text,
+                    &images,
+                    &audio,
+                    &tools,
+                    Some(&sink),
+                ),
                 &mut sink_rx,
                 &mut reply,
                 &cancellation,
             )
             .await;
-        self.resume_workspace(&mut workspace, &session_id).await;
+        self.resume_workspace(&mut workspace, &session_id, &cancellation)
+            .await;
         let mut result = match outcome {
             Ok(result) => result,
             Err(DrainTurnError::Cancelled) => {
@@ -3138,36 +3543,68 @@ impl SiGitAgent {
                 }
 
                 // Permission gate: read-only tools pass straight through; a
-                // mutating tool consults policy and may ask the client.
-                let output = match decision {
-                    None => format!(
-                        "The tool `{}` was not executed again because the model repeated \
-                         the same call three times. Continue without this tool.",
-                        tc.name
+                // mutating tool consults policy and may ask the client. The
+                // flag says whether the tool actually ran: a call that was
+                // denied or skipped ends `failed`, not `completed` (#139).
+                let mut change = None;
+                let mut terminal = None;
+                let (output, executed) = match decision {
+                    None => (
+                        format!(
+                            "The tool `{}` was not executed again because the model repeated \
+                             the same call three times. Continue without this tool.",
+                            tc.name
+                        ),
+                        false,
                     ),
                     Some(decision) => match decision {
                         permissions::Decision::Allow => {
-                            tools::execute_tool(&tc.name, &tc.arguments).await
+                            let outcome = tools::execute_tool_with_change(
+                                &tc.name,
+                                &tc.arguments,
+                                Some(&tc.id),
+                            )
+                            .await;
+                            change = outcome.change;
+                            terminal = outcome.terminal;
+                            (outcome.output, true)
                         }
                         permissions::Decision::Deny(reason) => {
                             log::info!("  ✗ {} denied by policy", tc.name);
-                            reason
+                            (reason, false)
                         }
                         permissions::Decision::Ask => {
+                            // Worked out while the session still holds the
+                            // workspace: a relative path resolves against
+                            // its cwd.
+                            let preview = tools::preview_file_change(&tc.name, &tc.arguments).await;
                             // The answer can take as long as the user likes.
                             if release_while_waiting {
                                 workspace.release();
                             }
-                            let verdict = self
-                                .request_tool_permission(
+                            // A client that cancels the turn answers the
+                            // request itself. One that closes the session
+                            // need not, so the wait ends on either.
+                            let verdict = tokio::select! {
+                                verdict = self.request_tool_permission(
                                     cx,
                                     &session_id,
                                     &tc.id,
                                     &tc.name,
                                     &tc.arguments,
-                                )
+                                    preview.as_ref(),
+                                ) => verdict,
+                                _ = cancellation.cancelled() => PermissionVerdict::TurnCancelled,
+                            };
+                            self.resume_workspace(&mut workspace, &session_id, &cancellation)
                                 .await;
-                            self.resume_workspace(&mut workspace, &session_id).await;
+                            // An approval can cross a cancellation on the wire,
+                            // or arrive while this turn waited for the lock.
+                            let verdict = if cancellation.cancelled.load(Ordering::Acquire) {
+                                PermissionVerdict::TurnCancelled
+                            } else {
+                                verdict
+                            };
                             match verdict {
                                 PermissionVerdict::Approved => {
                                     // The call the user just approved leaves
@@ -3190,11 +3627,19 @@ impl SiGitAgent {
                                         )
                                         .ok();
                                     }
-                                    tools::execute_tool(&tc.name, &tc.arguments).await
+                                    let outcome = tools::execute_tool_with_change(
+                                        &tc.name,
+                                        &tc.arguments,
+                                        Some(&tc.id),
+                                    )
+                                    .await;
+                                    change = outcome.change;
+                                    terminal = outcome.terminal;
+                                    (outcome.output, true)
                                 }
                                 PermissionVerdict::Denied(reason) => {
                                     log::info!("  ✗ {} denied by user", tc.name);
-                                    reason
+                                    (reason, false)
                                 }
                                 PermissionVerdict::TurnCancelled => {
                                     log::info!(
@@ -3246,16 +3691,27 @@ impl SiGitAgent {
                 log::info!("  ← {} chars", output.len());
 
                 if !render_as_plan {
+                    let mut fields = ToolCallUpdateFields::new()
+                        .status(if executed {
+                            ToolCallStatus::Completed
+                        } else {
+                            ToolCallStatus::Failed
+                        })
+                        .content(tool_result_content(
+                            &output,
+                            change.as_ref(),
+                            terminal.as_deref(),
+                        ))
+                        .raw_output(serde_json::Value::String(output.clone()));
+                    // A denial at the prompt leaves the card titled with the
+                    // permission request's full arguments; put its own back.
+                    if !executed && announced_status == ToolCallStatus::Pending {
+                        fields = fields.title(chat::tool_title(&tc.name, &tc.arguments));
+                    }
                     self.send_tool_call_update(
                         cx,
                         session_id.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            tc.id.clone(),
-                            ToolCallUpdateFields::new()
-                                .status(ToolCallStatus::Completed)
-                                .content(vec![tool_output_content(&output)])
-                                .raw_output(serde_json::Value::String(output.clone())),
-                        )),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tc.id.clone(), fields)),
                     )
                     .ok();
                 }
@@ -3308,7 +3764,8 @@ impl SiGitAgent {
                     &cancellation,
                 )
                 .await;
-            self.resume_workspace(&mut workspace, &session_id).await;
+            self.resume_workspace(&mut workspace, &session_id, &cancellation)
+                .await;
             result = match outcome {
                 Ok(result) => result,
                 Err(DrainTurnError::Cancelled) => {
@@ -3442,6 +3899,10 @@ impl SiGitAgent {
     /// recorded via [`permissions::grant_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
     /// dispatch loop must be free to route the client's answer back to us.
+    ///
+    /// `preview` is the file change the call would make, from
+    /// [`tools::preview_file_change`]; when there is one the card shows it as
+    /// a diff, so the user approves an edit by looking at the change.
     async fn request_tool_permission(
         &self,
         cx: &ConnectionTo<Client>,
@@ -3449,6 +3910,7 @@ impl SiGitAgent {
         tool_call_id: &str,
         tool_name: &str,
         arguments: &str,
+        preview: Option<&tools::FileChange>,
     ) -> PermissionVerdict {
         // The user decides from this dialog, so show the arguments with any
         // truncation flagged (a silently clipped command could hide its tail
@@ -3473,6 +3935,7 @@ impl SiGitAgent {
                     .title(title)
                     .kind(tool_kind_for(tool_name))
                     .status(ToolCallStatus::Pending)
+                    .content(preview.map(|change| vec![file_change_content(change)]))
                     .raw_input(raw_input),
             ),
             vec![
@@ -5371,8 +5834,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_load_session(&task_cx, req).await)
                     })
@@ -5387,8 +5849,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_resume_session(&task_cx, req).await)
                     })
@@ -5405,8 +5866,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     state.begin_close(&req.session_id);
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_close_session(req).await)
                     })
@@ -5423,8 +5883,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     cx.spawn(async move {
                         // The source's lock: a fork copies its conversation,
                         // which has to be between turns.
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_fork_session(&task_cx, req).await)
                     })
@@ -5453,8 +5912,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         handle_response(responder, state.handle_prompt(&task_cx, req).await)
                     })
                 }
@@ -5470,8 +5928,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
@@ -5489,8 +5946,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
@@ -6390,6 +6846,89 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global env for the whole test
+    async fn a_session_lock_entry_goes_once_its_session_and_its_waiters_are_gone() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let agent = Arc::new(SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        ));
+        let held = |key: &str| agent.session_locks.lock().unwrap().contains_key(key);
+        let thread = SessionId::new("lock-thread");
+        agent.sessions.lock().unwrap().insert(
+            "lock-thread".into(),
+            agent.session_state(&std::env::temp_dir(), &[]),
+        );
+
+        // An open session keeps its entry between requests.
+        drop(agent.lock_session(&thread).await);
+        assert!(held("lock-thread"));
+
+        // A request naming an id nobody opened leaves nothing behind.
+        drop(agent.lock_session(&SessionId::new("lock-stranger")).await);
+        assert!(!held("lock-stranger"));
+
+        // The session closes with another request queued behind the close.
+        // That request still has to find the same lock, so the entry stays
+        // until it has had its turn.
+        let closing = agent.lock_session(&thread).await;
+        let queued = agent.lock_session(&thread);
+        tokio::pin!(queued);
+        tokio::select! {
+            biased;
+            _ = &mut queued => panic!("the queued request ran beside the one holding the lock"),
+            _ = std::future::ready(()) => {}
+        }
+        agent.sessions.lock().unwrap().remove("lock-thread");
+        drop(closing);
+        assert!(held("lock-thread"));
+        drop(queued.await);
+        assert!(!held("lock-thread"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global env for the whole test
+    async fn a_turn_whose_session_cannot_be_reinstalled_is_cancelled() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        let gone = SessionId::new("resume-thread-gone");
+        let cancellation = PromptCancellation::default();
+        let mut workspace = WorkspaceHold::acquire(&agent.workspace_lock).await;
+
+        // The lock was never given up, so there is nothing to reinstall.
+        agent
+            .resume_workspace(&mut workspace, &gone, &cancellation)
+            .await;
+        assert!(!cancellation.cancelled.load(Ordering::Acquire));
+
+        workspace.release();
+        agent
+            .resume_workspace(&mut workspace, &gone, &cancellation)
+            .await;
+        assert!(cancellation.cancelled.load(Ordering::Acquire));
+        // The signal is there for whatever waits on it next.
+        cancellation.cancelled().await;
+        assert!(agent.active_session.lock().unwrap().is_none());
+    }
+
     #[test]
     fn session_context_message_lists_every_root_of_a_multi_root_project() {
         let primary = PathBuf::from("/tmp/primary");
@@ -6604,8 +7143,8 @@ mod tests {
     #[test]
     fn streamed_reply_sends_each_fragment_as_it_is_revealed() {
         let mut reply = StreamedReply::default();
-        assert_eq!(reply.push("Hello"), Some("Hello".to_string()));
-        assert_eq!(reply.push(", world"), Some(", world".to_string()));
+        assert_eq!(reply.push("Hello").visible, Some("Hello".to_string()));
+        assert_eq!(reply.push(", world").visible, Some(", world".to_string()));
         assert!(reply.streamed_any);
     }
 
@@ -6618,12 +7157,15 @@ mod tests {
         reply.interrupt();
 
         assert_eq!(
-            reply.push("Let me broaden the search:"),
+            reply.push("Let me broaden the search:").visible,
             Some("\n\nLet me broaden the search:".to_string()),
             "the new round must not run onto the end of the last sentence"
         );
         // Only the seam gets a break; the rest of the round streams as usual.
-        assert_eq!(reply.push(" Found them."), Some(" Found them.".to_string()));
+        assert_eq!(
+            reply.push(" Found them.").visible,
+            Some(" Found them.".to_string())
+        );
     }
 
     #[test]
@@ -6634,9 +7176,9 @@ mod tests {
 
         // A fragment of pure whitespace reveals nothing and must not consume
         // the pending break.
-        assert_eq!(reply.push("\n"), None);
+        assert_eq!(reply.push("\n").visible, None);
         assert_eq!(
-            reply.push("  Done."),
+            reply.push("  Done.").visible,
             Some("\n\nDone.".to_string()),
             "the break replaces the model's leading whitespace"
         );
@@ -6649,24 +7191,47 @@ mod tests {
         let mut reply = StreamedReply::default();
         reply.interrupt();
 
-        assert_eq!(reply.push("Found them."), Some("Found them.".to_string()));
+        assert_eq!(
+            reply.push("Found them.").visible,
+            Some("Found them.".to_string())
+        );
     }
 
     #[test]
-    fn streamed_reply_hides_reasoning_and_still_breaks_the_paragraph() {
+    fn streamed_reply_keeps_reasoning_out_of_the_reply_and_still_breaks_the_paragraph() {
         let mut reply = StreamedReply::default();
         reply.push("Looking now.");
         reply.interrupt();
 
-        // A round that opens with reasoning reveals nothing until the visible
-        // text arrives — and that text still starts the new paragraph.
-        assert_eq!(reply.push("<think>weigh"), None);
-        assert_eq!(reply.push(" options</think>"), None);
+        // A round that opens with reasoning reveals no *visible* text until the
+        // reply arrives — and that text still starts the new paragraph.
+        assert_eq!(reply.push("<think>weigh").visible, None);
+        assert_eq!(reply.push(" options</think>").visible, None);
         assert_eq!(
-            reply.push("Here it is."),
+            reply.push("Here it is.").visible,
             Some("\n\nHere it is.".to_string()),
             "the break waits for the reasoning to end and rides out with the text"
         );
+    }
+
+    #[test]
+    fn streamed_reply_surfaces_inline_think_reasoning_incrementally() {
+        let mut reply = StreamedReply::default();
+
+        // Inline `<think>` content is routed as reasoning, not reply text, and
+        // only the newly-revealed suffix is emitted each time.
+        let r = reply.push("<think>weigh");
+        assert_eq!(r.visible, None);
+        assert_eq!(r.reasoning, Some("weigh".to_string()));
+
+        let r = reply.push(" options</think>");
+        assert_eq!(r.visible, None);
+        assert_eq!(r.reasoning, Some(" options".to_string()));
+
+        // The visible answer carries no reasoning.
+        let r = reply.push("Here it is.");
+        assert_eq!(r.visible, Some("Here it is.".to_string()));
+        assert_eq!(r.reasoning, None);
     }
 
     #[test]
@@ -6833,6 +7398,54 @@ mod tests {
     }
 
     #[test]
+    fn a_file_change_is_sent_as_diff_content_before_the_result() {
+        let change = tools::FileChange {
+            path: PathBuf::from("/repo/src/lib.rs"),
+            old_text: Some("old\n".to_string()),
+            new_text: "new\n".to_string(),
+        };
+        let content = serde_json::to_value(tool_result_content(
+            "Edited file: /repo/src/lib.rs (4 bytes written)",
+            Some(&change),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({
+                "type": "diff",
+                "path": "/repo/src/lib.rs",
+                "oldText": "old\n",
+                "newText": "new\n",
+            })
+        );
+        assert_eq!(content[1]["type"], "content");
+        assert_eq!(content.as_array().unwrap().len(), 2);
+
+        // A created file has no old text; ACP leaves `oldText` out.
+        let created = tools::FileChange {
+            old_text: None,
+            ..change
+        };
+        let diff = serde_json::to_value(file_change_content(&created)).unwrap();
+        assert!(diff.get("oldText").is_none_or(serde_json::Value::is_null));
+
+        // Every other tool keeps the result text alone.
+        // A command that ran in the client's terminal keeps the terminal,
+        // which already shows its output.
+        let ran = serde_json::to_value(tool_result_content("Exit code 0:\nhi", None, Some("t-1")))
+            .unwrap();
+        assert_eq!(
+            ran,
+            serde_json::json!([{ "type": "terminal", "terminalId": "t-1" }])
+        );
+
+        let plain = serde_json::to_value(tool_result_content("ok", None, None)).unwrap();
+        assert_eq!(plain.as_array().unwrap().len(), 1);
+        assert_eq!(plain[0]["type"], "content");
+    }
+
+    #[test]
     fn tool_arguments_content_only_labels_valid_json() {
         let json = format!("{:?}", tool_arguments_content(r#"{"path":"src/main.rs"}"#));
         let malformed = format!("{:?}", tool_arguments_content("{not json"));
@@ -6917,6 +7530,33 @@ mod tests {
             again.is_none(),
             "the note is shown once, not on every prompt"
         );
+    }
+
+    #[test]
+    fn a_model_without_audio_gets_a_note_and_the_user_is_told() {
+        let clip = AudioInput {
+            mime_type: "audio/wav".to_string(),
+            data: "AAAA".to_string(),
+        };
+        let (text, audio, notice) = audio_for_turn(
+            "listen".to_string(),
+            vec![clip],
+            false,
+            "Nova",
+            0,
+            "s-audio",
+        );
+        assert!(audio.is_empty());
+        assert!(
+            text.starts_with("listen\n\n[The user attached 1 audio clip."),
+            "{text}"
+        );
+        let notice = notice.expect("the user must be told the audio was left out");
+        assert!(
+            notice.starts_with("> **Audio not sent.** Nova cannot take audio"),
+            "{notice}"
+        );
+        assert!(notice.contains("1 attached audio clip was"), "{notice}");
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::backend::{
-    self, InferenceBackend, OpenAiBackend, ToolResult as BackendToolResult, TurnResult,
+    self, InferenceBackend, OpenAiBackend, TokenChunk, ToolResult as BackendToolResult, TurnResult,
 };
 use crate::{permissions, provider, session_store, settings, tools};
 
@@ -435,7 +435,7 @@ async fn run_prompt(
     // Token sink: assistant text streams through this while a turn runs; the
     // drain loop forwards the visible portion to stdout live. In quiet mode no
     // sink is passed and only the final message is printed.
-    let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<TokenChunk>();
     let sink_opt = if config.quiet { None } else { Some(&sink) };
     let mut reply = crate::StreamedReply::default();
 
@@ -607,7 +607,7 @@ async fn run_prompt(
 /// arrive — the stdio counterpart of `SiGitAgent::drain_turn`.
 async fn drain_to_stdout<F>(
     fut: F,
-    sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TokenChunk>,
     reply: &mut crate::StreamedReply,
     config: &HeadlessConfig,
 ) -> Result<TurnResult, backend::BackendError>
@@ -618,35 +618,62 @@ where
     let result = loop {
         tokio::select! {
             done = &mut fut => break done,
-            Some(piece) = sink_rx.recv() => {
-                emit_visible_chunk(&piece, reply, config);
+            Some(chunk) = sink_rx.recv() => {
+                emit_token_chunk(chunk, reply, config);
             }
         }
     };
     // Flush tokens that landed between the last poll and the future resolving.
-    while let Ok(piece) = sink_rx.try_recv() {
-        emit_visible_chunk(&piece, reply, config);
+    while let Ok(chunk) = sink_rx.try_recv() {
+        emit_token_chunk(chunk, reply, config);
     }
     result
 }
 
 /// Fold a streamed fragment into `reply` and print whatever it newly reveals —
-/// the stdio counterpart of `SiGitAgent::emit_visible_chunk`.
-fn emit_visible_chunk(piece: &str, reply: &mut crate::StreamedReply, config: &HeadlessConfig) {
-    if let Some(extra) = reply.push(piece) {
-        if config.output == OutputFormat::Jsonl {
-            emit_event(
-                config,
-                serde_json::json!({
-                    "type": "assistant_delta",
-                    "session_id": config.session_id,
-                    "text": extra,
-                }),
-            );
-        } else {
-            print!("{extra}");
+/// the stdio counterpart of `SiGitAgent::emit_token_chunk`. Reasoning (from a
+/// dedicated field or an inline `<think>` block) never joins the stdout answer
+/// stream; under `--output jsonl` it surfaces as a separate `reasoning_delta`
+/// event, and is dropped in plain mode.
+fn emit_token_chunk(chunk: TokenChunk, reply: &mut crate::StreamedReply, config: &HeadlessConfig) {
+    match chunk {
+        TokenChunk::Reasoning(text) => emit_reasoning_delta(&text, config),
+        TokenChunk::Visible(piece) => {
+            let revealed = reply.push(&piece);
+            if let Some(reasoning) = revealed.reasoning {
+                emit_reasoning_delta(&reasoning, config);
+            }
+            if let Some(extra) = revealed.visible {
+                if config.output == OutputFormat::Jsonl {
+                    emit_event(
+                        config,
+                        serde_json::json!({
+                            "type": "assistant_delta",
+                            "session_id": config.session_id,
+                            "text": extra,
+                        }),
+                    );
+                } else {
+                    print!("{extra}");
+                }
+                let _ = std::io::stdout().flush();
+            }
         }
-        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Emit model reasoning as a structured event under `--output jsonl`. In plain
+/// mode reasoning is not part of the answer, so it is dropped.
+fn emit_reasoning_delta(text: &str, config: &HeadlessConfig) {
+    if config.output == OutputFormat::Jsonl {
+        emit_event(
+            config,
+            serde_json::json!({
+                "type": "reasoning_delta",
+                "session_id": config.session_id,
+                "text": text,
+            }),
+        );
     }
 }
 
