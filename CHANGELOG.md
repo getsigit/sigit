@@ -11,6 +11,15 @@
   parsing the title, and a replayed thread from `session/load` carries the same
   name (#196).
 
+### Fixed
+
+- **A linked selection written as `L10-L20` or `L10` reads just those lines.**
+  siGit Code read the line range of a `resource_link` only as `L10:20` or
+  `L10-20`, so `L10-L20` (the GitHub style) and a single line `L10` sent the
+  whole file instead of the selection. It now reads the same forms Zed's own
+  mention parser does, and a range that starts at line 0 or runs backwards
+  counts as no range.
+
 ## 1.6.5
 
 ### Added
@@ -45,13 +54,6 @@
   drops the second copy of crossterm (0.28) from the build.
 
 ### Fixed
-
-- **A linked selection written as `L10-L20` or `L10` reads just those lines.**
-  siGit Code read the line range of a `resource_link` only as `L10:20` or
-  `L10-20`, so `L10-L20` (the GitHub style) and a single line `L10` sent the
-  whole file instead of the selection. It now reads the same forms Zed's own
-  mention parser does, and a range that starts at line 0 or runs backwards
-  counts as no range.
 
 - **Tags a model makes up no longer show in the reply.** After a long run of
   tool rounds, a model could start writing markup that looked like it came
