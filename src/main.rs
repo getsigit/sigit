@@ -46,6 +46,7 @@ mod mcp;
 mod models;
 mod permissions;
 mod provider;
+mod repetition;
 mod session_store;
 mod settings;
 mod setup;
@@ -309,6 +310,8 @@ fn stop_reason_for(round_cap_reached: bool, finish: backend::FinishReason) -> St
         backend::FinishReason::Complete => StopReason::EndTurn,
         backend::FinishReason::Length => StopReason::MaxTokens,
         backend::FinishReason::ContentFilter => StopReason::Refusal,
+        // Cut by the agent, not the token limit; no ACP reason fits better.
+        backend::FinishReason::Repetition => StopReason::EndTurn,
     }
 }
 
@@ -6318,11 +6321,16 @@ mod tests {
             stop_reason_for(false, FinishReason::ContentFilter),
             StopReason::Refusal
         );
+        assert_eq!(
+            stop_reason_for(false, FinishReason::Repetition),
+            StopReason::EndTurn
+        );
         // The cap wins: the last round was a forced reply either way.
         for finish in [
             FinishReason::Complete,
             FinishReason::Length,
             FinishReason::ContentFilter,
+            FinishReason::Repetition,
         ] {
             assert_eq!(stop_reason_for(true, finish), StopReason::MaxTurnRequests);
         }

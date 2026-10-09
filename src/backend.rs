@@ -75,6 +75,9 @@ pub enum FinishReason {
     Length,
     /// The endpoint withheld the reply instead of answering.
     ContentFilter,
+    /// The harness cut the reply off because it had degenerated into
+    /// repetition (see `repetition`).
+    Repetition,
 }
 
 impl FinishReason {
@@ -1017,16 +1020,26 @@ impl OpenAiBackend {
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
         let (result, malformed) = self.request(tools, allow_tool_calls, sink).await?;
-        if malformed == 0 || !allow_tool_calls || !result.tool_calls.is_empty() {
+        let retry_note = if !allow_tool_calls || !result.tool_calls.is_empty() {
+            None
+        } else if malformed > 0 {
+            log::warn!(
+                "dropped {malformed} unparseable inline tool call(s); asking the model to retry"
+            );
+            Some(MALFORMED_TOOL_CALL_RETRY)
+        } else if result.finish == FinishReason::Repetition {
+            log::warn!("reply was cut off as a repetition loop; asking the model to retry");
+            Some(REPETITION_RETRY)
+        } else {
+            None
+        };
+        let Some(retry_note) = retry_note else {
             return Ok(result);
-        }
+        };
 
-        log::warn!(
-            "dropped {malformed} unparseable inline tool call(s); asking the model to retry"
-        );
         self.history.lock().await.push(serde_json::json!({
             "role": "user",
-            "content": MALFORMED_TOOL_CALL_RETRY,
+            "content": retry_note,
         }));
         if let Some(sink) = sink
             && !result.text.trim().is_empty()
@@ -1380,6 +1393,9 @@ impl OpenAiBackend {
         let mut markup = crate::harness_markup::MarkupFilter::new();
         let mut recovered: Vec<ToolCall> = Vec::new();
         let mut malformed = 0usize;
+        // Stops a reply that falls into a repetition loop. See `repetition`.
+        let mut guard = crate::repetition::RepetitionGuard::new();
+        let mut degenerate = false;
 
         while let Some(item) = stream.next().await {
             let bytes = item.map_err(|error| format!("stream read error: {error}"))?;
@@ -1448,9 +1464,14 @@ impl OpenAiBackend {
                                     continue;
                                 }
                                 text.push_str(&chunk);
+                                let looping = guard.push(&chunk);
                                 if sink.send(TokenChunk::Visible(chunk)).is_err() {
                                     // Consumer dropped (turn cancelled).
                                     cancelled = true;
+                                    break;
+                                }
+                                if looping {
+                                    degenerate = true;
                                     break;
                                 }
                             }
@@ -1473,7 +1494,7 @@ impl OpenAiBackend {
                             }
                         }
                     }
-                    if cancelled {
+                    if cancelled || degenerate {
                         done = true;
                         break;
                     }
@@ -1507,20 +1528,35 @@ impl OpenAiBackend {
         // tool-call block that never closed is dropped like any other
         // unparseable one.
         let mut leftover = String::new();
-        match scanner.finish() {
-            Some(crate::inline_tool_calls::ScanEvent::Text(rest)) => {
-                leftover = markup.push(&rest);
+        if degenerate {
+            // Dropping the stream below closes the connection, so the endpoint
+            // stops generating. Nothing held back is worth flushing.
+            let keep = guard.loop_start().unwrap_or(text.len()).min(text.len());
+            log::warn!(
+                "reply degenerated into repetition; cut {} of {} bytes",
+                text.len() - keep,
+                text.len()
+            );
+            text.truncate(keep);
+            text.truncate(text.trim_end().len());
+            finish = FinishReason::Repetition;
+            let _ = sink.send(TokenChunk::Visible(REPETITION_NOTICE.to_string()));
+        } else {
+            match scanner.finish() {
+                Some(crate::inline_tool_calls::ScanEvent::Text(rest)) => {
+                    leftover = markup.push(&rest);
+                }
+                Some(crate::inline_tool_calls::ScanEvent::Malformed(block)) => {
+                    log_malformed_block(&block);
+                    malformed += 1;
+                }
+                Some(crate::inline_tool_calls::ScanEvent::ToolCall(_)) | None => {}
             }
-            Some(crate::inline_tool_calls::ScanEvent::Malformed(block)) => {
-                log_malformed_block(&block);
-                malformed += 1;
+            leftover.push_str(&markup.finish());
+            if !leftover.is_empty() {
+                text.push_str(&leftover);
+                let _ = sink.send(TokenChunk::Visible(leftover));
             }
-            Some(crate::inline_tool_calls::ScanEvent::ToolCall(_)) | None => {}
-        }
-        leftover.push_str(&markup.finish());
-        if !leftover.is_empty() {
-            text.push_str(&leftover);
-            let _ = sink.send(TokenChunk::Visible(leftover));
         }
 
         let mut tool_calls: Vec<ToolCall> = tool_accum
@@ -1553,7 +1589,7 @@ impl OpenAiBackend {
         }
 
         // Record the assistant turn so later tool results have context.
-        if malformed > 0 && tool_calls.is_empty() {
+        if (malformed > 0 || degenerate) && tool_calls.is_empty() {
             self.push_reply_without_calls(&text).await;
         } else {
             self.history
@@ -1578,6 +1614,16 @@ const MALFORMED_TOOL_CALL_RETRY: &str = "[siGit Code] Your last reply tried to c
     writing the call out as text, and it could not be parsed, so nothing ran and the user did \
     not see it. Do not write tool calls or tool results as text. Make the call again using the \
     tool-calling interface, or answer in plain prose if no tool is needed.";
+
+/// Sent as a user turn after a reply was cut off as a repetition loop.
+const REPETITION_RETRY: &str = "[siGit Code] Your last reply started repeating the same few \
+    words and was cut off. Do not continue it. Make the next tool call you need, or answer \
+    briefly in plain prose.";
+
+/// Shown to the user, who has already watched the loop stream. Not kept in
+/// history.
+const REPETITION_NOTICE: &str =
+    "\n\n[siGit Code stopped this reply because the model started repeating itself.]";
 
 fn log_malformed_block(block: &str) {
     log::warn!(
@@ -2832,6 +2878,125 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (addr, receiver)
+    }
+
+    /// Scripted SSE endpoint: one response per connection, in order. The
+    /// receiver yields each request body.
+    fn spawn_sse_sequence_stub(
+        replies: Vec<Vec<String>>,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for deltas in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:")?.trim().parse().ok())
+                            .unwrap_or(0usize);
+                        if request.len() >= end + 4 + length {
+                            let _ = sender
+                                .send(String::from_utf8_lossy(&request[end + 4..]).into_owned());
+                            break;
+                        }
+                    }
+                }
+                let mut body = String::new();
+                for delta in deltas {
+                    let frame = serde_json::json!({
+                        "choices": [{ "delta": { "content": delta } }]
+                    });
+                    body.push_str(&format!("data: {frame}\n\n"));
+                }
+                body.push_str("data: [DONE]\n\n");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (addr, receiver)
+    }
+
+    /// Issue #123: a streamed reply that degenerates into a repetition loop is
+    /// cut off, history keeps only what came before the loop, and the model
+    /// gets one retry.
+    #[tokio::test]
+    async fn a_repetition_loop_is_cut_and_retried_once() {
+        let intro = "Let me look at the commits. ";
+        let looped: Vec<String> = std::iter::once(intro.to_string())
+            .chain(
+                crate::repetition::issue_loop_text()
+                    .as_bytes()
+                    .chunks(40)
+                    .map(|c| String::from_utf8_lossy(c).into_owned()),
+            )
+            .collect();
+        let (addr, requests) =
+            spawn_sse_sequence_stub(vec![looped, vec!["Here is the answer.".to_string()]]);
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+        let (sink, mut tokens) = tokio::sync::mpsc::unbounded_channel();
+        let tools = vec![ToolSpec {
+            name: "run_command".to_string(),
+            description: "Run a command".to_string(),
+            parameters_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+        }];
+
+        let result = backend
+            .send_message_with_tools("what changed", &tools, Some(&sink))
+            .await
+            .unwrap();
+
+        assert_eq!(result.finish, FinishReason::Complete);
+        assert!(result.text.starts_with(intro.trim_end()), "{}", result.text);
+        assert!(result.text.ends_with("Here is the answer."));
+        assert!(
+            result.text.len() < 600,
+            "junk kept: {} bytes",
+            result.text.len()
+        );
+
+        let first = requests.recv().unwrap();
+        assert!(!first.contains(REPETITION_RETRY));
+        let second = requests.recv().unwrap();
+        assert!(second.contains(REPETITION_RETRY));
+
+        let history = backend.history_snapshot().await;
+        let kept = history
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .and_then(|m| m["content"].as_str())
+            .unwrap();
+        assert!(
+            kept.len() < 600,
+            "history kept the loop: {} bytes",
+            kept.len()
+        );
+
+        drop(sink);
+        let mut shown = String::new();
+        while let Ok(chunk) = tokens.try_recv() {
+            if let TokenChunk::Visible(text) = chunk {
+                shown.push_str(&text);
+            }
+        }
+        assert!(shown.contains("stopped this reply"), "{shown}");
     }
 
     #[test]

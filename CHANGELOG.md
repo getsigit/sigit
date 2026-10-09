@@ -13,6 +13,13 @@
 
 ### Fixed
 
+- **A reply that degenerates into a repetition loop is cut off.** After a tool
+  call, a model could fall into thousands of words from a tiny vocabulary
+  (`find: list: check: get: …`) with no tool call and no end, and the junk went
+  into history for the next turn. siGit Code now watches a streamed reply for a
+  window of 200 words with very few distinct ones (code blocks excepted), stops
+  reading, keeps only the text before the loop, tells you it stopped, and asks
+  the model once to make its call or answer briefly (#123).
 - **A linked selection written as `L10-L20` or `L10` reads just those lines.**
   siGit Code read the line range of a `resource_link` only as `L10:20` or
   `L10-20`, so `L10-L20` (the GitHub style) and a single line `L10` sent the

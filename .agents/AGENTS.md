@@ -159,6 +159,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   never touched, and an opening tag only counts at the start of a line, since prose writes
   placeholders like `<repo_url>` the same way. It has to run after the inline-call scanner,
   because `<tool_call>` matches its underscore rule.
+  `src/repetition.rs` guards the same stream against a reply that degenerates into a loop over a
+  tiny vocabulary (issue #123): a window of 200 words with at most 40 distinct ones, fenced code
+  excepted, makes `consume_stream` stop reading, truncate the text to where the loop began (so
+  history never holds the junk), tell the user, and finish with `FinishReason::Repetition`
+  (`EndTurn` in ACP). `complete` then retries once with `REPETITION_RETRY`, like the malformed
+  tool call retry. Only the streaming path is guarded; `consume_json` and `LocalBackend` are not.
   Image attachments: ACP fixes `promptCapabilities.image` for the whole connection, while the
   model can change on any turn, so the capability is always advertised and the decision is made
   per prompt. `InferenceBackend::accepts_images` answers for the active model (on-device: no;
