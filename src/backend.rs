@@ -1183,9 +1183,9 @@ impl OpenAiBackend {
             .next()
             .ok_or_else(|| "endpoint returned no choices".to_string())?;
         let finish = FinishReason::from_wire(choice.finish_reason.as_deref());
-        let message = choice.message;
+        let mut message = choice.message;
 
-        let mut text = message.content.clone().unwrap_or_default();
+        let text = message.content.clone().unwrap_or_default();
         let mut tool_calls: Vec<ToolCall> = message
             .tool_calls
             .iter()
@@ -1197,7 +1197,10 @@ impl OpenAiBackend {
             })
             .collect();
 
-        let extracted = crate::inline_tool_calls::extract(&text, tools);
+        let mut extracted = crate::inline_tool_calls::extract(&text, tools);
+        // Markup the model made up in the harness's shape goes too, from the
+        // reply and the history alike. See `harness_markup`.
+        extracted.text = crate::harness_markup::strip(&extracted.text);
         let malformed = extracted.malformed;
         if malformed > 0 {
             log::warn!("dropped {malformed} unparseable inline tool call(s) from the reply");
@@ -1205,7 +1208,7 @@ impl OpenAiBackend {
 
         if !allow_tool_calls {
             let recovered = extracted.calls;
-            text = extracted.text;
+            let text = extracted.text;
             let suppressed = tool_calls.len() + recovered.len();
             if suppressed > 0 {
                 let names = tool_calls
@@ -1236,7 +1239,7 @@ impl OpenAiBackend {
         // instead of using the structured field (see `inline_tool_calls`).
         // Recover it, or the turn ends with the tag rendered as prose and
         // whatever the model meant to do is dropped.
-        if tool_calls.is_empty() {
+        if tool_calls.is_empty() && (malformed > 0 || !extracted.calls.is_empty()) {
             let cleaned = extracted.text;
             let recovered = extracted.calls;
             if !recovered.is_empty() {
@@ -1270,19 +1273,18 @@ impl OpenAiBackend {
                     malformed,
                 ));
             }
-            if malformed > 0 {
-                // Keep the broken block out of history as well as the reply;
-                // see `inline_tool_calls` for why it poisons later turns.
-                self.push_reply_without_calls(&cleaned).await;
-                return Ok((
-                    TurnResult {
-                        text: cleaned,
-                        tool_calls,
-                        finish,
-                    },
-                    malformed,
-                ));
-            }
+            // Nothing recovered, so what was found is a broken block. Keep it
+            // out of history as well as the reply; see `inline_tool_calls` for
+            // why it poisons later turns.
+            self.push_reply_without_calls(&cleaned).await;
+            return Ok((
+                TurnResult {
+                    text: cleaned,
+                    tool_calls,
+                    finish,
+                },
+                malformed,
+            ));
         } else if malformed > 0 || !extracted.calls.is_empty() {
             // Structured calls arrived with inline blocks beside them. As on
             // the streaming path, inline calls that parse run alongside the
@@ -1314,7 +1316,13 @@ impl OpenAiBackend {
             ));
         }
 
-        // Record the assistant turn so later tool results have context.
+        // Record the assistant turn so later tool results have context. No
+        // inline block was found, so the only change `extracted.text` can
+        // carry is the stripped markup.
+        let text = extracted.text;
+        if message.content.is_some() {
+            message.content = Some(text.clone());
+        }
         self.history.lock().await.push(message.into_history_value());
 
         Ok((
@@ -1366,6 +1374,10 @@ impl OpenAiBackend {
         // it arrives, so by the time a whole turn is assembled the tag has
         // already been rendered. See `inline_tool_calls`.
         let mut scanner = crate::inline_tool_calls::StreamScanner::new(tools);
+        // What it lets through then loses any markup the model made up in the
+        // harness's shape, like a `<system_warning>` block. See
+        // `harness_markup`.
+        let mut markup = crate::harness_markup::MarkupFilter::new();
         let mut recovered: Vec<ToolCall> = Vec::new();
         let mut malformed = 0usize;
 
@@ -1431,6 +1443,10 @@ impl OpenAiBackend {
                     for event in scanner.push(&content) {
                         match event {
                             crate::inline_tool_calls::ScanEvent::Text(chunk) => {
+                                let chunk = markup.push(&chunk);
+                                if chunk.is_empty() {
+                                    continue;
+                                }
                                 text.push_str(&chunk);
                                 if sink.send(TokenChunk::Visible(chunk)).is_err() {
                                     // Consumer dropped (turn cancelled).
@@ -1490,16 +1506,21 @@ impl OpenAiBackend {
         // Flush what was held back. A partial marker is just text; a
         // tool-call block that never closed is dropped like any other
         // unparseable one.
+        let mut leftover = String::new();
         match scanner.finish() {
-            Some(crate::inline_tool_calls::ScanEvent::Text(leftover)) => {
-                text.push_str(&leftover);
-                let _ = sink.send(TokenChunk::Visible(leftover));
+            Some(crate::inline_tool_calls::ScanEvent::Text(rest)) => {
+                leftover = markup.push(&rest);
             }
             Some(crate::inline_tool_calls::ScanEvent::Malformed(block)) => {
                 log_malformed_block(&block);
                 malformed += 1;
             }
             Some(crate::inline_tool_calls::ScanEvent::ToolCall(_)) | None => {}
+        }
+        leftover.push_str(&markup.finish());
+        if !leftover.is_empty() {
+            text.push_str(&leftover);
+            let _ = sink.send(TokenChunk::Visible(leftover));
         }
 
         let mut tool_calls: Vec<ToolCall> = tool_accum

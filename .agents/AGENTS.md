@@ -152,6 +152,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
   didn't run. Leaving the raw block in history makes the model invent `<function_results>` later.
+  What that scanner lets through then goes through `src/harness_markup.rs`, which removes
+  markup the model makes up in the harness's shape (issue #122): a `<system_warning>`-style
+  block (any `system_*`/`system-*` tag) is dropped whole, from the reply and the history, and
+  other underscore-named tags like `<Option_Picker>` lose the tags but keep their text. Code is
+  never touched, and an opening tag only counts at the start of a line, since prose writes
+  placeholders like `<repo_url>` the same way. It has to run after the inline-call scanner,
+  because `<tool_call>` matches its underscore rule.
   Image attachments: ACP fixes `promptCapabilities.image` for the whole connection, while the
   model can change on any turn, so the capability is always advertised and the decision is made
   per prompt. `InferenceBackend::accepts_images` answers for the active model (on-device: no;

@@ -3422,7 +3422,12 @@ mod tui {
         backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
+        // to be thread-safe.
+        B::Error: Send + Sync + 'static,
+    {
         event_loop(terminal, engine, backend, load_rx, load_model_name).await
     }
 
@@ -3432,7 +3437,12 @@ mod tui {
         backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
+        // to be thread-safe.
+        B::Error: Send + Sync + 'static,
+    {
         let mut app = App::new(load_model_name, backend);
         let mut event_stream = EventStream::new();
 

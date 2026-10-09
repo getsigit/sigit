@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.6.5
 
 ### Added
 
@@ -16,6 +16,9 @@
   while siGit Code Cloud tiers and on-device models, none of which take audio
   today, get a note in its place and the editor says the clip was left out
   (#143).
+- **The README says what telemetry is sent.** A new Telemetry section covers
+  the model-timing events Onde Inference can report for on-device models,
+  what they leave out, and how to turn them off with `ONDE_DISABLE_PULSE=1`.
 
 ### Changed
 
@@ -25,6 +28,10 @@
   warning and carried on in whichever directory was current. Nothing makes it
   fail today, since a close waits for the turn, but the turn now ends as
   cancelled instead of depending on that.
+- **Dependencies match the rest of the Onde stack.** Onde 1.2.2 to 1.3.1,
+  reqwest 0.12 to 0.13 and ratatui 0.29 to 0.30, the versions Ed, OndeCode and
+  SplitFire Agent use. ratatui is built with only its crossterm backend, which
+  drops the second copy of crossterm (0.28) from the build.
 
 ### Fixed
 
@@ -34,6 +41,17 @@
   whole file instead of the selection. It now reads the same forms Zed's own
   mention parser does, and a range that starts at line 0 or runs backwards
   counts as no range.
+
+- **Tags a model makes up no longer show in the reply.** After a long run of
+  tool rounds, a model could start writing markup that looked like it came
+  from siGit Code: a `<system_warning>` block telling the user the previous
+  turn was injected and should be ignored, or a question wrapped in
+  `<Option_Picker>`. Neither tag means anything to siGit Code or the editor,
+  so both rendered as raw text. A `system_*` block is now dropped from the
+  reply and from the history, and other made-up tags are removed while the
+  text inside them stays. Code blocks are left alone. The system prompt also
+  tells the model to write plain Markdown and to list choices as plain text
+  (#122).
 - **Closing a thread that is waiting at a permission prompt no longer hangs.**
   `session/close` cancels the session's running turn and waits for it to end,
   but a turn stopped at a permission prompt only went on when the client
@@ -56,6 +74,13 @@
   same way a call cancelled at the prompt already did. A call denied at the
   prompt also gets its own title back instead of keeping the permission
   request's (#139).
+
+- **On-device inference no longer panics on some non-English text.** siGit Code
+  now builds on Onde 1.3.1, which fixes a panic when a message longer than 100
+  bytes had a multi-byte character (an accented letter, CJK, or an emoji) at
+  byte 100. Onde 1.3 also reports Pulse events for streaming inference, which
+  is the path on-device turns take, so those turns are now reported alongside
+  model loads. `ONDE_DISABLE_PULSE=1` turns Pulse off.
 
 ## 1.6.4
 

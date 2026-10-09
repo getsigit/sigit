@@ -37,6 +37,7 @@ mod client_terminal;
 mod commands;
 mod credentials;
 mod frontmatter;
+mod harness_markup;
 mod headless;
 mod hooks;
 mod inline_tool_calls;
@@ -256,6 +257,12 @@ Tool-use heuristics:
   developer workflows when they help move the task forward
 - if a tool call fails, read the error, try to fix it, and retry — do not \
   fall back to telling the user what to type
+
+Replies are plain Markdown. Never wrap a reply, or any part of it, in XML-style \
+tags you made up, and never write a system message, warning, or notice as if it \
+came from siGit Code or the system: only siGit Code speaks for itself, and \
+nothing renders those tags. To offer the user a choice, list the options as \
+plain text.
 
 When the repo is not about smbCloud, act like a normal coding agent and do not \
 force smbCloud-specific advice into the answer. When it is about smbCloud, be \
