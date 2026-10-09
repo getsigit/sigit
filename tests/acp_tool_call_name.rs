@@ -1,0 +1,277 @@
+//! Regression: an ACP tool call carries the programmatic tool name.
+//!
+//! A `tool_call` has always carried a human title; `name` is what lets a
+//! client tell `run_command` from `read_file` without parsing it. The protocol
+//! puts the name on the first report of a call and forbids it changing
+//! afterwards, so it goes on `ToolCall` and never on a later
+//! `ToolCallUpdate`. `session/load` replays the call, so the replay needs it
+//! too (issue #196).
+//!
+//! This drives the real binary against a scripted OpenAI-compatible endpoint.
+
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+fn sse_body(chunks: &[Value]) -> String {
+    let mut body = String::new();
+    for chunk in chunks {
+        body.push_str(&format!("data: {chunk}\n\n"));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn sse_tool_call(id: &str, name: &str, arguments: &str) -> String {
+    sse_body(&[json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": id,
+            "function": {"name": name, "arguments": arguments},
+        }]}}]
+    })])
+}
+
+fn sse_text(text: &str) -> String {
+    sse_body(&[json!({"choices": [{"delta": {"content": text}}]})])
+}
+
+struct FakeEndpoint {
+    port: u16,
+}
+
+fn start_fake_endpoint(responses: Vec<String>) -> FakeEndpoint {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake endpoint");
+    let port = listener.local_addr().unwrap().port();
+    let queue = Mutex::new(VecDeque::from(responses));
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(match stream.try_clone() {
+                Ok(clone) => clone,
+                Err(_) => continue,
+            });
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let payload = queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "data: [DONE]\n\n".to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    FakeEndpoint { port }
+}
+
+struct AgentUnderTest {
+    child: Child,
+    stdin: ChildStdin,
+    incoming: Receiver<Value>,
+    next_id: u64,
+}
+
+fn spawn_agent(port: u16, config_dir: &std::path::Path) -> AgentUnderTest {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sigit"))
+        .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
+        .env("OPENAI_API_KEY", "test-key")
+        .env("SIGIT_MODEL", "scripted-model")
+        .env("SIGIT_CONFIG_DIR", config_dir)
+        .env("SIGIT_MCP", "off")
+        .env("SIGIT_PERMISSIONS", "allow")
+        .env_remove("SIGIT_LOCAL_INFERENCE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sigit in ACP mode");
+
+    let stdout = child.stdout.take().unwrap();
+    let (message_tx, incoming) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(message) = serde_json::from_str::<Value>(&line)
+                && message_tx.send(message).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let stdin = child.stdin.take().unwrap();
+    AgentUnderTest {
+        child,
+        stdin,
+        incoming,
+        next_id: 0,
+    }
+}
+
+impl AgentUnderTest {
+    fn request(&mut self, method: &str, params: Value) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut line =
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).expect("write stdin");
+        self.stdin.flush().expect("flush stdin");
+        id
+    }
+
+    /// The response to `id`, plus every `session/update` payload that arrived
+    /// before it — which for a prompt and for `session/load` is the whole
+    /// stream the client would render.
+    fn wait_for_response_with_updates(&mut self, id: u64) -> (Value, Vec<Value>) {
+        let mut updates = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the response to request {id}");
+            };
+            if message["method"] == "session/update" {
+                updates.push(message["params"]["update"].clone());
+            }
+            if message["id"] == id && message.get("method").is_none() {
+                assert!(
+                    message.get("error").is_none(),
+                    "request {id} failed: {message}"
+                );
+                return (message, updates);
+            }
+        }
+    }
+}
+
+impl Drop for AgentUnderTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn tool_call(updates: &[Value], id: &str) -> Value {
+    updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "tool_call" && update["toolCallId"] == id)
+        .unwrap_or_else(|| panic!("no tool_call for {id} in {updates:#?}"))
+        .clone()
+}
+
+#[test]
+fn a_tool_call_carries_its_name_live_and_on_replay() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_tool_name_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let work = scratch.join("work");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let notes = work.join("notes.txt");
+    std::fs::write(&notes, "hello from the notes\n").unwrap();
+
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "read_file", &json!({"path": notes}).to_string()),
+        sse_text("read it"),
+    ]);
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response_with_updates(id);
+
+    let id = agent.request("session/new", json!({"cwd": work, "mcpServers": []}));
+    let (response, updates) = agent.wait_for_response_with_updates(id);
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "tool_call"),
+        "session/new reports no tool call: {updates:#?}"
+    );
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "what do the notes say?"}]}),
+    );
+    let (_, live) = agent.wait_for_response_with_updates(id);
+
+    let first = tool_call(&live, "call_1");
+    assert_eq!(
+        first["name"], "read_file",
+        "the first report of a call must carry its tool name: {first}"
+    );
+
+    let later: Vec<&Value> = live
+        .iter()
+        .filter(|update| {
+            update["sessionUpdate"] == "tool_call_update" && update["toolCallId"] == "call_1"
+        })
+        .collect();
+    assert!(
+        !later.is_empty(),
+        "a finished call should have been updated at least once: {live:#?}"
+    );
+    for update in later {
+        assert!(
+            update.get("name").is_none(),
+            "the name belongs to the first report only: {update}"
+        );
+    }
+
+    // A thread reopened from the session store replays the call, so the replay
+    // has to carry the name too.
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": work, "mcpServers": []}),
+    );
+    let (_, replay) = agent.wait_for_response_with_updates(id);
+    let replayed = tool_call(&replay, "call_1");
+    assert_eq!(
+        replayed["name"], "read_file",
+        "a replayed tool call must carry its tool name: {replayed}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

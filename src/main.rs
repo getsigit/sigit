@@ -705,6 +705,7 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
                     };
                     let output = outputs.get(id).copied().unwrap_or_default();
                     let mut tool_call = ToolCall::new(replay_id, chat::tool_title(name, arguments))
+                        .name(name)
                         .kind(tool_kind_for(name))
                         .status(ToolCallStatus::Completed)
                         .content(vec![tool_output_content(output)])
@@ -3532,6 +3533,7 @@ impl SiGitAgent {
                         session_id.clone(),
                         SessionUpdate::ToolCall(
                             ToolCall::new(tc.id.clone(), chat::tool_title(&tc.name, &tc.arguments))
+                                .name(tc.name.clone())
                                 .kind(tool_kind_for(&tc.name))
                                 .status(announced_status)
                                 .content(vec![invocation_content])

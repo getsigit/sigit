@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **A tool call carries its programmatic tool name.** The `tool_call` an editor
+  gets for a running tool now includes `name` (`read_file`, `run_command`,
+  `mcp__…`) next to the human title, sent on the first report of the call only
+  as the protocol asks. A client can tell a command from a file edit without
+  parsing the title, and a replayed thread from `session/load` carries the same
+  name (#196).
+
 ## 1.6.5
 
 ### Added
