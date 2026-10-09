@@ -4952,14 +4952,20 @@ fn parse_file_link(uri: &str) -> Option<(PathBuf, Option<(usize, usize)>)> {
     Some((path, range))
 }
 
-/// Parses a `L207:219` or `L207-219` fragment into `(207, 219)`.
+/// Parses a line fragment into a 1-based inclusive `(start, end)`: `L207:219`
+/// (what Zed sends), `L207-219`, `L207-L219` (GitHub style), or a single line
+/// `L207`. These are the forms Zed's own mention parser accepts. A range that
+/// starts at 0 or runs backwards is no range, so the whole file is read.
 fn parse_line_range(fragment: &str) -> Option<(usize, usize)> {
     let rest = fragment.strip_prefix('L')?;
-    let sep = if rest.contains(':') { ':' } else { '-' };
-    let mut parts = rest.splitn(2, sep);
-    let start = parts.next()?.parse::<usize>().ok()?;
-    let end = parts.next()?.parse::<usize>().ok()?;
-    Some((start, end))
+    let (start, end) = rest
+        .split_once(':')
+        .or_else(|| rest.split_once('-'))
+        .unwrap_or((rest, rest));
+    let end = end.strip_prefix('L').unwrap_or(end);
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    (start >= 1 && end >= start).then_some((start, end))
 }
 
 /// ACP clients may prepend context as separate text blocks before the user's
@@ -6251,6 +6257,41 @@ mod tests {
         let (path, range) = parse_file_link("file:///C:/tmp/a.rs#L3-5").unwrap();
         assert_path_components(&path, "C:/tmp/a.rs");
         assert_eq!(range, Some((3, 5)));
+    }
+
+    #[test]
+    fn line_fragments_accept_the_forms_editors_send() {
+        assert_eq!(parse_line_range("L207:219"), Some((207, 219)));
+        assert_eq!(parse_line_range("L207-219"), Some((207, 219)));
+        assert_eq!(parse_line_range("L207-L219"), Some((207, 219)));
+        assert_eq!(parse_line_range("L7"), Some((7, 7)));
+        for no_range in ["L0:3", "L5:2", "207:219", "Lx", "L", ""] {
+            assert_eq!(parse_line_range(no_range), None, "{no_range}");
+        }
+    }
+
+    /// Zed adds `?column=` to a selection and `?symbol=` to a symbol; the query
+    /// must not end up in the path.
+    #[cfg(unix)]
+    #[test]
+    fn file_links_ignore_the_query_zed_adds() {
+        let (path, range) = parse_file_link("file:///tmp/a.rs?column=5#L10:20").unwrap();
+        assert_path_components(&path, "/tmp/a.rs");
+        assert_eq!(range, Some((10, 20)));
+        let (path, range) = parse_file_link("file:///tmp/a.rs?symbol=main#L3:9").unwrap();
+        assert_path_components(&path, "/tmp/a.rs");
+        assert_eq!(range, Some((3, 9)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_links_ignore_the_query_zed_adds() {
+        let (path, range) = parse_file_link("file:///C:/tmp/a.rs?column=5#L10:20").unwrap();
+        assert_path_components(&path, "C:/tmp/a.rs");
+        assert_eq!(range, Some((10, 20)));
+        let (path, range) = parse_file_link("file:///C:/tmp/a.rs?symbol=main#L3:9").unwrap();
+        assert_path_components(&path, "C:/tmp/a.rs");
+        assert_eq!(range, Some((3, 9)));
     }
 
     #[test]

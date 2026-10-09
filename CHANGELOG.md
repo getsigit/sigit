@@ -35,6 +35,13 @@
 
 ### Fixed
 
+- **A linked selection written as `L10-L20` or `L10` reads just those lines.**
+  siGit Code read the line range of a `resource_link` only as `L10:20` or
+  `L10-20`, so `L10-L20` (the GitHub style) and a single line `L10` sent the
+  whole file instead of the selection. It now reads the same forms Zed's own
+  mention parser does, and a range that starts at line 0 or runs backwards
+  counts as no range.
+
 - **Tags a model makes up no longer show in the reply.** After a long run of
   tool rounds, a model could start writing markup that looked like it came
   from siGit Code: a `<system_warning>` block telling the user the previous
@@ -45,7 +52,6 @@
   text inside them stays. Code blocks are left alone. The system prompt also
   tells the model to write plain Markdown and to list choices as plain text
   (#122).
-
 - **Closing a thread that is waiting at a permission prompt no longer hangs.**
   `session/close` cancels the session's running turn and waits for it to end,
   but a turn stopped at a permission prompt only went on when the client
