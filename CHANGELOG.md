@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.6.6
+
 ### Added
 
 - **A tool call carries its programmatic tool name.** The `tool_call` an editor
