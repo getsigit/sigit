@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+## 1.6.6
+
+### Added
+
+- **A tool call carries its programmatic tool name.** The `tool_call` an editor
+  gets for a running tool now includes `name` (`read_file`, `run_command`,
+  `mcp__…`) next to the human title, sent on the first report of the call only
+  as the protocol asks. A client can tell a command from a file edit without
+  parsing the title, and a replayed thread from `session/load` carries the same
+  name (#196).
+
+### Changed
+
+- **MCP runs on `rmcp`, the official Rust SDK, through `ed-mcp`.** siGit Code's
+  own JSON-RPC client for stdio and Streamable HTTP servers (about 600 lines)
+  is gone; `ed-mcp` is the layer every Onde agent shares. `mcp.toml`, the
+  baked-in `sigit` and `smbcloud` servers, tool names and `/mcp` are unchanged.
+  An HTTP server that stops answering is now reconnected and the call retried
+  once for any failure but a timeout, not only on a 404.
+
+### Fixed
+
+- **A reply that degenerates into a repetition loop is cut off.** After a tool
+  call, a model could fall into thousands of words from a tiny vocabulary
+  (`find: list: check: get: …`) with no tool call and no end, and the junk went
+  into history for the next turn. siGit Code now watches a streamed reply for a
+  window of 200 words with very few distinct ones (code blocks excepted), stops
+  reading, keeps only the text before the loop, tells you it stopped, and asks
+  the model once to make its call or answer briefly (#123).
+- **A linked selection written as `L10-L20` or `L10` reads just those lines.**
+  siGit Code read the line range of a `resource_link` only as `L10:20` or
+  `L10-20`, so `L10-L20` (the GitHub style) and a single line `L10` sent the
+  whole file instead of the selection. It now reads the same forms Zed's own
+  mention parser does, and a range that starts at line 0 or runs backwards
+  counts as no range.
+
 ## 1.6.5
 
 ### Added
@@ -45,7 +83,6 @@
   text inside them stays. Code blocks are left alone. The system prompt also
   tells the model to write plain Markdown and to list choices as plain text
   (#122).
-
 - **Closing a thread that is waiting at a permission prompt no longer hangs.**
   `session/close` cancels the session's running turn and waits for it to end,
   but a turn stopped at a permission prompt only went on when the client

@@ -46,6 +46,7 @@ mod mcp;
 mod models;
 mod permissions;
 mod provider;
+mod repetition;
 mod session_store;
 mod settings;
 mod setup;
@@ -309,6 +310,8 @@ fn stop_reason_for(round_cap_reached: bool, finish: backend::FinishReason) -> St
         backend::FinishReason::Complete => StopReason::EndTurn,
         backend::FinishReason::Length => StopReason::MaxTokens,
         backend::FinishReason::ContentFilter => StopReason::Refusal,
+        // Cut by the agent, not the token limit; no ACP reason fits better.
+        backend::FinishReason::Repetition => StopReason::EndTurn,
     }
 }
 
@@ -705,6 +708,7 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
                     };
                     let output = outputs.get(id).copied().unwrap_or_default();
                     let mut tool_call = ToolCall::new(replay_id, chat::tool_title(name, arguments))
+                        .name(name)
                         .kind(tool_kind_for(name))
                         .status(ToolCallStatus::Completed)
                         .content(vec![tool_output_content(output)])
@@ -3532,6 +3536,7 @@ impl SiGitAgent {
                         session_id.clone(),
                         SessionUpdate::ToolCall(
                             ToolCall::new(tc.id.clone(), chat::tool_title(&tc.name, &tc.arguments))
+                                .name(tc.name.clone())
                                 .kind(tool_kind_for(&tc.name))
                                 .status(announced_status)
                                 .content(vec![invocation_content])
@@ -4952,14 +4957,20 @@ fn parse_file_link(uri: &str) -> Option<(PathBuf, Option<(usize, usize)>)> {
     Some((path, range))
 }
 
-/// Parses a `L207:219` or `L207-219` fragment into `(207, 219)`.
+/// Parses a line fragment into a 1-based inclusive `(start, end)`: `L207:219`
+/// (what Zed sends), `L207-219`, `L207-L219` (GitHub style), or a single line
+/// `L207`. These are the forms Zed's own mention parser accepts. A range that
+/// starts at 0 or runs backwards is no range, so the whole file is read.
 fn parse_line_range(fragment: &str) -> Option<(usize, usize)> {
     let rest = fragment.strip_prefix('L')?;
-    let sep = if rest.contains(':') { ':' } else { '-' };
-    let mut parts = rest.splitn(2, sep);
-    let start = parts.next()?.parse::<usize>().ok()?;
-    let end = parts.next()?.parse::<usize>().ok()?;
-    Some((start, end))
+    let (start, end) = rest
+        .split_once(':')
+        .or_else(|| rest.split_once('-'))
+        .unwrap_or((rest, rest));
+    let end = end.strip_prefix('L').unwrap_or(end);
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    (start >= 1 && end >= start).then_some((start, end))
 }
 
 /// ACP clients may prepend context as separate text blocks before the user's
@@ -6254,6 +6265,41 @@ mod tests {
     }
 
     #[test]
+    fn line_fragments_accept_the_forms_editors_send() {
+        assert_eq!(parse_line_range("L207:219"), Some((207, 219)));
+        assert_eq!(parse_line_range("L207-219"), Some((207, 219)));
+        assert_eq!(parse_line_range("L207-L219"), Some((207, 219)));
+        assert_eq!(parse_line_range("L7"), Some((7, 7)));
+        for no_range in ["L0:3", "L5:2", "207:219", "Lx", "L", ""] {
+            assert_eq!(parse_line_range(no_range), None, "{no_range}");
+        }
+    }
+
+    /// Zed adds `?column=` to a selection and `?symbol=` to a symbol; the query
+    /// must not end up in the path.
+    #[cfg(unix)]
+    #[test]
+    fn file_links_ignore_the_query_zed_adds() {
+        let (path, range) = parse_file_link("file:///tmp/a.rs?column=5#L10:20").unwrap();
+        assert_path_components(&path, "/tmp/a.rs");
+        assert_eq!(range, Some((10, 20)));
+        let (path, range) = parse_file_link("file:///tmp/a.rs?symbol=main#L3:9").unwrap();
+        assert_path_components(&path, "/tmp/a.rs");
+        assert_eq!(range, Some((3, 9)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_links_ignore_the_query_zed_adds() {
+        let (path, range) = parse_file_link("file:///C:/tmp/a.rs?column=5#L10:20").unwrap();
+        assert_path_components(&path, "C:/tmp/a.rs");
+        assert_eq!(range, Some((10, 20)));
+        let (path, range) = parse_file_link("file:///C:/tmp/a.rs?symbol=main#L3:9").unwrap();
+        assert_path_components(&path, "C:/tmp/a.rs");
+        assert_eq!(range, Some((3, 9)));
+    }
+
+    #[test]
     fn file_links_reject_non_file_uris() {
         assert!(parse_file_link("https://example.com/a.rs").is_none());
         assert!(parse_file_link("not a uri").is_none());
@@ -6275,11 +6321,16 @@ mod tests {
             stop_reason_for(false, FinishReason::ContentFilter),
             StopReason::Refusal
         );
+        assert_eq!(
+            stop_reason_for(false, FinishReason::Repetition),
+            StopReason::EndTurn
+        );
         // The cap wins: the last round was a forced reply either way.
         for finish in [
             FinishReason::Complete,
             FinishReason::Length,
             FinishReason::ContentFilter,
+            FinishReason::Repetition,
         ] {
             assert_eq!(stop_reason_for(true, finish), StopReason::MaxTurnRequests);
         }
