@@ -11,6 +11,15 @@
   parsing the title, and a replayed thread from `session/load` carries the same
   name (#196).
 
+### Changed
+
+- **MCP runs on `rmcp`, the official Rust SDK, through `ed-mcp`.** siGit Code's
+  own JSON-RPC client for stdio and Streamable HTTP servers (about 600 lines)
+  is gone; `ed-mcp` is the layer every Onde agent shares. `mcp.toml`, the
+  baked-in `sigit` and `smbcloud` servers, tool names and `/mcp` are unchanged.
+  An HTTP server that stops answering is now reconnected and the call retried
+  once for any failure but a timeout, not only on a 404.
+
 ### Fixed
 
 - **A reply that degenerates into a repetition loop is cut off.** After a tool
