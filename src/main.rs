@@ -593,20 +593,13 @@ fn file_change_content(change: &tools::FileChange) -> ToolCallContent {
         .into()
 }
 
-/// The content of a finished tool call's card: the client terminal the
-/// command ran in, when it ran in one, which already shows its output (the
-/// full result text still travels as `raw_output`); otherwise the diff of the
-/// file it wrote, if it wrote one, then its result text.
-fn tool_result_content(
-    output: &str,
-    change: Option<&tools::FileChange>,
-    terminal: Option<&str>,
-) -> Vec<ToolCallContent> {
-    if let Some(terminal_id) = terminal {
-        return vec![ToolCallContent::Terminal(Terminal::new(
-            terminal_id.to_string(),
-        ))];
-    }
+/// The content of a finished tool call's card: the diff of the file it wrote,
+/// if it wrote one, then its result text. A command that ran in the client's
+/// terminal gets no content at all in its final update: the terminal is
+/// already embedded in the card and was released by then, so naming it again
+/// would point at an id the client no longer has. The result text still
+/// travels as `raw_output`.
+fn tool_result_content(output: &str, change: Option<&tools::FileChange>) -> Vec<ToolCallContent> {
     change
         .map(file_change_content)
         .into_iter()
@@ -2195,6 +2188,9 @@ fn validate_session_roots(
     Ok(())
 }
 
+/// The id of the one auth method `initialize` advertises.
+const AUTH_METHOD_ID: &str = "sigit";
+
 // ── ACP handler implementations ───────────────────────────────────────────────
 
 impl SiGitAgent {
@@ -2253,7 +2249,7 @@ impl SiGitAgent {
         // With an Agent method, clicking calls `authenticate`, which opens the
         // browser and finishes the sign-in itself.
         let auth_methods = vec![AuthMethod::Agent(
-            AuthMethodAgent::new("sigit", "Sign in to siGit Code")
+            AuthMethodAgent::new(AUTH_METHOD_ID, "Sign in to siGit Code")
                 .description("Opens sigit.si in your browser to authorize this device."),
         )];
 
@@ -2326,6 +2322,16 @@ impl SiGitAgent {
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
         log::info!("authenticate: method={}", req.method_id.0);
 
+        if req.method_id.0.as_ref() != AUTH_METHOD_ID {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!(
+                    "unknown auth method {}; the only one offered is {AUTH_METHOD_ID}",
+                    req.method_id.0
+                ),
+            ));
+        }
+
         // An existing session clears the gate without sending anyone to a
         // browser they didn't ask for.
         if let Ok(email) = account::verify_session().await {
@@ -2340,7 +2346,7 @@ impl SiGitAgent {
         let flow = browser_auth::begin();
         if !flow.is_loopback() {
             return Err(agent_client_protocol::Error::new(
-                -32000,
+                -32603,
                 "Could not open a local port to receive the sign-in. \
                  Run `sigit login` in a terminal instead."
                     .to_string(),
@@ -2358,7 +2364,7 @@ impl SiGitAgent {
                 Ok(AuthenticateResponse::default())
             }
             Err(reason) => Err(agent_client_protocol::Error::new(
-                -32000,
+                -32603,
                 format!(
                     "Sign-in did not complete ({reason}). \
                      Try again, or create an account at https://sigit.si."
@@ -2542,7 +2548,7 @@ impl SiGitAgent {
 
         let Some(state) = self.sessions.lock().unwrap().get(&key).cloned() else {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                -32002,
                 format!(
                     "unknown session {key}; create it with session/new or restore it with session/load"
                 ),
@@ -2802,6 +2808,14 @@ impl SiGitAgent {
         &self,
         args: ListSessionsRequest,
     ) -> agent_client_protocol::Result<ListSessionsResponse> {
+        if let Some(cwd) = args.cwd.as_ref()
+            && !cwd.is_absolute()
+        {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!("cwd must be an absolute path, got {}", cwd.display()),
+            ));
+        }
         let filter = args.cwd.clone();
         let sessions: Vec<SessionInfo> = session_store::list()
             .into_iter()
@@ -3309,7 +3323,22 @@ impl SiGitAgent {
                             ));
                         }
                         EmbeddedResourceResource::BlobResourceContents(blob) => {
-                            parts.push(format!("[binary resource: {}]", blob.uri));
+                            let mime = blob.mime_type.clone().unwrap_or_default();
+                            if mime.starts_with("image/") {
+                                images.push(ImageInput {
+                                    mime_type: mime,
+                                    data: blob.blob.clone(),
+                                });
+                            } else if mime.starts_with("audio/") {
+                                audio.push(AudioInput {
+                                    mime_type: mime,
+                                    data: blob.blob.clone(),
+                                });
+                            } else if mime.is_empty() {
+                                parts.push(format!("[binary resource: {}]", blob.uri));
+                            } else {
+                                parts.push(format!("[binary resource: {} ({mime})]", blob.uri));
+                            }
                         }
                         _ => {
                             log::debug!("ignoring unsupported embedded resource variant");
@@ -3872,12 +3901,10 @@ impl SiGitAgent {
                         } else {
                             ToolCallStatus::Failed
                         })
-                        .content(tool_result_content(
-                            &output,
-                            change.as_ref(),
-                            terminal.as_deref(),
-                        ))
                         .raw_output(serde_json::Value::String(output.clone()));
+                    if terminal.is_none() {
+                        fields = fields.content(tool_result_content(&output, change.as_ref()));
+                    }
                     // A denial at the prompt leaves the card titled with the
                     // permission request's full arguments; put its own back.
                     if !executed && announced_status == ToolCallStatus::Pending {
@@ -6737,7 +6764,7 @@ mod tests {
             .activate_session(&SessionId::new("not-opened"))
             .await
             .unwrap_err();
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(i32::from(error.code), -32002);
         assert!(error.message.contains("session/new"));
         assert!(agent.active_session.lock().unwrap().is_none());
     }
@@ -7879,7 +7906,6 @@ mod tests {
         let content = serde_json::to_value(tool_result_content(
             "Edited file: /repo/src/lib.rs (4 bytes written)",
             Some(&change),
-            None,
         ))
         .unwrap();
         assert_eq!(
@@ -7903,16 +7929,7 @@ mod tests {
         assert!(diff.get("oldText").is_none_or(serde_json::Value::is_null));
 
         // Every other tool keeps the result text alone.
-        // A command that ran in the client's terminal keeps the terminal,
-        // which already shows its output.
-        let ran = serde_json::to_value(tool_result_content("Exit code 0:\nhi", None, Some("t-1")))
-            .unwrap();
-        assert_eq!(
-            ran,
-            serde_json::json!([{ "type": "terminal", "terminalId": "t-1" }])
-        );
-
-        let plain = serde_json::to_value(tool_result_content("ok", None, None)).unwrap();
+        let plain = serde_json::to_value(tool_result_content("ok", None)).unwrap();
         assert_eq!(plain.as_array().unwrap().len(), 1);
         assert_eq!(plain[0]["type"], "content");
     }
