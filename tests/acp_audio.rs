@@ -308,3 +308,48 @@ fn a_cloud_tier_gets_the_text_and_the_user_is_told() {
         "the user must be told the clip was left out: {updates}"
     );
 }
+
+#[test]
+fn an_audio_only_prompt_reaches_the_endpoint() {
+    let endpoint = start_fake_endpoint(vec![sse_text("heard it")]);
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_audio_only_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir, "scripted-audio-model");
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "audio", "mimeType": "audio/wav", "data": CLIP}],
+        }),
+    );
+    let response = agent.wait_for_response(id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    let request = requests
+        .first()
+        .expect("a clip with no text is still a prompt, so the endpoint must see it");
+    assert!(
+        request.to_string().contains(CLIP),
+        "the clip must reach the endpoint: {request}"
+    );
+
+    drop(requests);
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

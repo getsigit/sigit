@@ -483,6 +483,21 @@ impl PromptCancellation {
     }
 }
 
+/// Removes a turn's cancellation from the agent's registry when the turn ends,
+/// whichever way it returns.
+struct PromptRegistration<'a> {
+    agent: &'a SiGitAgent,
+    session_id: SessionId,
+    cancellation: Arc<PromptCancellation>,
+}
+
+impl Drop for PromptRegistration<'_> {
+    fn drop(&mut self) {
+        self.agent
+            .finish_prompt(&self.session_id, &self.cancellation);
+    }
+}
+
 enum DrainTurnError {
     Backend(backend::BackendError),
     Cancelled,
@@ -3186,10 +3201,31 @@ impl SiGitAgent {
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
 
+        // Registered before anything that can wait, so a `session/cancel` that
+        // lands while this turn is still queued on the workspace, switching
+        // sessions or loading a model is seen. The session lock is held, so the
+        // slot can only be this turn's. The guard clears it on every return.
+        let cancellation = Arc::new(PromptCancellation::default());
+        self.prompt_cancellations
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), Arc::clone(&cancellation));
+        let _registration = PromptRegistration {
+            agent: self,
+            session_id: session_id.clone(),
+            cancellation: Arc::clone(&cancellation),
+        };
+
         // Everything below (slash commands included) acts on the live session,
         // so it has to be this one. Resource links are read relative to its cwd.
         let mut workspace = WorkspaceHold::acquire(&self.workspace_lock).await;
+        if cancellation.cancelled.load(Ordering::Acquire) {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
         self.activate_session(&session_id).await?;
+        if cancellation.cancelled.load(Ordering::Acquire) {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
 
         // log every block so we can debug @ references and file context
         for (i, block) in args.prompt.iter().enumerate() {
@@ -3327,7 +3363,7 @@ impl SiGitAgent {
 
         let user_text = parts.join("\n");
 
-        if user_text.trim().is_empty() && images.is_empty() {
+        if user_text.trim().is_empty() && images.is_empty() && audio.is_empty() {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
@@ -3353,17 +3389,18 @@ impl SiGitAgent {
                 match commands::resolve_command(&command) {
                     Some(custom) => commands::render(&custom.body, argument.as_deref()),
                     None => {
-                        return exec_slash_acp(
-                            self,
-                            cx,
-                            session_id,
-                            SlashCommand::Unknown(command, argument),
-                        )
-                        .await;
+                        return self
+                            .run_slash(
+                                cx,
+                                session_id,
+                                SlashCommand::Unknown(command, argument),
+                                &cancellation,
+                            )
+                            .await;
                     }
                 }
             }
-            Some(command) => return exec_slash_acp(self, cx, session_id, command).await,
+            Some(command) => return self.run_slash(cx, session_id, command, &cancellation).await,
             None => user_text,
         };
 
@@ -3390,7 +3427,12 @@ impl SiGitAgent {
         {
             if self.auto_load_local_model {
                 self.start_startup_model_load_if_needed();
-                self.await_model_ready(cx, &session_id).await?;
+                tokio::select! {
+                    ready = self.await_model_ready(cx, &session_id) => ready?,
+                    () = cancellation.cancelled() => {
+                        return Ok(PromptResponse::new(StopReason::Cancelled));
+                    }
+                }
             } else {
                 self.send_assistant_message(
                     cx,
@@ -3403,11 +3445,9 @@ impl SiGitAgent {
             }
         }
 
-        let cancellation = Arc::new(PromptCancellation::default());
-        self.prompt_cancellations
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), Arc::clone(&cancellation));
+        if cancellation.cancelled.load(Ordering::Acquire) {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
 
         // ── tool-calling loop ────────────────────────────────────────────
         // send message → execute any tool calls → feed results back
@@ -4170,6 +4210,24 @@ impl SiGitAgent {
                      for clients without permission support."
                 ))
             }
+        }
+    }
+
+    /// Run a built-in slash command as a turn. A `session/cancel` ends it with
+    /// `Cancelled`; only `/compact` and `/load` take long enough to notice.
+    async fn run_slash(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        command: SlashCommand,
+        cancellation: &PromptCancellation,
+    ) -> agent_client_protocol::Result<PromptResponse> {
+        if cancellation.cancelled.load(Ordering::Acquire) {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
+        tokio::select! {
+            response = exec_slash_acp(self, cx, session_id, command) => response,
+            () = cancellation.cancelled() => Ok(PromptResponse::new(StopReason::Cancelled)),
         }
     }
 
@@ -6621,6 +6679,71 @@ mod tests {
         assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
         assert!(error.message.contains("session/new"));
         assert!(agent.active_session.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_turn_leaves_no_cancellation_behind_however_it_returns() {
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        let session_id = SessionId::new("early");
+        let turn = Arc::new(PromptCancellation::default());
+        agent
+            .prompt_cancellations
+            .lock()
+            .unwrap()
+            .insert("early".into(), Arc::clone(&turn));
+        let registration = PromptRegistration {
+            agent: &agent,
+            session_id: session_id.clone(),
+            cancellation: Arc::clone(&turn),
+        };
+
+        // A cancel that arrives before the turn reaches inference is recorded
+        // and stays visible to every check the turn makes afterwards.
+        agent
+            .handle_cancel(CancelNotification::new(session_id.clone()))
+            .await
+            .unwrap();
+        assert!(turn.cancelled.load(Ordering::Acquire));
+        tokio::time::timeout(std::time::Duration::from_millis(50), turn.cancelled())
+            .await
+            .expect("a pre-cancelled turn must resolve at once");
+
+        drop(registration);
+        assert!(agent.prompt_cancellations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_does_not_remove_its_successors_cancellation() {
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        let old = Arc::new(PromptCancellation::default());
+        let new = Arc::new(PromptCancellation::default());
+        agent
+            .prompt_cancellations
+            .lock()
+            .unwrap()
+            .insert("s".into(), Arc::clone(&new));
+        drop(PromptRegistration {
+            agent: &agent,
+            session_id: SessionId::new("s"),
+            cancellation: old,
+        });
+        assert!(agent.prompt_cancellations.lock().unwrap().contains_key("s"));
     }
 
     #[tokio::test]

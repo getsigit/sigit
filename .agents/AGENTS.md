@@ -326,7 +326,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   conversation); lifecycle and config handlers hold it throughout, and `handle_prompt` holds it
   through a `WorkspaceHold` that it releases while waiting on an HTTP endpoint or a permission
   answer and retakes (reinstalling its session via `resume_workspace`) before any tool runs. An
-  on-device turn never releases it. Take the session lock first, never the other way round. Tool
+  on-device turn never releases it. Take the session lock first, never the other way round. A turn registers its `PromptCancellation` at
+  the top of `handle_prompt`, before it waits on either lock, and a `PromptRegistration`
+  guard clears it on every return, so a `session/cancel` that arrives while the turn
+  is still queued, switching threads, loading a model or running a slash command ends
+  it as `cancelled`. The checks sit after each of those waits. Tool
   execution, subagents included, still runs one session at a time.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
