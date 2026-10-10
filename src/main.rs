@@ -4420,6 +4420,69 @@ impl SiGitAgent {
     /// modes are the Permissions dropdown under another name, so this changes
     /// the same state and then refreshes the dropdown for a client that shows
     /// both.
+    /// `-32002` unless `session_id` is a session this process knows.
+    fn require_known_session(&self, session_id: &SessionId) -> agent_client_protocol::Result<()> {
+        let key = session_id.to_string();
+        if self.sessions.lock().unwrap().contains_key(&key) {
+            return Ok(());
+        }
+        Err(agent_client_protocol::Error::new(
+            -32002,
+            format!(
+                "unknown session {key}; create it with session/new or restore it with session/load"
+            ),
+        ))
+    }
+
+    /// The config options for `key`, built from that session's own model and
+    /// not from whichever session is live, so it can be read without the
+    /// workspace lock.
+    fn config_options_for_session(&self, key: &str) -> Vec<SessionConfigOption> {
+        let live = self.active_session.lock().unwrap().as_deref() == Some(key);
+        let model_id = if live {
+            self.current_model.lock().unwrap().model_id.clone()
+        } else {
+            self.sessions
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|state| {
+                    state
+                        .remote
+                        .as_ref()
+                        .map_or_else(|| state.model_id.clone(), |r| r.model.model_id.clone())
+                })
+                .unwrap_or_default()
+        };
+        build_config_options_for(&model_id, key)
+    }
+
+    /// Apply a Permissions change for `session_id`, which can be mid-turn.
+    ///
+    /// Takes neither the session lock nor the workspace lock: the turn holds
+    /// the first for its whole length, and a user flipping to Auto while a
+    /// permission prompt is open has to be heard at once. It touches only
+    /// state keyed by session (`permissions`), so the live session is left
+    /// alone. Returns the new config options and the status line to show.
+    fn change_permission_mode(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        mode_id: Option<&str>,
+    ) -> agent_client_protocol::Result<Vec<SessionConfigOption>> {
+        self.require_known_session(session_id)?;
+        let key = session_id.to_string();
+        let Some(message) = mode_id.and_then(|id| apply_permission_mode(&key, id)) else {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                format!("unknown permission mode: {mode_id:?}"),
+            ));
+        };
+        self.send_system_status(cx, session_id.clone(), message)
+            .ok();
+        Ok(self.config_options_for_session(&key))
+    }
+
     async fn handle_set_session_mode(
         &self,
         cx: &ConnectionTo<Client>,
@@ -4431,21 +4494,8 @@ impl SiGitAgent {
             args.mode_id
         );
 
-        self.activate_session(&args.session_id).await?;
-
-        let session_key = args.session_id.to_string();
-        let Some(message) = apply_permission_mode(&session_key, args.mode_id.0.as_ref()) else {
-            return Err(agent_client_protocol::Error::new(
-                -32602,
-                format!("unknown session mode: {}", args.mode_id),
-            ));
-        };
-        self.send_system_status(cx, args.session_id.clone(), message)
-            .ok();
-        let config_options = {
-            let current = self.current_model.lock().unwrap();
-            build_config_options(&current, &session_key)
-        };
+        let config_options =
+            self.change_permission_mode(cx, &args.session_id, Some(args.mode_id.0.as_ref()))?;
         self.send_tool_call_update(
             cx,
             args.session_id,
@@ -4465,6 +4515,16 @@ impl SiGitAgent {
             args.config_id,
             args.value
         );
+
+        // ── Permissions dropdown (issue #76) ────────────────────────────────
+        // Handled before the session is activated: the dispatch loop runs this
+        // one without the session or workspace lock, so it can land mid-turn.
+        if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
+            let picked = args.value.as_value_id().map(|v| v.0.as_ref());
+            let config_options = self.change_permission_mode(cx, &args.session_id, picked)?;
+            self.send_current_mode(cx, args.session_id);
+            return Ok(SetSessionConfigOptionResponse::new(config_options));
+        }
 
         // A model switch carries the live conversation onto the new backend, so
         // the live conversation has to be the one whose picker changed.
@@ -4503,25 +4563,6 @@ impl SiGitAgent {
             // Rebuild so the Model picker reflects the new emphasis/order.
             let current = self.current_model.lock().unwrap().clone();
             let config_options = build_config_options(&current, &args.session_id.to_string());
-            return Ok(SetSessionConfigOptionResponse::new(config_options));
-        }
-
-        // ── Permissions dropdown (issue #76) ────────────────────────────────
-        if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
-            let session_key = args.session_id.to_string();
-            let picked = args.value.as_value_id().map(|v| v.0.as_ref());
-            let Some(message) = picked.and_then(|id| apply_permission_mode(&session_key, id))
-            else {
-                return Err(agent_client_protocol::Error::new(
-                    -32602,
-                    format!("unknown Permissions value: {picked:?}"),
-                ));
-            };
-            self.send_current_mode(cx, args.session_id.clone());
-            self.send_system_status(cx, args.session_id.clone(), message)
-                .ok();
-            let current = self.current_model.lock().unwrap().clone();
-            let config_options = build_config_options(&current, &session_key);
             return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
@@ -4980,6 +5021,13 @@ fn build_config_options(
     current_model: &GgufModelConfig,
     session_key: &str,
 ) -> Vec<SessionConfigOption> {
+    build_config_options_for(&current_model.model_id, session_key)
+}
+
+/// The config options for a session whose selected model is `current_model_id`.
+/// Only the id matters, which is what lets a session that is not the live one
+/// have its options built without installing it.
+fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<SessionConfigOption> {
     // The full list, including the siGit Code Cloud tiers, so the panel picker
     // mirrors the TUI `/models`. Cloud entries are sign-in gated at selection.
     let items = models::build_model_picker_items();
@@ -5106,7 +5154,7 @@ fn build_config_options(
         return vec![local_option, permission_option];
     }
 
-    let current_value = SessionConfigValueId::new(current_model.model_id.as_str());
+    let current_value = SessionConfigValueId::new(current_model_id);
 
     vec![
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
@@ -6218,6 +6266,15 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
+                        // A Permissions change can arrive while a turn is
+                        // running, so it takes neither lock. Model and
+                        // Inference swap the live backend and wait for the turn.
+                        if req.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
+                            return handle_response(
+                                responder,
+                                state.handle_set_session_config_option(&task_cx, req).await,
+                            );
+                        }
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
@@ -6235,9 +6292,9 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                 async move |req: SetSessionModeRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
+                    // No locks: the mode can change while a turn is running,
+                    // and the change touches only state keyed by session.
                     cx.spawn(async move {
-                        let _session = state.lock_session(&req.session_id).await;
-                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
                             state.handle_set_session_mode(&task_cx, req).await,

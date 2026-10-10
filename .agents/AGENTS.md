@@ -335,7 +335,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `run_command` poll loop and `client_terminal::Route::run` watch, so a running
   foreground command is killed instead of finishing first. The signal is reset at the
   top of each turn, not when a tool starts, so a cancel that lands during a permission
-  prompt still stops the command that follows. Tool
+  prompt still stops the command that follows. Permission-mode changes
+  (`session/set_mode`, and `session/set_config_option` for `sigit-permission-mode`) are
+  the exception to the lock order: the dispatch loop runs them with neither lock, because
+  they touch only state keyed by session (`permissions`) and have to land mid-turn. They
+  check the id against `sessions` (`-32002` when unknown) and build the options from
+  that session's own model (`config_options_for_session`), never `activate_session`. Tool
   execution, subagents included, still runs one session at a time.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,

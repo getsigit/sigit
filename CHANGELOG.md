@@ -14,6 +14,12 @@
   noticed the cancel. A cancel or `session/close` now kills the process tree, or
   sends `terminal/kill` when the command runs in the editor's terminal, and the
   turn ends `cancelled` within a moment.
+- **Switching permission mode works while a turn is running.** `session/set_mode`
+  and the Permissions config option queued behind the turn's session lock, so
+  choosing Auto while a permission prompt was open did nothing until the turn
+  ended. They now take no lock, are answered at once, and the pending call's
+  successors follow the new mode. Model and Inference changes still wait for
+  the turn.
 - **A prompt that is only audio is answered.** A clip with no text or image used
   to end the turn at once with nothing sent to the model, even though the agent
   advertises audio.
