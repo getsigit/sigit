@@ -118,6 +118,13 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `SessionState::remote`), so its turn can wait on the endpoint while another thread is
   installed. Unknown session ids are rejected instead of silently borrowing the active thread's
   cwd. Prompt cancellation takes no lock, which lets a client cancel a turn whatever it holds.
+  Message chunks carry a `messageId`: each inference round is one message, so every chunk of
+  it, reasoning included, shares `StreamedReply::message_id` and a tool round starts a new id.
+  A standalone notice (`send_assistant_message`) gets an id of its own, and replayed messages
+  get fresh ones; ids are random, so none is stored in history.
+  The Inference (local/cloud) config option is a `boolean` for a client that advertises
+  `session.configOptions.boolean` (read into `CLIENT_BOOLEAN_CONFIG_OPTIONS` in `initialize`)
+  and a two-value select for any other; `handle_set_session_config_option` takes either value.
   `session/load` and `session/resume` share `restore_session`; the only difference is that
   resume must not replay the history as `session/update`. `session/close` is the one place a
   `SessionState` is dropped. It runs in two halves: `begin_close` signals the session's turn
@@ -126,7 +133,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   still queued; `handle_close_session` then runs under the session and workspace locks and
   removes the state, the permission grants and the background commands
   (`tools::kill_session_tasks`). It leaves `session_store` alone, so a closed thread still lists
-  and reopens. The
+  and reopens. `session/delete` is the one that removes it from disk: it runs the same two halves
+  (`begin_close`, then `handle_close_session` from `handle_delete_session`) and then
+  `session_store::delete`, and succeeds for an id that is already gone. The
   `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
   smbCloud, and stay general otherwise.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
@@ -138,6 +147,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
   the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
   explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
+  `TurnResult::context_tokens` carries the endpoint's token count (prompt plus completion) up
+  to the loop, which sends it as a `usage_update` after each model response, with the
+  model's picker `context_window_tokens` as `size`; with no count (always on-device) the
+  history is estimated instead. A streamed request asks for the count with
+  `stream_options.include_usage`, and an endpoint that rejects the option is asked again
+  without it and never asked again (`stream_usage_refused`).
   `TurnResult::finish` carries the endpoint's `finish_reason` up to the loop, and
   `stop_reason_for` in `main.rs` turns it into the ACP stop reason: the tool-round cap is
   `max_turn_requests`, `length` is `max_tokens`, `content_filter` is `refusal`. ACP defines a
@@ -289,11 +304,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
-  mutating tools with a present-a-plan message), session "always allow" grants, per-tool
-  overrides and the default mode from `[permissions]` in `settings.toml` (`allow`/`ask`/`deny`,
-  default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`, the ACP path sends
-  `session/request_permission` (allow once / allow for session / deny) and the TUI pauses the
-  inference task on a y/a/n prompt. On the ACP path the decision is taken *before* the call is
+  mutating tools with a present-a-plan message), session "always deny" and "always allow"
+  choices (deny checked first, both scoped by `session_grant_rule` and dropped with the session),
+  per-tool overrides and the default mode from `[permissions]` in `settings.toml`
+  (`allow`/`ask`/`deny`, default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`,
+  the ACP path sends `session/request_permission` (allow once / allow for session / deny / deny
+  for session) and the TUI pauses the inference task on a y/a/n/d prompt. On the ACP path the decision is taken *before* the call is
   announced, because it sets the announced status: a call that will ask starts `pending`, the
   permission request carries that call's own id, and an `in_progress` update follows approval.
   That update also puts the card's title back, since the permission request overwrites it
@@ -392,7 +408,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   editor's "Import Threads" picker) must report an absolute `cwd` per session and may filter on
   it, so a session without one is skipped there while still reopening by id through
   `session/load`. Sidecars are written at save time, not at session start, so a thread nobody
-  spoke in leaves nothing behind.
+  spoke in leaves nothing behind. Each ACP save (`persist_session` in `main.rs`) is also sent to
+  the client as a `session_info_update` carrying a fresh `updatedAt`, plus the title when it
+  differs from the last one sent (`announced_titles`), so a new thread gets its title in the
+  sidebar without waiting for the next `session/list`.
 - **`src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
   Must run (`setup_shared_model_cache`) *before* anything touches `ChatEngine`/`hf-hub`, since
   those read env vars once at init.

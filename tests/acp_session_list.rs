@@ -244,3 +244,182 @@ fn saved_sessions_are_listed_for_their_project() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// A thread the user removes in the editor is gone for good: it no longer
+/// lists or reopens, and deleting it again still succeeds (issue #192).
+#[test]
+fn a_deleted_session_no_longer_lists_or_loads() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_delete_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("Done.")]);
+    let mut agent = spawn_agent(port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let initialize = agent.wait_for_response(id);
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["delete"].is_object(),
+        "session/delete is gated on its capability: {initialize}"
+    );
+
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "say done"}],
+        }),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let listed = agent.wait_for_response(id);
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+
+    // The live thread is deleted: closed first, then removed from disk.
+    let id = agent.request("session/delete", json!({"sessionId": session_id}));
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let listed = agent.wait_for_response(id);
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "a deleted thread must not come back in the picker: {listed}"
+    );
+    let saved: Vec<_> = std::fs::read_dir(config_dir.join("sessions"))
+        .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+        .unwrap_or_default();
+    assert!(saved.is_empty(), "history and sidecar removed: {saved:?}");
+
+    // Nothing is left to reopen.
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": project, "mcpServers": []}),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    let load = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = agent
+            .incoming
+            .recv_timeout(remaining)
+            .expect("session/load response");
+        if message["id"] == id && message.get("method").is_none() {
+            break message;
+        }
+    };
+    assert!(load.get("error").is_some(), "{load}");
+
+    // Deleting it again, or an id that never existed, succeeds quietly.
+    let id = agent.request("session/delete", json!({"sessionId": session_id}));
+    agent.wait_for_response(id);
+    let id = agent.request("session/delete", json!({"sessionId": "never-existed"}));
+    agent.wait_for_response(id);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Every notification for `session_id` that arrives before the response to
+/// request `id`, in order.
+fn updates_until_response(agent: &mut AgentUnderTest, id: u64) -> Vec<Value> {
+    let mut updates = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = agent
+            .incoming
+            .recv_timeout(remaining)
+            .unwrap_or_else(|_| panic!("timed out waiting for the response to request {id}"));
+        if message["method"] == "session/update" {
+            updates.push(message["params"]["update"].clone());
+        }
+        if message["id"] == id && message.get("method").is_none() {
+            assert!(message.get("error").is_none(), "{message}");
+            return updates;
+        }
+    }
+}
+
+/// A saved turn reaches the editor's sidebar right away: the title the first
+/// time there is one, and a fresh `updatedAt` on every save (issue #193).
+#[test]
+fn a_saved_turn_sends_session_info_to_the_client() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_info_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("First."), sse_text("Second.")]);
+    let mut agent = spawn_agent(port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let info_updates = |updates: Vec<Value>| -> Vec<Value> {
+        updates
+            .into_iter()
+            .filter(|update| update["sessionUpdate"] == "session_info_update")
+            .collect()
+    };
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "tidy up the build script"}],
+        }),
+    );
+    let first = info_updates(updates_until_response(&mut agent, id));
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0]["title"], "tidy up the build script");
+    let updated_at = first[0]["updatedAt"].as_str().unwrap_or_default();
+    assert!(
+        updated_at.len() == 24 && updated_at.ends_with('Z'),
+        "updatedAt is an ISO 8601 instant: {updated_at:?}"
+    );
+    for field in ["sessionId", "cwd", "additionalDirectories"] {
+        assert!(first[0].get(field).is_none(), "{field} must not be sent");
+    }
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "and the tests"}],
+        }),
+    );
+    let second = info_updates(updates_until_response(&mut agent, id));
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(
+        second[0].get("title").is_none(),
+        "an unchanged title is not sent again: {second:?}"
+    );
+    assert!(second[0]["updatedAt"].is_string(), "{second:?}");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

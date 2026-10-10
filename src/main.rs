@@ -77,23 +77,24 @@ use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
     AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
-    ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
-    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, KillTerminalRequest, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
-    LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
-    SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput, WaitForTerminalExitRequest, WriteTextFileRequest,
+    ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest,
+    DeleteSessionResponse, Diff, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, MessageId, Meta,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeState,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -374,6 +375,10 @@ struct StreamedReply {
     streamed_any: bool,
     /// Whether the next visible text should open a new paragraph.
     paragraph_pending: bool,
+    /// The ACP `messageId` of the model message being streamed. Each
+    /// inference round is its own message in history, so a tool round
+    /// interrupting the prose starts a new one.
+    message_id: Option<MessageId>,
 }
 
 /// What a streamed fragment newly revealed once `<think>` blocks were split:
@@ -391,6 +396,13 @@ impl StreamedReply {
     /// no sentence to break away from, hence the `streamed_any` guard.
     fn interrupt(&mut self) {
         self.paragraph_pending = self.streamed_any;
+        self.message_id = None;
+    }
+
+    /// The id every chunk of the current model message carries, its reply
+    /// text and its reasoning alike.
+    fn message_id(&mut self) -> MessageId {
+        self.message_id.get_or_insert_with(new_message_id).clone()
     }
 
     /// Fold one streamed fragment into the reply and return the text it newly
@@ -446,6 +458,12 @@ impl StreamedReply {
 
         revealed
     }
+}
+
+/// A fresh ACP `messageId`. Ids are opaque and only have to be unique within
+/// a session, so a random one serves both live chunks and replayed ones.
+fn new_message_id() -> MessageId {
+    MessageId::new(format!("msg_{}", uuid::Uuid::new_v4().simple()))
 }
 
 #[derive(Default)]
@@ -670,17 +688,17 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
             "user" => {
                 let text = history_message_text(message);
                 if !text.trim().is_empty() {
-                    updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
-                        ContentBlock::from(text),
-                    )));
+                    updates.push(SessionUpdate::UserMessageChunk(
+                        ContentChunk::new(ContentBlock::from(text)).message_id(new_message_id()),
+                    ));
                 }
             }
             "assistant" => {
                 let (_think, visible) = chat::strip_think_blocks(&history_message_text(message));
                 if !visible.trim().is_empty() {
-                    updates.push(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                        ContentBlock::from(visible),
-                    )));
+                    updates.push(SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(ContentBlock::from(visible)).message_id(new_message_id()),
+                    ));
                 }
                 for call in message["tool_calls"].as_array().into_iter().flatten() {
                     let name = call["function"]["name"].as_str().unwrap_or("tool");
@@ -1264,6 +1282,9 @@ struct SiGitAgent {
     /// Sessions a `session/close` is waiting to tear down. A prompt for one of
     /// these that reaches the front of its session lock first is cancelled.
     closing_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The title last sent to the client for each session in a
+    /// `session_info_update`, so an unchanged title is not sent again.
+    announced_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
@@ -1317,6 +1338,7 @@ impl SiGitAgent {
             active_session: std::sync::Mutex::new(None),
             prompt_cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             closing_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            announced_titles: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
             startup_model_load_started,
@@ -1564,29 +1586,50 @@ impl SiGitAgent {
         Ok(())
     }
 
+    /// Send a message of its own: a notice, a slash command's answer. It gets
+    /// a fresh `messageId`, so a client never folds it into the reply around
+    /// it. Text that belongs to the model's reply goes through
+    /// [`Self::send_reply_chunk`] instead.
     fn send_assistant_message(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: SessionId,
         text: impl Into<String>,
     ) -> agent_client_protocol::Result<()> {
+        self.send_reply_chunk(cx, session_id, new_message_id(), text)
+    }
+
+    /// Send one chunk of the model message `message_id`.
+    fn send_reply_chunk(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        message_id: MessageId,
+        text: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(
             session_id,
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::from(text.into())).message_id(message_id),
+            ),
         ))
     }
 
     /// Stream a fragment of the model's reasoning as a thought chunk. Clients
     /// render these in a collapsed "thinking" section, separate from the reply.
+    /// It carries the id of the model message it came with.
     fn send_agent_thought(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: SessionId,
+        message_id: MessageId,
         text: impl Into<String>,
     ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(
             session_id,
-            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+            SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(ContentBlock::from(text.into())).message_id(message_id),
+            ),
         ))
     }
 
@@ -1666,16 +1709,20 @@ impl SiGitAgent {
     ) {
         match chunk {
             TokenChunk::Reasoning(text) => {
-                self.send_agent_thought(cx, session_id.clone(), text).ok();
+                let message_id = reply.message_id();
+                self.send_agent_thought(cx, session_id.clone(), message_id, text)
+                    .ok();
             }
             TokenChunk::Visible(piece) => {
                 let revealed = reply.push(&piece);
                 if let Some(reasoning) = revealed.reasoning {
-                    self.send_agent_thought(cx, session_id.clone(), reasoning)
+                    let message_id = reply.message_id();
+                    self.send_agent_thought(cx, session_id.clone(), message_id, reasoning)
                         .ok();
                 }
                 if let Some(visible) = revealed.visible {
-                    self.send_assistant_message(cx, session_id.clone(), visible)
+                    let message_id = reply.message_id();
+                    self.send_reply_chunk(cx, session_id.clone(), message_id, visible)
                         .ok();
                 }
             }
@@ -2173,6 +2220,18 @@ impl SiGitAgent {
             client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
         }
 
+        // A client that renders boolean config options gets the Inference
+        // switch as a toggle; the rest keep the two-value select.
+        let boolean_options = req
+            .client_capabilities
+            .session
+            .as_ref()
+            .and_then(|session| session.config_options.as_ref())
+            .and_then(|config_options| config_options.boolean.as_ref())
+            .is_some();
+        log::info!("boolean config options: {boolean_options}");
+        CLIENT_BOOLEAN_CONFIG_OPTIONS.store(boolean_options, Ordering::Relaxed);
+
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
         // like Zed advertise terminal-auth capability but don't actually spawn the
         // login terminal for *custom* ACP agents, so the button is a silent no-op.
@@ -2236,7 +2295,11 @@ impl SiGitAgent {
                             .resume(SessionResumeCapabilities::new())
                             // Lets the client say a thread is gone, so its
                             // state does not sit here until the process exits.
-                            .close(SessionCloseCapabilities::new()),
+                            .close(SessionCloseCapabilities::new())
+                            // Without this, a thread the user removes in the
+                            // editor stays on disk and comes back in "Import
+                            // Threads".
+                            .delete(SessionDeleteCapabilities::new()),
                     ),
             )
             .meta(initialize_meta()))
@@ -2655,12 +2718,22 @@ impl SiGitAgent {
     /// session request is recorded — never the process cwd, which a later
     /// session in the same process may have moved: a thread listed under the
     /// wrong project is worse than one that isn't listed at all.
-    async fn persist_session(&self, session_id: &SessionId, snapshot: &[serde_json::Value]) {
+    ///
+    /// Each save is also reported to the client in a `session_info_update`, so
+    /// the thread's title and `updatedAt` reach the editor's sidebar without
+    /// waiting for the next `session/list`.
+    async fn persist_session(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        snapshot: &[serde_json::Value],
+    ) {
         let key = session_id.to_string();
         if let Err(error) = session_store::save(&key, snapshot) {
             log::warn!("session({session_id}) save failed: {error}");
             return;
         }
+        self.send_session_info(cx, session_id, snapshot);
         let state = self.sessions.lock().unwrap().get(&key).cloned();
         match state {
             Some(state) => session_store::save_meta(
@@ -2673,6 +2746,35 @@ impl SiGitAgent {
                 "session({session_id}) has no recorded cwd — saved, but it won't be listed"
             ),
         }
+    }
+
+    /// Tell the client a session was just saved: always a fresh `updatedAt`,
+    /// and the title only when it differs from the one last sent. The update
+    /// names no `sessionId`, `cwd` or `additionalDirectories`; the spec keeps
+    /// those out of it.
+    fn send_session_info(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        snapshot: &[serde_json::Value],
+    ) {
+        let key = session_id.to_string();
+        let mut update = SessionInfoUpdate::new();
+        if let Some(modified) = session_store::modified(&key) {
+            update = update.updated_at(session_store::iso8601(modified));
+        }
+        if let Some(title) = session_store::history_title(snapshot) {
+            let mut announced = self.announced_titles.lock().unwrap();
+            if announced.get(&key) != Some(&title) {
+                announced.insert(key, title.clone());
+                update = update.title(title);
+            }
+        }
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::SessionInfoUpdate(update),
+        ))
+        .ok();
     }
 
     /// ACP `session/list`: the saved threads an editor can reopen.
@@ -2904,6 +3006,7 @@ impl SiGitAgent {
         }
 
         permissions::reset_session(&key);
+        self.announced_titles.lock().unwrap().remove(&key);
         let killed = tools::kill_session_tasks(&key);
         self.closing_sessions.lock().unwrap().remove(&key);
 
@@ -2911,6 +3014,26 @@ impl SiGitAgent {
             "close_session: id={key} (known={known}, live={was_live}, {killed} background task(s) stopped)"
         );
         Ok(CloseSessionResponse::new())
+    }
+
+    /// ACP `session/delete`: the user removed a thread in the editor.
+    ///
+    /// A live thread is closed first, exactly as `session/close` would (the
+    /// caller has run `begin_close` and holds the same locks), so its turn,
+    /// permission grants and background commands go with it. Then the saved
+    /// history and its sidecar are removed, which is what takes the thread out
+    /// of `session/list`. Deleting an id that was never saved, or is already
+    /// gone, succeeds quietly.
+    async fn handle_delete_session(
+        &self,
+        args: DeleteSessionRequest,
+    ) -> agent_client_protocol::Result<DeleteSessionResponse> {
+        let key = args.session_id.to_string();
+        self.handle_close_session(CloseSessionRequest::new(args.session_id))
+            .await?;
+        session_store::delete(&key);
+        log::info!("delete_session: id={key}");
+        Ok(DeleteSessionResponse::new())
     }
 
     /// First half of `session/close`, run before waiting for any lock.
@@ -3294,6 +3417,7 @@ impl SiGitAgent {
         let max_tool_rounds = headless::max_tool_rounds_from_env();
 
         let model_name = self.current_model.lock().unwrap().display_name.clone();
+        let context_window = self.context_window_tokens();
         let earlier_images = if backend.accepts_images() {
             0
         } else {
@@ -3401,11 +3525,14 @@ impl SiGitAgent {
                 // The client keeps this prompt in its thread after the error,
                 // so keep it in the saved conversation too.
                 let snapshot = backend.history_snapshot().await;
-                self.persist_session(&session_id, &snapshot).await;
+                self.persist_session(cx, &session_id, &snapshot).await;
                 self.finish_prompt(&session_id, &cancellation);
                 return Err(agent_client_protocol::Error::new(-32603, error));
             }
         };
+
+        self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
+            .await;
 
         let mut round = 0;
         // Set when the repetition guard blocked a call; names the tool.
@@ -3791,6 +3918,8 @@ impl SiGitAgent {
                     return Err(agent_client_protocol::Error::new(-32603, error));
                 }
             };
+            self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
+                .await;
         }
 
         // ── Final text response ───────────────────────────────────────────
@@ -3825,7 +3954,8 @@ impl SiGitAgent {
             };
 
             if !final_text.is_empty() {
-                self.send_assistant_message(cx, session_id.clone(), final_text)
+                let message_id = reply.message_id();
+                self.send_reply_chunk(cx, session_id.clone(), message_id, final_text)
                     .ok();
             }
         } else if round > 0 && !round_cap_reached && reply.sent.len() == sent_before_last_round {
@@ -3838,9 +3968,11 @@ impl SiGitAgent {
                 session_id,
                 round
             );
-            self.send_assistant_message(
+            let message_id = reply.message_id();
+            self.send_reply_chunk(
                 cx,
                 session_id.clone(),
+                message_id,
                 format!(
                     "{PARAGRAPH_BREAK}{}",
                     silent_stop_message(stopped_repeating.as_deref(), round)
@@ -3855,9 +3987,11 @@ impl SiGitAgent {
                 session_id,
                 max_tool_rounds
             );
-            self.send_assistant_message(
+            let message_id = reply.message_id();
+            self.send_reply_chunk(
                 cx,
                 session_id.clone(),
+                message_id,
                 format!(
                     "{PARAGRAPH_BREAK}{}",
                     round_cap_stop_message(max_tool_rounds)
@@ -3885,7 +4019,7 @@ impl SiGitAgent {
         // Persist the completed turn so a restart (or session/load) can pick
         // the conversation back up.
         let snapshot = backend.history_snapshot().await;
-        self.persist_session(&session_id, &snapshot).await;
+        self.persist_session(cx, &session_id, &snapshot).await;
         self.finish_prompt(&session_id, &cancellation);
 
         log::info!(
@@ -3897,11 +4031,50 @@ impl SiGitAgent {
         Ok(PromptResponse::new(stop_reason))
     }
 
+    /// The context window of the session's model, for `usage_update`. A model
+    /// the picker does not list (a provider-supplied name, say) falls back to
+    /// the compaction budget, the same as the TUI's gauge.
+    fn context_window_tokens(&self) -> u64 {
+        let current = self.current_model.lock().unwrap().clone();
+        models::build_model_picker_items()
+            .into_iter()
+            .find(|item| {
+                item.config.model_id == current.model_id
+                    || item.display_name == current.display_name
+            })
+            .map(|item| item.context_window_tokens)
+            .unwrap_or(backend::DEFAULT_CONTEXT_TOKEN_BUDGET as u64)
+    }
+
+    /// Report how much of the context window the session uses after one
+    /// model response. The endpoint's own count is used when it gave one;
+    /// otherwise (always on-device) the history is estimated, the way
+    /// compaction does it.
+    async fn send_usage(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        backend: &dyn InferenceBackend,
+        result: &TurnResult,
+        size: u64,
+    ) {
+        let used = match result.context_tokens {
+            Some(tokens) => tokens,
+            None => backend::estimate_tokens(&backend.history_snapshot().await) as u64,
+        };
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
+        ))
+        .ok();
+    }
+
     /// Ask the ACP client for permission to run one tool call. The request
     /// names the call by `tool_call_id`, the id it was announced under, so the
     /// client updates that one card instead of drawing a second. Presents
-    /// allow-once / allow-for-session / deny; an "always allow" choice is
-    /// recorded via [`permissions::grant_for_session`]. Only safe to call from
+    /// allow-once / allow-for-session / deny / deny-for-session; an "always"
+    /// choice is recorded via [`permissions::grant_for_session`] or
+    /// [`permissions::deny_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
     /// dispatch loop must be free to route the client's answer back to us.
     ///
@@ -3951,6 +4124,11 @@ impl SiGitAgent {
                     PermissionOptionKind::AllowAlways,
                 ),
                 PermissionOption::new("reject_once", "Deny", PermissionOptionKind::RejectOnce),
+                PermissionOption::new(
+                    "reject_session",
+                    "Deny for this session",
+                    PermissionOptionKind::RejectAlways,
+                ),
             ],
         );
 
@@ -3966,6 +4144,14 @@ impl SiGitAgent {
                                 arguments,
                             );
                             PermissionVerdict::Approved
+                        }
+                        "reject_session" => {
+                            permissions::deny_for_session(
+                                &session_id.to_string(),
+                                tool_name,
+                                arguments,
+                            );
+                            PermissionVerdict::Denied(permissions::user_denial(tool_name))
                         }
                         _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
                     }
@@ -4224,10 +4410,15 @@ impl SiGitAgent {
 
         // ── Local Inference toggle ──────────────────────────────────────────
         if args.config_id.0.as_ref() == LOCAL_INFERENCE_CONFIG_ID {
-            let enabled = match args.value.as_value_id().map(|v| v.0.as_ref()) {
-                Some(LOCAL_INFERENCE_ON) => true,
-                Some(LOCAL_INFERENCE_OFF) => false,
-                other => {
+            // A toggle sends a boolean, the select fallback one of its ids.
+            let enabled = match (
+                args.value.as_bool(),
+                args.value.as_value_id().map(|v| v.0.as_ref()),
+            ) {
+                (Some(enabled), _) => enabled,
+                (_, Some(LOCAL_INFERENCE_ON)) => true,
+                (_, Some(LOCAL_INFERENCE_OFF)) => false,
+                (_, other) => {
                     return Err(agent_client_protocol::Error::new(
                         -32602,
                         format!("unknown Local Inference value: {other:?}"),
@@ -4616,10 +4807,15 @@ impl SiGitAgent {
 /// config option ID for the model picker in Zed's agent panel
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
-/// config option ID for the Local Inference on/off toggle. Surfaced as a
-/// two-option `select` so ACP clients without slash-command support (e.g. Xcode)
-/// can still flip the mode from the agent panel.
+/// config option ID for the Local Inference on/off toggle, so ACP clients
+/// without slash-command support (e.g. Xcode) can still flip the mode from the
+/// agent panel. A `boolean` option for clients that advertise
+/// `session.configOptions.boolean`, a two-option `select` for the rest.
 const LOCAL_INFERENCE_CONFIG_ID: &str = "sigit-local-inference";
+
+/// Whether the connected client advertised boolean config options. One
+/// process serves one ACP connection, so this is set once in `initialize`.
+static CLIENT_BOOLEAN_CONFIG_OPTIONS: AtomicBool = AtomicBool::new(false);
 
 /// `select` value ids for the Local Inference toggle.
 const LOCAL_INFERENCE_ON: &str = "local-inference-on";
@@ -4813,12 +5009,16 @@ fn build_config_options(
         )
         .description("Use siGit Code Cloud; cloud tiers are highlighted".to_string()),
     ];
-    let local_option = SessionConfigOption::select(
-        LOCAL_INFERENCE_CONFIG_ID,
-        "Inference",
-        local_current,
-        local_options,
-    )
+    let local_option = if CLIENT_BOOLEAN_CONFIG_OPTIONS.load(Ordering::Relaxed) {
+        SessionConfigOption::boolean(LOCAL_INFERENCE_CONFIG_ID, "Local inference", local_on)
+    } else {
+        SessionConfigOption::select(
+            LOCAL_INFERENCE_CONFIG_ID,
+            "Inference",
+            local_current,
+            local_options,
+        )
+    }
     .description("Toggle on-device inference; changes which models are highlighted");
 
     // Permissions dropdown (issue #76): Manual (ask), Auto (run unattended),
@@ -5187,7 +5387,7 @@ async fn exec_slash_acp(
                     let snapshot = backend.history_snapshot().await;
                     let after = backend::estimate_tokens(&snapshot);
                     // Keep the saved session in step with the compacted state.
-                    agent.persist_session(&session_id, &snapshot).await;
+                    agent.persist_session(cx, &session_id, &snapshot).await;
                     format!("Compacted history: ~{before} → ~{after} tokens (estimated).")
                 }
                 Err(error) => format!("Compaction failed: {error}"),
@@ -5880,6 +6080,23 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_close_session(req).await)
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: DeleteSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    // A delete closes the thread first, so it is signalled the
+                    // same way a close is.
+                    state.begin_close(&req.session_id);
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let _session = state.lock_session(&req.session_id).await;
+                        let _workspace = state.workspace_lock.lock().await;
+                        handle_response(responder, state.handle_delete_session(req).await)
                     })
                 }
             },
@@ -7086,6 +7303,26 @@ mod tests {
             other => panic!("expected the tool call, got {other:?}"),
         }
         assert!(matches!(updates[3], SessionUpdate::AgentMessageChunk(_)));
+
+        // Each replayed message has an id of its own.
+        let ids: Vec<_> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UserMessageChunk(chunk)
+                | SessionUpdate::AgentMessageChunk(chunk) => Some(
+                    chunk
+                        .message_id
+                        .clone()
+                        .expect("replayed chunk has a messageId"),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
+            "{ids:?}"
+        );
     }
 
     #[test]

@@ -384,7 +384,22 @@ fn permission_round_trip_cancel_then_allow() {
         .iter()
         .map(|option| option["optionId"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(option_ids, ["allow_once", "allow_session", "reject_once"]);
+    assert_eq!(
+        option_ids,
+        [
+            "allow_once",
+            "allow_session",
+            "reject_once",
+            "reject_session"
+        ]
+    );
+    let reject_always = params["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["optionId"] == "reject_session")
+        .unwrap();
+    assert_eq!(reject_always["kind"], "reject_always");
 
     agent.respond(
         permission["id"].clone(),
@@ -625,6 +640,155 @@ fn a_call_denied_at_the_prompt_ends_failed() {
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// "Deny for this session" answers the call it was picked for and every later
+/// call in the same family without asking again (issue #199).
+#[test]
+fn a_call_denied_for_the_session_is_not_asked_about_again() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo sigit-never"}"#),
+        sse_tool_call(
+            "call_2",
+            "run_command",
+            r#"{"command":"echo sigit-never again"}"#,
+        ),
+        sse_text("ok, I will stop"),
+    ]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_perm_deny_all_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+
+    let permission = agent.wait_for_agent_request("session/request_permission");
+    agent.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "reject_session"}}),
+    );
+
+    // The second call is denied by the recorded choice: no second request,
+    // which `wait_for_response_with_updates` would fail on.
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    let second = updates
+        .iter()
+        .rev()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update" && update["toolCallId"] == "call_2"
+        })
+        .expect("the second call closes");
+    assert_eq!(second["status"], "failed", "{second}");
+
+    let requests = endpoint.requests.lock().unwrap();
+    let result = requests[2]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_2")
+        .expect("tool result for the second call");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("always deny"),
+        "the model is told why: {result}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A client that renders boolean config options gets the Inference switch as
+/// a toggle, and can flip it with a boolean value; any other client keeps the
+/// two-value select (issue #198).
+#[test]
+fn the_inference_switch_is_a_toggle_for_clients_that_render_one() {
+    let inference_option = |options: &Value| -> Value {
+        options
+            .as_array()
+            .expect("config options")
+            .iter()
+            .find(|option| option["id"] == "sigit-local-inference")
+            .cloned()
+            .expect("inference option")
+    };
+
+    for (capabilities, expected_type) in [
+        (
+            json!({"session": {"configOptions": {"boolean": {}}}}),
+            "boolean",
+        ),
+        (json!({}), "select"),
+    ] {
+        let endpoint = start_fake_endpoint(vec![]);
+        let scratch = std::env::temp_dir().join(format!(
+            "sigit_acp_bool_option_{expected_type}_{}",
+            std::process::id()
+        ));
+        let config_dir = scratch.join("config");
+        let cwd = scratch.join("cwd");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut agent = spawn_agent(endpoint.port, &config_dir);
+        let id = agent.request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": capabilities}),
+        );
+        agent.wait_for_response(id);
+
+        let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+        let created = agent.wait_for_response(id);
+        let session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let option = inference_option(&created["result"]["configOptions"]);
+        assert_eq!(option["type"], expected_type, "{option}");
+
+        if expected_type == "boolean" {
+            let id = agent.request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": "sigit-local-inference",
+                    "type": "boolean",
+                    "value": true,
+                }),
+            );
+            let response = agent.wait_for_response(id);
+            let option = inference_option(&response["result"]["configOptions"]);
+            assert_eq!(option["currentValue"], true, "{option}");
+        }
+
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }
 
 #[test]
@@ -1038,6 +1202,151 @@ fn text_from_two_tool_rounds_reaches_the_client_as_separate_paragraphs() {
         !rendered.contains("pattern.Let me"),
         "rounds must not run together into one sentence, got: {rendered:?}"
     );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Every chunk of one model message carries the same `messageId`, its
+/// reasoning included, and the message after a tool round gets a new one
+/// (issue #195).
+#[test]
+fn chunks_of_one_model_message_share_a_message_id() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_body(&[
+            json!({"choices": [{"delta": {"reasoning_content": "Where is it?"}}]}),
+            json!({"choices": [{"delta": {"content": "I'll look "}}]}),
+            json!({"choices": [{"delta": {"content": "around."}}]}),
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "list_directory", "arguments": r#"{"path":"."}"#},
+                }]}}]
+            }),
+        ]),
+        sse_text("Found it."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_msg_ids_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "find it"}],
+        }),
+    );
+    let (_, updates) = agent.wait_for_response_with_updates(prompt_id);
+
+    let chunks: Vec<(&str, &str)> = updates
+        .iter()
+        .filter(|update| {
+            update["sessionUpdate"] == "agent_message_chunk"
+                || update["sessionUpdate"] == "agent_thought_chunk"
+        })
+        .map(|update| {
+            (
+                update["content"]["text"].as_str().unwrap_or_default(),
+                update["messageId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("chunk without a messageId: {update}")),
+            )
+        })
+        .collect();
+    let id_of = |text: &str| {
+        chunks
+            .iter()
+            .find(|(chunk, _)| chunk.contains(text))
+            .unwrap_or_else(|| panic!("no chunk with {text:?} in {chunks:?}"))
+            .1
+    };
+
+    let first = id_of("Where is it?");
+    assert_eq!(id_of("I'll look"), first, "{chunks:?}");
+    assert_eq!(id_of("around."), first, "{chunks:?}");
+    assert_ne!(
+        id_of("Found it."),
+        first,
+        "the round after the tool call is a new message: {chunks:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// After each model response the client hears how much of the context window
+/// the session uses: the endpoint's own count when it gives one, an estimate
+/// when it does not (issue #194).
+#[test]
+fn each_model_response_reports_context_usage() {
+    let endpoint = start_fake_endpoint(vec![
+        // No usage on this one.
+        sse_tool_call("call_1", "list_directory", r#"{"path":"."}"#),
+        sse_body(&[
+            json!({"choices": [{"delta": {"content": "Done."}}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 1500, "completion_tokens": 21}}),
+        ]),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_usage_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "look around"}],
+        }),
+    );
+    let (_, updates) = agent.wait_for_response_with_updates(prompt_id);
+
+    let usage: Vec<&Value> = updates
+        .iter()
+        .filter(|update| update["sessionUpdate"] == "usage_update")
+        .collect();
+    assert_eq!(usage.len(), 2, "one per model response: {usage:?}");
+    let estimated = usage[0]["used"].as_u64().expect("used");
+    assert!(estimated > 0, "an estimate stands in for a missing count");
+    assert_eq!(usage[1]["used"], 1521, "the endpoint's own count wins");
+    for update in &usage {
+        assert!(update["size"].as_u64().unwrap_or_default() > 0, "{update}");
+    }
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
