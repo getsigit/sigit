@@ -457,7 +457,17 @@ fn run_command_runs_in_the_client_terminal_and_shows_it() {
         .position(|update| update["status"] == "completed")
         .expect("call_1 never completed");
     assert!(shown < finished, "embedded after completion: {updates:?}");
-    assert_eq!(updates[finished]["content"], terminal);
+    // The terminal was released by then, so the closing update does not name
+    // it again; the card keeps the one already embedded.
+    assert!(
+        updates[finished]["content"].is_null(),
+        "the final update must not re-send the released terminal: {}",
+        updates[finished]
+    );
+    assert_eq!(
+        updates[finished]["rawOutput"],
+        format!("Exit code 0:\n{EDITOR_OUTPUT}")
+    );
 }
 
 #[test]
