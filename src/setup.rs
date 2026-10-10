@@ -431,11 +431,13 @@ fn resolve_shared_container() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
+    /// The crate-wide lock, not one of this module's own: the model picker
+    /// reads this cache from other modules' tests, and they must not see it
+    /// pointed at a scratch directory halfway through.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &crate::ENV_TEST_LOCK
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
