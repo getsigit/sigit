@@ -2295,6 +2295,8 @@ fn exec_delete_file(arguments: &str) -> String {
 
 // ── run_command ──────────────────────────────────────────────────────────────
 
+/// What a foreground command reports when the user cancelled the turn under it.
+const CANCELLED_BY_USER: &str = "Error: command was cancelled by the user and killed.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const COMMAND_OUTPUT_LIMIT: usize = 50_000;
 /// How long to keep waiting for the output drains once the command itself has
@@ -2679,11 +2681,16 @@ fn exec_run_command(arguments: &str, owner: Option<&str>) -> String {
     drain(1, child.stderr.take().map(|pipe| Box::new(pipe) as _));
     drop(chunks_tx);
 
+    let abort = owner.map(abort_signal);
     let start = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if abort.as_ref().is_some_and(|signal| signal.is_aborted()) {
+                    kill_shell_tree(&mut child);
+                    return CANCELLED_BY_USER.to_string();
+                }
                 if start.elapsed() >= COMMAND_TIMEOUT {
                     kill_shell_tree(&mut child);
                     return format!(
@@ -2809,6 +2816,18 @@ async fn exec_run_command_via_client(
             }
             (result, terminal_id)
         }
+        Run::Cancelled {
+            terminal_id,
+            output,
+        } => {
+            let mut result = CANCELLED_BY_USER.to_string();
+            let combined = client_output_text(output);
+            if !combined.is_empty() {
+                result.push_str("\nOutput before it was killed:\n");
+                result.push_str(&combined);
+            }
+            (result, terminal_id)
+        }
         Run::Failed { terminal_id, error } => (format!("Error: {error}"), terminal_id),
     };
 
@@ -2878,6 +2897,64 @@ fn active_session() -> Option<String> {
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+/// Raised when a session's turn is cancelled or its session closed, so a
+/// foreground tool does not run on to its own end with nobody waiting for it.
+#[derive(Default)]
+pub struct AbortSignal {
+    aborted: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl AbortSignal {
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the signal is raised. `notify_one` keeps a permit when
+    /// nothing is waiting, so a signal raised just before this is polled still
+    /// wakes it.
+    pub async fn aborted(&self) {
+        while !self.is_aborted() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+fn aborts() -> &'static Mutex<HashMap<String, Arc<AbortSignal>>> {
+    static ABORTS: OnceLock<Mutex<HashMap<String, Arc<AbortSignal>>>> = OnceLock::new();
+    ABORTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_aborts() -> std::sync::MutexGuard<'static, HashMap<String, Arc<AbortSignal>>> {
+    aborts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The abort signal of `session`'s current turn. Created on first use, so a
+/// signal raised before any tool asks for it is still there when one does.
+pub fn abort_signal(session: &str) -> Arc<AbortSignal> {
+    Arc::clone(lock_aborts().entry(session.to_string()).or_default())
+}
+
+/// Start a turn with a clean slate: a cancel aimed at an earlier turn must not
+/// kill this turn's first command.
+pub fn reset_abort(session: &str) {
+    lock_aborts().insert(session.to_string(), Arc::new(AbortSignal::default()));
+}
+
+/// Tell `session`'s running foreground tool to stop.
+pub fn abort_session_tools(session: &str) {
+    let signal = abort_signal(session);
+    signal.aborted.store(true, Ordering::Release);
+    signal.notify.notify_one();
+}
+
+/// Forget `session`'s signal once the session is gone.
+pub fn forget_abort(session: &str) {
+    lock_aborts().remove(session);
 }
 
 /// Process-global background task table (same pattern as `mcp::MCP`).
@@ -4026,6 +4103,35 @@ mod tests {
             result.contains("missing required parameter"),
             "got: {result}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_kills_a_running_foreground_command() {
+        reset_abort("tools-abort");
+        let trigger = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            abort_session_tools("tools-abort");
+        });
+        let started = std::time::Instant::now();
+        let result = exec_run_command(r#"{"command": "sleep 30"}"#, Some("tools-abort"));
+        trigger.join().unwrap();
+
+        assert_eq!(result, CANCELLED_BY_USER);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the command was not killed: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_turn_is_not_aborted_by_an_earlier_cancel() {
+        abort_session_tools("tools-stale");
+        reset_abort("tools-stale");
+        let result = exec_run_command(r#"{"command": "echo fine"}"#, Some("tools-stale"));
+        assert!(result.contains("fine"), "{result}");
     }
 
     #[test]
