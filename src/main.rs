@@ -7611,6 +7611,43 @@ mod tests {
 
     #[test]
     fn acp_config_option_labels_show_context_window() {
+        // The picker reads the permission default, the local-inference
+        // setting and the model cache from the environment, which other tests
+        // rewrite while they hold this lock (#168).
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = std::env::temp_dir().join(format!("sigit-labels-{}", uuid::Uuid::new_v4()));
+        let saved: Vec<_> = [
+            "SIGIT_CONFIG_DIR",
+            "SIGIT_PERMISSIONS",
+            "SIGIT_LOCAL_INFERENCE",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored below.
+        unsafe {
+            std::env::set_var("SIGIT_CONFIG_DIR", &config);
+            std::env::remove_var("SIGIT_PERMISSIONS");
+            std::env::remove_var("SIGIT_LOCAL_INFERENCE");
+        }
+        let outcome = std::panic::catch_unwind(acp_config_option_labels_once);
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn acp_config_option_labels_once() {
         let current = GgufModelConfig {
             model_id: "sigit-cloud:oke".to_string(),
             files: Vec::new(),
