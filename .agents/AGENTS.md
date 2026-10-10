@@ -301,6 +301,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   HTTP entries are connected too, with the URL and headers the client sent, because
   `handle_initialize` advertises `mcpCapabilities.http`. SSE is not advertised (the MCP spec
   deprecated it), so a conforming client never sends one and a stray entry is skipped.
+  An MCP server's `elicitation/create` is not forwarded to the ACP client as a form
+  elicitation: `ed-mcp`'s client handler declares no capabilities and has no hook for it, so
+  servers are never offered elicitation, and `rmcp` answers `ping` and refuses other server
+  requests itself. Forwarding needs that hook in `ed-mcp` first.
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
@@ -430,7 +434,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   resulting token goes into `credentials` like any other, and is served by `/api/v1/user` rather
   than the deprecated `/api/v1/me` — OAuth tokens are rejected there. The scopes requested are
   `user:read code:agent`; `code:agent` is what reaches `chat/completions` and the official MCP
-  server. Surfaces: ACP `authenticate` (loopback only — nowhere to show a code), a bare `/login`
+  server. Surfaces: ACP `authenticate` (loopback only, since a code cannot be pasted back; for a
+  client that advertises `elicitation.url`, `sign_in_via_client` hands it the authorize URL as a
+  URL-mode elicitation instead of launching a browser, ends the sign-in if the user declines, and
+  sends `elicitation/complete` once the code is redeemed; `authenticate` runs in a spawned task
+  so that answer can be routed), a bare `/login`
   in either chat surface, and `sigit login` (which adds the paste fallback, plus `--paste` to
   force it and `--password` for the old email/password prompt).
 - **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
