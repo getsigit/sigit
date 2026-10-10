@@ -3023,6 +3023,7 @@ impl SiGitAgent {
         permissions::reset_session(&key);
         self.announced_titles.lock().unwrap().remove(&key);
         let killed = tools::kill_session_tasks(&key);
+        tools::forget_abort(&key);
         self.closing_sessions.lock().unwrap().remove(&key);
 
         log::info!(
@@ -3065,6 +3066,7 @@ impl SiGitAgent {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
+        tools::abort_session_tools(&key);
     }
 
     async fn handle_fork_session(
@@ -3206,6 +3208,7 @@ impl SiGitAgent {
         // sessions or loading a model is seen. The session lock is held, so the
         // slot can only be this turn's. The guard clears it on every return.
         let cancellation = Arc::new(PromptCancellation::default());
+        tools::reset_abort(&session_id.to_string());
         self.prompt_cancellations
             .lock()
             .unwrap()
@@ -3892,9 +3895,9 @@ impl SiGitAgent {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
-                // Cancellation cannot preempt a synchronous foreground tool:
-                // it is observed here as soon as that tool exits. Background
-                // commands remain cancellable through `kill_command`.
+                // A cancel aborts a running foreground command (see
+                // `tools::abort_session_tools`), so it exits and is observed
+                // here. Background commands are stopped with `kill_command`.
                 if cancellation.cancelled.load(Ordering::Acquire) {
                     for pending in &result.tool_calls[call_index + 1..] {
                         tool_results.push(BackendToolResult {
@@ -4254,6 +4257,7 @@ impl SiGitAgent {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
+        tools::abort_session_tools(&args.session_id.to_string());
         Ok(())
     }
 

@@ -330,7 +330,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   the top of `handle_prompt`, before it waits on either lock, and a `PromptRegistration`
   guard clears it on every return, so a `session/cancel` that arrives while the turn
   is still queued, switching threads, loading a model or running a slash command ends
-  it as `cancelled`. The checks sit after each of those waits. Tool
+  it as `cancelled`. The checks sit after each of those waits. A cancel (and
+  `begin_close`) also raises the session's `tools::AbortSignal`, which the local
+  `run_command` poll loop and `client_terminal::Route::run` watch, so a running
+  foreground command is killed instead of finishing first. The signal is reset at the
+  top of each turn, not when a tool starts, so a cancel that lands during a permission
+  prompt still stops the command that follows. Tool
   execution, subagents included, still runs one session at a time.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
