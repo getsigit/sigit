@@ -2268,3 +2268,139 @@ fn session_modes_mirror_the_permissions_config_option() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// A mode change is heard while a turn waits on a permission prompt, and the
+/// call that follows obeys it. The turn holds its session's lock for its whole
+/// length, so a change that queued behind it would sit unanswered until the
+/// prompt had been dealt with.
+#[test]
+fn a_mode_switch_during_a_permission_prompt_is_answered_at_once() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo sigit-first"}"#),
+        sse_tool_call(
+            "call_2",
+            "run_command",
+            r#"{"command":"echo sigit-second"}"#,
+        ),
+        sse_text("done"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_mode_mid_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run both commands"}],
+        }),
+    );
+    let permission = agent.wait_for_agent_request("session/request_permission");
+
+    // The turn is parked on the question. Switch to Auto, and expect the
+    // answer now, not after the turn.
+    let mode_id = agent.request(
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "permission-mode-auto"}),
+    );
+    let response = agent.wait_for(
+        "the set_mode response while the permission prompt is open",
+        |message| {
+            message["id"] == mode_id && message.get("method").is_none()
+                || message["id"] == prompt_id && message.get("method").is_none()
+        },
+    );
+    assert_eq!(
+        response["id"], mode_id,
+        "the turn ended before set_mode was answered: {response}"
+    );
+    assert!(response.get("error").is_none(), "{response}");
+
+    // Same for the config option, which is the path most editors use.
+    let option_id = agent.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "sigit-permission-mode",
+            "value": "permission-mode-auto",
+        }),
+    );
+    let response = agent.wait_for(
+        "the set_config_option response while the permission prompt is open",
+        |message| {
+            message["id"] == option_id && message.get("method").is_none()
+                || message["id"] == prompt_id && message.get("method").is_none()
+        },
+    );
+    assert_eq!(response["id"], option_id, "{response}");
+    assert!(response.get("error").is_none(), "{response}");
+
+    // Allow the pending call. The next one is decided under Auto: no prompt.
+    agent.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}}),
+    );
+    let (response, _updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    let second_result = requests[2]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_2")
+        .expect("tool result for the second call");
+    assert!(
+        second_result["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sigit-second"),
+        "the second call should have run under Auto: {second_result}"
+    );
+
+    drop(requests);
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_mode_change_for_an_unknown_session_is_resource_not_found() {
+    let endpoint = start_fake_endpoint(vec![]);
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_mode_unknown_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request(
+        "session/set_mode",
+        json!({"sessionId": "nope", "modeId": "permission-mode-auto"}),
+    );
+    let response = agent.wait_for("set_mode answer", |m| m["id"] == id);
+    assert_eq!(response["error"]["code"], -32002, "{response}");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
