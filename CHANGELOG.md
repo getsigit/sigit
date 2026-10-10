@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A cancel that arrives before the turn starts is no longer lost.** A prompt
+  now registers for `session/cancel` as soon as it begins, not once it reaches
+  inference. A cancel that lands while the turn is queued on the workspace,
+  switching threads, loading a model, or running a slash command ends it with
+  `cancelled` instead of `end_turn`.
+- **A prompt that is only audio is answered.** A clip with no text or image used
+  to end the turn at once with nothing sent to the model, even though the agent
+  advertises audio.
+
 ## 1.6.6
 
 ### Added
