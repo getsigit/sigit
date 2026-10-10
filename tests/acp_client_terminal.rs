@@ -294,6 +294,56 @@ impl AgentUnderTest {
             .to_string()
     }
 
+    /// Send a prompt, then `session/cancel` as soon as the agent starts
+    /// waiting on the editor's terminal, which never answers. Returns the
+    /// prompt's response.
+    fn prompt_cancelled_mid_command(&mut self, session_id: &str, editor: &mut Editor) -> Value {
+        let id = self.request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "go"}]}),
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out: the cancel did not end the prompt");
+            };
+            if message["id"] == id && message.get("method").is_none() {
+                return message;
+            }
+            let Some(method) = message["method"].as_str() else {
+                continue;
+            };
+            if method == "session/update" {
+                editor.updates.push(message.clone());
+                continue;
+            }
+            if !method.starts_with("terminal/") {
+                continue;
+            }
+            editor.requests.push(message.clone());
+            let request_id = message["id"].clone();
+            let result = match method {
+                "terminal/create" => json!({"terminalId": "term-1"}),
+                "terminal/wait_for_exit" => {
+                    // The command is still running; the user presses stop.
+                    self.send(json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": {"sessionId": session_id},
+                    }));
+                    continue;
+                }
+                "terminal/output" => json!({
+                    "output": "partial\n",
+                    "truncated": false,
+                }),
+                _ => json!({}),
+            };
+            self.send(json!({"jsonrpc": "2.0", "id": request_id, "result": result}));
+        }
+    }
+
     fn prompt(&mut self, session_id: &str, editor: &mut Editor) {
         let id = self.request(
             "session/prompt",
@@ -501,4 +551,39 @@ fn sigit_client_terminal_off_keeps_commands_local() {
     let result = endpoint.tool_result("call_1");
     assert!(result.contains("ran-locally"), "run_command said: {result}");
     assert!(editor.requests.is_empty(), "{:?}", editor.requests);
+}
+
+#[test]
+fn a_cancel_mid_command_kills_the_client_terminal_and_ends_the_turn_cancelled() {
+    let scratch = Scratch::new("cancel");
+    let endpoint = start_fake_endpoint(vec![
+        echo_call("call_1", &scratch.work, false),
+        sse_text("never asked for"),
+    ]);
+    let mut agent = spawn_agent(endpoint.port, &scratch.config, None);
+    let session_id = agent.open_session(true, &scratch.work);
+
+    let mut editor = Editor::default();
+    let response = agent.prompt_cancelled_mid_command(&session_id, &mut editor);
+
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
+    assert_eq!(
+        editor.methods(),
+        [
+            "terminal/create",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "terminal/output",
+            "terminal/release",
+        ]
+    );
+    assert_eq!(
+        editor.request("terminal/kill")["params"]["terminalId"],
+        "term-1"
+    );
+    assert_eq!(
+        endpoint.requests.lock().unwrap().len(),
+        1,
+        "a cancelled turn must not ask the model for another round"
+    );
 }

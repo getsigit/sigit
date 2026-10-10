@@ -9,6 +9,11 @@
   inference. A cancel that lands while the turn is queued on the workspace,
   switching threads, loading a model, or running a slash command ends it with
   `cancelled` instead of `end_turn`.
+- **Cancelling a turn stops the command it is running.** A foreground
+  `run_command` used to run to its own end (up to two minutes) before the turn
+  noticed the cancel. A cancel or `session/close` now kills the process tree, or
+  sends `terminal/kill` when the command runs in the editor's terminal, and the
+  turn ends `cancelled` within a moment.
 - **A prompt that is only audio is answered.** A clip with no text or image used
   to end the turn at once with nothing sent to the model, even though the agent
   advertises audio.
