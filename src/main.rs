@@ -96,6 +96,10 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
     WaitForTerminalExitRequest, WriteTextFileRequest,
 };
+use agent_client_protocol::schema::v1::{
+    CompleteElicitationNotification, CreateElicitationRequest, ElicitationAction,
+    ElicitationRequestScope, ElicitationUrlMode, RequestId,
+};
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
 
@@ -2220,6 +2224,18 @@ impl SiGitAgent {
             client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
         }
 
+        // URL-mode elicitation is where `authenticate` sends the user to sign
+        // in. Form mode is never used: the spec forbids collecting
+        // credentials in a form, and nothing else here asks the user for
+        // structured input.
+        let elicit_url = req
+            .client_capabilities
+            .elicitation
+            .as_ref()
+            .is_some_and(|caps| caps.url.is_some());
+        log::info!("elicitation: url={elicit_url}");
+        CLIENT_ELICITATION_URL.store(elicit_url, Ordering::Relaxed);
+
         // A client that renders boolean config options gets the Inference
         // switch as a toggle; the rest keep the two-value select.
         let boolean_options = req
@@ -2305,8 +2321,14 @@ impl SiGitAgent {
             .meta(initialize_meta()))
     }
 
+    /// ACP `authenticate`. Runs in a spawned task: with URL-mode elicitation
+    /// it waits on the client's answer, which the dispatch loop has to be free
+    /// to deliver. `request_id` is the request's own id, which scopes that
+    /// elicitation, since no session exists yet.
     async fn handle_authenticate(
         &self,
+        cx: &ConnectionTo<Client>,
+        request_id: RequestId,
         req: AuthenticateRequest,
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
         log::info!("authenticate: method={}", req.method_id.0);
@@ -2319,9 +2341,10 @@ impl SiGitAgent {
         }
 
         // Otherwise run the browser flow. There is no way to collect a password
-        // here (the method has no UI of its own) and no way to show a code to
-        // paste, so this is the loopback variant or nothing: the editor gets an
-        // error naming the terminal command that does work without a listener.
+        // here (the spec forbids asking for credentials in a form) and no way
+        // to take a pasted code back, so this is the loopback variant or
+        // nothing: the editor gets an error naming the terminal command that
+        // does work without a listener.
         let flow = browser_auth::begin();
         if !flow.is_loopback() {
             return Err(agent_client_protocol::Error::new(
@@ -2332,12 +2355,17 @@ impl SiGitAgent {
             ));
         }
 
-        log::info!("authenticate: opening browser at {}", flow.authorize_url());
-        if !browser_auth::open_browser(flow.authorize_url()) {
-            log::warn!("authenticate: no browser could be launched");
-        }
+        let outcome = if CLIENT_ELICITATION_URL.load(Ordering::Relaxed) {
+            sign_in_via_client(cx, request_id, flow).await
+        } else {
+            log::info!("authenticate: opening browser at {}", flow.authorize_url());
+            if !browser_auth::open_browser(flow.authorize_url()) {
+                log::warn!("authenticate: no browser could be launched");
+            }
+            browser_auth::complete_loopback(flow).await
+        };
 
-        match browser_auth::complete_loopback(flow).await {
+        match outcome {
             Ok(email) => {
                 log::info!("authenticate: signed in as {email}");
                 Ok(AuthenticateResponse::default())
@@ -4817,6 +4845,10 @@ const LOCAL_INFERENCE_CONFIG_ID: &str = "sigit-local-inference";
 /// process serves one ACP connection, so this is set once in `initialize`.
 static CLIENT_BOOLEAN_CONFIG_OPTIONS: AtomicBool = AtomicBool::new(false);
 
+/// Whether the connected client advertised URL-mode elicitation, which
+/// `authenticate` uses to hand the sign-in page to the editor.
+static CLIENT_ELICITATION_URL: AtomicBool = AtomicBool::new(false);
+
 /// `select` value ids for the Local Inference toggle.
 const LOCAL_INFERENCE_ON: &str = "local-inference-on";
 const LOCAL_INFERENCE_OFF: &str = "local-inference-off";
@@ -6002,8 +6034,16 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: AuthenticateRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_authenticate(req).await)
+                async move |req: AuthenticateRequest, responder, cx: ConnectionTo<Client>| {
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    let request_id = responder.id().clone();
+                    cx.spawn(async move {
+                        handle_response(
+                            responder,
+                            state.handle_authenticate(&task_cx, request_id, req).await,
+                        )
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -6200,6 +6240,68 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
 
     log::info!("siGit shutting down");
     Ok(())
+}
+
+/// The loopback sign-in with the editor showing the page: the authorize URL
+/// goes to the client as a URL-mode elicitation, so the user sees where they
+/// are being sent and the editor opens it, which also works when this process
+/// cannot launch a browser itself. A user who declines ends the sign-in; a
+/// client that fails the request gets the old behaviour, a browser opened
+/// from here. Once the code is redeemed the client is told the elicitation
+/// is complete.
+async fn sign_in_via_client(
+    cx: &ConnectionTo<Client>,
+    request_id: RequestId,
+    flow: browser_auth::Flow,
+) -> Result<String, String> {
+    let url = flow.authorize_url().to_string();
+    let elicitation_id = uuid::Uuid::new_v4().to_string();
+    log::info!("authenticate: asking the client to open {url}");
+    let ask = cx
+        .send_request(CreateElicitationRequest::new(
+            ElicitationUrlMode::new(
+                ElicitationRequestScope::new(request_id),
+                elicitation_id.clone(),
+                url.clone(),
+            ),
+            "Sign in to siGit Code in your browser to use siGit Code Cloud.",
+        ))
+        .block_task();
+    let sign_in = browser_auth::complete_loopback(flow);
+    tokio::pin!(sign_in);
+
+    // The page can be finished before the client gets round to answering.
+    enum First {
+        Answer(
+            agent_client_protocol::Result<
+                agent_client_protocol::schema::v1::CreateElicitationResponse,
+            >,
+        ),
+        SignedIn(Result<String, String>),
+    }
+    let first = tokio::select! {
+        answer = ask => First::Answer(answer),
+        result = &mut sign_in => First::SignedIn(result),
+    };
+    let result = match first {
+        First::SignedIn(result) => result,
+        First::Answer(Ok(response)) => match response.action {
+            ElicitationAction::Accept(_) => sign_in.await,
+            _ => Err("the sign-in page was not opened".to_string()),
+        },
+        First::Answer(Err(error)) => {
+            log::warn!("authenticate: the client could not show the sign-in page ({error})");
+            if !browser_auth::open_browser(&url) {
+                log::warn!("authenticate: no browser could be launched");
+            }
+            sign_in.await
+        }
+    };
+    if result.is_ok() {
+        cx.send_notification(CompleteElicitationNotification::new(elicitation_id))
+            .ok();
+    }
+    result
 }
 
 /// Run the browser sign-in from a chat surface and describe how it went.
