@@ -20,6 +20,24 @@
   ended. They now take no lock, are answered at once, and the pending call's
   successors follow the new mode. Model and Inference changes still wait for
   the turn.
+- **`authenticate` checks the method id.** An id that `initialize` never offered
+  is now rejected with `invalid_params` (`-32602`) instead of starting a
+  browser sign-in. A sign-in that fails reports `-32603`, since `-32000` means
+  authentication is required before a call.
+- **A session the agent does not know is `-32002`.** `session/prompt`,
+  `session/set_mode` and `session/set_config_option` answered `-32602` for an
+  unknown id; they now say resource not found, as `session/load` and
+  `session/resume` already did.
+- **A finished terminal command no longer names a released terminal.** The
+  closing `tool_call_update` of a command that ran in the editor's terminal
+  re-sent the terminal id after `terminal/release`. It now leaves the content
+  alone, so the embedded terminal stays as it was, and the result still goes out
+  as `rawOutput`.
+- **`session/list` rejects a relative `cwd` filter** with `-32602`, as
+  `session/new` does.
+- **An embedded binary resource is read when the model can read it.** An image
+  blob becomes an image input and an audio blob an audio input. Any other blob
+  keeps its placeholder, now with its MIME type.
 - **A prompt that is only audio is answered.** A clip with no text or image used
   to end the turn at once with nothing sent to the model, even though the agent
   advertises audio.

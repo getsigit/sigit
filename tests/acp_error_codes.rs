@@ -1,12 +1,9 @@
-//! End-to-end check of embedded context over ACP (issue #141).
+//! The JSON-RPC error codes the agent answers with.
 //!
-//! A client only inlines a resource's contents into a prompt when the agent
-//! advertises `promptCapabilities.embeddedContext`. Otherwise it sends a
-//! `resource_link` and sigit reads the file from disk, which misses edits the
-//! user has not saved. This runs the real binary against a scripted
-//! OpenAI-compatible endpoint and checks that the capability is advertised
-//! and that an embedded resource reaches the model as sent, not as it is on
-//! disk.
+//! ACP uses the standard codes: `-32602` for a request whose parameters are
+//! wrong (an auth method that was never offered, a relative `cwd`), `-32002`
+//! for a session id the agent does not know. `-32000` is reserved for
+//! "authentication required", so a sign-in that fails is `-32603`.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -19,8 +16,6 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
-
-// ── Scripted OpenAI-compatible endpoint ─────────────────────────────────────
 
 fn sse_body(events: &[Value]) -> String {
     let mut body = String::new();
@@ -38,6 +33,8 @@ fn sse_text(text: &str) -> String {
 }
 
 /// Serves one scripted SSE response per request and records each request body.
+// Shared harness; this file never reads the recorded requests.
+#[allow(dead_code)]
 struct FakeEndpoint {
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -197,155 +194,87 @@ impl Drop for AgentUnderTest {
     }
 }
 
-#[test]
-fn an_embedded_resource_reaches_the_model_as_the_client_sent_it() {
-    let endpoint = start_fake_endpoint(vec![sse_text("done")]);
-    let scratch = std::env::temp_dir().join(format!("sigit_acp_embedded_{}", std::process::id()));
-    let config_dir = scratch.join("config");
-    let project = scratch.join("project");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::create_dir_all(&project).unwrap();
-    let notes = project.join("notes.txt");
-    std::fs::write(&notes, "saved on disk").unwrap();
-
-    let mut agent = spawn_agent(endpoint.port, &config_dir);
-
-    let id = agent.request(
-        "initialize",
-        json!({"protocolVersion": 1, "clientCapabilities": {}}),
-    );
-    let initialize = agent.wait_for_response(id);
-    assert_eq!(
-        initialize["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"], true,
-        "a client only embeds resources for an agent that advertises it: {initialize}"
-    );
-
-    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
-    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
-        .as_str()
-        .expect("session id")
-        .to_string();
-
-    // The editor's buffer has an edit the file on disk does not.
-    let uri = format!("file://{}", notes.display());
-    let id = agent.request(
-        "session/prompt",
-        json!({
-            "sessionId": session_id,
-            "prompt": [
-                {"type": "text", "text": "summarize this"},
-                {"type": "resource", "resource": {
-                    "uri": uri,
-                    "mimeType": "text/plain",
-                    "text": "unsaved buffer edit",
-                }},
-            ],
-        }),
-    );
-    let response = agent.wait_for_response(id);
-    assert_eq!(response["result"]["stopReason"], "end_turn");
-
-    let request = endpoint
-        .requests
-        .lock()
-        .unwrap()
-        .first()
-        .cloned()
-        .expect("the endpoint received a completion request");
-    let user = request["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .rev()
-        .find(|message| message["role"] == "user")
-        .expect("a user message")
-        .to_string();
-    assert!(
-        user.contains("unsaved buffer edit"),
-        "the embedded contents must reach the model: {user}"
-    );
-    assert!(
-        !user.contains("saved on disk"),
-        "an embedded resource must not be re-read from disk: {user}"
-    );
-
-    drop(agent);
-    let _ = std::fs::remove_dir_all(&scratch);
+impl AgentUnderTest {
+    /// The raw answer to request `id`, error or not.
+    fn answer(&mut self, id: u64) -> Value {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.incoming.recv_timeout(remaining) {
+                Ok(message) if message["id"] == id && message.get("method").is_none() => {
+                    return message;
+                }
+                Ok(_) => {}
+                Err(_) => panic!("timed out waiting for the answer to request {id}"),
+            }
+        }
+    }
 }
 
-/// A binary resource is not a text placeholder when the model can read it:
-/// an image becomes an image input, anything unreadable says what it was.
-#[test]
-fn an_embedded_blob_is_an_image_input_or_names_its_type() {
-    let endpoint = start_fake_endpoint(vec![sse_text("done")]);
-    let scratch = std::env::temp_dir().join(format!("sigit_acp_blob_{}", std::process::id()));
+fn open() -> (AgentUnderTest, std::path::PathBuf, std::path::PathBuf) {
+    let endpoint = start_fake_endpoint(vec![]);
+    let scratch = std::env::temp_dir().join(format!(
+        "sigit_acp_codes_{}_{}",
+        std::process::id(),
+        endpoint.port
+    ));
     let config_dir = scratch.join("config");
-    let project = scratch.join("project");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::create_dir_all(&project).unwrap();
-
     let mut agent = spawn_agent(endpoint.port, &config_dir);
     let id = agent.request(
         "initialize",
         json!({"protocolVersion": 1, "clientCapabilities": {}}),
     );
     agent.wait_for_response(id);
-    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
-    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
-        .as_str()
-        .expect("session id")
-        .to_string();
+    (agent, scratch, config_dir)
+}
 
-    let id = agent.request(
-        "session/prompt",
-        json!({
-            "sessionId": session_id,
-            "prompt": [
-                {"type": "text", "text": "what are these?"},
-                {"type": "resource", "resource": {
-                    "uri": "file:///shot.png",
-                    "mimeType": "image/png",
-                    "blob": "QUJDRA==",
-                }},
-                {"type": "resource", "resource": {
-                    "uri": "file:///paper.pdf",
-                    "mimeType": "application/pdf",
-                    "blob": "JVBERi0=",
-                }},
-            ],
-        }),
-    );
-    let response = agent.wait_for_response(id);
-    assert_eq!(response["result"]["stopReason"], "end_turn");
-
-    let request = endpoint
-        .requests
-        .lock()
-        .unwrap()
-        .first()
-        .cloned()
-        .expect("the endpoint received a completion request");
-    let user = request["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .rev()
-        .find(|message| message["role"] == "user")
-        .expect("a user message")
-        .to_string();
-    assert!(
-        user.contains("data:image/png;base64,QUJDRA=="),
-        "the image blob must reach the model as an image: {user}"
-    );
-    assert!(
-        user.contains("[binary resource: file:///paper.pdf (application/pdf)]"),
-        "an unreadable blob must say what it was: {user}"
-    );
-    assert!(
-        !user.contains("JVBERi0="),
-        "the pdf bytes must not be forwarded: {user}"
-    );
-
+#[test]
+fn an_auth_method_that_was_never_offered_is_invalid_params() {
+    let (mut agent, scratch, _) = open();
+    let id = agent.request("authenticate", json!({"methodId": "not-a-method"}));
+    let answer = agent.answer(id);
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
     drop(agent);
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_session_the_agent_does_not_know_is_resource_not_found() {
+    let (mut agent, scratch, _) = open();
+    for (method, params) in [
+        (
+            "session/prompt",
+            json!({"sessionId": "nope", "prompt": [{"type": "text", "text": "hi"}]}),
+        ),
+        (
+            "session/set_mode",
+            json!({"sessionId": "nope", "modeId": "permission-mode-auto"}),
+        ),
+        (
+            "session/set_config_option",
+            json!({"sessionId": "nope", "configId": "sigit-permission-mode",
+                   "value": "permission-mode-auto"}),
+        ),
+    ] {
+        let id = agent.request(method, params);
+        let answer = agent.answer(id);
+        assert_eq!(answer["error"]["code"], -32002, "{method}: {answer}");
+    }
+    drop(agent);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_relative_cwd_filter_on_session_list_is_invalid_params() {
+    let (mut agent, scratch, _) = open();
+    let id = agent.request("session/list", json!({"cwd": "relative/dir"}));
+    let answer = agent.answer(id);
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
+
+    let id = agent.request("session/list", json!({}));
+    let answer = agent.answer(id);
+    assert!(answer.get("error").is_none(), "{answer}");
+    drop(agent);
+    let _ = std::fs::remove_dir_all(scratch);
 }

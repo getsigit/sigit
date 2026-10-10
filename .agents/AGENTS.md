@@ -340,7 +340,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   the exception to the lock order: the dispatch loop runs them with neither lock, because
   they touch only state keyed by session (`permissions`) and have to land mid-turn. They
   check the id against `sessions` (`-32002` when unknown) and build the options from
-  that session's own model (`config_options_for_session`), never `activate_session`. Tool
+  that session's own model (`config_options_for_session`), never `activate_session`. Unknown session ids are `-32002` (resource not found) everywhere,
+  and `authenticate` accepts only `AUTH_METHOD_ID`. Tool
   execution, subagents included, still runs one session at a time.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
