@@ -124,6 +124,7 @@ jobs:
         run: Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
 
       - name: Submit new package
+        id: submit_new
         if: steps.exists.outputs.found == 'false'
         shell: pwsh
         env:
@@ -138,16 +139,28 @@ jobs:
 
           $version = "${{ steps.release.outputs.version }}"
 
+          # Tee stdout so we can scrape the PR URL afterwards. wingetcreate
+          # prints "Pull request can be found here: <url>" on success, and
+          # that line is the only handle we get on the PR it just opened.
           # --no-open because the runner has no browser to open the PR in.
           .\wingetcreate.exe submit manifests `
             --prtitle "New package: $env:PACKAGE_IDENTIFIER version $version" `
-            --no-open
+            --no-open 2>&1 | Tee-Object -Variable output
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "wingetcreate submit failed with exit code $LASTEXITCODE"
           }
 
+          $match = [regex]::Match(($output -join "`n"), 'https://github\.com/microsoft/winget-pkgs/pull/(\d+)')
+          if ($match.Success) {
+            "pr_url=$($match.Value)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "pr_number=$($match.Groups[1].Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Warning "Could not find the PR URL in wingetcreate output; skipping issue linking."
+          }
+
       - name: Submit manifest update
+        id: submit_update
         if: steps.exists.outputs.found == 'true'
         shell: pwsh
         env:
@@ -171,8 +184,86 @@ jobs:
             --release-date "${{ steps.release.outputs.date }}" `
             --prtitle "Update $env:PACKAGE_IDENTIFIER to version $version" `
             --submit `
-            --no-open
+            --no-open 2>&1 | Tee-Object -Variable output
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "wingetcreate failed with exit code $LASTEXITCODE"
           }
+
+          $match = [regex]::Match(($output -join "`n"), 'https://github\.com/microsoft/winget-pkgs/pull/(\d+)')
+          if ($match.Success) {
+            "pr_url=$($match.Value)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "pr_number=$($match.Groups[1].Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Warning "Could not find the PR URL in wingetcreate output; skipping issue linking."
+          }
+
+      # wingetcreate has no --prbody flag, so it always opens the PR with the
+      # winget-pkgs template: an empty Description and an unticked
+      # "Linked to an issue" box next to a "Resolves #[Issue Number]"
+      # placeholder. We used to tick that box and fill in the issue number by
+      # hand after every release. This step does it instead.
+      #
+      # On a first submission it also files the Package Request issue the
+      # linkable number comes from. Updates to an existing package don't need
+      # one (the checkbox is "if applicable"), so there we just fill the
+      # Description.
+      - name: Link the winget PR to a Package Request issue
+        id: link
+        if: >-
+          (steps.submit_new.outputs.pr_number != '') ||
+          (steps.submit_update.outputs.pr_number != '')
+        shell: bash
+        env:
+          # The PR and the issue both live in microsoft/winget-pkgs, which the
+          # default GITHUB_TOKEN can't write to. Reuse the wingetcreate PAT,
+          # which already has the scope to open PRs there.
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PR_URL="${{ steps.submit_new.outputs.pr_url || steps.submit_update.outputs.pr_url }}"
+          NEW_PACKAGE="${{ steps.exists.outputs.found == 'false' }}"
+          VERSION="${{ steps.release.outputs.version }}"
+          TAG="${{ steps.release.outputs.tag }}"
+
+          ISSUE_NUMBER=""
+          if [ "$NEW_PACKAGE" = "true" ]; then
+            ISSUE_URL=$(gh issue create \
+              --repo microsoft/winget-pkgs \
+              --title "Package Request: ${PACKAGE_IDENTIFIER} ${VERSION}" \
+              --body "Request to add ${PACKAGE_IDENTIFIER} version ${VERSION} to the Windows Package Manager Community Repository. Installers come from ${TAG} of ${REPO}.")
+            echo "Opened issue ${ISSUE_URL}"
+            ISSUE_NUMBER="${ISSUE_URL##*/}"
+          fi
+
+          # Rewrite the template body: fill the Description, tick the issue
+          # box when we have an issue, and drop in the real number (or remove
+          # the placeholder line on updates that aren't linked to anything).
+          if [ -n "$ISSUE_NUMBER" ]; then
+            CHECKBOX="- [x] Linked to an issue (if applicable)"
+            RESOLVES="- Resolves #${ISSUE_NUMBER}"
+            DESC="Adds ${PACKAGE_IDENTIFIER} version ${VERSION} from ${TAG}."
+          else
+            CHECKBOX="- [ ] Linked to an issue (if applicable)"
+            RESOLVES=""
+            DESC="Updates ${PACKAGE_IDENTIFIER} to version ${VERSION} from ${TAG}."
+          fi
+
+          BODY=$(cat <<EOF
+          ## 📖 Description
+          ${DESC}
+          ## ✅ Checklist
+          - [x] Signed the [Contributor License Agreement](https://cla.opensource.microsoft.com)
+          ${CHECKBOX}
+          ${RESOLVES}
+          ## 📦 Manifest Checklist
+          - [x] Checked that there aren't other open [pull requests](https://github.com/microsoft/winget-pkgs/pulls) for the same manifest update/change
+          - [x] This PR only modifies one (1) manifest
+          - [x] Validated manifest locally with \`winget validate\`
+          - [x] Tested manifest locally with \`winget install\`
+          EOF
+          )
+
+          gh pr edit "$PR_URL" --body "$BODY"
+          echo "Linked ${PR_URL} to issue #${ISSUE_NUMBER:-<none>}"
