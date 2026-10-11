@@ -272,3 +272,80 @@ fn an_embedded_resource_reaches_the_model_as_the_client_sent_it() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// A binary resource is not a text placeholder when the model can read it:
+/// an image becomes an image input, anything unreadable says what it was.
+#[test]
+fn an_embedded_blob_is_an_image_input_or_names_its_type() {
+    let endpoint = start_fake_endpoint(vec![sse_text("done")]);
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_blob_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [
+                {"type": "text", "text": "what are these?"},
+                {"type": "resource", "resource": {
+                    "uri": "file:///shot.png",
+                    "mimeType": "image/png",
+                    "blob": "QUJDRA==",
+                }},
+                {"type": "resource", "resource": {
+                    "uri": "file:///paper.pdf",
+                    "mimeType": "application/pdf",
+                    "blob": "JVBERi0=",
+                }},
+            ],
+        }),
+    );
+    let response = agent.wait_for_response(id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let request = endpoint
+        .requests
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the endpoint received a completion request");
+    let user = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .expect("a user message")
+        .to_string();
+    assert!(
+        user.contains("data:image/png;base64,QUJDRA=="),
+        "the image blob must reach the model as an image: {user}"
+    );
+    assert!(
+        user.contains("[binary resource: file:///paper.pdf (application/pdf)]"),
+        "an unreadable blob must say what it was: {user}"
+    );
+    assert!(
+        !user.contains("JVBERi0="),
+        "the pdf bytes must not be forwarded: {user}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

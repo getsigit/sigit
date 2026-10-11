@@ -80,13 +80,13 @@ use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentBlock, ContentChunk, CreateElicitationRequest,
     CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, Diff,
     ElicitationAction, ElicitationRequestScope, ElicitationUrlMode, EmbeddedResourceResource,
-    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    KillTerminalRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities,
-    McpServer, MessageId, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
-    PromptRequest, PromptResponse, ReadTextFileRequest, ReleaseTerminalRequest, RequestId,
-    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ErrorCode, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, KillTerminalRequest, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
+    McpCapabilities, McpServer, MessageId, Meta, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest, ReleaseTerminalRequest,
+    RequestId, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
     ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
     SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionConfigValueId, SessionDeleteCapabilities,
@@ -594,20 +594,13 @@ fn file_change_content(change: &tools::FileChange) -> ToolCallContent {
         .into()
 }
 
-/// The content of a finished tool call's card: the client terminal the
-/// command ran in, when it ran in one, which already shows its output (the
-/// full result text still travels as `raw_output`); otherwise the diff of the
-/// file it wrote, if it wrote one, then its result text.
-fn tool_result_content(
-    output: &str,
-    change: Option<&tools::FileChange>,
-    terminal: Option<&str>,
-) -> Vec<ToolCallContent> {
-    if let Some(terminal_id) = terminal {
-        return vec![ToolCallContent::Terminal(Terminal::new(
-            terminal_id.to_string(),
-        ))];
-    }
+/// The content of a finished tool call's card: the diff of the file it wrote,
+/// if it wrote one, then its result text. A command that ran in the client's
+/// terminal gets no content at all in its final update: the terminal is
+/// already embedded in the card and was released by then, so naming it again
+/// would point at an id the client no longer has. The result text still
+/// travels as `raw_output`.
+fn tool_result_content(output: &str, change: Option<&tools::FileChange>) -> Vec<ToolCallContent> {
     change
         .map(file_change_content)
         .into_iter()
@@ -1438,7 +1431,7 @@ impl SiGitAgent {
             // already done — might be a stored error from earlier
             if let Some(err) = self.model_load_error.lock().unwrap().as_ref() {
                 return Err(agent_client_protocol::Error::new(
-                    -32603,
+                    ErrorCode::InternalError.into(),
                     format!("model load failed: {err}"),
                 ));
             }
@@ -1576,7 +1569,7 @@ impl SiGitAgent {
             .ok();
 
             return Err(agent_client_protocol::Error::new(
-                -32603,
+                ErrorCode::InternalError.into(),
                 format!("model load failed: {err}"),
             ));
         }
@@ -1872,7 +1865,7 @@ impl SiGitAgent {
         let (new_config, max_tokens, new_tool_calling) = resolve_model_config(model_id)
             .ok_or_else(|| {
                 agent_client_protocol::Error::new(
-                    -32602,
+                    ErrorCode::InvalidParams.into(),
                     format!("unknown or unavailable model: {model_id}"),
                 )
             })?;
@@ -1924,10 +1917,18 @@ impl SiGitAgent {
 
         result_rx
             .await
-            .map_err(|_| agent_client_protocol::Error::new(-32603, "model loader thread crashed"))?
+            .map_err(|_| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    "model loader thread crashed",
+                )
+            })?
             .map_err(|error| {
                 log::error!("model switch failed: {error}");
-                agent_client_protocol::Error::new(-32603, format!("model switch failed: {error}"))
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    format!("model switch failed: {error}"),
+                )
             })?;
 
         self.startup_model_load_started
@@ -2180,13 +2181,13 @@ fn validate_session_roots(
 ) -> agent_client_protocol::Result<()> {
     if !cwd.is_absolute() {
         return Err(agent_client_protocol::Error::new(
-            -32602,
+            ErrorCode::InvalidParams.into(),
             format!("cwd must be an absolute path, got {}", cwd.display()),
         ));
     }
     if let Some(relative) = additional.iter().find(|dir| !dir.is_absolute()) {
         return Err(agent_client_protocol::Error::new(
-            -32602,
+            ErrorCode::InvalidParams.into(),
             format!(
                 "additionalDirectories entries must be absolute paths, got {}",
                 relative.display()
@@ -2195,6 +2196,9 @@ fn validate_session_roots(
     }
     Ok(())
 }
+
+/// The id of the one auth method `initialize` advertises.
+const AUTH_METHOD_ID: &str = "sigit";
 
 // ── ACP handler implementations ───────────────────────────────────────────────
 
@@ -2266,7 +2270,7 @@ impl SiGitAgent {
         // With an Agent method, clicking calls `authenticate`, which opens the
         // browser and finishes the sign-in itself.
         let auth_methods = vec![AuthMethod::Agent(
-            AuthMethodAgent::new("sigit", "Sign in to siGit Code")
+            AuthMethodAgent::new(AUTH_METHOD_ID, "Sign in to siGit Code")
                 .description("Opens sigit.si in your browser to authorize this device."),
         )];
 
@@ -2345,6 +2349,16 @@ impl SiGitAgent {
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
         log::info!("authenticate: method={}", req.method_id.0);
 
+        if req.method_id.0.as_ref() != AUTH_METHOD_ID {
+            return Err(agent_client_protocol::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!(
+                    "unknown auth method {}; the only one offered is {AUTH_METHOD_ID}",
+                    req.method_id.0
+                ),
+            ));
+        }
+
         // An existing session clears the gate without sending anyone to a
         // browser they didn't ask for.
         if let Ok(email) = account::verify_session().await {
@@ -2360,7 +2374,7 @@ impl SiGitAgent {
         let flow = browser_auth::begin();
         if !flow.is_loopback() {
             return Err(agent_client_protocol::Error::new(
-                -32000,
+                ErrorCode::InternalError.into(),
                 "Could not open a local port to receive the sign-in. \
                  Run `sigit login` in a terminal instead."
                     .to_string(),
@@ -2383,7 +2397,7 @@ impl SiGitAgent {
                 Ok(AuthenticateResponse::default())
             }
             Err(reason) => Err(agent_client_protocol::Error::new(
-                -32000,
+                ErrorCode::InternalError.into(),
                 format!(
                     "Sign-in did not complete ({reason}). \
                      Try again, or create an account at https://sigit.si."
@@ -2567,7 +2581,7 @@ impl SiGitAgent {
 
         let Some(state) = self.sessions.lock().unwrap().get(&key).cloned() else {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::ResourceNotFound.into(),
                 format!(
                     "unknown session {key}; create it with session/new or restore it with session/load"
                 ),
@@ -2827,6 +2841,14 @@ impl SiGitAgent {
         &self,
         args: ListSessionsRequest,
     ) -> agent_client_protocol::Result<ListSessionsResponse> {
+        if let Some(cwd) = args.cwd.as_ref()
+            && !cwd.is_absolute()
+        {
+            return Err(agent_client_protocol::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!("cwd must be an absolute path, got {}", cwd.display()),
+            ));
+        }
         let filter = args.cwd.clone();
         let sessions: Vec<SessionInfo> = session_store::list()
             .into_iter()
@@ -2946,7 +2968,7 @@ impl SiGitAgent {
         let Some(history) = session_store::load(&session_key).or(in_memory) else {
             log::warn!("{method}: no session {session_key}");
             return Err(agent_client_protocol::Error::new(
-                -32002,
+                ErrorCode::ResourceNotFound.into(),
                 format!("session {session_key} not found"),
             ));
         };
@@ -3048,6 +3070,7 @@ impl SiGitAgent {
         permissions::reset_session(&key);
         self.announced_titles.lock().unwrap().remove(&key);
         let killed = tools::kill_session_tasks(&key);
+        tools::forget_abort(&key);
         self.closing_sessions.lock().unwrap().remove(&key);
 
         log::info!(
@@ -3090,6 +3113,7 @@ impl SiGitAgent {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
+        tools::abort_session_tools(&key);
     }
 
     async fn handle_fork_session(
@@ -3231,6 +3255,7 @@ impl SiGitAgent {
         // sessions or loading a model is seen. The session lock is held, so the
         // slot can only be this turn's. The guard clears it on every return.
         let cancellation = Arc::new(PromptCancellation::default());
+        tools::reset_abort(&session_id.to_string());
         self.prompt_cancellations
             .lock()
             .unwrap()
@@ -3331,7 +3356,22 @@ impl SiGitAgent {
                             ));
                         }
                         EmbeddedResourceResource::BlobResourceContents(blob) => {
-                            parts.push(format!("[binary resource: {}]", blob.uri));
+                            let mime = blob.mime_type.clone().unwrap_or_default();
+                            if mime.starts_with("image/") {
+                                images.push(ImageInput {
+                                    mime_type: mime,
+                                    data: blob.blob.clone(),
+                                });
+                            } else if mime.starts_with("audio/") {
+                                audio.push(AudioInput {
+                                    mime_type: mime,
+                                    data: blob.blob.clone(),
+                                });
+                            } else if mime.is_empty() {
+                                parts.push(format!("[binary resource: {}]", blob.uri));
+                            } else {
+                                parts.push(format!("[binary resource: {} ({mime})]", blob.uri));
+                            }
                         }
                         _ => {
                             log::debug!("ignoring unsupported embedded resource variant");
@@ -3592,7 +3632,10 @@ impl SiGitAgent {
                 let snapshot = backend.history_snapshot().await;
                 self.persist_session(cx, &session_id, &snapshot).await;
                 self.finish_prompt(&session_id, &cancellation);
-                return Err(agent_client_protocol::Error::new(-32603, error));
+                return Err(agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    error,
+                ));
             }
         };
 
@@ -3894,12 +3937,10 @@ impl SiGitAgent {
                         } else {
                             ToolCallStatus::Failed
                         })
-                        .content(tool_result_content(
-                            &output,
-                            change.as_ref(),
-                            terminal.as_deref(),
-                        ))
                         .raw_output(serde_json::Value::String(output.clone()));
+                    if terminal.is_none() {
+                        fields = fields.content(tool_result_content(&output, change.as_ref()));
+                    }
                     // A denial at the prompt leaves the card titled with the
                     // permission request's full arguments; put its own back.
                     if !executed && announced_status == ToolCallStatus::Pending {
@@ -3917,9 +3958,9 @@ impl SiGitAgent {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
-                // Cancellation cannot preempt a synchronous foreground tool:
-                // it is observed here as soon as that tool exits. Background
-                // commands remain cancellable through `kill_command`.
+                // A cancel aborts a running foreground command (see
+                // `tools::abort_session_tools`), so it exits and is observed
+                // here. Background commands are stopped with `kill_command`.
                 if cancellation.cancelled.load(Ordering::Acquire) {
                     for pending in &result.tool_calls[call_index + 1..] {
                         tool_results.push(BackendToolResult {
@@ -3980,7 +4021,10 @@ impl SiGitAgent {
                         let _ = self.send_plan_update(cx, session_id.clone(), plan);
                     }
                     self.finish_prompt(&session_id, &cancellation);
-                    return Err(agent_client_protocol::Error::new(-32603, error));
+                    return Err(agent_client_protocol::Error::new(
+                        ErrorCode::InternalError.into(),
+                        error,
+                    ));
                 }
             };
             self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
@@ -4279,6 +4323,7 @@ impl SiGitAgent {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
+        tools::abort_session_tools(&args.session_id.to_string());
         Ok(())
     }
 
@@ -4441,6 +4486,69 @@ impl SiGitAgent {
     /// modes are the Permissions dropdown under another name, so this changes
     /// the same state and then refreshes the dropdown for a client that shows
     /// both.
+    /// `-32002` unless `session_id` is a session this process knows.
+    fn require_known_session(&self, session_id: &SessionId) -> agent_client_protocol::Result<()> {
+        let key = session_id.to_string();
+        if self.sessions.lock().unwrap().contains_key(&key) {
+            return Ok(());
+        }
+        Err(agent_client_protocol::Error::new(
+            ErrorCode::ResourceNotFound.into(),
+            format!(
+                "unknown session {key}; create it with session/new or restore it with session/load"
+            ),
+        ))
+    }
+
+    /// The config options for `key`, built from that session's own model and
+    /// not from whichever session is live, so it can be read without the
+    /// workspace lock.
+    fn config_options_for_session(&self, key: &str) -> Vec<SessionConfigOption> {
+        let live = self.active_session.lock().unwrap().as_deref() == Some(key);
+        let model_id = if live {
+            self.current_model.lock().unwrap().model_id.clone()
+        } else {
+            self.sessions
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|state| {
+                    state
+                        .remote
+                        .as_ref()
+                        .map_or_else(|| state.model_id.clone(), |r| r.model.model_id.clone())
+                })
+                .unwrap_or_default()
+        };
+        build_config_options_for(&model_id, key)
+    }
+
+    /// Apply a Permissions change for `session_id`, which can be mid-turn.
+    ///
+    /// Takes neither the session lock nor the workspace lock: the turn holds
+    /// the first for its whole length, and a user flipping to Auto while a
+    /// permission prompt is open has to be heard at once. It touches only
+    /// state keyed by session (`permissions`), so the live session is left
+    /// alone. Returns the new config options and the status line to show.
+    fn change_permission_mode(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        mode_id: Option<&str>,
+    ) -> agent_client_protocol::Result<Vec<SessionConfigOption>> {
+        self.require_known_session(session_id)?;
+        let key = session_id.to_string();
+        let Some(message) = mode_id.and_then(|id| apply_permission_mode(&key, id)) else {
+            return Err(agent_client_protocol::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!("unknown permission mode: {mode_id:?}"),
+            ));
+        };
+        self.send_system_status(cx, session_id.clone(), message)
+            .ok();
+        Ok(self.config_options_for_session(&key))
+    }
+
     async fn handle_set_session_mode(
         &self,
         cx: &ConnectionTo<Client>,
@@ -4452,21 +4560,8 @@ impl SiGitAgent {
             args.mode_id
         );
 
-        self.activate_session(&args.session_id).await?;
-
-        let session_key = args.session_id.to_string();
-        let Some(message) = apply_permission_mode(&session_key, args.mode_id.0.as_ref()) else {
-            return Err(agent_client_protocol::Error::new(
-                -32602,
-                format!("unknown session mode: {}", args.mode_id),
-            ));
-        };
-        self.send_system_status(cx, args.session_id.clone(), message)
-            .ok();
-        let config_options = {
-            let current = self.current_model.lock().unwrap();
-            build_config_options(&current, &session_key)
-        };
+        let config_options =
+            self.change_permission_mode(cx, &args.session_id, Some(args.mode_id.0.as_ref()))?;
         self.send_tool_call_update(
             cx,
             args.session_id,
@@ -4487,6 +4582,16 @@ impl SiGitAgent {
             args.value
         );
 
+        // ── Permissions dropdown (issue #76) ────────────────────────────────
+        // Handled before the session is activated: the dispatch loop runs this
+        // one without the session or workspace lock, so it can land mid-turn.
+        if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
+            let picked = args.value.as_value_id().map(|v| v.0.as_ref());
+            let config_options = self.change_permission_mode(cx, &args.session_id, picked)?;
+            self.send_current_mode(cx, args.session_id);
+            return Ok(SetSessionConfigOptionResponse::new(config_options));
+        }
+
         // A model switch carries the live conversation onto the new backend, so
         // the live conversation has to be the one whose picker changed.
         self.activate_session(&args.session_id).await?;
@@ -4503,14 +4608,14 @@ impl SiGitAgent {
                 (_, Some(LOCAL_INFERENCE_OFF)) => false,
                 (_, other) => {
                     return Err(agent_client_protocol::Error::new(
-                        -32602,
+                        ErrorCode::InvalidParams.into(),
                         format!("unknown Local Inference value: {other:?}"),
                     ));
                 }
             };
             if let Err(error) = settings::set_local_inference(enabled) {
                 return Err(agent_client_protocol::Error::new(
-                    -32603,
+                    ErrorCode::InternalError.into(),
                     format!("could not save Local Inference setting: {error}"),
                 ));
             }
@@ -4527,35 +4632,16 @@ impl SiGitAgent {
             return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
-        // ── Permissions dropdown (issue #76) ────────────────────────────────
-        if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
-            let session_key = args.session_id.to_string();
-            let picked = args.value.as_value_id().map(|v| v.0.as_ref());
-            let Some(message) = picked.and_then(|id| apply_permission_mode(&session_key, id))
-            else {
-                return Err(agent_client_protocol::Error::new(
-                    -32602,
-                    format!("unknown Permissions value: {picked:?}"),
-                ));
-            };
-            self.send_current_mode(cx, args.session_id.clone());
-            self.send_system_status(cx, args.session_id.clone(), message)
-                .ok();
-            let current = self.current_model.lock().unwrap().clone();
-            let config_options = build_config_options(&current, &session_key);
-            return Ok(SetSessionConfigOptionResponse::new(config_options));
-        }
-
         if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!("unknown config option: {}", args.config_id.0),
             ));
         }
 
         let Some(model_id) = args.value.as_value_id().map(|v| v.0.as_ref()) else {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!(
                     "expected a value-id for {MODEL_CONFIG_ID}, got {:?}",
                     args.value
@@ -5005,6 +5091,13 @@ fn build_config_options(
     current_model: &GgufModelConfig,
     session_key: &str,
 ) -> Vec<SessionConfigOption> {
+    build_config_options_for(&current_model.model_id, session_key)
+}
+
+/// The config options for a session whose selected model is `current_model_id`.
+/// Only the id matters, which is what lets a session that is not the live one
+/// have its options built without installing it.
+fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<SessionConfigOption> {
     // The full list, including the siGit Code Cloud tiers, so the panel picker
     // mirrors the TUI `/models`. Cloud entries are sign-in gated at selection.
     let items = models::build_model_picker_items();
@@ -5131,7 +5224,7 @@ fn build_config_options(
         return vec![local_option, permission_option];
     }
 
-    let current_value = SessionConfigValueId::new(current_model.model_id.as_str());
+    let current_value = SessionConfigValueId::new(current_model_id);
 
     vec![
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
@@ -5402,7 +5495,7 @@ async fn exec_slash_acp(
                 let mut sessions = agent.sessions.lock().unwrap();
                 let state = sessions.get_mut(&session_key).ok_or_else(|| {
                     agent_client_protocol::Error::new(
-                        -32602,
+                        ErrorCode::InvalidParams.into(),
                         format!("cannot clear unknown session {session_key}"),
                     )
                 })?;
@@ -6251,6 +6344,15 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
+                        // A Permissions change can arrive while a turn is
+                        // running, so it takes neither lock. Model and
+                        // Inference swap the live backend and wait for the turn.
+                        if req.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
+                            return handle_response(
+                                responder,
+                                state.handle_set_session_config_option(&task_cx, req).await,
+                            );
+                        }
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
@@ -6268,9 +6370,9 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                 async move |req: SetSessionModeRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
+                    // No locks: the mode can change while a turn is running,
+                    // and the change touches only state keyed by session.
                     cx.spawn(async move {
-                        let _session = state.lock_session(&req.session_id).await;
-                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
                             state.handle_set_session_mode(&task_cx, req).await,
@@ -6775,7 +6877,7 @@ mod tests {
             .activate_session(&SessionId::new("not-opened"))
             .await
             .unwrap_err();
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(i32::from(error.code), -32002);
         assert!(error.message.contains("session/new"));
         assert!(agent.active_session.lock().unwrap().is_none());
     }
@@ -7954,7 +8056,6 @@ mod tests {
         let content = serde_json::to_value(tool_result_content(
             "Edited file: /repo/src/lib.rs (4 bytes written)",
             Some(&change),
-            None,
         ))
         .unwrap();
         assert_eq!(
@@ -7978,16 +8079,7 @@ mod tests {
         assert!(diff.get("oldText").is_none_or(serde_json::Value::is_null));
 
         // Every other tool keeps the result text alone.
-        // A command that ran in the client's terminal keeps the terminal,
-        // which already shows its output.
-        let ran = serde_json::to_value(tool_result_content("Exit code 0:\nhi", None, Some("t-1")))
-            .unwrap();
-        assert_eq!(
-            ran,
-            serde_json::json!([{ "type": "terminal", "terminalId": "t-1" }])
-        );
-
-        let plain = serde_json::to_value(tool_result_content("ok", None, None)).unwrap();
+        let plain = serde_json::to_value(tool_result_content("ok", None)).unwrap();
         assert_eq!(plain.as_array().unwrap().len(), 1);
         assert_eq!(plain[0]["type"], "content");
     }

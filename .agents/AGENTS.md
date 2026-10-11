@@ -335,7 +335,18 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   the top of `handle_prompt`, before it waits on either lock, and a `PromptRegistration`
   guard clears it on every return, so a `session/cancel` that arrives while the turn
   is still queued, switching threads, loading a model or running a slash command ends
-  it as `cancelled`. The checks sit after each of those waits. Tool
+  it as `cancelled`. The checks sit after each of those waits. A cancel (and
+  `begin_close`) also raises the session's `tools::AbortSignal`, which the local
+  `run_command` poll loop and `client_terminal::Route::run` watch, so a running
+  foreground command is killed instead of finishing first. The signal is reset at the
+  top of each turn, not when a tool starts, so a cancel that lands during a permission
+  prompt still stops the command that follows. Permission-mode changes
+  (`session/set_mode`, and `session/set_config_option` for `sigit-permission-mode`) are
+  the exception to the lock order: the dispatch loop runs them with neither lock, because
+  they touch only state keyed by session (`permissions`) and have to land mid-turn. They
+  check the id against `sessions` (`-32002` when unknown) and build the options from
+  that session's own model (`config_options_for_session`), never `activate_session`. Unknown session ids are `-32002` (resource not found) everywhere,
+  and `authenticate` accepts only `AUTH_METHOD_ID`. Tool
   execution, subagents included, still runs one session at a time.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,

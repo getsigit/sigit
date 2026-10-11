@@ -141,6 +141,8 @@ pub enum Run {
     },
     /// The command was still running at the timeout and was killed.
     TimedOut { terminal_id: String, output: Output },
+    /// The user cancelled the turn while the command ran, and it was killed.
+    Cancelled { terminal_id: String, output: Output },
     /// The terminal started but the client failed a later request. The
     /// command may have run, so it must not be run again.
     Failed { terminal_id: String, error: String },
@@ -178,9 +180,27 @@ impl Route {
             self.terminal.embed(session, tool_call_id, id).await;
         }
 
-        let waited = tokio::time::timeout(timeout, self.terminal.wait_for_exit(session, id)).await;
+        let abort = crate::tools::abort_signal(session);
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(timeout, self.terminal.wait_for_exit(session, id)) => {
+                Some(waited)
+            }
+            () = abort.aborted() => None,
+        };
         let run = match waited {
-            Ok(Ok(status)) => match self.read_output(id).await {
+            None => {
+                if let Err(error) = self
+                    .ask("terminal/kill", self.terminal.kill(session, id))
+                    .await
+                {
+                    log::warn!("could not kill terminal {id}: {error}");
+                }
+                Run::Cancelled {
+                    terminal_id: terminal_id.clone(),
+                    output: self.read_output(id).await.unwrap_or_default(),
+                }
+            }
+            Some(Ok(Ok(status))) => match self.read_output(id).await {
                 Ok(output) => Run::Exited {
                     terminal_id: terminal_id.clone(),
                     status,
@@ -191,11 +211,11 @@ impl Route {
                     error,
                 },
             },
-            Ok(Err(error)) => Run::Failed {
+            Some(Ok(Err(error))) => Run::Failed {
                 terminal_id: terminal_id.clone(),
                 error: format!("terminal/wait_for_exit failed: {error}"),
             },
-            Err(_) => {
+            Some(Err(_)) => {
                 // Kill before reading, so the output is what the command
                 // printed up to the timeout and nothing more.
                 if let Err(error) = self
@@ -402,6 +422,50 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("echo hello"));
         assert_eq!(sent_cwd, cwd);
         assert_eq!(limit, 1000);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_kills_the_terminal_then_reads_what_it_printed() {
+        let terminal = Arc::new(FakeTerminal {
+            exit: None,
+            output: "partial\n",
+            ..FakeTerminal::default()
+        });
+        let route = Route {
+            terminal: Arc::clone(&terminal) as Arc<dyn ClientTerminal>,
+            session_id: "session-cancel".to_string(),
+        };
+        crate::tools::reset_abort("session-cancel");
+        let cwd = std::env::temp_dir();
+
+        let (run, ()) = tokio::join!(
+            route.run("sleep 999", &cwd, None, Duration::from_secs(30), 1000,),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                crate::tools::abort_session_tools("session-cancel");
+            }
+        );
+
+        assert_eq!(
+            run,
+            Run::Cancelled {
+                terminal_id: "term-1".to_string(),
+                output: Output {
+                    output: "partial\n".to_string(),
+                    truncated: false
+                },
+            }
+        );
+        assert_eq!(
+            terminal.calls(),
+            [
+                "create session-cancel",
+                "wait term-1",
+                "kill term-1",
+                "output term-1",
+                "release term-1",
+            ]
+        );
     }
 
     #[tokio::test]
