@@ -6245,7 +6245,26 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(unix))]
         {
-            anyhow::bail!("interactive mode requires Unix (macOS / Linux)");
+            // No TUI on non-Unix: the interactive full-screen client relies on
+            // fd redirection that only exists on Unix. A bare launch in a
+            // terminal (the common case, and exactly what the winget installer
+            // validator does — run `sigit.exe` with no arguments) therefore has
+            // nothing to do, so print how to use the binary and exit cleanly.
+            // Bailing here instead would return a non-zero exit code, which the
+            // validator reads as a failure (Validation-Executable-Error).
+            println!(
+                "siGit Code v{}\n\n\
+                 Interactive terminal mode is Unix-only (macOS / Linux). On this \
+                 platform sigit runs as an ACP agent for editor integration, or \
+                 non-interactively from a script:\n\n\
+                 \x20 sigit run \"<prompt>\"   run one prompt and exit\n\
+                 \x20 sigit --version        print the version\n\
+                 \x20 sigit login            sign in to siGit Code Cloud\n\n\
+                 Point your editor's ACP client at this binary to use it \
+                 interactively.",
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(())
         }
     } else {
         // ACP mode: keep stdout untouched for protocol JSON only.
