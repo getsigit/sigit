@@ -55,6 +55,44 @@ Step 4 is the only way commits are meant to reach `main`. A feature or fix PR ta
 
 Pushing the `v*.*.*` tag is what fires every release workflow, so create and push it only after the merge into `main` has landed. Do not commit, tag, or push until the user explicitly asks — confirm the version and that they want the release to go out first.
 
+### Scoped patch / hotfix flow (cherry-pick, not branch-off-development)
+
+The flow above assumes the release ships everything on `development`. A **scoped
+patch** is different: the user wants a new version that contains only one or a
+few specific merged PRs on top of the **last tag**, deliberately leaving out
+other work that has since landed on `development`. "A PR is merged into
+`development`" does **not** mean it belongs in a patch — a patch inherits the
+*previous tag's* tree, not `development`'s.
+
+Branching the release off `development` and only bumping the version is the
+classic mistake here: it silently drags in every unrelated PR merged since the
+last tag. For a scoped patch, never branch off `development`. Instead:
+
+1. Branch `release/v<version>` off the **previous tag** (`git checkout -b
+   release/v<version> v<previous>`), not off `development`. The tag already
+   points at the right `main` merge commit.
+2. `git cherry-pick` exactly the wanted commit(s). Prefer the feature/squash
+   commit (the merge commit's second parent) over the merge commit itself.
+   Resolve conflicts to keep the scope minimal.
+3. Apply the version bump and changelog edits (promote the cherry-picked
+   `## Unreleased` bullets into the `## <version>` section), then commit `Release
+   v<version>`.
+4. **Audit the scope before going further:** `git log --oneline
+   v<previous>..release/v<version>` must show only the cherry-picks plus the
+   release commit, and `git diff --stat v<previous>..release/v<version>` must be
+   the wanted source/test changes plus the three release-metadata files
+   (`Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`) — nothing else.
+5. Merge `release/v<version>` into `development` (so the version bump and the
+   promoted changelog entry are not lost), then merge `development` into `main`
+   and tag `v<version>` on that `main` merge commit, exactly as in the normal
+   flow. The `development` merge may be a no-op for the cherry-picked source if
+   it was already there; that is expected.
+
+Decide up front which case you are in and confirm the exact PR list with the
+user. If in doubt about whether a release is "everything on `development`" or a
+scoped patch, ask — the two flows start from different base commits and are not
+interchangeable.
+
 ## Typical files to inspect
 
 - `Cargo.toml`
@@ -80,6 +118,7 @@ Pushing the `v*.*.*` tag is what fires every release workflow, so create and pus
 - `pypi/pyproject.toml` still uses dynamic versioning unless there is a deliberate packaging change.
 - Release workflows still derive their version from the tag as expected.
 - Git flow followed: bump committed on `release/v<version>`, merged back to `development`, then `development` merged into `main`, with `v<version>` tagged on the `main` merge commit.
+- Scope matches intent: for a scoped patch/hotfix, `release/v<version>` is branched off the **previous tag** and carries only the cherry-picked PR(s) plus the release-metadata bump — confirmed with `git log --oneline v<previous>..release/v<version>` and `git diff --stat v<previous>..release/v<version>` — not everything that landed on `development` since the last tag.
 - Release notes or changelog entries match the actual changes.
 - CI-equivalent local checks pass for the relevant platform or target.
 - Package names, install commands, and branding stay consistent across npm, PyPI, crates.io, Homebrew, NuGet, Scoop, winget, AUR, and the `.deb`/`.rpm` packages.
