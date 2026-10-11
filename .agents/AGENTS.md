@@ -304,7 +304,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   An MCP server's `elicitation/create` is not forwarded to the ACP client as a form
   elicitation: `ed-mcp`'s client handler declares no capabilities and has no hook for it, so
   servers are never offered elicitation, and `rmcp` answers `ping` and refuses other server
-  requests itself. Forwarding needs that hook in `ed-mcp` first.
+  requests itself. Forwarding needs that hook in `ed-mcp` first
+  (tracked upstream at `ondeinference/ed#33`).
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
