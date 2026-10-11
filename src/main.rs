@@ -80,13 +80,13 @@ use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentBlock, ContentChunk, CreateElicitationRequest,
     CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, Diff,
     ElicitationAction, ElicitationRequestScope, ElicitationUrlMode, EmbeddedResourceResource,
-    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    KillTerminalRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities,
-    McpServer, MessageId, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
-    PromptRequest, PromptResponse, ReadTextFileRequest, ReleaseTerminalRequest, RequestId,
-    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ErrorCode, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, KillTerminalRequest, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
+    McpCapabilities, McpServer, MessageId, Meta, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest, ReleaseTerminalRequest,
+    RequestId, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
     ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
     SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionConfigValueId, SessionDeleteCapabilities,
@@ -1431,7 +1431,7 @@ impl SiGitAgent {
             // already done — might be a stored error from earlier
             if let Some(err) = self.model_load_error.lock().unwrap().as_ref() {
                 return Err(agent_client_protocol::Error::new(
-                    -32603,
+                    ErrorCode::InternalError.into(),
                     format!("model load failed: {err}"),
                 ));
             }
@@ -1569,7 +1569,7 @@ impl SiGitAgent {
             .ok();
 
             return Err(agent_client_protocol::Error::new(
-                -32603,
+                ErrorCode::InternalError.into(),
                 format!("model load failed: {err}"),
             ));
         }
@@ -1865,7 +1865,7 @@ impl SiGitAgent {
         let (new_config, max_tokens, new_tool_calling) = resolve_model_config(model_id)
             .ok_or_else(|| {
                 agent_client_protocol::Error::new(
-                    -32602,
+                    ErrorCode::InvalidParams.into(),
                     format!("unknown or unavailable model: {model_id}"),
                 )
             })?;
@@ -1917,10 +1917,18 @@ impl SiGitAgent {
 
         result_rx
             .await
-            .map_err(|_| agent_client_protocol::Error::new(-32603, "model loader thread crashed"))?
+            .map_err(|_| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    "model loader thread crashed",
+                )
+            })?
             .map_err(|error| {
                 log::error!("model switch failed: {error}");
-                agent_client_protocol::Error::new(-32603, format!("model switch failed: {error}"))
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    format!("model switch failed: {error}"),
+                )
             })?;
 
         self.startup_model_load_started
@@ -2173,13 +2181,13 @@ fn validate_session_roots(
 ) -> agent_client_protocol::Result<()> {
     if !cwd.is_absolute() {
         return Err(agent_client_protocol::Error::new(
-            -32602,
+            ErrorCode::InvalidParams.into(),
             format!("cwd must be an absolute path, got {}", cwd.display()),
         ));
     }
     if let Some(relative) = additional.iter().find(|dir| !dir.is_absolute()) {
         return Err(agent_client_protocol::Error::new(
-            -32602,
+            ErrorCode::InvalidParams.into(),
             format!(
                 "additionalDirectories entries must be absolute paths, got {}",
                 relative.display()
@@ -2343,7 +2351,7 @@ impl SiGitAgent {
 
         if req.method_id.0.as_ref() != AUTH_METHOD_ID {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!(
                     "unknown auth method {}; the only one offered is {AUTH_METHOD_ID}",
                     req.method_id.0
@@ -2366,7 +2374,7 @@ impl SiGitAgent {
         let flow = browser_auth::begin();
         if !flow.is_loopback() {
             return Err(agent_client_protocol::Error::new(
-                -32603,
+                ErrorCode::InternalError.into(),
                 "Could not open a local port to receive the sign-in. \
                  Run `sigit login` in a terminal instead."
                     .to_string(),
@@ -2389,7 +2397,7 @@ impl SiGitAgent {
                 Ok(AuthenticateResponse::default())
             }
             Err(reason) => Err(agent_client_protocol::Error::new(
-                -32603,
+                ErrorCode::InternalError.into(),
                 format!(
                     "Sign-in did not complete ({reason}). \
                      Try again, or create an account at https://sigit.si."
@@ -2573,7 +2581,7 @@ impl SiGitAgent {
 
         let Some(state) = self.sessions.lock().unwrap().get(&key).cloned() else {
             return Err(agent_client_protocol::Error::new(
-                -32002,
+                ErrorCode::ResourceNotFound.into(),
                 format!(
                     "unknown session {key}; create it with session/new or restore it with session/load"
                 ),
@@ -2837,7 +2845,7 @@ impl SiGitAgent {
             && !cwd.is_absolute()
         {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!("cwd must be an absolute path, got {}", cwd.display()),
             ));
         }
@@ -2960,7 +2968,7 @@ impl SiGitAgent {
         let Some(history) = session_store::load(&session_key).or(in_memory) else {
             log::warn!("{method}: no session {session_key}");
             return Err(agent_client_protocol::Error::new(
-                -32002,
+                ErrorCode::ResourceNotFound.into(),
                 format!("session {session_key} not found"),
             ));
         };
@@ -3624,7 +3632,10 @@ impl SiGitAgent {
                 let snapshot = backend.history_snapshot().await;
                 self.persist_session(cx, &session_id, &snapshot).await;
                 self.finish_prompt(&session_id, &cancellation);
-                return Err(agent_client_protocol::Error::new(-32603, error));
+                return Err(agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    error,
+                ));
             }
         };
 
@@ -4010,7 +4021,10 @@ impl SiGitAgent {
                         let _ = self.send_plan_update(cx, session_id.clone(), plan);
                     }
                     self.finish_prompt(&session_id, &cancellation);
-                    return Err(agent_client_protocol::Error::new(-32603, error));
+                    return Err(agent_client_protocol::Error::new(
+                        ErrorCode::InternalError.into(),
+                        error,
+                    ));
                 }
             };
             self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
@@ -4479,7 +4493,7 @@ impl SiGitAgent {
             return Ok(());
         }
         Err(agent_client_protocol::Error::new(
-            -32002,
+            ErrorCode::ResourceNotFound.into(),
             format!(
                 "unknown session {key}; create it with session/new or restore it with session/load"
             ),
@@ -4526,7 +4540,7 @@ impl SiGitAgent {
         let key = session_id.to_string();
         let Some(message) = mode_id.and_then(|id| apply_permission_mode(&key, id)) else {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!("unknown permission mode: {mode_id:?}"),
             ));
         };
@@ -4594,14 +4608,14 @@ impl SiGitAgent {
                 (_, Some(LOCAL_INFERENCE_OFF)) => false,
                 (_, other) => {
                     return Err(agent_client_protocol::Error::new(
-                        -32602,
+                        ErrorCode::InvalidParams.into(),
                         format!("unknown Local Inference value: {other:?}"),
                     ));
                 }
             };
             if let Err(error) = settings::set_local_inference(enabled) {
                 return Err(agent_client_protocol::Error::new(
-                    -32603,
+                    ErrorCode::InternalError.into(),
                     format!("could not save Local Inference setting: {error}"),
                 ));
             }
@@ -4620,14 +4634,14 @@ impl SiGitAgent {
 
         if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!("unknown config option: {}", args.config_id.0),
             ));
         }
 
         let Some(model_id) = args.value.as_value_id().map(|v| v.0.as_ref()) else {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!(
                     "expected a value-id for {MODEL_CONFIG_ID}, got {:?}",
                     args.value
@@ -5481,7 +5495,7 @@ async fn exec_slash_acp(
                 let mut sessions = agent.sessions.lock().unwrap();
                 let state = sessions.get_mut(&session_key).ok_or_else(|| {
                     agent_client_protocol::Error::new(
-                        -32602,
+                        ErrorCode::InvalidParams.into(),
                         format!("cannot clear unknown session {session_key}"),
                     )
                 })?;
