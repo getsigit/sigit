@@ -4313,18 +4313,25 @@ impl SiGitAgent {
 
     async fn handle_cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
         log::info!("cancel requested for session {}", args.session_id);
+        self.cancel_turn(&args.session_id);
+        Ok(())
+    }
+
+    /// Stop the turn running on `session_id`, if there is one, and whatever
+    /// command it is running. Reached from `session/cancel` and from a
+    /// `$/cancel_request` naming the prompt.
+    fn cancel_turn(&self, session_id: &SessionId) {
         if let Some(cancellation) = self
             .prompt_cancellations
             .lock()
             .unwrap()
-            .get(&args.session_id.to_string())
+            .get(&session_id.to_string())
             .cloned()
         {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
-        tools::abort_session_tools(&args.session_id.to_string());
-        Ok(())
+        tools::abort_session_tools(&session_id.to_string());
     }
 
     /// Swap the active backend to a siGit Code Cloud tier and reflect it as the
@@ -6186,11 +6193,17 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     let request_id = responder.id().clone();
+                    // A sign-in waits on the browser for minutes. Dropping it
+                    // on `$/cancel_request` closes the loopback listener, and
+                    // the request is answered `-32800`.
+                    let cancellation = responder.cancellation();
                     cx.spawn(async move {
-                        handle_response(
-                            responder,
-                            state.handle_authenticate(&task_cx, request_id, req).await,
-                        )
+                        let result = cancellation
+                            .run_until_cancelled(state.handle_authenticate(
+                                &task_cx, request_id, req,
+                            ))
+                            .await;
+                        handle_response(responder, result)
                     })
                 }
             },
@@ -6327,9 +6340,29 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                 async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
+                    let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let _session = state.lock_session(&req.session_id).await;
-                        handle_response(responder, state.handle_prompt(&task_cx, req).await)
+                        let session_id = req.session_id.clone();
+                        let turn = state.handle_prompt(&task_cx, req);
+                        tokio::pin!(turn);
+                        // `$/cancel_request` for the prompt's own id stops the
+                        // turn the way `session/cancel` does, and the request
+                        // is still answered with a `cancelled` stop reason so
+                        // the client keeps what was streamed. The turn is
+                        // polled first: it registers for cancellation on its
+                        // first poll, which a cancel that arrived while the
+                        // prompt was queued would otherwise beat.
+                        let result = tokio::select! {
+                            biased;
+                            result = &mut turn => result,
+                            () = cancellation.cancelled() => {
+                                log::info!("$/cancel_request for the prompt on session {session_id}");
+                                state.cancel_turn(&session_id);
+                                turn.await
+                            }
+                        };
+                        handle_response(responder, result)
                     })
                 }
             },
