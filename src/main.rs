@@ -45,6 +45,8 @@ mod instructions;
 mod mcp;
 mod models;
 mod permissions;
+#[cfg(unix)]
+mod program_status;
 mod provider;
 mod repetition;
 mod session_store;
@@ -6025,6 +6027,12 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
             }
         };
 
+    // The saved output fd may be redirected even when stdin is a TTY.
+    let program_status = if std::io::IsTerminal::is_terminal(&tty) {
+        program_status::Reporter::new(tty.try_clone()?)
+    } else {
+        program_status::Reporter::new(std::io::sink())
+    };
     crossterm::terminal::enable_raw_mode()?;
     let mut tty = BufWriter::new(tty);
     crossterm::execute!(tty, crossterm::terminal::EnterAlternateScreen)?;
@@ -6038,6 +6046,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
         inference_backend,
         load_rx,
         startup_model_name,
+        program_status,
     )
     .await;
 
