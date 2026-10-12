@@ -74,28 +74,29 @@ use onde::inference::SamplingConfig;
 // schema types moved under `schema::v1` in agent-client-protocol 1.0.
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
-    AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    CancelNotification, CloseSessionRequest, CloseSessionResponse, CompleteElicitationNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, CreateElicitationRequest,
-    CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, Diff,
-    ElicitationAction, ElicitationRequestScope, ElicitationUrlMode, EmbeddedResourceResource,
-    ErrorCode, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
-    InitializeResponse, KillTerminalRequest, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, MessageId, Meta, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest, ReleaseTerminalRequest,
-    RequestId, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionDeleteCapabilities,
-    SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
-    SessionMode, SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput, UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
+    AgentAuthCapabilities, AgentCapabilities, AudioContent, AuthMethod, AuthMethodAgent,
+    AuthenticateRequest, AuthenticateResponse, AvailableCommand, AvailableCommandInput,
+    AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    CompleteElicitationNotification, ConfigOptionUpdate, ContentBlock, ContentChunk,
+    CreateElicitationRequest, CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest,
+    DeleteSessionResponse, Diff, ElicitationAction, ElicitationRequestScope, ElicitationUrlMode,
+    EmbeddedResourceResource, ErrorCode, ForkSessionRequest, ForkSessionResponse, ImageContent,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, MessageId, Meta,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    ReadTextFileRequest, ReleaseTerminalRequest, RequestId, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeState,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -649,6 +650,36 @@ fn history_message_text(message: &serde_json::Value) -> String {
     }
 }
 
+/// The images and audio clips a saved user message carries, as the ACP
+/// content blocks the client sent them in. History keeps them as OpenAI
+/// content parts (see `backend::user_message`): an image as a base64 `data:`
+/// URL and a clip as `input_audio` with a bare format name. Anything that does
+/// not turn back into a block (an image by remote URL, say) is left out.
+fn history_message_attachments(message: &serde_json::Value) -> Vec<ContentBlock> {
+    let Some(parts) = message["content"].as_array() else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| match part["type"].as_str()? {
+            "image_url" => {
+                let url = part["image_url"]["url"].as_str()?;
+                let (mime_type, data) = url.strip_prefix("data:")?.split_once(";base64,")?;
+                Some(ContentBlock::Image(ImageContent::new(data, mime_type)))
+            }
+            "input_audio" => {
+                let data = part["input_audio"]["data"].as_str()?;
+                let mime_type = match part["input_audio"]["format"].as_str()? {
+                    "mp3" => "audio/mpeg".to_string(),
+                    format => format!("audio/{format}"),
+                };
+                Some(ContentBlock::Audio(AudioContent::new(data, mime_type)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// How many sessions one `session/list` reply carries. A client asks for the
 /// rest with the `nextCursor` of the page before.
 const SESSION_LIST_PAGE_SIZE: usize = 100;
@@ -766,18 +797,34 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
             // Seeded context and project instructions were never on screen.
             "system" => {}
             "user" => {
+                // The text and the attachments were one message when they
+                // were sent, so they replay under one id.
+                let message_id = new_message_id();
                 let text = history_message_text(message);
                 if !text.trim().is_empty() {
                     updates.push(SessionUpdate::UserMessageChunk(
-                        ContentChunk::new(ContentBlock::from(text)).message_id(new_message_id()),
+                        ContentChunk::new(ContentBlock::from(text)).message_id(message_id.clone()),
+                    ));
+                }
+                for attachment in history_message_attachments(message) {
+                    updates.push(SessionUpdate::UserMessageChunk(
+                        ContentChunk::new(attachment).message_id(message_id.clone()),
                     ));
                 }
             }
             "assistant" => {
-                let (_think, visible) = chat::strip_think_blocks(&history_message_text(message));
+                // Reasoning went out as thought chunks under the reply's id
+                // while the turn ran; it comes back the same way.
+                let message_id = new_message_id();
+                let (think, visible) = chat::strip_think_blocks(&history_message_text(message));
+                if !think.trim().is_empty() {
+                    updates.push(SessionUpdate::AgentThoughtChunk(
+                        ContentChunk::new(ContentBlock::from(think)).message_id(message_id.clone()),
+                    ));
+                }
                 if !visible.trim().is_empty() {
                     updates.push(SessionUpdate::AgentMessageChunk(
-                        ContentChunk::new(ContentBlock::from(visible)).message_id(new_message_id()),
+                        ContentChunk::new(ContentBlock::from(visible)).message_id(message_id),
                     ));
                 }
                 for call in message["tool_calls"].as_array().into_iter().flatten() {
@@ -7729,7 +7776,7 @@ mod tests {
         let updates = history_replay_updates(&history);
 
         // The system message seeded the model; it was never on screen.
-        assert_eq!(updates.len(), 4, "{updates:#?}");
+        assert_eq!(updates.len(), 5, "{updates:#?}");
 
         match &updates[0] {
             SessionUpdate::UserMessageChunk(chunk) => {
@@ -7737,16 +7784,23 @@ mod tests {
             }
             other => panic!("expected the user message first, got {other:?}"),
         }
+        // Reasoning comes back as a thought, apart from the reply, exactly
+        // as it went out live.
         match &updates[1] {
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                assert!(format!("{:?}", chunk.content).contains("which file?"));
+            }
+            other => panic!("expected the reasoning, got {other:?}"),
+        }
+        match &updates[2] {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let rendered = format!("{:?}", chunk.content);
                 assert!(rendered.contains("Reading it now."));
-                // Reasoning stays hidden on replay, exactly as it did live.
                 assert!(!rendered.contains("which file?"));
             }
             other => panic!("expected the assistant reply, got {other:?}"),
         }
-        match &updates[2] {
+        match &updates[3] {
             SessionUpdate::ToolCall(call) => {
                 assert_eq!(call.title, format!("read_file · {changelog_path_text}"));
                 assert_eq!(call.kind, ToolKind::Read);
@@ -7769,7 +7823,7 @@ mod tests {
             }
             other => panic!("expected the tool call, got {other:?}"),
         }
-        assert!(matches!(updates[3], SessionUpdate::AgentMessageChunk(_)));
+        assert!(matches!(updates[4], SessionUpdate::AgentMessageChunk(_)));
 
         // Each replayed message has an id of its own.
         let ids: Vec<_> = updates
@@ -7873,6 +7927,70 @@ mod tests {
             serde_json::json!({ "role": "assistant", "content": "" }),
         ];
         assert!(history_replay_updates(&history).is_empty());
+    }
+
+    #[test]
+    fn history_replay_sends_reasoning_as_a_thought_under_the_reply_id() {
+        let history = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "<think>check the lockfile first</think>The lockfile is stale.",
+        })];
+        match history_replay_updates(&history).as_slice() {
+            [
+                SessionUpdate::AgentThoughtChunk(thought),
+                SessionUpdate::AgentMessageChunk(reply),
+            ] => {
+                assert!(
+                    matches!(&thought.content, ContentBlock::Text(t) if t.text.contains("check the lockfile first"))
+                );
+                assert!(
+                    matches!(&reply.content, ContentBlock::Text(t) if t.text == "The lockfile is stale.")
+                );
+                assert!(thought.message_id.is_some());
+                assert_eq!(thought.message_id, reply.message_id);
+            }
+            other => panic!("expected a thought and a reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_replay_gives_back_the_attachments_of_a_user_message() {
+        let history = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in these?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } },
+                { "type": "input_audio", "input_audio": { "data": "BBBB", "format": "mp3" } },
+                { "type": "input_audio", "input_audio": { "data": "CCCC", "format": "wav" } },
+            ],
+        })];
+        match history_replay_updates(&history).as_slice() {
+            [
+                SessionUpdate::UserMessageChunk(text),
+                SessionUpdate::UserMessageChunk(image),
+                SessionUpdate::UserMessageChunk(mp3),
+                SessionUpdate::UserMessageChunk(wav),
+            ] => {
+                assert!(
+                    matches!(&text.content, ContentBlock::Text(t) if t.text == "what is in these?")
+                );
+                assert!(
+                    matches!(&image.content, ContentBlock::Image(i) if i.data == "AAAA" && i.mime_type == "image/png")
+                );
+                assert!(
+                    matches!(&mp3.content, ContentBlock::Audio(a) if a.data == "BBBB" && a.mime_type == "audio/mpeg")
+                );
+                assert!(
+                    matches!(&wav.content, ContentBlock::Audio(a) if a.data == "CCCC" && a.mime_type == "audio/wav")
+                );
+                assert!(text.message_id.is_some());
+                for chunk in [image, mp3, wav] {
+                    assert_eq!(chunk.message_id, text.message_id);
+                }
+            }
+            other => panic!("expected the text and three attachments, got {other:?}"),
+        }
     }
 
     fn listed(id: &str, modified_secs: u64) -> session_store::SessionEntry {
