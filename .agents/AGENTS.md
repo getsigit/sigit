@@ -502,8 +502,13 @@ Three of these need credentials or a one-time manual step before they work:
 
 - Scoop needs a `getsigit/scoop-bucket` repo and a `SCOOP_BUCKET_TOKEN` secret, mirroring the
   Homebrew tap setup.
-- winget needs a `WINGET_TOKEN` (PAT with `public_repo` scope) so `wingetcreate` can fork
-  `microsoft/winget-pkgs` and open the manifest PR. It is passed as
+- winget files a Package Request issue first and then opens the manifest PR that resolves it,
+  authored by two separate classic PATs (replacing the old single `WINGET_TOKEN`):
+  `WINGET_ISSUE_TOKEN` (`public_repo`) for the issue and `WINGET_PR_TOKEN` for the PR.
+  `WINGET_PR_TOKEN` needs `public_repo` plus `read:org` and `read:discussion`: `public_repo`
+  lets `wingetcreate` fork `microsoft/winget-pkgs` and open the PR, and the later `gh pr edit`
+  that sets the PR body runs a GraphQL query resolving org/team and discussion fields that
+  fails with a scope error on a `public_repo`-only token. The PR token is passed as
   `WINGET_CREATE_GITHUB_TOKEN` rather than `--token`, which wingetcreate warns can leak the
   token into logs. `wingetcreate update` only works on a package that already exists in
   `microsoft/winget-pkgs`, so the workflow checks the `manifests/g/getSigit/siGitCode` path
