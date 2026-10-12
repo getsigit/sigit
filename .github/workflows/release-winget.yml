@@ -129,18 +129,11 @@ jobs:
       # after) reads as "here's a request, and here's the PR that already did
       # it", posted seconds apart.
       #
-      # The issue and the PR are deliberately authored by *two different*
-      # GitHub accounts, because the author is decided by which PAT creates
-      # each one. The role-to-account mapping lives in the repo secrets, not
-      # here, so this YAML is identical in getsigit/sigit and smbcloud-cli;
-      # only the secret values are swapped:
-      #
-      #     repo           WINGET_ISSUE_TOKEN   WINGET_PR_TOKEN
-      #     getsigit/sigit setoelkahfi          paydii
-      #     smbcloud-cli   paydii               setoelkahfi
-      #
-      # Both PATs need public_repo scope on microsoft/winget-pkgs (fork + open
-      # issues/PRs). WINGET_PR_TOKEN replaces the old single WINGET_TOKEN.
+      # The issue and the PR are authored by two separate PATs, configured as
+      # the repo secrets WINGET_ISSUE_TOKEN (the Package Request issue) and
+      # WINGET_PR_TOKEN (the manifest PR). Both need public_repo scope on
+      # microsoft/winget-pkgs (fork + open issues/PRs). WINGET_PR_TOKEN
+      # replaces the old single WINGET_TOKEN.
       - name: File the winget Package Request issue
         id: issue
         shell: bash
