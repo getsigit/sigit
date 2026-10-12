@@ -59,8 +59,10 @@ const K3_SEP: &str = "<|sep|>";
 
 /// `｜` (U+FF5C), the bar every DSML marker above is built from.
 const FULLWIDTH_BAR: char = '｜';
+/// Two of them — the spelling [`fold_dsml_bars`] rewrites into one.
+const DOUBLED_BAR: &str = "｜｜";
 /// The name those markers wrap, and the only place [`fold_dsml_bars`] folds.
-const DSML_MARKER_NAME: &str = "DSML";
+const DSML_TAG_NAME: &str = "DSML";
 
 const DSML_TOOL_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
 const DSML_TOOL_CALLS_CLOSE: &str = "<｜DSML｜/tool_calls>";
@@ -459,6 +461,10 @@ impl<'a> StreamScanner<'a> {
         // The fold runs on the whole buffer, not the chunk: a doubled bar split
         // across two deltas is only visible once they are joined, and a marker
         // is never emitted before then because a partial prefix is held back.
+        // Both the single- and doubled-bar spellings are partial prefixes
+        // (START_MARKERS is single-bar), so a doubled-bar prefix is flushed as
+        // text on this push; the fold then rewrites the buffer and the next
+        // push re-runs `drain` against canonical markers.
         if let Some(folded) = fold_dsml_bars(&self.pending) {
             self.pending = folded;
         }
@@ -679,15 +685,21 @@ fn looks_like_dsml_call(after_marker: &str) -> bool {
 /// turns out not to be a call comes back with single bars — markup either way.
 ///
 /// Returns `None` when there is nothing to fold — in particular for any buffer
-/// without a `DSML` marker, which is the common case and costs no allocation.
+/// without a doubled bar, which is the common case and costs no allocation.
 fn fold_dsml_bars(text: &str) -> Option<String> {
-    if !text.contains(DSML_MARKER_NAME) {
+    if !text.contains(DSML_TAG_NAME) {
+        return None;
+    }
+    // A DSML tag with only single bars is canonical; only the doubled-bar
+    // spelling needs rewriting, so the buffer-walking allocation can be
+    // skipped when the only defect isn't present.
+    if !text.contains(DOUBLED_BAR) {
         return None;
     }
     let mut folded = String::with_capacity(text.len());
     let mut changed = false;
     let mut rest = text;
-    while let Some(idx) = rest.find(DSML_MARKER_NAME) {
+    while let Some(idx) = rest.find(DSML_TAG_NAME) {
         let (before, from_name) = rest.split_at(idx);
         // The run of bars closing the tag being opened, i.e. `<｜｜` in
         // `<｜｜DSML｜｜invoke`. Counted in bars, not bytes: a lone fullwidth bar
@@ -698,8 +710,8 @@ fn fold_dsml_bars(text: &str) -> Option<String> {
             changed |= opening_run > 1;
             folded.push(FULLWIDTH_BAR);
         }
-        folded.push_str(DSML_MARKER_NAME);
-        let after = &from_name[DSML_MARKER_NAME.len()..];
+        folded.push_str(DSML_TAG_NAME);
+        let after = &from_name[DSML_TAG_NAME.len()..];
         // The run opening the tag being closed, i.e. `｜｜>` in
         // `<｜DSML｜｜/invoke>`.
         let closing_run = bar_run_len(after, true);
@@ -714,7 +726,8 @@ fn fold_dsml_bars(text: &str) -> Option<String> {
 }
 
 /// Number of fullwidth bars in the run at the end of `text`, or at its start
-/// when `leading` is set.
+/// when `leading` is set. The caller passes the slice anchored to `DSML`, so
+/// the run being counted always sits at the boundary, never in the middle.
 fn bar_run_len(text: &str, leading: bool) -> usize {
     let bytes = if leading {
         text.len() - text.trim_start_matches(FULLWIDTH_BAR).len()
