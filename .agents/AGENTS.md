@@ -118,6 +118,14 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `SessionState::remote`), so its turn can wait on the endpoint while another thread is
   installed. Unknown session ids are rejected instead of silently borrowing the active thread's
   cwd. Prompt cancellation takes no lock, which lets a client cancel a turn whatever it holds.
+  `$/cancel_request` is the other way to stop a request, naming it by JSON-RPC id. The SDK only
+  records it; a handler has to read `responder.cancellation()`. The prompt handler does and calls
+  `cancel_turn`, the same path `session/cancel` takes, so the prompt still answers with a
+  `cancelled` stop reason. `authenticate` is dropped instead and answers `-32800`. The other
+  handlers ignore it, which the spec allows.
+  `session/load` replays the saved history as `session/update` (`history_replay_updates`):
+  user text and its image and audio parts, reasoning as a thought chunk under the reply's id,
+  and each tool call folded together with its result.
   Message chunks carry a `messageId`: each inference round is one message, so every chunk of
   it, reasoning included, shares `StreamedReply::message_id` and a tool round starts a new id.
   A standalone notice (`send_assistant_message`) gets an id of its own, and replayed messages
@@ -427,7 +435,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   (advertised as `sessionCapabilities.list`, handled by `handle_list_sessions` in `main.rs` — the
   editor's "Import Threads" picker) must report an absolute `cwd` per session and may filter on
   it, so a session without one is skipped there while still reopening by id through
-  `session/load`. Sidecars are written at save time, not at session start, so a thread nobody
+  `session/load`. A reply holds `SESSION_LIST_PAGE_SIZE` threads; `nextCursor` names the last
+  one on the page (`SessionListCursor`, modified time plus id) so a save or delete between two
+  requests cannot shift the next page, and an unparseable cursor is `-32602`. Sidecars are written at save time, not at session start, so a thread nobody
   spoke in leaves nothing behind. Each ACP save (`persist_session` in `main.rs`) is also sent to
   the client as a `session_info_update` carrying a fresh `updatedAt`, plus the title when it
   differs from the last one sent (`announced_titles`), so a new thread gets its title in the

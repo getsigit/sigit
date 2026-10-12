@@ -130,6 +130,24 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 }
 ```
 
+## ACP support
+
+siGit Code speaks [Agent Client Protocol](https://agentclientprotocol.com) v1 over stdio.
+As of 1.7.0 it implements the whole stable v1 surface an agent can offer:
+
+| Area | What is supported |
+|------|-------------------|
+| Sessions | `session/new`, `load`, `resume`, `fork`, `list` (paged, with a `cwd` filter), `close`, `delete`, and multi-root projects through `additionalDirectories` |
+| Prompts | Text, images, audio, embedded resources and resource links. Stop reasons `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` and `cancelled` |
+| Updates | Message and thought chunks with a `messageId`, tool calls with diffs, locations and embedded terminals, plans, `usage_update`, `session_info_update`, slash commands |
+| Cancellation | `session/cancel`, and `$/cancel_request` for a prompt or a sign-in |
+| Permissions | `session/request_permission` with allow or deny, once or for the session. Manual, Auto and Plan as config options and as session modes |
+| Client features | `fs/read_text_file` and `fs/write_text_file`, `terminal/*`, URL-mode elicitation and boolean config options, each used only when the client advertises it |
+| MCP | stdio and Streamable HTTP servers passed in `mcpServers` |
+| Auth | `authenticate` (browser sign-in) and `logout` |
+
+`session/fork` is still marked unstable in the protocol. Draft v2 is not enabled.
+
 ## Terminal mode
 
 Run `sigit` in a terminal and you get the same model and system prompt as the editor integration, just in a full-screen chat UI.

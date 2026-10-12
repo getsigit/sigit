@@ -202,11 +202,12 @@ the connection and the agent anymore. Don't reintroduce the mpsc forwarder patte
 | `NewSessionRequest` | `handle_new_session` | sets cwd, resets history, advertises commands + config options |
 | `LoadSessionRequest` | `handle_load_session` | like new_session; gated by `load_session(true)` capability |
 | `ForkSessionRequest` | `handle_fork_session` | gated by `unstable_session_fork` + `SessionForkCapabilities` |
-| `ListSessionsRequest` | `handle_list_sessions` | the editor's "Import Threads" picker; gated by `SessionListCapabilities` |
+| `ListSessionsRequest` | `handle_list_sessions` | the editor's "Import Threads" picker; gated by `SessionListCapabilities`; paged with `cursor` / `nextCursor` |
 | `PromptRequest` | `handle_prompt` | the turn: parse blocks → slash commands or tool-calling loop |
 | `SetSessionConfigOptionRequest` | `handle_set_session_config_option` | the Zed model picker — switches/downloads models |
 | `SetSessionModeRequest` | `handle_set_session_mode` | legacy mode selector; same Manual/Auto/Plan state as the Permissions config option |
 | `CancelNotification` | `handle_cancel` | notification, no response |
+| `$/cancel_request` | `responder.cancellation()` | not a registered handler: the SDK tracks it per request, and the prompt and `authenticate` closures read the marker |
 
 Everything else is left to the SDK default (method not found).
 

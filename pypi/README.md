@@ -35,7 +35,7 @@ needs the `--acp` argument.
 
 ### Zed
 
-siGit Code works as an [ACP-compatible](https://github.com/nicobailon/agent-client-protocol) agent in [Zed](https://zed.dev). Add this to your Zed settings:
+siGit Code works as an [ACP-compatible](https://agentclientprotocol.com) agent in [Zed](https://zed.dev). Add this to your Zed settings:
 
 ```json
 {
