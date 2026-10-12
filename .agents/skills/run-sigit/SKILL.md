@@ -94,7 +94,7 @@ tmux kill-session -t sigit
 ## Run (human path)
 
 ```bash
-cargo run                                # stdin is your TTY → launches the TUI
+cargo run -p sigit # stdin is your TTY → launches the TUI
 ```
 
 A full-screen chat opens; type a message or `/help`, Ctrl+C to quit. Useless

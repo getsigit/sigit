@@ -26,7 +26,7 @@ Spec:  https://agentclientprotocol.com
 > protocol (`Agent.v2()`, `V2ConnectionTo`) sits behind the `unstable_protocol_v2`
 > feature and siGit does not enable it.
 
-siGit's entire ACP server lives in `src/main.rs` (`run_acp_server`, the
+siGit's entire ACP server lives in `crates/cli/src/main.rs` (`run_acp_server`, the
 `SiGitAgent` struct, and its `handle_*` methods). Read it alongside this skill.
 
 ---
@@ -595,7 +595,7 @@ Editor                                Agent
 
 ## Where to look in the code
 
-Everything ACP lives in `src/main.rs`:
+Everything ACP lives in `crates/cli/src/main.rs`:
 
 - `run_acp_server` — builder wiring + transport.
 - `SiGitAgent` + `handle_*` — the handlers.
@@ -603,6 +603,6 @@ Everything ACP lives in `src/main.rs`:
 - `parse_slash` / `exec_slash_acp` — slash commands.
 - `handle_response` — the `Responder` helper.
 
-`src/backend.rs` holds the `InferenceBackend` trait (`LocalBackend` /
-`OpenAiBackend`) used by `handle_prompt`'s tool-calling loop; `src/tools.rs`
+`crates/cli/src/backend.rs` holds the `InferenceBackend` trait (`LocalBackend` /
+`OpenAiBackend`) used by `handle_prompt`'s tool-calling loop; `crates/cli/src/tools.rs`
 defines the agent tools and `execute_tool`.

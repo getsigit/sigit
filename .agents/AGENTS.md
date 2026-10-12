@@ -15,7 +15,7 @@ is a TTY:
   it relies on fd redirection to keep logs out of the TUI, so Windows gets ACP mode only.
 
 Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit login`,
-`sigit logout`, `sigit whoami` (see `src/main.rs` `main()`).
+`sigit logout`, `sigit whoami` (see `crates/cli/src/main.rs` `main()`).
 
 ## Working in this repo
 
@@ -67,21 +67,31 @@ the repo is a symlink into it, never a copy:
 
 - `.agents/AGENTS.md` — this file, the project instructions. The root
   `AGENTS.md` and `CLAUDE.md` are symlinks to it, so agents.md-standard tools,
-  Claude Code, and sigit itself (via `src/instructions.rs`, which prefers
+  Claude Code, and sigit itself (via `crates/cli/src/instructions.rs`, which prefers
   `AGENTS.md` over `CLAUDE.md` in the same directory and therefore reads it
   once) all load the same content. Edit this file; never replace the root
   symlinks with real files.
 - `.agents/skills/` — all project skills. `.claude/skills` is a symlink to it,
-  which is how both Claude Code and sigit itself (via `src/skills.rs`) discover
+  which is how both Claude Code and sigit itself (via `crates/cli/src/skills.rs`) discover
   them. Add new skills under `.agents/skills/<name>/SKILL.md`, never as real
   files under `.claude/`.
+
+## Workspace layout
+
+The repo root is a Cargo workspace (`members = ["crates/cli"]`, with `crates/sigit-*` added as
+they land). The `sigit` binary crate lives in `crates/cli`: its `src/` and `tests/` are what the
+architecture section below calls `src/` and `tests/`, and it publishes as `sigit` from there.
+Shared package fields and every dependency version are declared once in the root
+`Cargo.toml` (`[workspace.package]`, `[workspace.dependencies]`) and inherited with
+`workspace = true`. Build outputs are unchanged: `target/<triple>/release/sigit`. Release
+workflows build and publish with `-p sigit`.
 
 ## Build / test / lint
 
 ```sh
 cargo build                 # debug build
 cargo build --release       # release binary at target/release/sigit
-cargo run                   # launches interactive TUI (stdin is a TTY)
+cargo run -p sigit        # launches interactive TUI (stdin is a TTY)
 cargo test                  # CI runs: cargo test --locked --target <target>
 cargo clippy --tests -- -D warnings   # CI gate: clippy is -D warnings on all 4 targets
 cargo fmt -- --check        # CI gate (edition 2024)
@@ -110,7 +120,7 @@ The agent loop is backend-agnostic. The flow: a turn (messages + tool specs) goe
 `InferenceBackend`, which returns assistant text and/or tool calls; the loop executes tools and
 feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete backend.
 
-- **`src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
+- **`crates/cli/src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
   new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`.
   ACP session state owns its roots, conversation, and selected model even though the process has
   one working directory and one live backend slot; activating a thread parks and restores all
@@ -146,7 +156,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `session_store::delete`, and succeeds for an id that is already gone. The
   `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
   smbCloud, and stay general otherwise.
-- **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
+- **`crates/cli/src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
   `ToolResult`, `TurnResult`). Two impls: `LocalBackend` (on-device via `onde::ChatEngine`) and
   `OpenAiBackend` (any OpenAI-compatible HTTP endpoint). A `BackendError` is user-facing: the
   ACP prompt handler passes it to the client verbatim and the editor puts it in an error banner,
@@ -171,18 +181,18 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `round_cap_note` is appended to that round's last tool result, and the turn always closes
   with `round_cap_stop_message`. Without both, the thread stops on the model announcing a
   step that never runs (issue #120).
-  Some models write tool calls into content as text; `src/inline_tool_calls.rs` recovers the
+  Some models write tool calls into content as text; `crates/cli/src/inline_tool_calls.rs` recovers the
   well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
   didn't run. Leaving the raw block in history makes the model invent `<function_results>` later.
-  What that scanner lets through then goes through `src/harness_markup.rs`, which removes
+  What that scanner lets through then goes through `crates/cli/src/harness_markup.rs`, which removes
   markup the model makes up in the harness's shape (issue #122): a `<system_warning>`-style
   block (any `system_*`/`system-*` tag) is dropped whole, from the reply and the history, and
   other underscore-named tags like `<Option_Picker>` lose the tags but keep their text. Code is
   never touched, and an opening tag only counts at the start of a line, since prose writes
   placeholders like `<repo_url>` the same way. It has to run after the inline-call scanner,
   because `<tool_call>` matches its underscore rule.
-  `src/repetition.rs` guards the same stream against a reply that degenerates into a loop over a
+  `crates/cli/src/repetition.rs` guards the same stream against a reply that degenerates into a loop over a
   tiny vocabulary (issue #123): a window of 200 words with at most 40 distinct ones, fenced code
   excepted, makes `consume_stream` stop reading, truncate the text to where the loop began (so
   history never holds the junk), tell the user, and finish with `FinishReason::Repetition`
@@ -204,10 +214,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   takes audio, because onde-cloud drops `input_audio` parts when it parses a request, so
   `provider::model_accepts_audio` says no for every `onde-*` id and yes for a user's own
   endpoint. If onde-cloud ever routes audio, give it a tier table like `IMAGE_TIERS`.
-- **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
+- **`crates/cli/src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
-- **`src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
+- **`crates/cli/src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
   `list_directory`, `search_files`, `glob`, `read_website`, `create_file`, `edit_file`,
   `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
@@ -225,7 +235,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   (a subagent factory is registered — see `register_subagent_factory_for` in `main.rs`; on-device
   registers a `None`-returning factory since onde has a single shared history). A subagent's
   toolset is a hard-gated read-only allow-list (`SUBAGENT_TOOL_NAMES`) that is never expanded by a
-  configurable subagent type (see `src/subagents.rs`) — only ever narrowed — so a `.sigit/agents/*.md`
+  configurable subagent type (see `crates/cli/src/subagents.rs`) — only ever narrowed — so a `.sigit/agents/*.md`
   file can't grant itself `edit_file`/`run_command` and bypass the permission system. Also owns
   `web_search`: a thin native wrapper around the official MCP server's Brave-Search-backed
   `web_search` tool (`mcp__sigit__web_search`, implemented server-side in `sigit-si`'s
@@ -237,16 +247,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   of the assembled tool list (`is_web_search_delegate`) so the model sees one clean option, not
   two names for the same tool. Execution still forwards verbatim to `mcp::call_tool` — no second
   HTTP/JSON-RPC implementation.
-- **`src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
+- **`crates/cli/src/skills.rs`** — [Agent Skills](https://agentskills.io) support. Discovers skill
   folders (each with a `SKILL.md`: YAML frontmatter `name` + `description`, then Markdown
-  instructions) from `.sigit/skills/` and `.claude/skills/` in every project root (see `src/workspace.rs`),
+  instructions) from `.sigit/skills/` and `.claude/skills/` in every project root (see `crates/cli/src/workspace.rs`),
   `$SIGIT_CONFIG_DIR/skills/`,
   and `~/.claude/skills/`. Progressive disclosure: the discovery list (name + description) is
   baked into the dynamically-built `skill` tool's description, and activating a skill (the model
   calls `skill` with a name) loads the full `SKILL.md` body. The `skill` tool is appended in the
   `*_as_specs`/`build_tool_specs` layer (not in `all_tools()`) so its description can be dynamic,
   and only when at least one skill exists.
-- **`src/commands.rs`** — user-defined slash commands. Discovers Markdown files (each an
+- **`crates/cli/src/commands.rs`** — user-defined slash commands. Discovers Markdown files (each an
   optional YAML frontmatter block — `description`, `argument-hint` — followed by a prompt-template
   body) from `.sigit/commands/` and `.claude/commands/` in every project root, `$SIGIT_CONFIG_DIR/commands/`,
   and `~/.claude/commands/`. A subdirectory namespaces the command with `:`
@@ -259,7 +269,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   before falling back to "unknown command". A custom command sharing a name with a built-in is
   unreachable (built-ins match first in `parse_slash`) and is skipped when advertised to ACP
   clients, with a warning logged.
-- **`src/subagents.rs`** — configurable subagent types for the `task` tool. Discovers Markdown
+- **`crates/cli/src/subagents.rs`** — configurable subagent types for the `task` tool. Discovers Markdown
   files (YAML frontmatter `name` + `description`, optional comma-separated `tools:` allow-list,
   then a Markdown body that becomes the subagent's system prompt) from `.sigit/agents/` and
   `.claude/agents/` in every project root, `$SIGIT_CONFIG_DIR/agents/`, and `~/.claude/agents/`. Passing a
@@ -269,9 +279,9 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   module only discovers and parses files. `SubagentFactory` (in `tools.rs`) takes the resolved
   system prompt per call rather than baking one in at registration, so a single registered
   factory serves both the default research subagent and every configured type.
-- **`src/frontmatter.rs`** — shared "YAML frontmatter + Markdown body" parsing used by both
-  `src/skills.rs` (`SKILL.md`) and `src/commands.rs` (`.sigit/commands/*.md`).
-- **`src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Two
+- **`crates/cli/src/frontmatter.rs`** — shared "YAML frontmatter + Markdown body" parsing used by both
+  `crates/cli/src/skills.rs` (`SKILL.md`) and `crates/cli/src/commands.rs` (`.sigit/commands/*.md`).
+- **`crates/cli/src/mcp.rs`** — [Model Context Protocol](https://modelcontextprotocol.io) *client*. Two
   transports: **Streamable HTTP** (one JSON-RPC POST endpoint, `url` in `mcp.toml`; replies are
   `application/json` or SSE) and **stdio** (`command` + optional `args`/`[server.env]` in
   `mcp.toml`; sigit spawns the server and speaks newline-delimited JSON-RPC over its
@@ -290,7 +300,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `SIGIT_MCP_SMBCLOUD=off`). A user-defined entry named `sigit` or `smbcloud` overrides the
   corresponding baked-in one. Extra servers live in `mcp.toml` (global
   `$SIGIT_CONFIG_DIR/mcp.toml` and project-local `.sigit/mcp.toml`). The stdio path is covered by
-  `tests/mcp_stdio.rs`, driven by the test-only `src/bin/mcp_stdio_stub.rs` helper binary
+  `crates/cli/tests/mcp_stdio.rs`, driven by the test-only `crates/cli/src/bin/mcp_stdio_stub.rs` helper binary
   (excluded from the published crate via `exclude` in `Cargo.toml`). The baked-in official
   server is *also* listed in the public MCP Registry as `si.sigit/sigit` — a **remote**
   Streamable-HTTP listing owned by the [`getsigit/si`](https://github.com/getsigit/si) repo
@@ -314,7 +324,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   servers are never offered elicitation, and `rmcp` answers `ping` and refuses other server
   requests itself. Forwarding needs that hook in `ed-mcp` first
   (tracked upstream at `ondeinference/ed#33`).
-- **`src/permissions.rs`** — tool permission policy. Every tool call passes through
+- **`crates/cli/src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
   mutating tools with a present-a-plan message), session "always deny" and "always allow"
@@ -356,7 +366,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   that session's own model (`config_options_for_session`), never `activate_session`. Unknown session ids are `-32002` (resource not found) everywhere,
   and `authenticate` accepts only `AUTH_METHOD_ID`. Tool
   execution, subagents included, still runs one session at a time.
-- **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
+- **`crates/cli/src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
   plus a global file under `$SIGIT_CONFIG_DIR`. Files are ordered outermost-first so the deepest
@@ -364,7 +374,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   (`load_workspace_instructions`). The combined block is injected via `session_context_message`
   in `main.rs` — pushed as a system message at every ACP session entry point (new/load/fork +
   model switch) and appended to the system prompt on the cloud and TUI-startup paths.
-- **`src/workspace.rs`** — the directories the session treats as project roots. An editor can
+- **`crates/cli/src/workspace.rs`** — the directories the session treats as project roots. An editor can
   open several at once (Zed calls it a multi-root project) and ACP carries the extras as
   `additional_directories` on every session request; the headless CLI takes them as repeatable
   `--add-dir` flags. A client only sends those extras to an agent that advertises
@@ -382,8 +392,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   discovery reads it: skills, slash commands, subagent types, and instruction files all scan
   every root. MCP is deliberately not on that list — `mcp::init` runs once at startup, before
   any session exists, so a second root's `.sigit/mcp.toml` has nobody to tell. (The servers a
-  client names in `mcpServers` are a different thing and are per session; see `src/mcp.rs`.)
-- **`src/client_fs.rs`** — file reads and writes through the ACP client. A client that
+  client names in `mcpServers` are a different thing and are per session; see `crates/cli/src/mcp.rs`.)
+- **`crates/cli/src/client_fs.rs`** — file reads and writes through the ACP client. A client that
   advertises `fs.readTextFile` / `fs.writeTextFile` in `initialize` serves `fs/read_text_file`
   and `fs/write_text_file` from its buffers, so `read_file` sees unsaved changes and
   `edit_file` lands in the open buffer instead of underneath it. `tools.rs` has no access to the
@@ -403,8 +413,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   seconds is retried on disk with a warning in the log. The client is only ever asked from
   inside a spawned prompt turn, never from `handle_initialize` itself (deadlock, same as
   permission requests). Existence checks and `create_file`'s parent directories still use the
-  disk. `SIGIT_CLIENT_FS=off` turns the routing off. Covered by `tests/acp_client_fs.rs`.
-- **`src/client_terminal.rs`** — `run_command` in the ACP client's terminal. A client that
+  disk. `SIGIT_CLIENT_FS=off` turns the routing off. Covered by `crates/cli/tests/acp_client_fs.rs`.
+- **`crates/cli/src/client_terminal.rs`** — `run_command` in the ACP client's terminal. A client that
   advertises `terminal` in `initialize` runs a foreground command itself (`terminal/create`, with
   the platform shell as `command` and the whole command line as one argument), and
   `exec_run_command_via_client` embeds the terminal in the tool call as `terminal` content, so the
@@ -420,15 +430,15 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   after that is reported as the tool's error instead, because running it again could repeat its
   effects. The finished card keeps the terminal and drops the result text, which still goes out
   as `raw_output`. `SIGIT_CLIENT_TERMINAL=off` turns the routing off. Covered by
-  `tests/acp_client_terminal.rs`.
-- **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
+  `crates/cli/tests/acp_client_terminal.rs`.
+- **`crates/cli/src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
-- **`src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory
+- **`crates/cli/src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory
   clients. The legacy `-p` form reaches the same parser. Every new run gets a UUID session id;
   `--resume <id>` restores that session through `session_store`, and `--output jsonl` emits a
   structured session/delta/tool/result stream while logs stay on stderr. Headless permission
   prompts collapse to denial unless the tool was pre-approved with `--allow-tool`.
-- **`src/session_store.rs`** — durable conversations: one JSON-lines history file per session at
+- **`crates/cli/src/session_store.rs`** — durable conversations: one JSON-lines history file per session at
   `$SIGIT_CONFIG_DIR/sessions/<id>.jsonl`, written atomically, restorable into either backend.
   Each save also writes a `<id>.meta.json` sidecar naming the session's `cwd` and the extra roots
   of a multi-root project. That sidecar is what makes a thread *listable*: ACP's `session/list`
@@ -442,16 +452,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   the client as a `session_info_update` carrying a fresh `updatedAt`, plus the title when it
   differs from the last one sent (`announced_titles`), so a new thread gets its title in the
   sidebar without waiting for the next `session/list`.
-- **`src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
+- **`crates/cli/src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
   Must run (`setup_shared_model_cache`) *before* anything touches `ChatEngine`/`hf-hub`, since
   those read env vars once at init.
-- **`src/account.rs`** — siGit Code Cloud auth (`/login`, `/logout`, `/whoami`); authenticates
+- **`crates/cli/src/account.rs`** — siGit Code Cloud auth (`/login`, `/logout`, `/whoami`); authenticates
   against the account API and stores a session token. Performs no console I/O.
   ACP `logout` (the editor's sign out button, shown only because `handle_initialize` advertises
   `agentCapabilities.auth.logout`) and `/logout` both go through `SiGitAgent::sign_out` in
   `main.rs`. The request names no session, so `leave_cloud` moves the parked threads off their
   cloud tier along with the live one and each of them gets a fresh model picker.
-- **`src/browser_auth.rs`** — browser sign-in, the path the editor's "Sign in to siGit Code"
+- **`crates/cli/src/browser_auth.rs`** — browser sign-in, the path the editor's "Sign in to siGit Code"
   button takes. sigit is a public OAuth client (client id `sigit-code-cli`, no secret, PKCE
   S256) against the authorization server at `$SIGIT_API_URL/oauth`. Two ways the code gets
   back: a loopback listener on `127.0.0.1:0` (the registration lists `http://127.0.0.1/callback`
@@ -467,15 +477,15 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   so that answer can be routed), a bare `/login`
   in either chat surface, and `sigit login` (which adds the paste fallback, plus `--paste` to
   force it and `--password` for the old email/password prompt).
-- **`src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
-- **`src/models.rs`** — model-picker types shared across platforms.
+- **`crates/cli/src/credentials.rs`** — local session-token store (TOML, `0600` on Unix).
+- **`crates/cli/src/models.rs`** — model-picker types shared across platforms.
 
 Slash commands (`/help`, `/models`, `/skills`, `/agents`, `/commands`, `/mcp`, `/login`, `/logout`,
 `/whoami`, `/reload`, `/plan`, `/permissions`, `/init`, `/clear`, `/status`) are advertised via
 `advertise_commands` in `main.rs` and handled in both the TUI and ACP sessions. `/init` is
 special: instead of replying directly it substitutes `instructions::INIT_PROMPT` for the user
 text and runs a normal agent turn that explores the repo and writes (or improves) `AGENTS.md`
-through the ordinary tools and permission checks. User-defined commands (see `src/commands.rs`)
+through the ordinary tools and permission checks. User-defined commands (see `crates/cli/src/commands.rs`)
 get the same treatment via the `SlashCommand::Unknown` fallback path, so anyone can add their own
 `/name` commands without touching the built-in command list.
 
@@ -508,7 +518,7 @@ mutating tools; the escape hatch for clients without permission-request support)
 
 ## Releasing
 
-Version lives in `Cargo.toml`. Update `CHANGELOG.md` for releases.
+Version lives in `[workspace.package]` in the root `Cargo.toml`. Update `CHANGELOG.md` for releases.
 
 Publishing splits into two groups. **Language registries** each get their own tag-triggered
 workflow: `release-crates`, `release-npm`, `release-nuget`, `release-pypi`. The `npm/`, `nuget/`,
