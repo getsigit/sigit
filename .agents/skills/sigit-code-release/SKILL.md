@@ -43,7 +43,13 @@ Use this skill when preparing a release for this repository.
 
 ## Git release flow
 
-Releases are cut from `development` and shipped on `main`. The published tags (`v1.2.0`, `v1.2.1`) point at the `main`-side merge commit, never at a release branch or at `development`. Follow this order:
+Releases are shipped on `main`, and the published tags (`v1.2.0`, `v1.2.1`) point at the
+`main`-side merge commit, never at a release branch or at `development`. There are two flows,
+and picking the wrong one ships the wrong set of commits. Decide first which this is.
+
+### Full release (minor/major — ships everything on `development`)
+
+Cut from `development` when the release is meant to carry all the work that has accumulated there.
 
 1. Branch `release/v<version>` off `development`.
 2. Apply the version bump and changelog edits, then commit (e.g. `Release v<version>`).
@@ -51,9 +57,37 @@ Releases are cut from `development` and shipped on `main`. The published tags (`
 4. Merge `development` into `main` (commit message: `Merge development into main for v<version> release`).
 5. Tag `v<version>` on that `main` merge commit, then push `main` and the tag.
 
-Step 4 is the only way commits are meant to reach `main`. A feature or fix PR targeting `main` breaks that: it puts work on the release branch that `development` does not have, so the next release is cut without it. Such PRs belong on `development` (see the pull request target rule in `AGENTS.md`).
+For a full release, step 4 is the only way commits are meant to reach `main`. A feature or fix
+PR targeting `main` breaks that: it puts work on the release branch that `development` does not
+have, so the next release is cut without it. Such PRs belong on `development` (see the pull
+request target rule in `AGENTS.md`).
+
+### Scoped patch (hotfix — ships only specific fixes on top of the last tag)
+
+Use this when the patch must ship **only** a named set of fixes on top of the last released tag,
+**not** the unreleased work sitting on `development` (e.g. a patch over `v1.6.7` that must carry
+just a winget/Windows hotfix while ACP features stay unreleased). The giveaway is wording like
+"scoped patch off `v<prev>`" or "hotfix" — if `development` is far ahead, a `development → main`
+merge would drag all of it out under a patch tag, which is wrong.
+
+1. Branch `release/v<version>` off the **last released tag** (`v<prev>`), not `development`.
+2. Cherry-pick (or commit) only the in-scope fixes, then the version bump + changelog, and commit
+   (e.g. `Release v<version>`).
+3. Merge `release/v<version>` back into `development` so the bump and changelog carry forward.
+4. Merge `release/v<version>` **directly into `main`** (commit message: `Release v<version>`) —
+   **never `development → main` for a scoped patch**, since that would pull `development`'s
+   unreleased work onto `main`.
+5. Tag `v<version>` on that `main` merge commit, then push `main` and the tag.
+
+Before tagging a scoped patch, audit the scope: `git log --oneline v<prev>^{commit}..main` and
+`git diff --stat v<prev>^{commit}..main` must show only the intended fixes and the release
+metadata files (`Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`), nothing from `development`.
 
 Pushing the `v*.*.*` tag is what fires every release workflow, so create and push it only after the merge into `main` has landed. Do not commit, tag, or push until the user explicitly asks — confirm the version and that they want the release to go out first.
+
+Decide up front which flow you are in and confirm the exact scope with the user. If in doubt about
+whether a release ships everything on `development` or only a scoped set of fixes, ask — the two
+flows start from different base commits and are not interchangeable.
 
 ## Typical files to inspect
 
@@ -79,7 +113,9 @@ Pushing the `v*.*.*` tag is what fires every release workflow, so create and pus
 - `npm/sigit/package.json` is left at `0.0.0-dev` unless the packaging flow itself changed.
 - `pypi/pyproject.toml` still uses dynamic versioning unless there is a deliberate packaging change.
 - Release workflows still derive their version from the tag as expected.
-- Git flow followed: bump committed on `release/v<version>`, merged back to `development`, then `development` merged into `main`, with `v<version>` tagged on the `main` merge commit.
+- Correct git flow for the release type followed, with `v<version>` tagged on the `main` merge commit either way:
+  - **Full release:** bump committed on `release/v<version>` (off `development`), merged back to `development`, then `development` merged into `main`.
+  - **Scoped patch:** `release/v<version>` branched off the last tag `v<prev>`, in-scope fixes + bump committed, merged back to `development`, then `release/v<version>` merged **directly into `main`** (never `development → main`), and the scope audited (`git log --oneline v<prev>^{commit}..main` / `git diff --stat v<prev>^{commit}..main`) to show only the intended fixes plus release metadata.
 - Release notes or changelog entries match the actual changes.
 - CI-equivalent local checks pass for the relevant platform or target.
 - Package names, install commands, and branding stay consistent across npm, PyPI, crates.io, Homebrew, NuGet, Scoop, winget, AUR, and the `.deb`/`.rpm` packages.
