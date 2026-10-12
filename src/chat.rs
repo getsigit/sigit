@@ -965,7 +965,9 @@ mod tui {
         }
 
         fn status(&self) -> Status {
-            if self.load_error.is_some() {
+            if self.quit {
+                Status::Idle
+            } else if self.load_error.is_some() {
                 Status::Error
             } else if self.pending_approval.is_some() {
                 Status::Permission
@@ -3872,7 +3874,8 @@ mod tui {
                                         app.messages.push(ChatMessage::system("(cancelled)"));
                                     }
                                     // A visible stream can have cleared `thinking`;
-                                    // cancellation must still drop its receiver.
+                                    // cancellation must drop its receiver and clear
+                                    // thinking so the tab cannot stay on working.
                                     app.stop_thinking();
                                     if app.switching_model {
                                         // flag before drop so Disconnected handler stays quiet
@@ -4045,6 +4048,8 @@ mod tui {
             app.show_model_picker = false;
             app.set_load_error("failed".into());
             assert_eq!(app.status(), Status::Error);
+            app.quit = true;
+            assert_eq!(app.status(), Status::Idle);
         }
 
         #[test]

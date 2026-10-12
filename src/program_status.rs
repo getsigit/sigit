@@ -53,16 +53,8 @@ impl Reporter {
     }
 }
 
-impl Drop for Reporter {
-    fn drop(&mut self) {
-        // Records survive the alternate screen. Remove ours on every exit path,
-        // including unwinding. The TUI uses the protocol's root record.
-        if self.last.is_some() {
-            let _ = self.writer.write_all(b"\x1b]7501;state=clear\x1b\\");
-            let _ = self.writer.flush();
-        }
-    }
-}
+// Do not clear the root record on drop: a bare clear removes every program's
+// records. Terminals expire working/blocked on process exit and retain done/error.
 
 #[cfg(test)]
 mod tests {
@@ -82,7 +74,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_reports_are_framed_deduplicated_and_cleared() {
+    fn lifecycle_reports_are_framed_and_deduplicated() {
         let output = Output::default();
         {
             let mut reporter = Reporter::new(output.clone());
@@ -114,13 +106,12 @@ mod tests {
             "state=idle",
         ]
         .map(|pairs| format!("\x1b]7501;{pairs}:app=sigit\x1b\\"))
-        .join("")
-            + "\x1b]7501;state=clear\x1b\\";
+        .join("");
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn unwinding_clears_the_terminal_record() {
+    fn unwinding_does_not_clear_terminal_records() {
         let output = Output::default();
         let captured = output.clone();
         let _ = std::panic::catch_unwind(move || {
@@ -128,13 +119,25 @@ mod tests {
             reporter.report(Status::Working);
             panic!("terminal loop failed");
         });
-        assert!(
-            output
-                .0
-                .lock()
-                .unwrap()
-                .ends_with(b"\x1b]7501;state=clear\x1b\\")
+        assert_eq!(
+            *output.0.lock().unwrap(),
+            b"\x1b]7501;state=working:app=sigit\x1b\\"
         );
+    }
+
+    #[test]
+    fn dropping_preserves_completion_and_error_reports() {
+        for status in [Status::Done, Status::Error] {
+            let output = Output::default();
+            {
+                let mut reporter = Reporter::new(output.clone());
+                reporter.report(status);
+            }
+            assert_eq!(
+                *output.0.lock().unwrap(),
+                format!("\x1b]7501;{}:app=sigit\x1b\\", status.pairs()).as_bytes()
+            );
+        }
     }
 
     #[test]
