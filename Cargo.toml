@@ -2,11 +2,11 @@
 name = "sigit"
 version = "1.7.0"
 edition = "2024"
-description = "siGit Code — ACP-compatible AI coding agent. Sí, git."
+description = "A modular local inference LLM coding agent. Core component of siGit Factory."
 documentation = "https://github.com/getsigit/sigit"
 license = "Apache-2.0"
 repository = "https://github.com/getsigit/sigit"
-homepage = "https://sigit.si"
+homepage = "https://sigit.si/code"
 readme = "README.md"
 keywords = ["sigit", "cli", "ai", "coding-agent", "llm"]
 categories = ["command-line-utilities"]
