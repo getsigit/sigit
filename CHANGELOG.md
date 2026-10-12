@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.6.8
+
+### Fixed
+
+- **A bare launch of `sigit.exe` on Windows exits 0 instead of bailing.** A
+  no-argument launch with a TTY stdin falls through to the non-Unix branch,
+  which has no TUI to start (the interactive client needs Unix-only fd
+  redirection). It now prints a short usage message pointing at ACP and
+  headless modes and exits 0, so winget's installer validator no longer reports
+  a `Validation-Executable-Error`.
+
+### Changed
+
+- **winget submissions link back to their Package Request issue.** The release
+  workflow scrapes the winget-pkgs PR URL from wingetcreate, opens a Package
+  Request issue on first submission, and rewrites the PR body to fill the
+  Description, tick the issue checkbox, and add `Resolves #NNN` — replacing the
+  manual per-PR edit that used to follow each release.
+- **The winget release workflow files its Package Request issue first and uses
+  two scoped tokens.** The Package Request issue is opened before the
+  winget-pkgs PR so the PR can reference it immediately, and issue creation and
+  PR submission now use separate tokens (`WINGET_ISSUE_TOKEN` and
+  `WINGET_PR_TOKEN`) rather than one shared token.
+
 ## 1.6.7
 
 ### Fixed
