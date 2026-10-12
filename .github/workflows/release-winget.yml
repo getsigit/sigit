@@ -132,8 +132,11 @@ jobs:
       # The issue and the PR are authored by two separate PATs, configured as
       # the repo secrets WINGET_ISSUE_TOKEN (the Package Request issue) and
       # WINGET_PR_TOKEN (the manifest PR). Both need public_repo scope on
-      # microsoft/winget-pkgs (fork + open issues/PRs). WINGET_PR_TOKEN
-      # replaces the old single WINGET_TOKEN.
+      # microsoft/winget-pkgs (fork + open issues/PRs). WINGET_PR_TOKEN also
+      # needs read:org and read:discussion: the "Set the winget PR body" step
+      # below calls `gh pr edit`, whose GraphQL query resolves org/team and
+      # discussion fields and fails with a scope error without them.
+      # WINGET_PR_TOKEN replaces the old single WINGET_TOKEN.
       - name: File the winget Package Request issue
         id: issue
         shell: bash
@@ -182,6 +185,11 @@ jobs:
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
           echo "issue_number=${ISSUE_URL##*/}" >> "$GITHUB_OUTPUT"
 
+      - name: Sebat dulu ...
+        if: steps.issue.outputs.issue_number != ''
+        shell: bash
+        run: sleep $(( RANDOM % 61 + 150 ))
+
       - name: Submit new package
         id: submit_new
         if: steps.exists.outputs.found == 'false'
@@ -194,7 +202,7 @@ jobs:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo, read:org, and read:discussion scopes so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR, and gh can edit the PR body."
           }
 
           $version = "${{ steps.release.outputs.version }}"
@@ -228,7 +236,7 @@ jobs:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo, read:org, and read:discussion scopes so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR, and gh can edit the PR body."
           }
 
           $tag = "${{ steps.release.outputs.tag }}"
