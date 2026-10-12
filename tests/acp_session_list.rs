@@ -154,6 +154,22 @@ impl AgentUnderTest {
     }
 }
 
+impl AgentUnderTest {
+    /// Like `wait_for_response`, for a request that is expected to fail.
+    fn wait_for_reply(&mut self, id: u64) -> Value {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the reply to request {id}");
+            };
+            if message["id"] == id && message.get("method").is_none() {
+                return message;
+            }
+        }
+    }
+}
+
 impl Drop for AgentUnderTest {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -419,6 +435,80 @@ fn a_saved_turn_sends_session_info_to_the_client() {
         "an unchanged title is not sent again: {second:?}"
     );
     assert!(second[0]["updatedAt"].is_string(), "{second:?}");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Write a saved thread straight into the session store, the way a finished
+/// turn leaves one.
+fn seed_session(config_dir: &std::path::Path, id: &str, cwd: &std::path::Path) {
+    let sessions = config_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{id}.jsonl")),
+        format!(
+            "{}\n",
+            json!({"role": "user", "content": format!("thread {id}")})
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        sessions.join(format!("{id}.meta.json")),
+        json!({"cwd": cwd}).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_long_session_list_is_paged_with_a_cursor() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_list_pages_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    // One more than a page holds.
+    for index in 0..101 {
+        seed_session(&config_dir, &format!("thread-{index:03}"), &project);
+    }
+
+    let port = start_fake_endpoint(Vec::new());
+    let mut agent = spawn_agent(port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let first = agent.wait_for_response(id);
+    let first_page = first["result"]["sessions"].as_array().expect("sessions");
+    assert_eq!(first_page.len(), 100);
+    let cursor = first["result"]["nextCursor"]
+        .as_str()
+        .expect("a full page with more behind it carries nextCursor")
+        .to_string();
+
+    let id = agent.request("session/list", json!({"cwd": project, "cursor": cursor}));
+    let second = agent.wait_for_response(id);
+    let second_page = second["result"]["sessions"].as_array().expect("sessions");
+    assert_eq!(second_page.len(), 1);
+    assert!(
+        second["result"].get("nextCursor").is_none(),
+        "the last page has no cursor: {second}"
+    );
+
+    let mut seen: Vec<&str> = first_page
+        .iter()
+        .chain(second_page)
+        .map(|session| session["sessionId"].as_str().unwrap())
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 101, "every thread is listed exactly once");
+
+    let id = agent.request("session/list", json!({"cursor": "not-a-cursor"}));
+    let rejected = agent.wait_for_reply(id);
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);

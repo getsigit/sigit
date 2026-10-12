@@ -649,6 +649,77 @@ fn history_message_text(message: &serde_json::Value) -> String {
     }
 }
 
+/// How many sessions one `session/list` reply carries. A client asks for the
+/// rest with the `nextCursor` of the page before.
+const SESSION_LIST_PAGE_SIZE: usize = 100;
+
+/// Where a `session/list` page ended: the last session on it, by the two
+/// things the list is sorted on. Naming the entry instead of counting an
+/// offset keeps the next page right when a thread is saved or deleted between
+/// the two requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionListCursor {
+    modified_nanos: u128,
+    id: String,
+}
+
+impl SessionListCursor {
+    fn after(entry: &session_store::SessionEntry) -> Self {
+        Self {
+            modified_nanos: modified_nanos(entry.modified),
+            id: entry.id.clone(),
+        }
+    }
+
+    /// The cursor as the client carries it. Clients must treat it as opaque.
+    fn encode(&self) -> String {
+        format!("{}:{}", self.modified_nanos, self.id)
+    }
+
+    fn decode(cursor: &str) -> Option<Self> {
+        let (modified_nanos, id) = cursor.split_once(':')?;
+        if id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            modified_nanos: modified_nanos.parse().ok()?,
+            id: id.to_string(),
+        })
+    }
+
+    /// Does `entry` come after this cursor in `session_store::list` order
+    /// (newest first, then by id)?
+    fn precedes(&self, entry: &session_store::SessionEntry) -> bool {
+        let modified = modified_nanos(entry.modified);
+        modified < self.modified_nanos
+            || (modified == self.modified_nanos && entry.id.as_str() > self.id.as_str())
+    }
+}
+
+fn modified_nanos(time: std::time::SystemTime) -> u128 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
+}
+
+/// One page of `sessions` (already in list order) starting after `cursor`,
+/// and the cursor for the page after it when there is one.
+fn session_list_page(
+    sessions: Vec<session_store::SessionEntry>,
+    cursor: Option<&SessionListCursor>,
+    page_size: usize,
+) -> (Vec<session_store::SessionEntry>, Option<String>) {
+    let mut rest = sessions
+        .into_iter()
+        .filter(|entry| cursor.is_none_or(|cursor| cursor.precedes(entry)));
+    let page: Vec<_> = rest.by_ref().take(page_size).collect();
+    let next_cursor = match (rest.next(), page.last()) {
+        (Some(_), Some(last)) => Some(SessionListCursor::after(last).encode()),
+        _ => None,
+    };
+    (page, next_cursor)
+}
+
 /// Do two paths name the same directory, for `session/list` filtering?
 ///
 /// Canonicalizing resolves the symlinks and `..` segments that make a client's
@@ -2849,19 +2920,34 @@ impl SiGitAgent {
                 format!("cwd must be an absolute path, got {}", cwd.display()),
             ));
         }
+        // A cursor is one this agent handed out. Anything else is a client
+        // error, not a reason to start again from the first page.
+        let cursor = match args.cursor.as_deref() {
+            Some(cursor) => Some(SessionListCursor::decode(cursor).ok_or_else(|| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InvalidParams.into(),
+                    "cursor is not one this agent returned from session/list",
+                )
+            })?),
+            None => None,
+        };
         let filter = args.cwd.clone();
-        let sessions: Vec<SessionInfo> = session_store::list()
+        let entries: Vec<session_store::SessionEntry> = session_store::list()
             .into_iter()
             .filter(|entry| entry.message_count > 0)
+            .filter(|entry| match (&entry.cwd, &filter) {
+                (None, _) => false,
+                (Some(cwd), Some(filter)) => same_dir(cwd, filter),
+                (Some(_), None) => true,
+            })
+            .collect();
+        let (page, next_cursor) =
+            session_list_page(entries, cursor.as_ref(), SESSION_LIST_PAGE_SIZE);
+        let sessions: Vec<SessionInfo> = page
+            .into_iter()
             .filter_map(|entry| {
-                let cwd = entry.cwd?;
-                if let Some(filter) = &filter
-                    && !same_dir(&cwd, filter)
-                {
-                    return None;
-                }
                 Some(
-                    SessionInfo::new(SessionId::new(entry.id), cwd)
+                    SessionInfo::new(SessionId::new(entry.id), entry.cwd?)
                         .additional_directories(entry.additional_directories)
                         .title(entry.title)
                         .updated_at(session_store::iso8601(entry.modified)),
@@ -2870,15 +2956,20 @@ impl SiGitAgent {
             .collect();
 
         log::info!(
-            "list_sessions: {} session(s){}",
+            "list_sessions: {} session(s){}{}",
             sessions.len(),
             args.cwd
                 .as_ref()
                 .map(|cwd| format!(" for cwd={}", cwd.display()))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if next_cursor.is_some() {
+                ", more to come"
+            } else {
+                ""
+            }
         );
 
-        Ok(ListSessionsResponse::new(sessions))
+        Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
     }
 
     async fn handle_load_session(
@@ -7782,6 +7873,80 @@ mod tests {
             serde_json::json!({ "role": "assistant", "content": "" }),
         ];
         assert!(history_replay_updates(&history).is_empty());
+    }
+
+    fn listed(id: &str, modified_secs: u64) -> session_store::SessionEntry {
+        session_store::SessionEntry {
+            id: id.to_string(),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs),
+            message_count: 1,
+            cwd: Some(PathBuf::from("/project")),
+            additional_directories: Vec::new(),
+            model_id: None,
+            title: None,
+        }
+    }
+
+    fn ids(page: &[session_store::SessionEntry]) -> Vec<&str> {
+        page.iter().map(|entry| entry.id.as_str()).collect()
+    }
+
+    #[test]
+    fn session_list_pages_follow_one_another_without_gaps_or_repeats() {
+        // In `session_store::list` order: newest first, ties by id.
+        let sessions = || {
+            vec![
+                listed("e", 50),
+                listed("a", 40),
+                listed("b", 40),
+                listed("c", 40),
+                listed("d", 10),
+            ]
+        };
+
+        let (first, cursor) = session_list_page(sessions(), None, 2);
+        assert_eq!(ids(&first), ["e", "a"]);
+        let cursor = SessionListCursor::decode(&cursor.expect("more pages follow")).unwrap();
+
+        let (second, cursor) = session_list_page(sessions(), Some(&cursor), 2);
+        assert_eq!(ids(&second), ["b", "c"]);
+        let cursor = SessionListCursor::decode(&cursor.expect("one more page")).unwrap();
+
+        let (third, cursor) = session_list_page(sessions(), Some(&cursor), 2);
+        assert_eq!(ids(&third), ["d"]);
+        assert_eq!(cursor, None, "the last page carries no cursor");
+    }
+
+    #[test]
+    fn session_list_has_no_cursor_when_everything_fits_on_one_page() {
+        let (page, cursor) = session_list_page(vec![listed("a", 2), listed("b", 1)], None, 2);
+        assert_eq!(ids(&page), ["a", "b"]);
+        assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn session_list_cursor_survives_the_session_it_names_being_deleted() {
+        let (_, cursor) = session_list_page(
+            vec![listed("a", 30), listed("b", 20), listed("c", 10)],
+            None,
+            2,
+        );
+        let cursor = SessionListCursor::decode(&cursor.unwrap()).unwrap();
+        // "b" ended the first page and is gone by the second request.
+        let (page, _) = session_list_page(vec![listed("a", 30), listed("c", 10)], Some(&cursor), 2);
+        assert_eq!(ids(&page), ["c"]);
+    }
+
+    #[test]
+    fn session_list_cursor_rejects_what_it_did_not_write() {
+        for cursor in ["", "abc", "12", "12:", "x:session", ":session"] {
+            assert_eq!(SessionListCursor::decode(cursor), None, "{cursor:?}");
+        }
+        let cursor = SessionListCursor {
+            modified_nanos: 1_700_000_000_123_456_789,
+            id: "a:b".to_string(),
+        };
+        assert_eq!(SessionListCursor::decode(&cursor.encode()), Some(cursor));
     }
 
     #[test]
