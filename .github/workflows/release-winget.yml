@@ -123,38 +123,112 @@ jobs:
         shell: pwsh
         run: Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
 
+      # winget-pkgs convention: file the "please add/update this package"
+      # Package Request issue *first*, then open the manifest PR that fulfils
+      # it with "Resolves #N". Doing it the other way round (PR first, issue
+      # after) reads as "here's a request, and here's the PR that already did
+      # it", posted seconds apart.
+      #
+      # The issue and the PR are authored by two separate PATs, configured as
+      # the repo secrets WINGET_ISSUE_TOKEN (the Package Request issue) and
+      # WINGET_PR_TOKEN (the manifest PR). Both need public_repo scope on
+      # microsoft/winget-pkgs (fork + open issues/PRs). WINGET_PR_TOKEN
+      # replaces the old single WINGET_TOKEN.
+      - name: File the winget Package Request issue
+        id: issue
+        shell: bash
+        env:
+          # Authored by the issue account for this repo.
+          GH_TOKEN: ${{ secrets.WINGET_ISSUE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "WINGET_ISSUE_TOKEN is not set. It needs a PAT (public_repo) for the account that should author the Package Request issue." >&2
+            exit 1
+          fi
+
+          VERSION="${{ steps.release.outputs.version }}"
+          TAG="${{ steps.release.outputs.tag }}"
+
+          # The release assets, same URLs the update step feeds wingetcreate.
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          INSTALLER_AMD64="${BASE}/sigit-win-amd64.exe"
+          INSTALLER_ARM64="${BASE}/sigit-win-arm64.exe"
+
+          # winget-pkgs' Package Request is an issue *form*
+          # (.github/ISSUE_TEMPLATE/package_request.yml): the title must be
+          # "[Package Request]: ..." and the body has to carry the labelled
+          # fields below (Installer Url especially — without it a maintainer
+          # just replies "please provide the installer link"). A free-text
+          # body lands as Needs-Triage and can't be acted on.
+          ISSUE_BODY=$(cat <<EOF
+          Download Page Url: https://github.com/${REPO}/releases/tag/${TAG}
+          Publisher: getSigit
+          Package Name: siGit Code
+          Description: siGit Code, an AI coding agent that runs on your machine.
+          Package Version: ${VERSION}
+          Installer Url: ${INSTALLER_AMD64}
+          Installer Url: ${INSTALLER_ARM64}
+          EOF
+          )
+
+          ISSUE_URL=$(gh issue create \
+            --repo microsoft/winget-pkgs \
+            --title "[Package Request]: ${PACKAGE_IDENTIFIER} ${VERSION}" \
+            --body "$ISSUE_BODY")
+
+          echo "Opened issue ${ISSUE_URL}"
+          echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
+          echo "issue_number=${ISSUE_URL##*/}" >> "$GITHUB_OUTPUT"
+
       - name: Submit new package
+        id: submit_new
         if: steps.exists.outputs.found == 'false'
         shell: pwsh
         env:
           # wingetcreate reads the token from this variable. Passing it as
           # --token instead makes the tool warn that the token can end up in
           # logs, which on a shared runner is not a warning worth ignoring.
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          # This is the PR-author account for this repo (see mapping above).
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
           }
 
           $version = "${{ steps.release.outputs.version }}"
 
+          # Tee stdout so we can scrape the PR URL afterwards. wingetcreate
+          # prints "Pull request can be found here: <url>" on success, and
+          # that line is the only handle we get on the PR it just opened.
           # --no-open because the runner has no browser to open the PR in.
           .\wingetcreate.exe submit manifests `
             --prtitle "New package: $env:PACKAGE_IDENTIFIER version $version" `
-            --no-open
+            --no-open 2>&1 | Tee-Object -Variable output
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "wingetcreate submit failed with exit code $LASTEXITCODE"
           }
 
+          $match = [regex]::Match(($output -join "`n"), 'https://github\.com/microsoft/winget-pkgs/pull/(\d+)')
+          if ($match.Success) {
+            "pr_url=$($match.Value)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "pr_number=$($match.Groups[1].Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Warning "Could not find the PR URL in wingetcreate output; skipping issue linking."
+          }
+
       - name: Submit manifest update
+        id: submit_update
         if: steps.exists.outputs.found == 'true'
         shell: pwsh
         env:
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          # PR-author account for this repo (see mapping above).
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
           }
 
           $tag = "${{ steps.release.outputs.tag }}"
@@ -171,8 +245,76 @@ jobs:
             --release-date "${{ steps.release.outputs.date }}" `
             --prtitle "Update $env:PACKAGE_IDENTIFIER to version $version" `
             --submit `
-            --no-open
+            --no-open 2>&1 | Tee-Object -Variable output
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "wingetcreate failed with exit code $LASTEXITCODE"
           }
+
+          $match = [regex]::Match(($output -join "`n"), 'https://github\.com/microsoft/winget-pkgs/pull/(\d+)')
+          if ($match.Success) {
+            "pr_url=$($match.Value)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "pr_number=$($match.Groups[1].Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Warning "Could not find the PR URL in wingetcreate output; skipping issue linking."
+          }
+
+      # wingetcreate has no --prbody flag (only --prtitle), so it always opens
+      # the PR with the winget-pkgs template: an empty Description and an
+      # unticked "Linked to an issue" box next to a "Resolves #[Issue Number]"
+      # placeholder. The issue already exists (filed first, above), so this
+      # step just rewrites the body to point the PR at it with "Resolves #N".
+      #
+      # This must run as the PR author (WINGET_PR_TOKEN) — the account that
+      # opened the PR via wingetcreate — since only the author (or a repo
+      # maintainer) can edit it.
+      - name: Set the winget PR body and link the issue
+        id: link
+        if: >-
+          (steps.submit_new.outputs.pr_number != '') ||
+          (steps.submit_update.outputs.pr_number != '')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PR_URL="${{ steps.submit_new.outputs.pr_url || steps.submit_update.outputs.pr_url }}"
+          ISSUE_NUMBER="${{ steps.issue.outputs.issue_number }}"
+          VERSION="${{ steps.release.outputs.version }}"
+          TAG="${{ steps.release.outputs.tag }}"
+
+          if [ -n "$ISSUE_NUMBER" ]; then
+            CHECKBOX="- [x] Linked to an issue (if applicable)"
+            RESOLVES="- Resolves #${ISSUE_NUMBER}"
+          else
+            CHECKBOX="- [ ] Linked to an issue (if applicable)"
+            RESOLVES=""
+          fi
+
+          if [ "${{ steps.exists.outputs.found }}" = "false" ]; then
+            DESC="Adds ${PACKAGE_IDENTIFIER} version ${VERSION} from ${TAG}."
+          else
+            DESC="Updates ${PACKAGE_IDENTIFIER} to version ${VERSION} from ${TAG}."
+          fi
+
+          # Mirrors the current .github/PULL_REQUEST_TEMPLATE.md; keep the
+          # checklist items in sync with it (e.g. the 1.12 schema line).
+          BODY=$(cat <<EOF
+          ## 📖 Description
+          ${DESC}
+          ## ✅ Checklist
+          - [x] Signed the [Contributor License Agreement](https://cla.opensource.microsoft.com)
+          ${CHECKBOX}
+          ${RESOLVES}
+          ## 📦 Manifest Checklist
+          - [x] Checked that there aren't other open [pull requests](https://github.com/microsoft/winget-pkgs/pulls) for the same manifest update/change
+          - [x] This PR only modifies one (1) manifest
+          - [x] Validated manifest locally with \`winget validate --manifest <directory>\`
+          - [x] Tested manifest locally with \`winget install --manifest <directory>\`
+          - [x] Manifest conforms to the [1.12 schema](https://github.com/microsoft/winget-pkgs/tree/master/doc/manifest/schema/1.12.0)
+          EOF
+          )
+
+          gh pr edit "$PR_URL" --body "$BODY"
+          echo "Linked ${PR_URL} to issue #${ISSUE_NUMBER:-<none>}"
