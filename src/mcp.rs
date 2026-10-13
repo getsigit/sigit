@@ -31,7 +31,11 @@
 //! error. Opt out with `smbcloud = false` in `mcp.toml` or
 //! `SIGIT_MCP_SMBCLOUD=off`.
 //!
-//! Both baked-in entries yield to a user-defined `mcp.toml` server of the same
+//! The App Store Connect API CLI's MCP server (`asc --mcp`, stdio) is baked
+//! in the same way: only when the `asc` binary is on `PATH`, opt out with
+//! `ascapi = false` in `mcp.toml` or `SIGIT_MCP_ASCAPI=off`.
+//!
+//! All baked-in entries yield to a user-defined `mcp.toml` server of the same
 //! name, so either can be repointed or reconfigured without a special case.
 //! Additional servers are configured in `mcp.toml` (see [`load_configs`]).
 //!
@@ -112,6 +116,24 @@ const SMBCLOUD_COMMAND: &str = "smb";
 pub fn smbcloud_tool_suffix(name: &str) -> Option<&str> {
     name.strip_prefix(MCP_PREFIX)?
         .strip_prefix(SMBCLOUD_SERVER_NAME)?
+        .strip_prefix("__")
+}
+
+/// Name of the baked-in App Store Connect API CLI server; its tools are
+/// namespaced `mcp__ascapi__<tool>`. Like the other baked-in servers, a
+/// user-defined `mcp.toml` entry with this name overrides the baked-in
+/// command line.
+const ASCAPI_SERVER_NAME: &str = "ascapi";
+
+/// The App Store Connect API CLI binary the baked-in stdio entry spawns
+/// (`asc --mcp`).
+const ASCAPI_COMMAND: &str = "asc";
+
+/// The bare tool name when `name` belongs to the ascapi server
+/// (`mcp__ascapi__app_list` → `Some("app_list")`), else `None`.
+pub fn ascapi_tool_suffix(name: &str) -> Option<&str> {
+    name.strip_prefix(MCP_PREFIX)?
+        .strip_prefix(ASCAPI_SERVER_NAME)?
         .strip_prefix("__")
 }
 
@@ -257,6 +279,11 @@ struct McpFile {
     /// `true`; set `false` to opt out. Moot when `smb` isn't installed.
     #[serde(default)]
     smbcloud: Option<bool>,
+    /// Include the baked-in App Store Connect API CLI server (`asc --mcp`).
+    /// Defaults to `true`; set `false` to opt out. Moot when `asc` isn't
+    /// installed.
+    #[serde(default)]
+    ascapi: Option<bool>,
     #[serde(default)]
     server: Vec<ServerEntry>,
 }
@@ -375,6 +402,7 @@ fn load_configs() -> Vec<ServerDef> {
 
     let mut include_official = true;
     let mut include_smbcloud = true;
+    let mut include_ascapi = true;
     // De-duplicated by sanitized name; a later config file overrides an earlier
     // one for the same name (project-local wins over global).
     let mut defs: Vec<ServerDef> = Vec::new();
@@ -395,6 +423,9 @@ fn load_configs() -> Vec<ServerDef> {
         }
         if let Some(smbcloud) = parsed.smbcloud {
             include_smbcloud = smbcloud;
+        }
+        if let Some(ascapi) = parsed.ascapi {
+            include_ascapi = ascapi;
         }
         for entry in parsed.server {
             if entry.enabled == Some(false) {
@@ -471,6 +502,36 @@ fn load_configs() -> Vec<ServerDef> {
             });
         } else {
             log::debug!("mcp: `{SMBCLOUD_COMMAND}` not on PATH; skipping the smbcloud server");
+        }
+    }
+
+    // The ascapi server can also be disabled with SIGIT_MCP_ASCAPI=off.
+    if let Ok(value) = std::env::var("SIGIT_MCP_ASCAPI")
+        && matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    {
+        include_ascapi = false;
+    }
+
+    // Add the baked-in ascapi server (`asc --mcp`), with the same
+    // never-clobber rule as the others. Only when `asc` is actually
+    // installed: a hardwired entry for a binary most users don't have
+    // would surface a spawn failure in `/mcp` instead of just staying out
+    // of the way.
+    if include_ascapi && !defs.iter().any(|d| d.name == ASCAPI_SERVER_NAME) {
+        if on_path(ASCAPI_COMMAND) {
+            defs.push(ServerDef {
+                name: ASCAPI_SERVER_NAME.to_string(),
+                transport: TransportDef::Stdio {
+                    command: ASCAPI_COMMAND.to_string(),
+                    args: vec!["--mcp".to_string()],
+                    env: Vec::new(),
+                },
+            });
+        } else {
+            log::debug!("mcp: `{ASCAPI_COMMAND}` not on PATH; skipping the ascapi server");
         }
     }
 
@@ -1001,6 +1062,19 @@ mod tests {
     }
 
     #[test]
+    fn ascapi_tool_suffix_strips_only_the_ascapi_namespace() {
+        assert_eq!(
+            ascapi_tool_suffix("mcp__ascapi__app_list"),
+            Some("app_list")
+        );
+        assert_eq!(ascapi_tool_suffix("mcp__sigit__app_list"), None);
+        // `ascapi` must be the whole server name, not a prefix of it.
+        assert_eq!(ascapi_tool_suffix("mcp__ascapix__app_list"), None);
+        assert_eq!(ascapi_tool_suffix("app_list"), None);
+        assert_eq!(ascapi_tool_suffix("mcp__ascapi__"), Some(""));
+    }
+
+    #[test]
     fn sanitize_collapses_invalid_chars() {
         assert_eq!(sanitize("github"), "github");
         assert_eq!(sanitize("my server"), "my_server");
@@ -1047,6 +1121,15 @@ mod tests {
         // Absent means "include" (the default stays true in load_configs).
         let parsed: McpFile = toml::from_str("").unwrap();
         assert_eq!(parsed.smbcloud, None);
+    }
+
+    #[test]
+    fn parses_ascapi_opt_out_flag() {
+        let parsed: McpFile = toml::from_str("ascapi = false").unwrap();
+        assert_eq!(parsed.ascapi, Some(false));
+        // Absent means "include" (the default stays true in load_configs).
+        let parsed: McpFile = toml::from_str("").unwrap();
+        assert_eq!(parsed.ascapi, None);
     }
 
     #[test]
