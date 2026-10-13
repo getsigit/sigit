@@ -295,9 +295,26 @@ impl AgentUnderTest {
     }
 
     /// Send a prompt, then `session/cancel` as soon as the agent starts
-    /// waiting on the editor's terminal, which never answers. Returns the
-    /// prompt's response.
+    /// waiting on the editor's terminal. Returns the prompt's response.
     fn prompt_cancelled_mid_command(&mut self, session_id: &str, editor: &mut Editor) -> Value {
+        self.prompt_stopped_mid_command(session_id, editor, |_prompt_id| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id},
+            })
+        })
+    }
+
+    /// Send a prompt and, once the agent is waiting on the editor's terminal
+    /// (which never answers), send whatever `stop` builds from the prompt's
+    /// request id. Returns the prompt's response.
+    fn prompt_stopped_mid_command(
+        &mut self,
+        session_id: &str,
+        editor: &mut Editor,
+        stop: impl Fn(u64) -> Value,
+    ) -> Value {
         let id = self.request(
             "session/prompt",
             json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "go"}]}),
@@ -327,11 +344,7 @@ impl AgentUnderTest {
                 "terminal/create" => json!({"terminalId": "term-1"}),
                 "terminal/wait_for_exit" => {
                     // The command is still running; the user presses stop.
-                    self.send(json!({
-                        "jsonrpc": "2.0",
-                        "method": "session/cancel",
-                        "params": {"sessionId": session_id},
-                    }));
+                    self.send(stop(id));
                     continue;
                 }
                 "terminal/output" => json!({
@@ -587,6 +600,40 @@ fn a_cancel_mid_command_kills_the_client_terminal_and_ends_the_turn_cancelled() 
             "terminal/release",
         ]
     );
+    assert_eq!(
+        editor.request("terminal/kill")["params"]["terminalId"],
+        "term-1"
+    );
+    assert_eq!(
+        endpoint.requests.lock().unwrap().len(),
+        1,
+        "a cancelled turn must not ask the model for another round"
+    );
+}
+
+/// `$/cancel_request` names the prompt by its JSON-RPC id instead of the
+/// session. It has to stop the turn the same way, and the prompt is still
+/// answered with a result, so the client keeps what was streamed.
+#[test]
+fn a_cancel_request_for_the_prompt_ends_the_turn_cancelled() {
+    let scratch = Scratch::new("cancel_request");
+    let endpoint = start_fake_endpoint(vec![
+        echo_call("call_1", &scratch.work, false),
+        sse_text("never asked for"),
+    ]);
+    let mut agent = spawn_agent(endpoint.port, &scratch.config, None);
+    let session_id = agent.open_session(true, &scratch.work);
+
+    let mut editor = Editor::default();
+    let response = agent.prompt_stopped_mid_command(&session_id, &mut editor, |prompt_id| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancel_request",
+            "params": {"requestId": prompt_id},
+        })
+    });
+
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
     assert_eq!(
         editor.request("terminal/kill")["params"]["terminalId"],
         "term-1"
