@@ -81,8 +81,8 @@ jobs:
 
           # Homebrew formula for siGit Code (\`sigit\` binary).
           class Sigit < Formula
-            desc 'AI coding agent powered by local LLM via Onde Inference'
-            homepage 'https://github.com/getsigit/sigit'
+            desc 'A modular local inference LLM coding agent. Core component of siGit Factory.'
+            homepage 'https://sigit.si/code'
             version '${VERSION}'
             license 'Apache-2.0'
 

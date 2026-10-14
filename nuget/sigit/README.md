@@ -1,7 +1,7 @@
 # siGit Code for .NET
 
-`sigit` is the command-line interface for [siGit Code](https://sigit.si), an AI coding agent that
-runs on your machine.
+`sigit` is the command-line interface for [siGit Code](https://sigit.si) — a modular local
+inference LLM coding agent and core component of siGit Factory.
 
 ## Install
 
@@ -59,7 +59,7 @@ npm, and PyPI packages each download only the binary for your platform.
 ## Source
 
 - Repository: <https://github.com/getsigit/sigit>
-- Website: <https://sigit.si>
+- Website: <https://sigit.si/code>
 - Issues: <https://github.com/getsigit/sigit/issues>
 
 ## License
@@ -68,4 +68,4 @@ npm, and PyPI packages each download only the binary for your platform.
 
 ## Copyright
 
-© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)).
+© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](https://github.com/getsigit/sigit/blob/main/NOTICE) for the rights holder and distributor.

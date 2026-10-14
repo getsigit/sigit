@@ -4,14 +4,17 @@
   <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Crates.io"></a>
   <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/v/sigit-code?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
   <a href="https://www.npmjs.com/package/@getsigit/sigit"><img src="https://img.shields.io/npm/v/@getsigit/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
-  <a href="https://smbcloud.xyz"><img src="https://img.shields.io/badge/smbcloud.xyz-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
+  <a href="https://sigit.si/code"><img src="https://img.shields.io/badge/sigit.si%2Fcode-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
-siGit Code is the local agent runtime for **siGit Factory**. It runs on your machine by default,
-with optional cloud inference and remote automation when you choose them.
+siGit Code is a local-first AI coding agent. It runs on your machine by default, with optional
+cloud inference and remote automation when you choose them. No API key is required to start; the
+on-device path needs none at all.
 
-Its home is [code.sigit.si](https://code.sigit.si). You can run it yourself, as below, or use the hosted version (siGit Code Cloud) there if you would rather not run a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
+It is the agent runtime for [siGit Factory](https://factory.sigit.si/), the hosted version of the
+same product. Run it yourself, as below, or use siGit Code Cloud there if you would rather not
+host a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
 
 It works in any codebase. In smbCloud repos it is more useful out of the box because it already understands the Rust workspace layout, deploy flows, auth boundaries, and GresIQ.
 
@@ -130,6 +133,24 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 }
 ```
 
+## ACP support
+
+siGit Code speaks [Agent Client Protocol](https://agentclientprotocol.com) v1 over stdio.
+As of 1.7.0 it implements the whole stable v1 surface an agent can offer:
+
+| Area | What is supported |
+|------|-------------------|
+| Sessions | `session/new`, `load`, `resume`, `fork`, `list` (paged, with a `cwd` filter), `close`, `delete`, and multi-root projects through `additionalDirectories` |
+| Prompts | Text, images, audio, embedded resources and resource links. Stop reasons `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` and `cancelled` |
+| Updates | Message and thought chunks with a `messageId`, tool calls with diffs, locations and embedded terminals, plans, `usage_update`, `session_info_update`, slash commands |
+| Cancellation | `session/cancel`, and `$/cancel_request` for a prompt or a sign-in |
+| Permissions | `session/request_permission` with allow or deny, once or for the session. Manual, Auto and Plan as config options and as session modes |
+| Client features | `fs/read_text_file` and `fs/write_text_file`, `terminal/*`, URL-mode elicitation and boolean config options, each used only when the client advertises it |
+| MCP | stdio and Streamable HTTP servers passed in `mcpServers` |
+| Auth | `authenticate` (browser sign-in) and `logout` |
+
+`session/fork` is still marked unstable in the protocol. Draft v2 is not enabled.
+
 ## Terminal mode
 
 Run `sigit` in a terminal and you get the same model and system prompt as the editor integration, just in a full-screen chat UI.
@@ -206,10 +227,6 @@ editor, put it in the agent's `env` block:
 
 [Apache 2.0](https://github.com/getsigit/sigit/blob/main/LICENSE)
 
-## Distribution
-
-[Splitfire AB](https://5mb.app).
-
 ## Copyright
 
-© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)).
+© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](https://github.com/getsigit/sigit/blob/main/NOTICE) for the rights holder and distributor.
