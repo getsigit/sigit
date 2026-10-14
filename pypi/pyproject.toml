@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sigit-code"
-description = "AI coding agent powered by local LLM via Onde Inference."
+description = "A modular local inference LLM coding agent. Core component of siGit Factory."
 readme = "README.md"
 requires-python = ">=3.8"
 dynamic = ["version"]
@@ -14,7 +14,7 @@ authors = [
     { name = "paydii", email = "193906237+paydii@users.noreply.github.com" },
     { name = "keypair34", email = "216233964+keypair34@users.noreply.github.com" }
 ]
-keywords = ["sigit", "cli", "ai", "coding-agent", "llm", "on-device"]
+keywords = ["cli", "ai", "coding-agent", "llm", "acp", "local", "on-device", "sigit"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -31,7 +31,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://sigit.si"
+Homepage = "https://sigit.si/code"
 Documentation = "https://github.com/getsigit/sigit"
 Repository = "https://github.com/getsigit/sigit"
 Issues = "https://github.com/getsigit/sigit/issues"

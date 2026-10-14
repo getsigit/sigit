@@ -1255,4 +1255,4 @@ ACP and editor mode work on Windows. The part that is still missing is the inter
 
 ---
 
-*© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)), distributed by [Splitfire AB](https://5mb.app).*
+*© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](NOTICE) for the rights holder and distributor.*

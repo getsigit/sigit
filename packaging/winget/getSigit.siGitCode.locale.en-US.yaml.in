@@ -6,14 +6,16 @@ Publisher: getSigit
 PublisherUrl: https://sigit.si/
 PublisherSupportUrl: https://github.com/@REPO@/issues
 PackageName: siGit Code
-PackageUrl: https://code.sigit.si
+PackageUrl: https://sigit.si/code
 License: Apache-2.0
 LicenseUrl: https://github.com/@REPO@/blob/main/LICENSE
-Copyright: Copyright 2026 PT Sigit Mitra Bangun
-ShortDescription: siGit Code, an AI coding agent that runs on your machine.
+Copyright: Copyright 2026 Seto Elkahfi, trading as siGit Code & Deploy
+ShortDescription: A modular local inference LLM coding agent. Core component of siGit Factory.
 Description: |-
-  siGit Code is a local coding agent. It runs on your machine, not someone
-  else's. No API keys, no cloud round-trips, no subscription.
+  siGit Code is a modular local inference LLM coding agent and the core
+  component of siGit Factory. It runs on your machine by default, with
+  optional cloud inference and remote automation when you choose them.
+  No API key is required to start; the on-device path needs none at all.
 
   It works two ways from the same binary. Zed and other ACP-compatible
   editors start it over stdio and talk the Agent Client Protocol to it. Run
@@ -31,6 +33,7 @@ Tags:
   - coding-agent
   - developer-tools
   - llm
+  - local
   - terminal
 ReleaseNotesUrl: https://github.com/@REPO@/releases/tag/@TAG@
 Documentations:

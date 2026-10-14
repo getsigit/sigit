@@ -4,14 +4,17 @@
   <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Crates.io"></a>
   <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/v/sigit-code?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
   <a href="https://www.npmjs.com/package/@getsigit/sigit"><img src="https://img.shields.io/npm/v/@getsigit/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
-  <a href="https://smbcloud.xyz"><img src="https://img.shields.io/badge/smbcloud.xyz-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
+  <a href="https://sigit.si/code"><img src="https://img.shields.io/badge/sigit.si%2Fcode-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
-siGit Code is the local agent runtime for **siGit Factory**. It runs on your machine by default,
-with optional cloud inference and remote automation when you choose them.
+siGit Code is a local-first AI coding agent. It runs on your machine by default, with optional
+cloud inference and remote automation when you choose them. No API key is required to start; the
+on-device path needs none at all.
 
-Its home is [code.sigit.si](https://code.sigit.si). You can run it yourself, as below, or use the hosted version (siGit Code Cloud) there if you would rather not run a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
+It is the agent runtime for [siGit Factory](https://sigit.si/code), the hosted version of the
+same product. Run it yourself, as below, or use siGit Code Cloud there if you would rather not
+host a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
 
 It works in any codebase. In smbCloud repos it is more useful out of the box because it already understands the Rust workspace layout, deploy flows, auth boundaries, and GresIQ.
 
@@ -224,10 +227,6 @@ editor, put it in the agent's `env` block:
 
 [Apache 2.0](https://github.com/getsigit/sigit/blob/main/LICENSE)
 
-## Distribution
-
-[Splitfire AB](https://5mb.app).
-
 ## Copyright
 
-© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)).
+© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](https://github.com/getsigit/sigit/blob/main/NOTICE) for the rights holder and distributor.

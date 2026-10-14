@@ -10,9 +10,9 @@
 pkgname=sigit-bin
 pkgver=@VERSION@
 pkgrel=1
-pkgdesc="siGit Code, an AI coding agent that runs on your machine"
+pkgdesc="A modular local inference LLM coding agent. Core component of siGit Factory."
 arch=('x86_64' 'aarch64')
-url="https://github.com/getsigit/sigit"
+url="https://sigit.si/code"
 license=('Apache-2.0')
 depends=('glibc' 'gcc-libs')
 provides=('sigit')
