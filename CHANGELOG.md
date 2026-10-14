@@ -79,6 +79,28 @@ with its reasoning and attachments.
   blob becomes an image input and an audio blob an audio input. Any other blob
   keeps its placeholder, now with its MIME type.
 
+## 1.6.9
+
+### Fixed
+
+- **Doubled-bar DSML markers survive inline tool-call recovery.** Some models
+  write `||name||args||` (and single-bar `|name|args|`) instead of the
+  underscore-form `__name__args__` that `inline_tool_calls` was matching.
+  These were being dropped from the recovered reply and from history, so the
+  model thought its call had run. The scanner now accepts both forms, and
+  a buffer that contains no doubled bar skips the regex fold entirely
+  instead of allocating an empty `String`.
+
+### Changed
+
+- **The release workflow is split into full-release and scoped-patch flows.**
+  `sigit-code-release` now leads with a scoped-patch path for one or two
+  commits on top of the last tag (no new release skill, no ACP advert,
+  no `## $version` requirement), then a full-release path for normal
+  development → `main` releases. Winget CI also gets a blank line between
+  the issue body and the manifest PR body so the rendered issue no longer
+  runs the two together.
+
 ## 1.6.8
 
 ### Fixed
