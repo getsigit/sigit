@@ -33,6 +33,10 @@
 //! malformed when what follows the marker looks like the start of a call (see
 //! [`looks_like_xml_call`] and [`looks_like_k3_call`]); otherwise it stays
 //! text, as it always did.
+//!
+//! One spelling difference is folded away before matching: DSML markers are
+//! built from fullwidth bars, and some stacks hand them back with each bar
+//! doubled (`<｜｜DSML｜｜invoke …>`). See [`fold_dsml_bars`].
 
 use std::collections::HashMap;
 
@@ -52,6 +56,13 @@ const K3_RESPONSE_CLOSE: &str = "<|close|>response<|sep|>";
 const K3_THINK_OPEN: &str = "<|open|>think<|sep|>";
 const K3_THINK_CLOSE: &str = "<|close|>think<|sep|>";
 const K3_SEP: &str = "<|sep|>";
+
+/// `｜` (U+FF5C), the bar every DSML marker above is built from.
+const FULLWIDTH_BAR: char = '｜';
+/// Two of them — the spelling [`fold_dsml_bars`] rewrites into one.
+const DOUBLED_BAR: &str = "｜｜";
+/// The name those markers wrap, and the only place [`fold_dsml_bars`] folds.
+const DSML_TAG_NAME: &str = "DSML";
 
 const DSML_TOOL_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
 const DSML_TOOL_CALLS_CLOSE: &str = "<｜DSML｜/tool_calls>";
@@ -447,6 +458,16 @@ impl<'a> StreamScanner<'a> {
     /// be empty if the chunk was absorbed into a tag that hasn't closed yet.
     pub fn push(&mut self, chunk: &str) -> Vec<ScanEvent> {
         self.pending.push_str(chunk);
+        // The fold runs on the whole buffer, not the chunk: a doubled bar split
+        // across two deltas is only visible once they are joined, and a marker
+        // is never emitted before then because a partial prefix is held back.
+        // Both the single- and doubled-bar spellings are partial prefixes
+        // (START_MARKERS is single-bar), so a doubled-bar prefix is flushed as
+        // text on this push; the fold then rewrites the buffer and the next
+        // push re-runs `drain` against canonical markers.
+        if let Some(folded) = fold_dsml_bars(&self.pending) {
+            self.pending = folded;
+        }
         self.drain()
     }
 
@@ -649,6 +670,71 @@ fn looks_like_k3_call(after_marker: &str) -> bool {
 fn looks_like_dsml_call(after_marker: &str) -> bool {
     let rest = after_marker.trim_start();
     rest.is_empty() || rest.starts_with(DSML_INVOKE_OPEN)
+}
+
+/// Every DSML marker above carries exactly one fullwidth bar on each side of
+/// `DSML`. Some serving stacks emit each bar twice (`<｜｜DSML｜｜invoke …>`),
+/// which no marker matches, so the block falls through as text and renders raw
+/// in the editor.
+///
+/// Folding the run on both sides of `DSML` down to a single bar, rather than
+/// listing a doubled-bar constant next to each one, keeps the marker set at six
+/// and covers a run of any length. A bar run elsewhere is never touched, so a
+/// fullwidth bar used as prose or as a table rule passes through unchanged. The
+/// fold is not conditional on the block parsing, so a doubled-bar marker that
+/// turns out not to be a call comes back with single bars — markup either way.
+///
+/// Returns `None` when there is nothing to fold — in particular for any buffer
+/// without a doubled bar, which is the common case and costs no allocation.
+fn fold_dsml_bars(text: &str) -> Option<String> {
+    if !text.contains(DSML_TAG_NAME) {
+        return None;
+    }
+    // A DSML tag with only single bars is canonical; only the doubled-bar
+    // spelling needs rewriting, so the buffer-walking allocation can be
+    // skipped when the only defect isn't present.
+    if !text.contains(DOUBLED_BAR) {
+        return None;
+    }
+    let mut folded = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut rest = text;
+    while let Some(idx) = rest.find(DSML_TAG_NAME) {
+        let (before, from_name) = rest.split_at(idx);
+        // The run of bars closing the tag being opened, i.e. `<｜｜` in
+        // `<｜｜DSML｜｜invoke`. Counted in bars, not bytes: a lone fullwidth bar
+        // is three bytes, so a byte count would read as a run of its own.
+        let opening_run = bar_run_len(before, false);
+        folded.push_str(&before[..before.len() - opening_run * FULLWIDTH_BAR.len_utf8()]);
+        if opening_run > 0 {
+            changed |= opening_run > 1;
+            folded.push(FULLWIDTH_BAR);
+        }
+        folded.push_str(DSML_TAG_NAME);
+        let after = &from_name[DSML_TAG_NAME.len()..];
+        // The run opening the tag being closed, i.e. `｜｜>` in
+        // `<｜DSML｜｜/invoke>`.
+        let closing_run = bar_run_len(after, true);
+        if closing_run > 0 {
+            changed |= closing_run > 1;
+            folded.push(FULLWIDTH_BAR);
+        }
+        rest = &after[closing_run * FULLWIDTH_BAR.len_utf8()..];
+    }
+    folded.push_str(rest);
+    changed.then_some(folded)
+}
+
+/// Number of fullwidth bars in the run at the end of `text`, or at its start
+/// when `leading` is set. The caller passes the slice anchored to `DSML`, so
+/// the run being counted always sits at the boundary, never in the middle.
+fn bar_run_len(text: &str, leading: bool) -> usize {
+    let bytes = if leading {
+        text.len() - text.trim_start_matches(FULLWIDTH_BAR).len()
+    } else {
+        text.len() - text.trim_end_matches(FULLWIDTH_BAR).len()
+    };
+    bytes / FULLWIDTH_BAR.len_utf8()
 }
 
 fn scan_complete_text(text: &str, tools: &[ToolSpec]) -> Vec<ScanEvent> {
@@ -1491,5 +1577,96 @@ mod tests {
                 "<｜DSML｜tool_calls><｜DSML｜invoke name=\"run_command\">".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn fold_dsml_bars_collapses_runs_glued_to_dsml_only() {
+        assert_eq!(
+            fold_dsml_bars("<｜｜DSML｜｜invoke name=\"run_command\">"),
+            Some("<｜DSML｜invoke name=\"run_command\">".to_string())
+        );
+        assert_eq!(
+            fold_dsml_bars("<｜｜｜｜DSML｜/tool_calls>"),
+            Some("<｜DSML｜/tool_calls>".to_string())
+        );
+        // Only the bar run adjacent to DSML folds; a doubled bar further along
+        // in the tag name or body is not part of the marker grammar.
+        assert_eq!(
+            fold_dsml_bars("<｜DSML｜｜param｜｜eter"),
+            Some("<｜DSML｜param｜｜eter".to_string())
+        );
+        // A bar run that isn't a marker, and single-bar markup, are left alone.
+        assert_eq!(fold_dsml_bars("a ｜｜ b <｜DSML｜invoke>"), None);
+        assert_eq!(fold_dsml_bars("<｜DSML｜invoke>"), None);
+        assert_eq!(fold_dsml_bars("plain text"), None);
+    }
+
+    #[test]
+    fn a_doubled_bar_dsml_call_is_recovered() {
+        let tools = vec![run_command_spec()];
+        let Extracted {
+            text,
+            calls,
+            malformed,
+        } = extract(
+            "before <｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"run_command\">\
+             <｜｜DSML｜｜parameter name=\"command\" string=\"true\">echo hi\
+             <｜｜DSML｜｜/parameter><｜｜DSML｜｜/invoke><｜｜DSML｜｜/tool_calls> after",
+            &tools,
+        );
+
+        assert_eq!(text, "before  after");
+        assert_eq!(malformed, 0);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "echo hi");
+    }
+
+    #[test]
+    fn a_doubled_bar_split_across_pushes_is_recovered() {
+        let tools = vec![run_command_spec()];
+        let mut scanner = StreamScanner::new(&tools);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+
+        for chunk in [
+            "pre <｜",
+            "｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"run_com",
+            "mand\"><｜｜DSML｜｜parameter name=\"command\" string=\"true\">echo hi\
+             <｜｜DSML｜｜/parameter><｜｜DSML｜｜/invoke><｜｜DSML｜｜/tool_calls>",
+            " post",
+        ] {
+            for event in scanner.push(chunk) {
+                match event {
+                    ScanEvent::Text(t) => text.push_str(&t),
+                    ScanEvent::ToolCall(call) => calls.push(call),
+                    ScanEvent::Malformed(block) => panic!("unexpected malformed block: {block}"),
+                }
+            }
+        }
+        if let Some(ScanEvent::Text(rest)) = scanner.finish() {
+            text.push_str(&rest);
+        }
+
+        assert_eq!(text, "pre  post");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "echo hi");
+    }
+
+    #[test]
+    fn doubled_bar_markup_outside_a_call_returns_folded_as_text() {
+        let tools = vec![run_command_spec()];
+        let Extracted {
+            text,
+            calls,
+            malformed,
+        } = extract("the tag <｜｜DSML｜｜done> is not a call", &tools);
+
+        assert_eq!(text, "the tag <｜DSML｜done> is not a call");
+        assert!(calls.is_empty());
+        assert_eq!(malformed, 0);
     }
 }
