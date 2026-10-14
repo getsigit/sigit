@@ -31,9 +31,10 @@
 //! error. Opt out with `smbcloud = false` in `mcp.toml` or
 //! `SIGIT_MCP_SMBCLOUD=off`.
 //!
-//! The App Store Connect API CLI's MCP server (`asc --mcp`, stdio) is baked
-//! in the same way: only when the `asc` binary is on `PATH`, opt out with
-//! `ascapi = false` in `mcp.toml` or `SIGIT_MCP_ASCAPI=off`.
+//! Ascapi — the App Stores Coolest API, via its own CLI's MCP server
+//! (`asc --mcp`, stdio) — is baked in the same way: only when the `asc` binary
+//! is on `PATH`, opt out with `ascapi = false` in `mcp.toml` or
+//! `SIGIT_MCP_ASCAPI=off`.
 //!
 //! All baked-in entries yield to a user-defined `mcp.toml` server of the same
 //! name, so either can be repointed or reconfigured without a special case.
@@ -119,17 +120,16 @@ pub fn smbcloud_tool_suffix(name: &str) -> Option<&str> {
         .strip_prefix("__")
 }
 
-/// Name of the baked-in App Store Connect API CLI server; its tools are
-/// namespaced `mcp__ascapi__<tool>`. Like the other baked-in servers, a
+/// Name of the baked-in Ascapi (the App Stores Coolest API) server; its tools
+/// are namespaced `mcp__ascapi__<tool>`. Like the other baked-in servers, a
 /// user-defined `mcp.toml` entry with this name overrides the baked-in
 /// command line.
 const ASCAPI_SERVER_NAME: &str = "ascapi";
 
-/// The App Store Connect API CLI binary the baked-in stdio entry spawns
-/// (`asc --mcp`).
+/// The Ascapi CLI binary the baked-in stdio entry spawns (`asc --mcp`).
 const ASCAPI_COMMAND: &str = "asc";
 
-/// The bare tool name when `name` belongs to the ascapi server
+/// The bare tool name when `name` belongs to the Ascapi server
 /// (`mcp__ascapi__app_list` → `Some("app_list")`), else `None`.
 pub fn ascapi_tool_suffix(name: &str) -> Option<&str> {
     name.strip_prefix(MCP_PREFIX)?
@@ -279,9 +279,9 @@ struct McpFile {
     /// `true`; set `false` to opt out. Moot when `smb` isn't installed.
     #[serde(default)]
     smbcloud: Option<bool>,
-    /// Include the baked-in App Store Connect API CLI server (`asc --mcp`).
-    /// Defaults to `true`; set `false` to opt out. Moot when `asc` isn't
-    /// installed.
+    /// Include the baked-in Ascapi server (`asc --mcp`) — Ascapi is the App
+    /// Stores Coolest API. Defaults to `true`; set `false` to opt out. Moot
+    /// when `asc` isn't installed.
     #[serde(default)]
     ascapi: Option<bool>,
     #[serde(default)]
@@ -505,7 +505,7 @@ fn load_configs() -> Vec<ServerDef> {
         }
     }
 
-    // The ascapi server can also be disabled with SIGIT_MCP_ASCAPI=off.
+    // The Ascapi server can also be disabled with SIGIT_MCP_ASCAPI=off.
     if let Ok(value) = std::env::var("SIGIT_MCP_ASCAPI")
         && matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -515,7 +515,7 @@ fn load_configs() -> Vec<ServerDef> {
         include_ascapi = false;
     }
 
-    // Add the baked-in ascapi server (`asc --mcp`), with the same
+    // Add the baked-in Ascapi server (`asc --mcp`), with the same
     // never-clobber rule as the others. Only when `asc` is actually
     // installed: a hardwired entry for a binary most users don't have
     // would surface a spawn failure in `/mcp` instead of just staying out
@@ -531,7 +531,7 @@ fn load_configs() -> Vec<ServerDef> {
                 },
             });
         } else {
-            log::debug!("mcp: `{ASCAPI_COMMAND}` not on PATH; skipping the ascapi server");
+            log::debug!("mcp: `{ASCAPI_COMMAND}` not on PATH; skipping the Ascapi server");
         }
     }
 

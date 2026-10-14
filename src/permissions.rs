@@ -107,7 +107,7 @@ pub enum Decision {
 /// (`mcp__smbcloud__*`) read tools are exempted by an explicit allow-list
 /// rather than a name shape, since its names don't follow the `list_`/`get_`
 /// convention — a tool the list doesn't know (e.g. from a newer smb) fails
-/// safe to mutating. The `ascapi` App Store Connect CLI server
+/// safe to mutating. The Ascapi (the App Stores Coolest API) server
 /// (`mcp__ascapi__*`) works the same way as the smbCloud one: a fixed
 /// allow-list of the read-only `asc apps *`/`asc certificates list`/etc.
 /// tool names exempts them, and any other name on that server (or an empty
