@@ -12,7 +12,7 @@ siGit Code is a local-first AI coding agent. It runs on your machine by default,
 cloud inference and remote automation when you choose them. No API key is required to start; the
 on-device path needs none at all.
 
-It is the agent runtime for [siGit Factory](https://sigit.si/code), the hosted version of the
+It is the agent runtime for [siGit Factory](https://factory.sigit.si/), the hosted version of the
 same product. Run it yourself, as below, or use siGit Code Cloud there if you would rather not
 host a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
 
