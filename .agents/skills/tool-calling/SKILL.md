@@ -13,7 +13,7 @@ Tool calling spans these layers:
 
 ```
 siGit (agent loop + tool execution)
-  → InferenceBackend (src/backend.rs — LocalBackend or OpenAiBackend/cloud)
+  → InferenceBackend (crates/cli/src/backend.rs — LocalBackend or OpenAiBackend/cloud)
     → onde ChatEngine (tool-aware API)   ── for LocalBackend
       → mistral.rs (model inference + tool call parsing)
     └ OpenAI-compatible HTTP endpoint    ── for OpenAiBackend (siGit Code Cloud)
@@ -31,7 +31,7 @@ a remote OpenAI-compatible endpoint (the siGit Code Cloud tiers). Both implement
 Tool calling needs a model mistral.rs has a tool-call parser for. The supported
 set is the **Qwen 3 family** (`<tool_call>...</tool_call>` XML) plus **Qwen 2.5
 Coder 7B**. Plain Qwen 2.5 and the smaller Qwen 2.5 Coder variants do NOT support
-tool calling. The authoritative list is `is_tool_calling()` in `src/models.rs`.
+tool calling. The authoritative list is `is_tool_calling()` in `crates/cli/src/models.rs`.
 
 | Model | Constructor | Size | Tool calling |
 |-------|-----------|------|:---:|
@@ -54,7 +54,7 @@ fallback. Users pick a tool-calling model via the `/models` picker.
 
 ### max_tokens
 
-`max_tokens_for()` in `src/models.rs` gives tool-calling models **4096** tokens
+`max_tokens_for()` in `crates/cli/src/models.rs` gives tool-calling models **4096** tokens
 and non-tool models **512** (tool models need headroom because `<think>` blocks
 eat the budget). The TUI startup load in `run_interactive` overrides this to
 **8192**. Don't assume a single value.
@@ -139,7 +139,7 @@ In ACP mode, `handle_prompt` currently always passes the full tool set (`agent_t
 | `send_message_with_tools(msg, &[ToolDefinition])` | Returns `ToolAwareResult` with possible tool calls |
 | `send_tool_results(Vec<ToolResult>, Option<&[ToolDefinition]>)` | Feed results back; `None` forces text response |
 
-#### Layer 2.5: the `InferenceBackend` abstraction (`src/backend.rs`)
+#### Layer 2.5: the `InferenceBackend` abstraction (`crates/cli/src/backend.rs`)
 
 siGit doesn't call the engine directly from the agent loop — it goes through the
 `InferenceBackend` trait so on-device and cloud inference share one code path:
@@ -155,7 +155,7 @@ siGit doesn't call the engine directly from the agent loop — it goes through t
 `handle_prompt` snapshots `self.backend.lock().await.clone()` once per turn so a
 mid-turn model/tier switch can't split the conversation across backends. When
 `backend.is_remote()` it skips the local model load + readiness wait. Cloud tiers
-(`fast`, `balanced`, `large`) come from `src/provider.rs` and are sign-in gated.
+(`fast`, `balanced`, `large`) come from `crates/cli/src/provider.rs` and are sign-in gated.
 
 #### Internal details
 
@@ -167,7 +167,7 @@ mid-turn model/tier switch can't split the conversation across backends. When
 
 ### Layer 3: siGit (agent-level)
 
-#### ACP session handling (`src/main.rs`)
+#### ACP session handling (`crates/cli/src/main.rs`)
 
 All session handlers (`load_session`, `fork_session`, `new_session`) do:
 
@@ -252,7 +252,7 @@ Models are stored in the shared Onde App Group container on macOS:
 
 ## Adding a New Tool
 
-1. Add an `AgentTool` entry to `all_tools()` in `src/tools.rs`
+1. Add an `AgentTool` entry to `all_tools()` in `crates/cli/src/tools.rs`
 2. Add a match arm to `execute_tool()` — use `spawn_blocking` if the implementation blocks
 3. Write `exec_your_tool(arguments: &str) -> String`
 4. Update `test_all_tools_count` test (currently expects 9)
