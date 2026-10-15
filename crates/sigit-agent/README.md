@@ -42,6 +42,9 @@ tokio::spawn(ed_acp::serve(Arc::new(SiGitCode::without_shell()), opts, agent_end
 // Connect an ACP client to `client_end`, then initialize, authenticate and open a session.
 ```
 
+`ed_acp::serve` is a future, so this runs inside the host's own async runtime. The example
+assumes a `tokio` runtime, so the host needs `tokio` as a dependency.
+
 `crates/sigit-agent/tests/embedded.rs` is a complete version of this against a mock
 endpoint: it checks that the sign-in method is advertised, that a signed-out session is
 refused, that a stored session reaches the endpoint as the bearer, and that signing out takes
