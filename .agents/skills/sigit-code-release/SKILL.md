@@ -17,20 +17,20 @@ Use this skill when preparing a release for this repository.
 ## Working approach
 
 1. Read the files that define the release version and distribution metadata before proposing any changes.
-2. Treat `Cargo.toml` as the primary release version source for the Rust crate and the PyPI package in this repository.
+2. Treat `[workspace.package].version` in the root `Cargo.toml` as the primary release version source for the Rust crate and the PyPI package in this repository.
 3. Check how the release workflows rewrite or derive versions before editing checked-in npm or Python metadata.
 4. Prefer targeted verification commands that match CI or packaging workflows already present in the repository.
 5. Report blockers clearly: failed checks, version mismatches, missing changelog entries, or unpublished packaging changes.
 
 ## Repo-specific release rules
 
-- Bump the crate version in `Cargo.toml`.
+- Bump `[workspace.package].version` in the root `Cargo.toml`; every workspace crate inherits it.
 - Update the root `sigit` package entry in `Cargo.lock` when the crate version changes.
 - Add or update the top changelog entry in `CHANGELOG.md` for the release being cut.
 - Do not treat `npm/sigit/package.json` `0.0.0-dev` as a bug by default. The npm release workflow rewrites it at publish time using `npm/scripts/render-main-package.cjs` and the release tag.
 - Every npm package publishes twice, under `@getsigit` and under `@smbcloud`. `@smbcloud` is the pre-1.5.5 name, mirrored so an install predating the rename keeps updating; `@getsigit` is canonical and is what the README, the Homebrew tap, and the ACP registry entry point at. All fourteen names (two base packages, twelve platform packages) publish over OIDC and each needs its own Trusted Publisher on npm pointing at `release-npm.yml`.
 - The scope is a render-time argument, not a second copy of the packaging: `render-platform-package.cjs` takes it as a fifth argument, and the base package picks it up from `package-main.json.tmpl` versus `package-compat.json.tmpl`. `npm/sigit/src/index.ts` is built once and shipped under both names — it reads its own `package.json` at runtime to decide which scope to resolve the platform binary from, and prints the migration notice only when it finds itself running as `@smbcloud/sigit`.
-- Do not add a hardcoded version to `pypi/pyproject.toml` for normal releases. PyPI uses `maturin` with `dynamic = ["version"]` and derives the published package version from `Cargo.toml`.
+- Do not add a hardcoded version to `pypi/pyproject.toml` for normal releases. PyPI uses `maturin` with `dynamic = ["version"]` and derives the published package version from `crates/cli/Cargo.toml`, which inherits the workspace version.
 - Release workflows are tag-driven. `release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, `release-homebrew.yml`, `release-nuget.yml`, and `release-mcp-registry.yml` all derive `RELEASE_VERSION` from a `v*.*.*` tag or a manually supplied tag input.
 - The crate is published to crates.io (`release-crates.yml`) and the Homebrew tap is updated (`release-homebrew.yml`) as part of the tag-driven flow. Per the siGit release flow, Homebrew is auto-triggered — do not dispatch it manually.
 - `release-github.yml` builds the binaries, attaches them (plus a `.deb`/`.rpm` per Linux target built with nfpm from `packaging/nfpm.yaml`) to the GitHub release, then dispatches `release-homebrew`, `release-scoop`, `release-winget`, and `release-aur`. A dispatch failure in any one of those four is logged as a warning, not a hard failure — an unconfigured channel doesn't block the rest of the release. `release-nuget.yml` and `release-mcp-registry.yml`, by contrast, are tag-triggered directly like the other language-registry workflows, not dispatched from `release-github.yml`.

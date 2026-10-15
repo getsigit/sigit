@@ -19,12 +19,13 @@
     <PackageVersion>0.0.0-local</PackageVersion>
     <Version>$(PackageVersion)</Version>
     <Authors>Seto Elkahfi</Authors>
-    <Description>siGit Code — ACP-compatible AI coding agent. Sí, git.</Description>
+    <Copyright>Copyright 2026 Seto Elkahfi, trading as siGit Code &amp; Deploy</Copyright>
+    <Description>A modular local inference LLM coding agent. Core component of siGit Factory.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
-    <PackageProjectUrl>https://sigit.si</PackageProjectUrl>
+    <PackageProjectUrl>https://sigit.si/code</PackageProjectUrl>
     <RepositoryUrl>https://github.com/getsigit/sigit</RepositoryUrl>
-    <PackageTags>cli;sigit;ai;coding-agent;llm;acp;developer-tools;dotnet-tool</PackageTags>
+    <PackageTags>cli;ai;coding-agent;llm;acp;local;on-device;developer-tools;dotnet-tool;sigit</PackageTags>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
   </PropertyGroup>
 

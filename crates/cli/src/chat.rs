@@ -652,6 +652,9 @@ mod tui {
         Session,
         /// skip the call; the model gets an explanatory tool result
         Deny,
+        /// skip it and stop asking: deny calls like it for the rest of the
+        /// session
+        DenySession,
     }
 
     enum ModelLoadUpdate {
@@ -736,7 +739,7 @@ mod tui {
         stream_buf: String,
         inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
         model_load_rx: Option<mpsc::Receiver<ModelLoadUpdate>>,
-        /// a tool call waiting on the user's y/a/n answer; the inference task is
+        /// a tool call waiting on the user's y/a/n/d answer; the inference task is
         /// paused on the other end of the channel
         pending_approval: Option<(String, oneshot::Sender<ApprovalChoice>)>,
         thinking: bool,
@@ -2590,7 +2593,7 @@ mod tui {
 
         if let Some((tool, _)) = &app.pending_approval {
             spans.push(Span::styled(
-                format!("  allow {tool}? [y]es · [a]lways · [n]o"),
+                format!("  allow {tool}? [y]es · [a]lways · [n]o · [d]eny always"),
                 Style::default().fg(Color::Yellow),
             ));
         } else if app.thinking || app.switching_model || app.is_streaming() {
@@ -3272,7 +3275,7 @@ mod tui {
 
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may pause on the user's
-                // y/a/n answer (delivered over a oneshot from the event loop).
+                // y/a/n/d answer (delivered over a oneshot from the event loop).
                 use crate::permissions::{self, Decision, TUI_SESSION};
                 let output = match permissions::decision_for(TUI_SESSION, &tc.name, &tc.arguments) {
                     Decision::Allow => crate::tools::execute_tool(&tc.name, &tc.arguments).await,
@@ -3303,6 +3306,11 @@ mod tui {
                             }
                             Ok(ApprovalChoice::Deny) => {
                                 log::info!("  ✗ {} denied by user", tc.name);
+                                permissions::user_denial(&tc.name)
+                            }
+                            Ok(ApprovalChoice::DenySession) => {
+                                log::info!("  ✗ {} denied by user for the session", tc.name);
+                                permissions::deny_for_session(TUI_SESSION, &tc.name, &tc.arguments);
                                 permissions::user_denial(&tc.name)
                             }
                             // The UI dropped the reply channel (Ctrl+C or
@@ -3596,7 +3604,7 @@ mod tui {
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
                         Some(InferenceUpdate::ApprovalRequest { tool, args, reply }) => {
-                            // The y/a/n prompt lives on the Session tab; make
+                            // The y/a/n/d prompt lives on the Session tab; make
                             // sure the user can see what they're answering.
                             app.active_tab = Tab::Session;
                             let call = if args.is_empty() {
@@ -3605,7 +3613,7 @@ mod tui {
                                 format!("{tool}({args})")
                             };
                             app.messages.push(ChatMessage::system(format!(
-                                "⚠ permission — allow {call}?  [y]es · [a]lways this session · [n]o"
+                                "⚠ permission — allow {call}?  [y]es · [a]lways this session · [n]o · [d]eny this session"
                             )));
                             app.pending_approval = Some((tool, reply));
                         }
@@ -3709,7 +3717,7 @@ mod tui {
                             continue;
                         }
 
-                        // pending tool approval — y/a/n answer the prompt; the
+                        // pending tool approval — y/a/n/d answer the prompt; the
                         // inference task is paused on the reply channel. Checked
                         // before the busy gate because the app *is* busy here.
                         if app.pending_approval.is_some() {
@@ -3736,6 +3744,9 @@ mod tui {
                                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                                             Some(ApprovalChoice::Deny)
                                         }
+                                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                                            Some(ApprovalChoice::DenySession)
+                                        }
                                         _ => None,
                                     }
                                 };
@@ -3746,6 +3757,7 @@ mod tui {
                                         ApprovalChoice::Once => "allowed once",
                                         ApprovalChoice::Session => "allowed for this session",
                                         ApprovalChoice::Deny => "denied",
+                                        ApprovalChoice::DenySession => "denied for this session",
                                     };
                                     app.messages.push(ChatMessage::system(format!(
                                         "{tool}: {verdict}"

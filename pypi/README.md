@@ -1,15 +1,15 @@
 <h1 align="center">siGit Code</h1>
 
 <p align="center">
-  A local coding agent powered by <a href="https://ondeinference.com">Onde Inference</a>.<br>
-  Runs on your machine. No API keys. No cloud round-trips.
+  A modular local inference LLM coding agent. Core component of siGit Factory.<br>
+  Runs on your machine by default, with optional cloud inference when you choose it.
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/v/sigit-code?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
   <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Crates.io"></a>
   <a href="https://www.npmjs.com/package/@getsigit/sigit"><img src="https://img.shields.io/npm/v/@getsigit/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
-  <a href="https://smbcloud.xyz"><img src="https://img.shields.io/badge/smbcloud.xyz-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
+  <a href="https://sigit.si/code"><img src="https://img.shields.io/badge/sigit.si%2Fcode-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
@@ -35,7 +35,7 @@ needs the `--acp` argument.
 
 ### Zed
 
-siGit Code works as an [ACP-compatible](https://github.com/nicobailon/agent-client-protocol) agent in [Zed](https://zed.dev). Add this to your Zed settings:
+siGit Code works as an [ACP-compatible](https://agentclientprotocol.com) agent in [Zed](https://zed.dev). Add this to your Zed settings:
 
 ```json
 {
@@ -86,4 +86,4 @@ This package ships a prebuilt binary. The source code lives at [github.com/getsi
 
 ## Copyright
 
-© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)), distributed by [Splitfire AB](https://5mb.app).
+© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](https://github.com/getsigit/sigit/blob/main/NOTICE) for the rights holder and distributor.

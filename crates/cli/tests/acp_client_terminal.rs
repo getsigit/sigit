@@ -294,6 +294,69 @@ impl AgentUnderTest {
             .to_string()
     }
 
+    /// Send a prompt, then `session/cancel` as soon as the agent starts
+    /// waiting on the editor's terminal. Returns the prompt's response.
+    fn prompt_cancelled_mid_command(&mut self, session_id: &str, editor: &mut Editor) -> Value {
+        self.prompt_stopped_mid_command(session_id, editor, |_prompt_id| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id},
+            })
+        })
+    }
+
+    /// Send a prompt and, once the agent is waiting on the editor's terminal
+    /// (which never answers), send whatever `stop` builds from the prompt's
+    /// request id. Returns the prompt's response.
+    fn prompt_stopped_mid_command(
+        &mut self,
+        session_id: &str,
+        editor: &mut Editor,
+        stop: impl Fn(u64) -> Value,
+    ) -> Value {
+        let id = self.request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "go"}]}),
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out: the cancel did not end the prompt");
+            };
+            if message["id"] == id && message.get("method").is_none() {
+                return message;
+            }
+            let Some(method) = message["method"].as_str() else {
+                continue;
+            };
+            if method == "session/update" {
+                editor.updates.push(message.clone());
+                continue;
+            }
+            if !method.starts_with("terminal/") {
+                continue;
+            }
+            editor.requests.push(message.clone());
+            let request_id = message["id"].clone();
+            let result = match method {
+                "terminal/create" => json!({"terminalId": "term-1"}),
+                "terminal/wait_for_exit" => {
+                    // The command is still running; the user presses stop.
+                    self.send(stop(id));
+                    continue;
+                }
+                "terminal/output" => json!({
+                    "output": "partial\n",
+                    "truncated": false,
+                }),
+                _ => json!({}),
+            };
+            self.send(json!({"jsonrpc": "2.0", "id": request_id, "result": result}));
+        }
+    }
+
     fn prompt(&mut self, session_id: &str, editor: &mut Editor) {
         let id = self.request(
             "session/prompt",
@@ -407,7 +470,17 @@ fn run_command_runs_in_the_client_terminal_and_shows_it() {
         .position(|update| update["status"] == "completed")
         .expect("call_1 never completed");
     assert!(shown < finished, "embedded after completion: {updates:?}");
-    assert_eq!(updates[finished]["content"], terminal);
+    // The terminal was released by then, so the closing update does not name
+    // it again; the card keeps the one already embedded.
+    assert!(
+        updates[finished]["content"].is_null(),
+        "the final update must not re-send the released terminal: {}",
+        updates[finished]
+    );
+    assert_eq!(
+        updates[finished]["rawOutput"],
+        format!("Exit code 0:\n{EDITOR_OUTPUT}")
+    );
 }
 
 #[test]
@@ -501,4 +574,73 @@ fn sigit_client_terminal_off_keeps_commands_local() {
     let result = endpoint.tool_result("call_1");
     assert!(result.contains("ran-locally"), "run_command said: {result}");
     assert!(editor.requests.is_empty(), "{:?}", editor.requests);
+}
+
+#[test]
+fn a_cancel_mid_command_kills_the_client_terminal_and_ends_the_turn_cancelled() {
+    let scratch = Scratch::new("cancel");
+    let endpoint = start_fake_endpoint(vec![
+        echo_call("call_1", &scratch.work, false),
+        sse_text("never asked for"),
+    ]);
+    let mut agent = spawn_agent(endpoint.port, &scratch.config, None);
+    let session_id = agent.open_session(true, &scratch.work);
+
+    let mut editor = Editor::default();
+    let response = agent.prompt_cancelled_mid_command(&session_id, &mut editor);
+
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
+    assert_eq!(
+        editor.methods(),
+        [
+            "terminal/create",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "terminal/output",
+            "terminal/release",
+        ]
+    );
+    assert_eq!(
+        editor.request("terminal/kill")["params"]["terminalId"],
+        "term-1"
+    );
+    assert_eq!(
+        endpoint.requests.lock().unwrap().len(),
+        1,
+        "a cancelled turn must not ask the model for another round"
+    );
+}
+
+/// `$/cancel_request` names the prompt by its JSON-RPC id instead of the
+/// session. It has to stop the turn the same way, and the prompt is still
+/// answered with a result, so the client keeps what was streamed.
+#[test]
+fn a_cancel_request_for_the_prompt_ends_the_turn_cancelled() {
+    let scratch = Scratch::new("cancel_request");
+    let endpoint = start_fake_endpoint(vec![
+        echo_call("call_1", &scratch.work, false),
+        sse_text("never asked for"),
+    ]);
+    let mut agent = spawn_agent(endpoint.port, &scratch.config, None);
+    let session_id = agent.open_session(true, &scratch.work);
+
+    let mut editor = Editor::default();
+    let response = agent.prompt_stopped_mid_command(&session_id, &mut editor, |prompt_id| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancel_request",
+            "params": {"requestId": prompt_id},
+        })
+    });
+
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
+    assert_eq!(
+        editor.request("terminal/kill")["params"]["terminalId"],
+        "term-1"
+    );
+    assert_eq!(
+        endpoint.requests.lock().unwrap().len(),
+        1,
+        "a cancelled turn must not ask the model for another round"
+    );
 }

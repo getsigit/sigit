@@ -1,0 +1,515 @@
+//! End-to-end check that saved threads can be imported through `session/list`.
+//!
+//! Editors offer an "Import Threads" picker only to an agent that advertises
+//! ACP's `sessionCapabilities.list` and answers `session/list` with the
+//! sessions it has stored — before this, Zed said siGit Code doesn't support
+//! the capability (issue #93).
+//!
+//! This drives the real binary against a scripted OpenAI-compatible endpoint:
+//! run one prompt so a session gets saved, then list and assert the thread
+//! comes back with its directory, title, and timestamp — and that the `cwd`
+//! filter keeps another project's threads out.
+
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+const TIMEOUT: Duration = Duration::from_secs(60);
+
+fn sse_text(text: &str) -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices": [{"delta": {"content": text}}]})
+    )
+}
+
+/// Serves one scripted SSE response per request.
+fn start_fake_endpoint(responses: Vec<String>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake endpoint");
+    let port = listener.local_addr().unwrap().port();
+    let queue = Mutex::new(VecDeque::from(responses));
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(match stream.try_clone() {
+                Ok(clone) => clone,
+                Err(_) => continue,
+            });
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let payload = queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "data: [DONE]\n\n".to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    port
+}
+
+struct AgentUnderTest {
+    child: Child,
+    stdin: ChildStdin,
+    incoming: Receiver<Value>,
+    next_id: u64,
+}
+
+fn spawn_agent(port: u16, config_dir: &std::path::Path) -> AgentUnderTest {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sigit"))
+        .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
+        .env("OPENAI_API_KEY", "test-key")
+        .env("SIGIT_MODEL", "scripted-model")
+        .env("SIGIT_CONFIG_DIR", config_dir)
+        .env("SIGIT_MCP", "off")
+        .env("SIGIT_PERMISSIONS", "allow")
+        .env_remove("SIGIT_LOCAL_INFERENCE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sigit in ACP mode");
+
+    let stdout = child.stdout.take().unwrap();
+    let (message_tx, incoming) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(message) = serde_json::from_str::<Value>(&line)
+                && message_tx.send(message).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let stdin = child.stdin.take().unwrap();
+    AgentUnderTest {
+        child,
+        stdin,
+        incoming,
+        next_id: 0,
+    }
+}
+
+impl AgentUnderTest {
+    fn request(&mut self, method: &str, params: Value) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut line =
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        line.push('\n');
+        self.stdin
+            .write_all(line.as_bytes())
+            .expect("write to agent stdin");
+        self.stdin.flush().expect("flush agent stdin");
+        id
+    }
+
+    fn wait_for_response(&mut self, id: u64) -> Value {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the response to request {id}");
+            };
+            if message["id"] == id && message.get("method").is_none() {
+                assert!(
+                    message.get("error").is_none(),
+                    "request {id} failed: {message}"
+                );
+                return message;
+            }
+        }
+    }
+}
+
+impl AgentUnderTest {
+    /// Like `wait_for_response`, for a request that is expected to fail.
+    fn wait_for_reply(&mut self, id: u64) -> Value {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the reply to request {id}");
+            };
+            if message["id"] == id && message.get("method").is_none() {
+                return message;
+            }
+        }
+    }
+}
+
+impl Drop for AgentUnderTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn saved_sessions_are_listed_for_their_project() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_list_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    let other = scratch.join("other");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("Sure thing.")]);
+    let mut agent = spawn_agent(port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let initialize = agent.wait_for_response(id);
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_object(),
+        "the import picker is gated on the session/list capability: {initialize}"
+    );
+
+    // Nothing saved yet.
+    let id = agent.request("session/list", json!({}));
+    let empty = agent.wait_for_response(id);
+    assert_eq!(
+        empty["result"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "no sessions have been saved yet: {empty}"
+    );
+
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let new_session = agent.wait_for_response(id);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "rename the parser module"}],
+        }),
+    );
+    agent.wait_for_response(id);
+
+    // The saved thread shows up for its own project …
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let listed = agent.wait_for_response(id);
+    let sessions = listed["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sessions array: {listed}"));
+    assert_eq!(sessions.len(), 1, "one saved thread expected: {listed}");
+    let info = &sessions[0];
+    assert_eq!(info["sessionId"], json!(session_id));
+    assert_eq!(
+        std::fs::canonicalize(info["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&project).unwrap()
+    );
+    assert_eq!(
+        info["title"], "rename the parser module",
+        "the title comes from the first user message: {info}"
+    );
+    let updated_at = info["updatedAt"].as_str().unwrap_or_default();
+    assert!(
+        updated_at.len() == 24 && updated_at.ends_with('Z') && updated_at.contains('.'),
+        "updatedAt should be an ISO 8601 UTC instant with milliseconds, got {updated_at:?}"
+    );
+
+    // … and not for a different one.
+    let id = agent.request("session/list", json!({"cwd": other}));
+    let elsewhere = agent.wait_for_response(id);
+    assert_eq!(
+        elsewhere["result"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "another project's threads must not be offered: {elsewhere}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A thread the user removes in the editor is gone for good: it no longer
+/// lists or reopens, and deleting it again still succeeds (issue #192).
+#[test]
+fn a_deleted_session_no_longer_lists_or_loads() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_delete_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("Done.")]);
+    let mut agent = spawn_agent(port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let initialize = agent.wait_for_response(id);
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["delete"].is_object(),
+        "session/delete is gated on its capability: {initialize}"
+    );
+
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "say done"}],
+        }),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let listed = agent.wait_for_response(id);
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+
+    // The live thread is deleted: closed first, then removed from disk.
+    let id = agent.request("session/delete", json!({"sessionId": session_id}));
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let listed = agent.wait_for_response(id);
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "a deleted thread must not come back in the picker: {listed}"
+    );
+    let saved: Vec<_> = std::fs::read_dir(config_dir.join("sessions"))
+        .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+        .unwrap_or_default();
+    assert!(saved.is_empty(), "history and sidecar removed: {saved:?}");
+
+    // Nothing is left to reopen.
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": project, "mcpServers": []}),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    let load = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = agent
+            .incoming
+            .recv_timeout(remaining)
+            .expect("session/load response");
+        if message["id"] == id && message.get("method").is_none() {
+            break message;
+        }
+    };
+    assert!(load.get("error").is_some(), "{load}");
+
+    // Deleting it again, or an id that never existed, succeeds quietly.
+    let id = agent.request("session/delete", json!({"sessionId": session_id}));
+    agent.wait_for_response(id);
+    let id = agent.request("session/delete", json!({"sessionId": "never-existed"}));
+    agent.wait_for_response(id);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Every notification for `session_id` that arrives before the response to
+/// request `id`, in order.
+fn updates_until_response(agent: &mut AgentUnderTest, id: u64) -> Vec<Value> {
+    let mut updates = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = agent
+            .incoming
+            .recv_timeout(remaining)
+            .unwrap_or_else(|_| panic!("timed out waiting for the response to request {id}"));
+        if message["method"] == "session/update" {
+            updates.push(message["params"]["update"].clone());
+        }
+        if message["id"] == id && message.get("method").is_none() {
+            assert!(message.get("error").is_none(), "{message}");
+            return updates;
+        }
+    }
+}
+
+/// A saved turn reaches the editor's sidebar right away: the title the first
+/// time there is one, and a fresh `updatedAt` on every save (issue #193).
+#[test]
+fn a_saved_turn_sends_session_info_to_the_client() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_info_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(vec![sse_text("First."), sse_text("Second.")]);
+    let mut agent = spawn_agent(port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let info_updates = |updates: Vec<Value>| -> Vec<Value> {
+        updates
+            .into_iter()
+            .filter(|update| update["sessionUpdate"] == "session_info_update")
+            .collect()
+    };
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "tidy up the build script"}],
+        }),
+    );
+    let first = info_updates(updates_until_response(&mut agent, id));
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0]["title"], "tidy up the build script");
+    let updated_at = first[0]["updatedAt"].as_str().unwrap_or_default();
+    assert!(
+        updated_at.len() == 24 && updated_at.ends_with('Z'),
+        "updatedAt is an ISO 8601 instant: {updated_at:?}"
+    );
+    for field in ["sessionId", "cwd", "additionalDirectories"] {
+        assert!(first[0].get(field).is_none(), "{field} must not be sent");
+    }
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "and the tests"}],
+        }),
+    );
+    let second = info_updates(updates_until_response(&mut agent, id));
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(
+        second[0].get("title").is_none(),
+        "an unchanged title is not sent again: {second:?}"
+    );
+    assert!(second[0]["updatedAt"].is_string(), "{second:?}");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Write a saved thread straight into the session store, the way a finished
+/// turn leaves one.
+fn seed_session(config_dir: &std::path::Path, id: &str, cwd: &std::path::Path) {
+    let sessions = config_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{id}.jsonl")),
+        format!(
+            "{}\n",
+            json!({"role": "user", "content": format!("thread {id}")})
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        sessions.join(format!("{id}.meta.json")),
+        json!({"cwd": cwd}).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_long_session_list_is_paged_with_a_cursor() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_list_pages_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    // One more than a page holds.
+    for index in 0..101 {
+        seed_session(&config_dir, &format!("thread-{index:03}"), &project);
+    }
+
+    let port = start_fake_endpoint(Vec::new());
+    let mut agent = spawn_agent(port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/list", json!({"cwd": project}));
+    let first = agent.wait_for_response(id);
+    let first_page = first["result"]["sessions"].as_array().expect("sessions");
+    assert_eq!(first_page.len(), 100);
+    let cursor = first["result"]["nextCursor"]
+        .as_str()
+        .expect("a full page with more behind it carries nextCursor")
+        .to_string();
+
+    let id = agent.request("session/list", json!({"cwd": project, "cursor": cursor}));
+    let second = agent.wait_for_response(id);
+    let second_page = second["result"]["sessions"].as_array().expect("sessions");
+    assert_eq!(second_page.len(), 1);
+    assert!(
+        second["result"].get("nextCursor").is_none(),
+        "the last page has no cursor: {second}"
+    );
+
+    let mut seen: Vec<&str> = first_page
+        .iter()
+        .chain(second_page)
+        .map(|session| session["sessionId"].as_str().unwrap())
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 101, "every thread is listed exactly once");
+
+    let id = agent.request("session/list", json!({"cursor": "not-a-cursor"}));
+    let rejected = agent.wait_for_reply(id);
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

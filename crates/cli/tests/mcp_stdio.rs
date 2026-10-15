@@ -398,7 +398,7 @@ fn client_supplied_stdio_server_is_scoped_to_its_session() {
     // client.
     std::fs::write(
         config_dir.join("mcp.toml"),
-        "official = false\nsmbcloud = false\n",
+        "official = false\nsmbcloud = false\nascapi = false\n",
     )
     .unwrap();
 
@@ -613,7 +613,7 @@ fn client_supplied_http_server_is_connected() {
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::write(
         config_dir.join("mcp.toml"),
-        "official = false\nsmbcloud = false\n",
+        "official = false\nsmbcloud = false\nascapi = false\n",
     )
     .unwrap();
 

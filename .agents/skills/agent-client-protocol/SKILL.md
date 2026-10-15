@@ -26,7 +26,7 @@ Spec:  https://agentclientprotocol.com
 > protocol (`Agent.v2()`, `V2ConnectionTo`) sits behind the `unstable_protocol_v2`
 > feature and siGit does not enable it.
 
-siGit's entire ACP server lives in `src/main.rs` (`run_acp_server`, the
+siGit's entire ACP server lives in `crates/cli/src/main.rs` (`run_acp_server`, the
 `SiGitAgent` struct, and its `handle_*` methods). Read it alongside this skill.
 
 ---
@@ -202,11 +202,12 @@ the connection and the agent anymore. Don't reintroduce the mpsc forwarder patte
 | `NewSessionRequest` | `handle_new_session` | sets cwd, resets history, advertises commands + config options |
 | `LoadSessionRequest` | `handle_load_session` | like new_session; gated by `load_session(true)` capability |
 | `ForkSessionRequest` | `handle_fork_session` | gated by `unstable_session_fork` + `SessionForkCapabilities` |
-| `ListSessionsRequest` | `handle_list_sessions` | the editor's "Import Threads" picker; gated by `SessionListCapabilities` |
+| `ListSessionsRequest` | `handle_list_sessions` | the editor's "Import Threads" picker; gated by `SessionListCapabilities`; paged with `cursor` / `nextCursor` |
 | `PromptRequest` | `handle_prompt` | the turn: parse blocks → slash commands or tool-calling loop |
 | `SetSessionConfigOptionRequest` | `handle_set_session_config_option` | the Zed model picker — switches/downloads models |
 | `SetSessionModeRequest` | `handle_set_session_mode` | legacy mode selector; same Manual/Auto/Plan state as the Permissions config option |
 | `CancelNotification` | `handle_cancel` | notification, no response |
+| `$/cancel_request` | `responder.cancellation()` | not a registered handler: the SDK tracks it per request, and the prompt and `authenticate` closures read the marker |
 
 Everything else is left to the SDK default (method not found).
 
@@ -594,7 +595,7 @@ Editor                                Agent
 
 ## Where to look in the code
 
-Everything ACP lives in `src/main.rs`:
+Everything ACP lives in `crates/cli/src/main.rs`:
 
 - `run_acp_server` — builder wiring + transport.
 - `SiGitAgent` + `handle_*` — the handlers.
@@ -602,6 +603,6 @@ Everything ACP lives in `src/main.rs`:
 - `parse_slash` / `exec_slash_acp` — slash commands.
 - `handle_response` — the `Responder` helper.
 
-`src/backend.rs` holds the `InferenceBackend` trait (`LocalBackend` /
-`OpenAiBackend`) used by `handle_prompt`'s tool-calling loop; `src/tools.rs`
+`crates/cli/src/backend.rs` holds the `InferenceBackend` trait (`LocalBackend` /
+`OpenAiBackend`) used by `handle_prompt`'s tool-calling loop; `crates/cli/src/tools.rs`
 defines the agent tools and `execute_tool`.

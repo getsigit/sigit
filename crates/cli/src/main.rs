@@ -30,12 +30,10 @@
 
 mod account;
 mod backend;
-mod browser_auth;
 mod chat;
 mod client_fs;
 mod client_terminal;
 mod commands;
-mod credentials;
 mod frontmatter;
 mod harness_markup;
 mod headless;
@@ -54,6 +52,10 @@ mod skills;
 mod subagents;
 mod tools;
 mod workspace;
+
+// Sign-in and the stored session live in `sigit-agent`, where an embedding host reaches them
+// too; the rest of this crate keeps its `crate::` paths.
+pub(crate) use sigit_agent::{browser_auth, credentials};
 
 /// Serializes tests that mutate process-global state: env vars
 /// (`SIGIT_CONFIG_DIR` etc.) and the current directory. `cargo test` runs
@@ -74,29 +76,34 @@ use onde::inference::SamplingConfig;
 // schema types moved under `schema::v1` in agent-client-protocol 1.0.
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
-    AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
-    ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
-    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, KillTerminalRequest, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
-    LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
-    SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput, WaitForTerminalExitRequest, WriteTextFileRequest,
+    AgentAuthCapabilities, AgentCapabilities, AudioContent, AuthMethod, AuthMethodAgent,
+    AuthenticateRequest, AuthenticateResponse, AvailableCommand, AvailableCommandInput,
+    AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    CompleteElicitationNotification, ConfigOptionUpdate, ContentBlock, ContentChunk,
+    CreateElicitationRequest, CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest,
+    DeleteSessionResponse, Diff, ElicitationAction, ElicitationRequestScope, ElicitationUrlMode,
+    EmbeddedResourceResource, ErrorCode, ForkSessionRequest, ForkSessionResponse, ImageContent,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, MessageId, Meta,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    ReadTextFileRequest, ReleaseTerminalRequest, RequestId, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeState,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
+
+use sigit_agent::prompt::{CO_AUTHOR_TRAILER_PLACEHOLDER, SYSTEM_PROMPT};
 
 use crate::backend::{
     AudioInput, ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, TokenChunk,
@@ -109,169 +116,6 @@ use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-
-/// Stands in for the commit trailer inside [`SYSTEM_PROMPT`]; see
-/// [`system_prompt_for_model`].
-const CO_AUTHOR_TRAILER_PLACEHOLDER: &str = "{commit_co_author_trailer}";
-
-const SYSTEM_PROMPT: &str = concat!(
-    "\
-Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
-Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
-
-You are a strong general-purpose coding agent. smbCloud is your home turf, \
-but you should still be useful in any codebase. When the project is clearly \
-about smbCloud, use that context directly instead of falling back to vague \
-cloud-platform advice.
-
-smbCloud context you should know and use when it helps:
-- smbCloud is a platform for deploying and managing projects
-- the main CLI is a Rust workspace with focused crates rather than one giant crate
-- common areas include auth, project management, deploy flows, networking, \
-  shared models, release tooling, and managed services
-- deploy branches usually follow `release/service-{name}`
-- Next.js SSR deploys on smbCloud are not the same as generic git-push deploys; \
-  they often use a local build plus rsync/PM2 style flow
-- auth has a hard boundary between smbCloud platform users and tenant app users; \
-  platform flows use `/v1/users*`, tenant app flows use `/v1/client/*`, and \
-  you should not casually mix `User`, `TenantMembership`, `AuthApp`, and `AuthUser`
-- smbCloud authorization is layered; do not flatten platform accounts, tenant \
-  memberships, auth-app collaborators, and tenant end users into one model
-- `Project` is the umbrella workspace, while app-like resources such as \
-  `FrontendApp`, `AuthApp`, and GresIQ are the deployable units with their own \
-  ownership, sharing, and collaboration rules
-- `FrontendApp` is many-per-project, while `AuthApp` is intentionally one-per-project; \
-  preserve those cardinality rules unless the code clearly changes them
-- GresIQ is smbCloud's managed PostgreSQL offering; treat it as a platform \
-  service with its own credentials and boundaries, not as a generic local DB helper
-- when debugging smbCloud Rails APIs, first classify the request: first-party \
-  smbCloud app or tenant app, then check which endpoint family and validator \
-  should be involved before changing code
-- when working in smbCloud repos, prefer existing workspace patterns, existing \
-  crate boundaries, existing Rails conventions, and existing command flows over \
-  inventing new abstractions
-
-CRITICAL RULE — never tell the user to run a command. You have tools. Use them. \
-When the user asks you to clone a repo, run a build, check git status, or do \
-anything that involves a shell command, you MUST call the run_command tool and \
-execute it yourself. Do not print shell commands for the user to copy-paste. \
-Do not give step-by-step instructions. Do not say \"you can run …\". Just do it. \
-If a command fails, try to fix the problem and re-run it. If you cannot fix it \
-after two attempts, explain what went wrong and what you tried.
-
-Git operations — always use run_command:
-- git clone: always pass the full absolute destination path as the last argument \
-  and set cwd to an existing writable parent directory. Example: \
-  run_command({\"command\": \"git clone https://github.com/org/repo /Users/me/Repositories/repo\", \
-  \"cwd\": \"/Users/me/Repositories\"})
-- git init, add, commit, push, pull, fetch, checkout, branch, diff, log, status, \
-  stash, rebase, merge, tag — use run_command with an absolute cwd pointing to \
-  the repo root
-- never run git clone without an explicit absolute destination path
-- if a clone or init fails, check the error, fix the cause (wrong path, missing \
-  directory, permissions), and retry
-- when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: ",
-    // CO_AUTHOR_TRAILER_PLACEHOLDER (concat! takes only literals), filled in
-    // by `system_prompt_for_model` with tools::commit_co_author_trailer(),
-    // which depends on the surface picked at startup.
-    "{commit_co_author_trailer}",
-    " \
-  — that exact format is the standard co-author trailer git forges detect, so \
-  siGit is credited as co-author. If a commit lands without it, siGit Code \
-  amends the trailer in automatically and the tool output says so; do not amend \
-  again yourself.
-
-CRITICAL — forge boundaries: git is not the forge. Plain git commands (clone, \
-commit, push, pull, branch, log, diff, tag, ...) work on any repository, but \
-issues, pull requests, reviews, releases, and other forge features are NOT git \
-features and there is no forge-agnostic way to reach them. Detect the forge \
-from the repo's remote URL (run `git remote get-url origin`) before doing any \
-issue or PR work:
-- sigit.si: issue and pull request workflows go through the official MCP \
-  tools: mcp__sigit__list_issues, mcp__sigit__get_issue, \
-  mcp__sigit__create_issue, mcp__sigit__list_pull_requests, and \
-  mcp__sigit__get_pull_request. These tools are valid ONLY for repositories \
-  hosted on sigit.si. Prefer them over shelling out to git or fetching web \
-  pages for issue and PR queries on sigit.si repos.
-- any other host (github.com, gitlab.com, bitbucket.org, self-hosted forges, \
-  ...): the mcp__sigit__* tools do NOT work there. Use the forge's own CLI via \
-  run_command when it is installed (`gh` for GitHub, `glab` for GitLab, `tea` \
-  for Gitea/Forgejo), its web API via read_website when that is practical, or \
-  ask the user how they want to interact with the forge.
-Never assume a repo is on GitHub, and never use the mcp__sigit__* tools \
-against a repo whose remote is not sigit.si.
-
-Never introduce yourself unless asked. Jump straight into the answer. \
-Keep answers short. Write idiomatic code. \
-Fix root causes, not symptoms.
-
-You have access to tools that let you read files, read websites directly from \
-http and https URLs, create directories, list directories, search code, create \
-new files, edit existing files, delete files, and run shell commands. You can \
-also use git directly through shell commands, including `git init` and normal \
-git workflows. Use them proactively. Read the code or website before answering. \
-Prefer absolute paths when referring to files and directories, especially in \
-protocol-facing output and tool arguments. Create directories when needed. Run \
-builds, tests, and git commands after making changes. Ground your answers in \
-the actual code or fetched page content, not in guesses.
-
-CRITICAL — you CAN access websites. You are NOT a typical LLM without internet \
-access. You have a read_website tool that fetches any http or https URL and \
-returns the page text. When the user gives you a URL or asks you to read, \
-summarize, or inspect a web page, you MUST call the read_website tool with that \
-URL. Never say \"I cannot access websites\" or \"I cannot browse the internet\". \
-You can. Use the tool.
-
-CRITICAL — before every edit_file call, you MUST call read_file on the target \
-file first (or the specific line range if one was given). Never rely on file \
-content you saw in a previous turn — the user may have reverted, edited, or \
-changed the file externally since then. Always re-read to get the current state \
-before constructing old_text. \
-When the user corrects a previous edit (e.g. \"don't remove X, append instead\"), \
-treat it as a fresh task: re-read the file, identify the current content, and \
-plan the edit from scratch. Do not assume the file still reflects your last edit.
-
-Tool-use heuristics:
-- when the user provides a URL or asks about a web page, ALWAYS call \
-  read_website — never refuse or claim you lack internet access
-- prefer absolute paths over relative paths when you mention, return, or pass \
-  file and directory paths
-- if a path does not exist yet, create the directory before creating files in it
-- if the user asks to clone a repo, immediately call run_command with git clone \
-  and an absolute destination path — do not ask where to put it unless the \
-  request is ambiguous; default to the user's home Repositories directory
-- if the user asks for a new repo, scaffold, or scratch project, create the \
-  directory, create the first files, and run `git init` without waiting unless \
-  the request says otherwise
-- if the repo looks like smbCloud CLI code, respect workspace crate boundaries, \
-  shared models, and existing command handlers before adding new abstractions
-- if the repo looks like smbCloud Rails code, check routes, controllers, \
-  validators, and model boundaries before changing business logic
-- if the task touches smbCloud auth, first decide whether it is a platform-user \
-  flow or a tenant-app flow, then follow the right endpoint family and model layer
-- if the task touches smbCloud deploy code, check whether it is the generic \
-  deploy path or the Next.js SSR path before proposing changes
-- after edits, prefer running the smallest useful verification step first, then \
-  widen to broader checks if needed
-- use git commands naturally for status checks, repo setup, diffs, and normal \
-  developer workflows when they help move the task forward
-- if a tool call fails, read the error, try to fix it, and retry — do not \
-  fall back to telling the user what to type
-
-Replies are plain Markdown. Never wrap a reply, or any part of it, in XML-style \
-tags you made up, and never write a system message, warning, or notice as if it \
-came from siGit Code or the system: only siGit Code speaks for itself, and \
-nothing renders those tags. To offer the user a choice, list the options as \
-plain text.
-
-When the repo is not about smbCloud, act like a normal coding agent and do not \
-force smbCloud-specific advice into the answer. When it is about smbCloud, be \
-specific and practical.
-
-Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever."
-);
 
 /// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
 /// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
@@ -374,6 +218,10 @@ struct StreamedReply {
     streamed_any: bool,
     /// Whether the next visible text should open a new paragraph.
     paragraph_pending: bool,
+    /// The ACP `messageId` of the model message being streamed. Each
+    /// inference round is its own message in history, so a tool round
+    /// interrupting the prose starts a new one.
+    message_id: Option<MessageId>,
 }
 
 /// What a streamed fragment newly revealed once `<think>` blocks were split:
@@ -391,6 +239,13 @@ impl StreamedReply {
     /// no sentence to break away from, hence the `streamed_any` guard.
     fn interrupt(&mut self) {
         self.paragraph_pending = self.streamed_any;
+        self.message_id = None;
+    }
+
+    /// The id every chunk of the current model message carries, its reply
+    /// text and its reasoning alike.
+    fn message_id(&mut self) -> MessageId {
+        self.message_id.get_or_insert_with(new_message_id).clone()
     }
 
     /// Fold one streamed fragment into the reply and return the text it newly
@@ -446,6 +301,12 @@ impl StreamedReply {
 
         revealed
     }
+}
+
+/// A fresh ACP `messageId`. Ids are opaque and only have to be unique within
+/// a session, so a random one serves both live chunks and replayed ones.
+fn new_message_id() -> MessageId {
+    MessageId::new(format!("msg_{}", uuid::Uuid::new_v4().simple()))
 }
 
 #[derive(Default)]
@@ -575,20 +436,13 @@ fn file_change_content(change: &tools::FileChange) -> ToolCallContent {
         .into()
 }
 
-/// The content of a finished tool call's card: the client terminal the
-/// command ran in, when it ran in one, which already shows its output (the
-/// full result text still travels as `raw_output`); otherwise the diff of the
-/// file it wrote, if it wrote one, then its result text.
-fn tool_result_content(
-    output: &str,
-    change: Option<&tools::FileChange>,
-    terminal: Option<&str>,
-) -> Vec<ToolCallContent> {
-    if let Some(terminal_id) = terminal {
-        return vec![ToolCallContent::Terminal(Terminal::new(
-            terminal_id.to_string(),
-        ))];
-    }
+/// The content of a finished tool call's card: the diff of the file it wrote,
+/// if it wrote one, then its result text. A command that ran in the client's
+/// terminal gets no content at all in its final update: the terminal is
+/// already embedded in the card and was released by then, so naming it again
+/// would point at an id the client no longer has. The result text still
+/// travels as `raw_output`.
+fn tool_result_content(output: &str, change: Option<&tools::FileChange>) -> Vec<ToolCallContent> {
     change
         .map(file_change_content)
         .into_iter()
@@ -637,6 +491,107 @@ fn history_message_text(message: &serde_json::Value) -> String {
     }
 }
 
+/// The images and audio clips a saved user message carries, as the ACP
+/// content blocks the client sent them in. History keeps them as OpenAI
+/// content parts (see `backend::user_message`): an image as a base64 `data:`
+/// URL and a clip as `input_audio` with a bare format name. Anything that does
+/// not turn back into a block (an image by remote URL, say) is left out.
+fn history_message_attachments(message: &serde_json::Value) -> Vec<ContentBlock> {
+    let Some(parts) = message["content"].as_array() else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| match part["type"].as_str()? {
+            "image_url" => {
+                let url = part["image_url"]["url"].as_str()?;
+                let (mime_type, data) = url.strip_prefix("data:")?.split_once(";base64,")?;
+                Some(ContentBlock::Image(ImageContent::new(data, mime_type)))
+            }
+            "input_audio" => {
+                let data = part["input_audio"]["data"].as_str()?;
+                let mime_type = match part["input_audio"]["format"].as_str()? {
+                    "mp3" => "audio/mpeg".to_string(),
+                    format => format!("audio/{format}"),
+                };
+                Some(ContentBlock::Audio(AudioContent::new(data, mime_type)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many sessions one `session/list` reply carries. A client asks for the
+/// rest with the `nextCursor` of the page before.
+const SESSION_LIST_PAGE_SIZE: usize = 100;
+
+/// Where a `session/list` page ended: the last session on it, by the two
+/// things the list is sorted on. Naming the entry instead of counting an
+/// offset keeps the next page right when a thread is saved or deleted between
+/// the two requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionListCursor {
+    modified_nanos: u128,
+    id: String,
+}
+
+impl SessionListCursor {
+    fn after(entry: &session_store::SessionEntry) -> Self {
+        Self {
+            modified_nanos: modified_nanos(entry.modified),
+            id: entry.id.clone(),
+        }
+    }
+
+    /// The cursor as the client carries it. Clients must treat it as opaque.
+    fn encode(&self) -> String {
+        format!("{}:{}", self.modified_nanos, self.id)
+    }
+
+    fn decode(cursor: &str) -> Option<Self> {
+        let (modified_nanos, id) = cursor.split_once(':')?;
+        if id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            modified_nanos: modified_nanos.parse().ok()?,
+            id: id.to_string(),
+        })
+    }
+
+    /// Does `entry` come after this cursor in `session_store::list` order
+    /// (newest first, then by id)?
+    fn precedes(&self, entry: &session_store::SessionEntry) -> bool {
+        let modified = modified_nanos(entry.modified);
+        modified < self.modified_nanos
+            || (modified == self.modified_nanos && entry.id.as_str() > self.id.as_str())
+    }
+}
+
+fn modified_nanos(time: std::time::SystemTime) -> u128 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
+}
+
+/// One page of `sessions` (already in list order) starting after `cursor`,
+/// and the cursor for the page after it when there is one.
+fn session_list_page(
+    sessions: Vec<session_store::SessionEntry>,
+    cursor: Option<&SessionListCursor>,
+    page_size: usize,
+) -> (Vec<session_store::SessionEntry>, Option<String>) {
+    let mut rest = sessions
+        .into_iter()
+        .filter(|entry| cursor.is_none_or(|cursor| cursor.precedes(entry)));
+    let page: Vec<_> = rest.by_ref().take(page_size).collect();
+    let next_cursor = match (rest.next(), page.last()) {
+        (Some(_), Some(last)) => Some(SessionListCursor::after(last).encode()),
+        _ => None,
+    };
+    (page, next_cursor)
+}
+
 /// Do two paths name the same directory, for `session/list` filtering?
 ///
 /// Canonicalizing resolves the symlinks and `..` segments that make a client's
@@ -683,19 +638,35 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
             // Seeded context and project instructions were never on screen.
             "system" => {}
             "user" => {
+                // The text and the attachments were one message when they
+                // were sent, so they replay under one id.
+                let message_id = new_message_id();
                 let text = history_message_text(message);
                 if !text.trim().is_empty() {
-                    updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
-                        ContentBlock::from(text),
-                    )));
+                    updates.push(SessionUpdate::UserMessageChunk(
+                        ContentChunk::new(ContentBlock::from(text)).message_id(message_id.clone()),
+                    ));
+                }
+                for attachment in history_message_attachments(message) {
+                    updates.push(SessionUpdate::UserMessageChunk(
+                        ContentChunk::new(attachment).message_id(message_id.clone()),
+                    ));
                 }
             }
             "assistant" => {
-                let (_think, visible) = chat::strip_think_blocks(&history_message_text(message));
+                // Reasoning went out as thought chunks under the reply's id
+                // while the turn ran; it comes back the same way.
+                let message_id = new_message_id();
+                let (think, visible) = chat::strip_think_blocks(&history_message_text(message));
+                if !think.trim().is_empty() {
+                    updates.push(SessionUpdate::AgentThoughtChunk(
+                        ContentChunk::new(ContentBlock::from(think)).message_id(message_id.clone()),
+                    ));
+                }
                 if !visible.trim().is_empty() {
-                    updates.push(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                        ContentBlock::from(visible),
-                    )));
+                    updates.push(SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(ContentBlock::from(visible)).message_id(message_id),
+                    ));
                 }
                 for call in message["tool_calls"].as_array().into_iter().flatten() {
                     let name = call["function"]["name"].as_str().unwrap_or("tool");
@@ -1279,6 +1250,9 @@ struct SiGitAgent {
     /// Sessions a `session/close` is waiting to tear down. A prompt for one of
     /// these that reaches the front of its session lock first is cancelled.
     closing_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The title last sent to the client for each session in a
+    /// `session_info_update`, so an unchanged title is not sent again.
+    announced_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
@@ -1332,6 +1306,7 @@ impl SiGitAgent {
             active_session: std::sync::Mutex::new(None),
             prompt_cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             closing_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            announced_titles: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_model: std::sync::Mutex::new(initial_model),
             model_ready,
             startup_model_load_started,
@@ -1415,7 +1390,7 @@ impl SiGitAgent {
             // already done — might be a stored error from earlier
             if let Some(err) = self.model_load_error.lock().unwrap().as_ref() {
                 return Err(agent_client_protocol::Error::new(
-                    -32603,
+                    ErrorCode::InternalError.into(),
                     format!("model load failed: {err}"),
                 ));
             }
@@ -1553,7 +1528,7 @@ impl SiGitAgent {
             .ok();
 
             return Err(agent_client_protocol::Error::new(
-                -32603,
+                ErrorCode::InternalError.into(),
                 format!("model load failed: {err}"),
             ));
         }
@@ -1579,29 +1554,50 @@ impl SiGitAgent {
         Ok(())
     }
 
+    /// Send a message of its own: a notice, a slash command's answer. It gets
+    /// a fresh `messageId`, so a client never folds it into the reply around
+    /// it. Text that belongs to the model's reply goes through
+    /// [`Self::send_reply_chunk`] instead.
     fn send_assistant_message(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: SessionId,
         text: impl Into<String>,
     ) -> agent_client_protocol::Result<()> {
+        self.send_reply_chunk(cx, session_id, new_message_id(), text)
+    }
+
+    /// Send one chunk of the model message `message_id`.
+    fn send_reply_chunk(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        message_id: MessageId,
+        text: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(
             session_id,
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::from(text.into())).message_id(message_id),
+            ),
         ))
     }
 
     /// Stream a fragment of the model's reasoning as a thought chunk. Clients
     /// render these in a collapsed "thinking" section, separate from the reply.
+    /// It carries the id of the model message it came with.
     fn send_agent_thought(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: SessionId,
+        message_id: MessageId,
         text: impl Into<String>,
     ) -> agent_client_protocol::Result<()> {
         cx.send_notification(SessionNotification::new(
             session_id,
-            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+            SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(ContentBlock::from(text.into())).message_id(message_id),
+            ),
         ))
     }
 
@@ -1681,16 +1677,20 @@ impl SiGitAgent {
     ) {
         match chunk {
             TokenChunk::Reasoning(text) => {
-                self.send_agent_thought(cx, session_id.clone(), text).ok();
+                let message_id = reply.message_id();
+                self.send_agent_thought(cx, session_id.clone(), message_id, text)
+                    .ok();
             }
             TokenChunk::Visible(piece) => {
                 let revealed = reply.push(&piece);
                 if let Some(reasoning) = revealed.reasoning {
-                    self.send_agent_thought(cx, session_id.clone(), reasoning)
+                    let message_id = reply.message_id();
+                    self.send_agent_thought(cx, session_id.clone(), message_id, reasoning)
                         .ok();
                 }
                 if let Some(visible) = revealed.visible {
-                    self.send_assistant_message(cx, session_id.clone(), visible)
+                    let message_id = reply.message_id();
+                    self.send_reply_chunk(cx, session_id.clone(), message_id, visible)
                         .ok();
                 }
             }
@@ -1824,7 +1824,7 @@ impl SiGitAgent {
         let (new_config, max_tokens, new_tool_calling) = resolve_model_config(model_id)
             .ok_or_else(|| {
                 agent_client_protocol::Error::new(
-                    -32602,
+                    ErrorCode::InvalidParams.into(),
                     format!("unknown or unavailable model: {model_id}"),
                 )
             })?;
@@ -1876,10 +1876,18 @@ impl SiGitAgent {
 
         result_rx
             .await
-            .map_err(|_| agent_client_protocol::Error::new(-32603, "model loader thread crashed"))?
+            .map_err(|_| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    "model loader thread crashed",
+                )
+            })?
             .map_err(|error| {
                 log::error!("model switch failed: {error}");
-                agent_client_protocol::Error::new(-32603, format!("model switch failed: {error}"))
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    format!("model switch failed: {error}"),
+                )
             })?;
 
         self.startup_model_load_started
@@ -2132,13 +2140,13 @@ fn validate_session_roots(
 ) -> agent_client_protocol::Result<()> {
     if !cwd.is_absolute() {
         return Err(agent_client_protocol::Error::new(
-            -32602,
+            ErrorCode::InvalidParams.into(),
             format!("cwd must be an absolute path, got {}", cwd.display()),
         ));
     }
     if let Some(relative) = additional.iter().find(|dir| !dir.is_absolute()) {
         return Err(agent_client_protocol::Error::new(
-            -32602,
+            ErrorCode::InvalidParams.into(),
             format!(
                 "additionalDirectories entries must be absolute paths, got {}",
                 relative.display()
@@ -2147,6 +2155,9 @@ fn validate_session_roots(
     }
     Ok(())
 }
+
+/// The id of the one auth method `initialize` advertises.
+const AUTH_METHOD_ID: &str = "sigit";
 
 // ── ACP handler implementations ───────────────────────────────────────────────
 
@@ -2188,13 +2199,37 @@ impl SiGitAgent {
             client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
         }
 
+        // URL-mode elicitation is where `authenticate` sends the user to sign
+        // in. Form mode is never used: the spec forbids collecting
+        // credentials in a form, and nothing else here asks the user for
+        // structured input.
+        let elicit_url = req
+            .client_capabilities
+            .elicitation
+            .as_ref()
+            .is_some_and(|caps| caps.url.is_some());
+        log::info!("elicitation: url={elicit_url}");
+        CLIENT_ELICITATION_URL.store(elicit_url, Ordering::Relaxed);
+
+        // A client that renders boolean config options gets the Inference
+        // switch as a toggle; the rest keep the two-value select.
+        let boolean_options = req
+            .client_capabilities
+            .session
+            .as_ref()
+            .and_then(|session| session.config_options.as_ref())
+            .and_then(|config_options| config_options.boolean.as_ref())
+            .is_some();
+        log::info!("boolean config options: {boolean_options}");
+        CLIENT_BOOLEAN_CONFIG_OPTIONS.store(boolean_options, Ordering::Relaxed);
+
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
         // like Zed advertise terminal-auth capability but don't actually spawn the
         // login terminal for *custom* ACP agents, so the button is a silent no-op.
         // With an Agent method, clicking calls `authenticate`, which opens the
         // browser and finishes the sign-in itself.
         let auth_methods = vec![AuthMethod::Agent(
-            AuthMethodAgent::new("sigit", "Sign in to siGit Code")
+            AuthMethodAgent::new(AUTH_METHOD_ID, "Sign in to siGit Code")
                 .description("Opens sigit.si in your browser to authorize this device."),
         )];
 
@@ -2251,17 +2286,37 @@ impl SiGitAgent {
                             .resume(SessionResumeCapabilities::new())
                             // Lets the client say a thread is gone, so its
                             // state does not sit here until the process exits.
-                            .close(SessionCloseCapabilities::new()),
+                            .close(SessionCloseCapabilities::new())
+                            // Without this, a thread the user removes in the
+                            // editor stays on disk and comes back in "Import
+                            // Threads".
+                            .delete(SessionDeleteCapabilities::new()),
                     ),
             )
             .meta(initialize_meta()))
     }
 
+    /// ACP `authenticate`. Runs in a spawned task: with URL-mode elicitation
+    /// it waits on the client's answer, which the dispatch loop has to be free
+    /// to deliver. `request_id` is the request's own id, which scopes that
+    /// elicitation, since no session exists yet.
     async fn handle_authenticate(
         &self,
+        cx: &ConnectionTo<Client>,
+        request_id: RequestId,
         req: AuthenticateRequest,
     ) -> agent_client_protocol::Result<AuthenticateResponse> {
         log::info!("authenticate: method={}", req.method_id.0);
+
+        if req.method_id.0.as_ref() != AUTH_METHOD_ID {
+            return Err(agent_client_protocol::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!(
+                    "unknown auth method {}; the only one offered is {AUTH_METHOD_ID}",
+                    req.method_id.0
+                ),
+            ));
+        }
 
         // An existing session clears the gate without sending anyone to a
         // browser they didn't ask for.
@@ -2271,31 +2326,37 @@ impl SiGitAgent {
         }
 
         // Otherwise run the browser flow. There is no way to collect a password
-        // here (the method has no UI of its own) and no way to show a code to
-        // paste, so this is the loopback variant or nothing: the editor gets an
-        // error naming the terminal command that does work without a listener.
+        // here (the spec forbids asking for credentials in a form) and no way
+        // to take a pasted code back, so this is the loopback variant or
+        // nothing: the editor gets an error naming the terminal command that
+        // does work without a listener.
         let flow = browser_auth::begin();
         if !flow.is_loopback() {
             return Err(agent_client_protocol::Error::new(
-                -32000,
+                ErrorCode::InternalError.into(),
                 "Could not open a local port to receive the sign-in. \
                  Run `sigit login` in a terminal instead."
                     .to_string(),
             ));
         }
 
-        log::info!("authenticate: opening browser at {}", flow.authorize_url());
-        if !browser_auth::open_browser(flow.authorize_url()) {
-            log::warn!("authenticate: no browser could be launched");
-        }
+        let outcome = if CLIENT_ELICITATION_URL.load(Ordering::Relaxed) {
+            sign_in_via_client(cx, request_id, flow).await
+        } else {
+            log::info!("authenticate: opening browser at {}", flow.authorize_url());
+            if !browser_auth::open_browser(flow.authorize_url()) {
+                log::warn!("authenticate: no browser could be launched");
+            }
+            browser_auth::complete_loopback(flow).await
+        };
 
-        match browser_auth::complete_loopback(flow).await {
+        match outcome {
             Ok(email) => {
                 log::info!("authenticate: signed in as {email}");
                 Ok(AuthenticateResponse::default())
             }
             Err(reason) => Err(agent_client_protocol::Error::new(
-                -32000,
+                ErrorCode::InternalError.into(),
                 format!(
                     "Sign-in did not complete ({reason}). \
                      Try again, or create an account at https://sigit.si."
@@ -2479,7 +2540,7 @@ impl SiGitAgent {
 
         let Some(state) = self.sessions.lock().unwrap().get(&key).cloned() else {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::ResourceNotFound.into(),
                 format!(
                     "unknown session {key}; create it with session/new or restore it with session/load"
                 ),
@@ -2670,12 +2731,22 @@ impl SiGitAgent {
     /// session request is recorded — never the process cwd, which a later
     /// session in the same process may have moved: a thread listed under the
     /// wrong project is worse than one that isn't listed at all.
-    async fn persist_session(&self, session_id: &SessionId, snapshot: &[serde_json::Value]) {
+    ///
+    /// Each save is also reported to the client in a `session_info_update`, so
+    /// the thread's title and `updatedAt` reach the editor's sidebar without
+    /// waiting for the next `session/list`.
+    async fn persist_session(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        snapshot: &[serde_json::Value],
+    ) {
         let key = session_id.to_string();
         if let Err(error) = session_store::save(&key, snapshot) {
             log::warn!("session({session_id}) save failed: {error}");
             return;
         }
+        self.send_session_info(cx, session_id, snapshot);
         let state = self.sessions.lock().unwrap().get(&key).cloned();
         match state {
             Some(state) => session_store::save_meta(
@@ -2690,6 +2761,35 @@ impl SiGitAgent {
         }
     }
 
+    /// Tell the client a session was just saved: always a fresh `updatedAt`,
+    /// and the title only when it differs from the one last sent. The update
+    /// names no `sessionId`, `cwd` or `additionalDirectories`; the spec keeps
+    /// those out of it.
+    fn send_session_info(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        snapshot: &[serde_json::Value],
+    ) {
+        let key = session_id.to_string();
+        let mut update = SessionInfoUpdate::new();
+        if let Some(modified) = session_store::modified(&key) {
+            update = update.updated_at(session_store::iso8601(modified));
+        }
+        if let Some(title) = session_store::history_title(snapshot) {
+            let mut announced = self.announced_titles.lock().unwrap();
+            if announced.get(&key) != Some(&title) {
+                announced.insert(key, title.clone());
+                update = update.title(title);
+            }
+        }
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::SessionInfoUpdate(update),
+        ))
+        .ok();
+    }
+
     /// ACP `session/list`: the saved threads an editor can reopen.
     ///
     /// Only sessions with a recorded working directory qualify — `SessionInfo`
@@ -2700,19 +2800,42 @@ impl SiGitAgent {
         &self,
         args: ListSessionsRequest,
     ) -> agent_client_protocol::Result<ListSessionsResponse> {
+        if let Some(cwd) = args.cwd.as_ref()
+            && !cwd.is_absolute()
+        {
+            return Err(agent_client_protocol::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!("cwd must be an absolute path, got {}", cwd.display()),
+            ));
+        }
+        // A cursor is one this agent handed out. Anything else is a client
+        // error, not a reason to start again from the first page.
+        let cursor = match args.cursor.as_deref() {
+            Some(cursor) => Some(SessionListCursor::decode(cursor).ok_or_else(|| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InvalidParams.into(),
+                    "cursor is not one this agent returned from session/list",
+                )
+            })?),
+            None => None,
+        };
         let filter = args.cwd.clone();
-        let sessions: Vec<SessionInfo> = session_store::list()
+        let entries: Vec<session_store::SessionEntry> = session_store::list()
             .into_iter()
             .filter(|entry| entry.message_count > 0)
+            .filter(|entry| match (&entry.cwd, &filter) {
+                (None, _) => false,
+                (Some(cwd), Some(filter)) => same_dir(cwd, filter),
+                (Some(_), None) => true,
+            })
+            .collect();
+        let (page, next_cursor) =
+            session_list_page(entries, cursor.as_ref(), SESSION_LIST_PAGE_SIZE);
+        let sessions: Vec<SessionInfo> = page
+            .into_iter()
             .filter_map(|entry| {
-                let cwd = entry.cwd?;
-                if let Some(filter) = &filter
-                    && !same_dir(&cwd, filter)
-                {
-                    return None;
-                }
                 Some(
-                    SessionInfo::new(SessionId::new(entry.id), cwd)
+                    SessionInfo::new(SessionId::new(entry.id), entry.cwd?)
                         .additional_directories(entry.additional_directories)
                         .title(entry.title)
                         .updated_at(session_store::iso8601(entry.modified)),
@@ -2721,15 +2844,20 @@ impl SiGitAgent {
             .collect();
 
         log::info!(
-            "list_sessions: {} session(s){}",
+            "list_sessions: {} session(s){}{}",
             sessions.len(),
             args.cwd
                 .as_ref()
                 .map(|cwd| format!(" for cwd={}", cwd.display()))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if next_cursor.is_some() {
+                ", more to come"
+            } else {
+                ""
+            }
         );
 
-        Ok(ListSessionsResponse::new(sessions))
+        Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
     }
 
     async fn handle_load_session(
@@ -2819,7 +2947,7 @@ impl SiGitAgent {
         let Some(history) = session_store::load(&session_key).or(in_memory) else {
             log::warn!("{method}: no session {session_key}");
             return Err(agent_client_protocol::Error::new(
-                -32002,
+                ErrorCode::ResourceNotFound.into(),
                 format!("session {session_key} not found"),
             ));
         };
@@ -2919,13 +3047,35 @@ impl SiGitAgent {
         }
 
         permissions::reset_session(&key);
+        self.announced_titles.lock().unwrap().remove(&key);
         let killed = tools::kill_session_tasks(&key);
+        tools::forget_abort(&key);
         self.closing_sessions.lock().unwrap().remove(&key);
 
         log::info!(
             "close_session: id={key} (known={known}, live={was_live}, {killed} background task(s) stopped)"
         );
         Ok(CloseSessionResponse::new())
+    }
+
+    /// ACP `session/delete`: the user removed a thread in the editor.
+    ///
+    /// A live thread is closed first, exactly as `session/close` would (the
+    /// caller has run `begin_close` and holds the same locks), so its turn,
+    /// permission grants and background commands go with it. Then the saved
+    /// history and its sidecar are removed, which is what takes the thread out
+    /// of `session/list`. Deleting an id that was never saved, or is already
+    /// gone, succeeds quietly.
+    async fn handle_delete_session(
+        &self,
+        args: DeleteSessionRequest,
+    ) -> agent_client_protocol::Result<DeleteSessionResponse> {
+        let key = args.session_id.to_string();
+        self.handle_close_session(CloseSessionRequest::new(args.session_id))
+            .await?;
+        session_store::delete(&key);
+        log::info!("delete_session: id={key}");
+        Ok(DeleteSessionResponse::new())
     }
 
     /// First half of `session/close`, run before waiting for any lock.
@@ -2942,6 +3092,7 @@ impl SiGitAgent {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
+        tools::abort_session_tools(&key);
     }
 
     async fn handle_fork_session(
@@ -3083,6 +3234,7 @@ impl SiGitAgent {
         // sessions or loading a model is seen. The session lock is held, so the
         // slot can only be this turn's. The guard clears it on every return.
         let cancellation = Arc::new(PromptCancellation::default());
+        tools::reset_abort(&session_id.to_string());
         self.prompt_cancellations
             .lock()
             .unwrap()
@@ -3183,7 +3335,22 @@ impl SiGitAgent {
                             ));
                         }
                         EmbeddedResourceResource::BlobResourceContents(blob) => {
-                            parts.push(format!("[binary resource: {}]", blob.uri));
+                            let mime = blob.mime_type.clone().unwrap_or_default();
+                            if mime.starts_with("image/") {
+                                images.push(ImageInput {
+                                    mime_type: mime,
+                                    data: blob.blob.clone(),
+                                });
+                            } else if mime.starts_with("audio/") {
+                                audio.push(AudioInput {
+                                    mime_type: mime,
+                                    data: blob.blob.clone(),
+                                });
+                            } else if mime.is_empty() {
+                                parts.push(format!("[binary resource: {}]", blob.uri));
+                            } else {
+                                parts.push(format!("[binary resource: {} ({mime})]", blob.uri));
+                            }
                         }
                         _ => {
                             log::debug!("ignoring unsupported embedded resource variant");
@@ -3334,6 +3501,7 @@ impl SiGitAgent {
         let max_tool_rounds = headless::max_tool_rounds_from_env();
 
         let model_name = self.current_model.lock().unwrap().display_name.clone();
+        let context_window = self.context_window_tokens();
         let earlier_images = if backend.accepts_images() {
             0
         } else {
@@ -3441,11 +3609,17 @@ impl SiGitAgent {
                 // The client keeps this prompt in its thread after the error,
                 // so keep it in the saved conversation too.
                 let snapshot = backend.history_snapshot().await;
-                self.persist_session(&session_id, &snapshot).await;
+                self.persist_session(cx, &session_id, &snapshot).await;
                 self.finish_prompt(&session_id, &cancellation);
-                return Err(agent_client_protocol::Error::new(-32603, error));
+                return Err(agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    error,
+                ));
             }
         };
+
+        self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
+            .await;
 
         let mut round = 0;
         // Set when the repetition guard blocked a call; names the tool.
@@ -3742,12 +3916,10 @@ impl SiGitAgent {
                         } else {
                             ToolCallStatus::Failed
                         })
-                        .content(tool_result_content(
-                            &output,
-                            change.as_ref(),
-                            terminal.as_deref(),
-                        ))
                         .raw_output(serde_json::Value::String(output.clone()));
+                    if terminal.is_none() {
+                        fields = fields.content(tool_result_content(&output, change.as_ref()));
+                    }
                     // A denial at the prompt leaves the card titled with the
                     // permission request's full arguments; put its own back.
                     if !executed && announced_status == ToolCallStatus::Pending {
@@ -3765,9 +3937,9 @@ impl SiGitAgent {
                     tool_call_id: tc.id.clone(),
                     content: output,
                 });
-                // Cancellation cannot preempt a synchronous foreground tool:
-                // it is observed here as soon as that tool exits. Background
-                // commands remain cancellable through `kill_command`.
+                // A cancel aborts a running foreground command (see
+                // `tools::abort_session_tools`), so it exits and is observed
+                // here. Background commands are stopped with `kill_command`.
                 if cancellation.cancelled.load(Ordering::Acquire) {
                     for pending in &result.tool_calls[call_index + 1..] {
                         tool_results.push(BackendToolResult {
@@ -3828,9 +4000,14 @@ impl SiGitAgent {
                         let _ = self.send_plan_update(cx, session_id.clone(), plan);
                     }
                     self.finish_prompt(&session_id, &cancellation);
-                    return Err(agent_client_protocol::Error::new(-32603, error));
+                    return Err(agent_client_protocol::Error::new(
+                        ErrorCode::InternalError.into(),
+                        error,
+                    ));
                 }
             };
+            self.send_usage(cx, &session_id, backend.as_ref(), &result, context_window)
+                .await;
         }
 
         // ── Final text response ───────────────────────────────────────────
@@ -3865,7 +4042,8 @@ impl SiGitAgent {
             };
 
             if !final_text.is_empty() {
-                self.send_assistant_message(cx, session_id.clone(), final_text)
+                let message_id = reply.message_id();
+                self.send_reply_chunk(cx, session_id.clone(), message_id, final_text)
                     .ok();
             }
         } else if round > 0 && !round_cap_reached && reply.sent.len() == sent_before_last_round {
@@ -3878,9 +4056,11 @@ impl SiGitAgent {
                 session_id,
                 round
             );
-            self.send_assistant_message(
+            let message_id = reply.message_id();
+            self.send_reply_chunk(
                 cx,
                 session_id.clone(),
+                message_id,
                 format!(
                     "{PARAGRAPH_BREAK}{}",
                     silent_stop_message(stopped_repeating.as_deref(), round)
@@ -3895,9 +4075,11 @@ impl SiGitAgent {
                 session_id,
                 max_tool_rounds
             );
-            self.send_assistant_message(
+            let message_id = reply.message_id();
+            self.send_reply_chunk(
                 cx,
                 session_id.clone(),
+                message_id,
                 format!(
                     "{PARAGRAPH_BREAK}{}",
                     round_cap_stop_message(max_tool_rounds)
@@ -3925,7 +4107,7 @@ impl SiGitAgent {
         // Persist the completed turn so a restart (or session/load) can pick
         // the conversation back up.
         let snapshot = backend.history_snapshot().await;
-        self.persist_session(&session_id, &snapshot).await;
+        self.persist_session(cx, &session_id, &snapshot).await;
         self.finish_prompt(&session_id, &cancellation);
 
         log::info!(
@@ -3937,11 +4119,50 @@ impl SiGitAgent {
         Ok(PromptResponse::new(stop_reason))
     }
 
+    /// The context window of the session's model, for `usage_update`. A model
+    /// the picker does not list (a provider-supplied name, say) falls back to
+    /// the compaction budget, the same as the TUI's gauge.
+    fn context_window_tokens(&self) -> u64 {
+        let current = self.current_model.lock().unwrap().clone();
+        models::build_model_picker_items()
+            .into_iter()
+            .find(|item| {
+                item.config.model_id == current.model_id
+                    || item.display_name == current.display_name
+            })
+            .map(|item| item.context_window_tokens)
+            .unwrap_or(backend::DEFAULT_CONTEXT_TOKEN_BUDGET as u64)
+    }
+
+    /// Report how much of the context window the session uses after one
+    /// model response. The endpoint's own count is used when it gave one;
+    /// otherwise (always on-device) the history is estimated, the way
+    /// compaction does it.
+    async fn send_usage(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        backend: &dyn InferenceBackend,
+        result: &TurnResult,
+        size: u64,
+    ) {
+        let used = match result.context_tokens {
+            Some(tokens) => tokens,
+            None => backend::estimate_tokens(&backend.history_snapshot().await) as u64,
+        };
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
+        ))
+        .ok();
+    }
+
     /// Ask the ACP client for permission to run one tool call. The request
     /// names the call by `tool_call_id`, the id it was announced under, so the
     /// client updates that one card instead of drawing a second. Presents
-    /// allow-once / allow-for-session / deny; an "always allow" choice is
-    /// recorded via [`permissions::grant_for_session`]. Only safe to call from
+    /// allow-once / allow-for-session / deny / deny-for-session; an "always"
+    /// choice is recorded via [`permissions::grant_for_session`] or
+    /// [`permissions::deny_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
     /// dispatch loop must be free to route the client's answer back to us.
     ///
@@ -3991,6 +4212,11 @@ impl SiGitAgent {
                     PermissionOptionKind::AllowAlways,
                 ),
                 PermissionOption::new("reject_once", "Deny", PermissionOptionKind::RejectOnce),
+                PermissionOption::new(
+                    "reject_session",
+                    "Deny for this session",
+                    PermissionOptionKind::RejectAlways,
+                ),
             ],
         );
 
@@ -4006,6 +4232,14 @@ impl SiGitAgent {
                                 arguments,
                             );
                             PermissionVerdict::Approved
+                        }
+                        "reject_session" => {
+                            permissions::deny_for_session(
+                                &session_id.to_string(),
+                                tool_name,
+                                arguments,
+                            );
+                            PermissionVerdict::Denied(permissions::user_denial(tool_name))
                         }
                         _ => PermissionVerdict::Denied(permissions::user_denial(tool_name)),
                     }
@@ -4058,17 +4292,25 @@ impl SiGitAgent {
 
     async fn handle_cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
         log::info!("cancel requested for session {}", args.session_id);
+        self.cancel_turn(&args.session_id);
+        Ok(())
+    }
+
+    /// Stop the turn running on `session_id`, if there is one, and whatever
+    /// command it is running. Reached from `session/cancel` and from a
+    /// `$/cancel_request` naming the prompt.
+    fn cancel_turn(&self, session_id: &SessionId) {
         if let Some(cancellation) = self
             .prompt_cancellations
             .lock()
             .unwrap()
-            .get(&args.session_id.to_string())
+            .get(&session_id.to_string())
             .cloned()
         {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
-        Ok(())
+        tools::abort_session_tools(&session_id.to_string());
     }
 
     /// Swap the active backend to a siGit Code Cloud tier and reflect it as the
@@ -4230,6 +4472,69 @@ impl SiGitAgent {
     /// modes are the Permissions dropdown under another name, so this changes
     /// the same state and then refreshes the dropdown for a client that shows
     /// both.
+    /// `-32002` unless `session_id` is a session this process knows.
+    fn require_known_session(&self, session_id: &SessionId) -> agent_client_protocol::Result<()> {
+        let key = session_id.to_string();
+        if self.sessions.lock().unwrap().contains_key(&key) {
+            return Ok(());
+        }
+        Err(agent_client_protocol::Error::new(
+            ErrorCode::ResourceNotFound.into(),
+            format!(
+                "unknown session {key}; create it with session/new or restore it with session/load"
+            ),
+        ))
+    }
+
+    /// The config options for `key`, built from that session's own model and
+    /// not from whichever session is live, so it can be read without the
+    /// workspace lock.
+    fn config_options_for_session(&self, key: &str) -> Vec<SessionConfigOption> {
+        let live = self.active_session.lock().unwrap().as_deref() == Some(key);
+        let model_id = if live {
+            self.current_model.lock().unwrap().model_id.clone()
+        } else {
+            self.sessions
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|state| {
+                    state
+                        .remote
+                        .as_ref()
+                        .map_or_else(|| state.model_id.clone(), |r| r.model.model_id.clone())
+                })
+                .unwrap_or_default()
+        };
+        build_config_options_for(&model_id, key)
+    }
+
+    /// Apply a Permissions change for `session_id`, which can be mid-turn.
+    ///
+    /// Takes neither the session lock nor the workspace lock: the turn holds
+    /// the first for its whole length, and a user flipping to Auto while a
+    /// permission prompt is open has to be heard at once. It touches only
+    /// state keyed by session (`permissions`), so the live session is left
+    /// alone. Returns the new config options and the status line to show.
+    fn change_permission_mode(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        mode_id: Option<&str>,
+    ) -> agent_client_protocol::Result<Vec<SessionConfigOption>> {
+        self.require_known_session(session_id)?;
+        let key = session_id.to_string();
+        let Some(message) = mode_id.and_then(|id| apply_permission_mode(&key, id)) else {
+            return Err(agent_client_protocol::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!("unknown permission mode: {mode_id:?}"),
+            ));
+        };
+        self.send_system_status(cx, session_id.clone(), message)
+            .ok();
+        Ok(self.config_options_for_session(&key))
+    }
+
     async fn handle_set_session_mode(
         &self,
         cx: &ConnectionTo<Client>,
@@ -4241,21 +4546,8 @@ impl SiGitAgent {
             args.mode_id
         );
 
-        self.activate_session(&args.session_id).await?;
-
-        let session_key = args.session_id.to_string();
-        let Some(message) = apply_permission_mode(&session_key, args.mode_id.0.as_ref()) else {
-            return Err(agent_client_protocol::Error::new(
-                -32602,
-                format!("unknown session mode: {}", args.mode_id),
-            ));
-        };
-        self.send_system_status(cx, args.session_id.clone(), message)
-            .ok();
-        let config_options = {
-            let current = self.current_model.lock().unwrap();
-            build_config_options(&current, &session_key)
-        };
+        let config_options =
+            self.change_permission_mode(cx, &args.session_id, Some(args.mode_id.0.as_ref()))?;
         self.send_tool_call_update(
             cx,
             args.session_id,
@@ -4276,25 +4568,40 @@ impl SiGitAgent {
             args.value
         );
 
+        // ── Permissions dropdown (issue #76) ────────────────────────────────
+        // Handled before the session is activated: the dispatch loop runs this
+        // one without the session or workspace lock, so it can land mid-turn.
+        if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
+            let picked = args.value.as_value_id().map(|v| v.0.as_ref());
+            let config_options = self.change_permission_mode(cx, &args.session_id, picked)?;
+            self.send_current_mode(cx, args.session_id);
+            return Ok(SetSessionConfigOptionResponse::new(config_options));
+        }
+
         // A model switch carries the live conversation onto the new backend, so
         // the live conversation has to be the one whose picker changed.
         self.activate_session(&args.session_id).await?;
 
         // ── Local Inference toggle ──────────────────────────────────────────
         if args.config_id.0.as_ref() == LOCAL_INFERENCE_CONFIG_ID {
-            let enabled = match args.value.as_value_id().map(|v| v.0.as_ref()) {
-                Some(LOCAL_INFERENCE_ON) => true,
-                Some(LOCAL_INFERENCE_OFF) => false,
-                other => {
+            // A toggle sends a boolean, the select fallback one of its ids.
+            let enabled = match (
+                args.value.as_bool(),
+                args.value.as_value_id().map(|v| v.0.as_ref()),
+            ) {
+                (Some(enabled), _) => enabled,
+                (_, Some(LOCAL_INFERENCE_ON)) => true,
+                (_, Some(LOCAL_INFERENCE_OFF)) => false,
+                (_, other) => {
                     return Err(agent_client_protocol::Error::new(
-                        -32602,
+                        ErrorCode::InvalidParams.into(),
                         format!("unknown Local Inference value: {other:?}"),
                     ));
                 }
             };
             if let Err(error) = settings::set_local_inference(enabled) {
                 return Err(agent_client_protocol::Error::new(
-                    -32603,
+                    ErrorCode::InternalError.into(),
                     format!("could not save Local Inference setting: {error}"),
                 ));
             }
@@ -4311,35 +4618,16 @@ impl SiGitAgent {
             return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
-        // ── Permissions dropdown (issue #76) ────────────────────────────────
-        if args.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
-            let session_key = args.session_id.to_string();
-            let picked = args.value.as_value_id().map(|v| v.0.as_ref());
-            let Some(message) = picked.and_then(|id| apply_permission_mode(&session_key, id))
-            else {
-                return Err(agent_client_protocol::Error::new(
-                    -32602,
-                    format!("unknown Permissions value: {picked:?}"),
-                ));
-            };
-            self.send_current_mode(cx, args.session_id.clone());
-            self.send_system_status(cx, args.session_id.clone(), message)
-                .ok();
-            let current = self.current_model.lock().unwrap().clone();
-            let config_options = build_config_options(&current, &session_key);
-            return Ok(SetSessionConfigOptionResponse::new(config_options));
-        }
-
         if args.config_id.0.as_ref() != MODEL_CONFIG_ID {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!("unknown config option: {}", args.config_id.0),
             ));
         }
 
         let Some(model_id) = args.value.as_value_id().map(|v| v.0.as_ref()) else {
             return Err(agent_client_protocol::Error::new(
-                -32602,
+                ErrorCode::InvalidParams.into(),
                 format!(
                     "expected a value-id for {MODEL_CONFIG_ID}, got {:?}",
                     args.value
@@ -4674,10 +4962,19 @@ impl SiGitAgent {
 /// config option ID for the model picker in Zed's agent panel
 const MODEL_CONFIG_ID: &str = "sigit-model";
 
-/// config option ID for the Local Inference on/off toggle. Surfaced as a
-/// two-option `select` so ACP clients without slash-command support (e.g. Xcode)
-/// can still flip the mode from the agent panel.
+/// config option ID for the Local Inference on/off toggle, so ACP clients
+/// without slash-command support (e.g. Xcode) can still flip the mode from the
+/// agent panel. A `boolean` option for clients that advertise
+/// `session.configOptions.boolean`, a two-option `select` for the rest.
 const LOCAL_INFERENCE_CONFIG_ID: &str = "sigit-local-inference";
+
+/// Whether the connected client advertised boolean config options. One
+/// process serves one ACP connection, so this is set once in `initialize`.
+static CLIENT_BOOLEAN_CONFIG_OPTIONS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the connected client advertised URL-mode elicitation, which
+/// `authenticate` uses to hand the sign-in page to the editor.
+static CLIENT_ELICITATION_URL: AtomicBool = AtomicBool::new(false);
 
 /// `select` value ids for the Local Inference toggle.
 const LOCAL_INFERENCE_ON: &str = "local-inference-on";
@@ -4780,6 +5077,13 @@ fn build_config_options(
     current_model: &GgufModelConfig,
     session_key: &str,
 ) -> Vec<SessionConfigOption> {
+    build_config_options_for(&current_model.model_id, session_key)
+}
+
+/// The config options for a session whose selected model is `current_model_id`.
+/// Only the id matters, which is what lets a session that is not the live one
+/// have its options built without installing it.
+fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<SessionConfigOption> {
     // The full list, including the siGit Code Cloud tiers, so the panel picker
     // mirrors the TUI `/models`. Cloud entries are sign-in gated at selection.
     let items = models::build_model_picker_items();
@@ -4871,12 +5175,16 @@ fn build_config_options(
         )
         .description("Use siGit Code Cloud; cloud tiers are highlighted".to_string()),
     ];
-    let local_option = SessionConfigOption::select(
-        LOCAL_INFERENCE_CONFIG_ID,
-        "Inference",
-        local_current,
-        local_options,
-    )
+    let local_option = if CLIENT_BOOLEAN_CONFIG_OPTIONS.load(Ordering::Relaxed) {
+        SessionConfigOption::boolean(LOCAL_INFERENCE_CONFIG_ID, "Local inference", local_on)
+    } else {
+        SessionConfigOption::select(
+            LOCAL_INFERENCE_CONFIG_ID,
+            "Inference",
+            local_current,
+            local_options,
+        )
+    }
     .description("Toggle on-device inference; changes which models are highlighted");
 
     // Permissions dropdown (issue #76): Manual (ask), Auto (run unattended),
@@ -4902,7 +5210,7 @@ fn build_config_options(
         return vec![local_option, permission_option];
     }
 
-    let current_value = SessionConfigValueId::new(current_model.model_id.as_str());
+    let current_value = SessionConfigValueId::new(current_model_id);
 
     vec![
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
@@ -5173,7 +5481,7 @@ async fn exec_slash_acp(
                 let mut sessions = agent.sessions.lock().unwrap();
                 let state = sessions.get_mut(&session_key).ok_or_else(|| {
                     agent_client_protocol::Error::new(
-                        -32602,
+                        ErrorCode::InvalidParams.into(),
                         format!("cannot clear unknown session {session_key}"),
                     )
                 })?;
@@ -5245,7 +5553,7 @@ async fn exec_slash_acp(
                     let snapshot = backend.history_snapshot().await;
                     let after = backend::estimate_tokens(&snapshot);
                     // Keep the saved session in step with the compacted state.
-                    agent.persist_session(&session_id, &snapshot).await;
+                    agent.persist_session(cx, &session_id, &snapshot).await;
                     format!("Compacted history: ~{before} → ~{after} tokens (estimated).")
                 }
                 Err(error) => format!("Compaction failed: {error}"),
@@ -5860,8 +6168,22 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: AuthenticateRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_authenticate(req).await)
+                async move |req: AuthenticateRequest, responder, cx: ConnectionTo<Client>| {
+                    let state = Arc::clone(&state);
+                    let task_cx = cx.clone();
+                    let request_id = responder.id().clone();
+                    // A sign-in waits on the browser for minutes. Dropping it
+                    // on `$/cancel_request` closes the loopback listener, and
+                    // the request is answered `-32800`.
+                    let cancellation = responder.cancellation();
+                    cx.spawn(async move {
+                        let result = cancellation
+                            .run_until_cancelled(state.handle_authenticate(
+                                &task_cx, request_id, req,
+                            ))
+                            .await;
+                        handle_response(responder, result)
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -5946,6 +6268,23 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |req: DeleteSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    // A delete closes the thread first, so it is signalled the
+                    // same way a close is.
+                    state.begin_close(&req.session_id);
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let _session = state.lock_session(&req.session_id).await;
+                        let _workspace = state.workspace_lock.lock().await;
+                        handle_response(responder, state.handle_delete_session(req).await)
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |req: ForkSessionRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
@@ -5980,9 +6319,29 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                 async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
+                    let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let _session = state.lock_session(&req.session_id).await;
-                        handle_response(responder, state.handle_prompt(&task_cx, req).await)
+                        let session_id = req.session_id.clone();
+                        let turn = state.handle_prompt(&task_cx, req);
+                        tokio::pin!(turn);
+                        // `$/cancel_request` for the prompt's own id stops the
+                        // turn the way `session/cancel` does, and the request
+                        // is still answered with a `cancelled` stop reason so
+                        // the client keeps what was streamed. The turn is
+                        // polled first: it registers for cancellation on its
+                        // first poll, which a cancel that arrived while the
+                        // prompt was queued would otherwise beat.
+                        let result = tokio::select! {
+                            biased;
+                            result = &mut turn => result,
+                            () = cancellation.cancelled() => {
+                                log::info!("$/cancel_request for the prompt on session {session_id}");
+                                state.cancel_turn(&session_id);
+                                turn.await
+                            }
+                        };
+                        handle_response(responder, result)
                     })
                 }
             },
@@ -5997,6 +6356,15 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
+                        // A Permissions change can arrive while a turn is
+                        // running, so it takes neither lock. Model and
+                        // Inference swap the live backend and wait for the turn.
+                        if req.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
+                            return handle_response(
+                                responder,
+                                state.handle_set_session_config_option(&task_cx, req).await,
+                            );
+                        }
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
@@ -6014,9 +6382,9 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                 async move |req: SetSessionModeRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
+                    // No locks: the mode can change while a turn is running,
+                    // and the change touches only state keyed by session.
                     cx.spawn(async move {
-                        let _session = state.lock_session(&req.session_id).await;
-                        let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
                             state.handle_set_session_mode(&task_cx, req).await,
@@ -6041,6 +6409,68 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
 
     log::info!("siGit shutting down");
     Ok(())
+}
+
+/// The loopback sign-in with the editor showing the page: the authorize URL
+/// goes to the client as a URL-mode elicitation, so the user sees where they
+/// are being sent and the editor opens it, which also works when this process
+/// cannot launch a browser itself. A user who declines ends the sign-in; a
+/// client that fails the request gets the old behaviour, a browser opened
+/// from here. Once the code is redeemed the client is told the elicitation
+/// is complete.
+async fn sign_in_via_client(
+    cx: &ConnectionTo<Client>,
+    request_id: RequestId,
+    flow: browser_auth::Flow,
+) -> Result<String, String> {
+    let url = flow.authorize_url().to_string();
+    let elicitation_id = uuid::Uuid::new_v4().to_string();
+    log::info!("authenticate: asking the client to open {url}");
+    let ask = cx
+        .send_request(CreateElicitationRequest::new(
+            ElicitationUrlMode::new(
+                ElicitationRequestScope::new(request_id),
+                elicitation_id.clone(),
+                url.clone(),
+            ),
+            "Sign in to siGit Code in your browser to use siGit Code Cloud.",
+        ))
+        .block_task();
+    let sign_in = browser_auth::complete_loopback(flow);
+    tokio::pin!(sign_in);
+
+    // The page can be finished before the client gets round to answering.
+    enum First {
+        Answer(
+            agent_client_protocol::Result<
+                agent_client_protocol::schema::v1::CreateElicitationResponse,
+            >,
+        ),
+        SignedIn(Result<String, String>),
+    }
+    let first = tokio::select! {
+        answer = ask => First::Answer(answer),
+        result = &mut sign_in => First::SignedIn(result),
+    };
+    let result = match first {
+        First::SignedIn(result) => result,
+        First::Answer(Ok(response)) => match response.action {
+            ElicitationAction::Accept(_) => sign_in.await,
+            _ => Err("the sign-in page was not opened".to_string()),
+        },
+        First::Answer(Err(error)) => {
+            log::warn!("authenticate: the client could not show the sign-in page ({error})");
+            if !browser_auth::open_browser(&url) {
+                log::warn!("authenticate: no browser could be launched");
+            }
+            sign_in.await
+        }
+    };
+    if result.is_ok() {
+        cx.send_notification(CompleteElicitationNotification::new(elicitation_id))
+            .ok();
+    }
+    result
 }
 
 /// Run the browser sign-in from a chat surface and describe how it went.
@@ -6478,7 +6908,7 @@ mod tests {
             .activate_session(&SessionId::new("not-opened"))
             .await
             .unwrap_err();
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(i32::from(error.code), -32002);
         assert!(error.message.contains("session/new"));
         assert!(agent.active_session.lock().unwrap().is_none());
     }
@@ -7187,7 +7617,7 @@ mod tests {
         let updates = history_replay_updates(&history);
 
         // The system message seeded the model; it was never on screen.
-        assert_eq!(updates.len(), 4, "{updates:#?}");
+        assert_eq!(updates.len(), 5, "{updates:#?}");
 
         match &updates[0] {
             SessionUpdate::UserMessageChunk(chunk) => {
@@ -7195,16 +7625,23 @@ mod tests {
             }
             other => panic!("expected the user message first, got {other:?}"),
         }
+        // Reasoning comes back as a thought, apart from the reply, exactly
+        // as it went out live.
         match &updates[1] {
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                assert!(format!("{:?}", chunk.content).contains("which file?"));
+            }
+            other => panic!("expected the reasoning, got {other:?}"),
+        }
+        match &updates[2] {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let rendered = format!("{:?}", chunk.content);
                 assert!(rendered.contains("Reading it now."));
-                // Reasoning stays hidden on replay, exactly as it did live.
                 assert!(!rendered.contains("which file?"));
             }
             other => panic!("expected the assistant reply, got {other:?}"),
         }
-        match &updates[2] {
+        match &updates[3] {
             SessionUpdate::ToolCall(call) => {
                 assert_eq!(call.title, format!("read_file · {changelog_path_text}"));
                 assert_eq!(call.kind, ToolKind::Read);
@@ -7227,7 +7664,27 @@ mod tests {
             }
             other => panic!("expected the tool call, got {other:?}"),
         }
-        assert!(matches!(updates[3], SessionUpdate::AgentMessageChunk(_)));
+        assert!(matches!(updates[4], SessionUpdate::AgentMessageChunk(_)));
+
+        // Each replayed message has an id of its own.
+        let ids: Vec<_> = updates
+            .iter()
+            .filter_map(|update| match update {
+                SessionUpdate::UserMessageChunk(chunk)
+                | SessionUpdate::AgentMessageChunk(chunk) => Some(
+                    chunk
+                        .message_id
+                        .clone()
+                        .expect("replayed chunk has a messageId"),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
+            "{ids:?}"
+        );
     }
 
     #[test]
@@ -7311,6 +7768,144 @@ mod tests {
             serde_json::json!({ "role": "assistant", "content": "" }),
         ];
         assert!(history_replay_updates(&history).is_empty());
+    }
+
+    #[test]
+    fn history_replay_sends_reasoning_as_a_thought_under_the_reply_id() {
+        let history = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "<think>check the lockfile first</think>The lockfile is stale.",
+        })];
+        match history_replay_updates(&history).as_slice() {
+            [
+                SessionUpdate::AgentThoughtChunk(thought),
+                SessionUpdate::AgentMessageChunk(reply),
+            ] => {
+                assert!(
+                    matches!(&thought.content, ContentBlock::Text(t) if t.text.contains("check the lockfile first"))
+                );
+                assert!(
+                    matches!(&reply.content, ContentBlock::Text(t) if t.text == "The lockfile is stale.")
+                );
+                assert!(thought.message_id.is_some());
+                assert_eq!(thought.message_id, reply.message_id);
+            }
+            other => panic!("expected a thought and a reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_replay_gives_back_the_attachments_of_a_user_message() {
+        let history = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in these?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } },
+                { "type": "input_audio", "input_audio": { "data": "BBBB", "format": "mp3" } },
+                { "type": "input_audio", "input_audio": { "data": "CCCC", "format": "wav" } },
+            ],
+        })];
+        match history_replay_updates(&history).as_slice() {
+            [
+                SessionUpdate::UserMessageChunk(text),
+                SessionUpdate::UserMessageChunk(image),
+                SessionUpdate::UserMessageChunk(mp3),
+                SessionUpdate::UserMessageChunk(wav),
+            ] => {
+                assert!(
+                    matches!(&text.content, ContentBlock::Text(t) if t.text == "what is in these?")
+                );
+                assert!(
+                    matches!(&image.content, ContentBlock::Image(i) if i.data == "AAAA" && i.mime_type == "image/png")
+                );
+                assert!(
+                    matches!(&mp3.content, ContentBlock::Audio(a) if a.data == "BBBB" && a.mime_type == "audio/mpeg")
+                );
+                assert!(
+                    matches!(&wav.content, ContentBlock::Audio(a) if a.data == "CCCC" && a.mime_type == "audio/wav")
+                );
+                assert!(text.message_id.is_some());
+                for chunk in [image, mp3, wav] {
+                    assert_eq!(chunk.message_id, text.message_id);
+                }
+            }
+            other => panic!("expected the text and three attachments, got {other:?}"),
+        }
+    }
+
+    fn listed(id: &str, modified_secs: u64) -> session_store::SessionEntry {
+        session_store::SessionEntry {
+            id: id.to_string(),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs),
+            message_count: 1,
+            cwd: Some(PathBuf::from("/project")),
+            additional_directories: Vec::new(),
+            model_id: None,
+            title: None,
+        }
+    }
+
+    fn ids(page: &[session_store::SessionEntry]) -> Vec<&str> {
+        page.iter().map(|entry| entry.id.as_str()).collect()
+    }
+
+    #[test]
+    fn session_list_pages_follow_one_another_without_gaps_or_repeats() {
+        // In `session_store::list` order: newest first, ties by id.
+        let sessions = || {
+            vec![
+                listed("e", 50),
+                listed("a", 40),
+                listed("b", 40),
+                listed("c", 40),
+                listed("d", 10),
+            ]
+        };
+
+        let (first, cursor) = session_list_page(sessions(), None, 2);
+        assert_eq!(ids(&first), ["e", "a"]);
+        let cursor = SessionListCursor::decode(&cursor.expect("more pages follow")).unwrap();
+
+        let (second, cursor) = session_list_page(sessions(), Some(&cursor), 2);
+        assert_eq!(ids(&second), ["b", "c"]);
+        let cursor = SessionListCursor::decode(&cursor.expect("one more page")).unwrap();
+
+        let (third, cursor) = session_list_page(sessions(), Some(&cursor), 2);
+        assert_eq!(ids(&third), ["d"]);
+        assert_eq!(cursor, None, "the last page carries no cursor");
+    }
+
+    #[test]
+    fn session_list_has_no_cursor_when_everything_fits_on_one_page() {
+        let (page, cursor) = session_list_page(vec![listed("a", 2), listed("b", 1)], None, 2);
+        assert_eq!(ids(&page), ["a", "b"]);
+        assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn session_list_cursor_survives_the_session_it_names_being_deleted() {
+        let (_, cursor) = session_list_page(
+            vec![listed("a", 30), listed("b", 20), listed("c", 10)],
+            None,
+            2,
+        );
+        let cursor = SessionListCursor::decode(&cursor.unwrap()).unwrap();
+        // "b" ended the first page and is gone by the second request.
+        let (page, _) = session_list_page(vec![listed("a", 30), listed("c", 10)], Some(&cursor), 2);
+        assert_eq!(ids(&page), ["c"]);
+    }
+
+    #[test]
+    fn session_list_cursor_rejects_what_it_did_not_write() {
+        for cursor in ["", "abc", "12", "12:", "x:session", ":session"] {
+            assert_eq!(SessionListCursor::decode(cursor), None, "{cursor:?}");
+        }
+        let cursor = SessionListCursor {
+            modified_nanos: 1_700_000_000_123_456_789,
+            id: "a:b".to_string(),
+        };
+        assert_eq!(SessionListCursor::decode(&cursor.encode()), Some(cursor));
     }
 
     #[test]
@@ -7516,6 +8111,43 @@ mod tests {
 
     #[test]
     fn acp_config_option_labels_show_context_window() {
+        // The picker reads the permission default, the local-inference
+        // setting and the model cache from the environment, which other tests
+        // rewrite while they hold this lock (#168).
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = std::env::temp_dir().join(format!("sigit-labels-{}", uuid::Uuid::new_v4()));
+        let saved: Vec<_> = [
+            "SIGIT_CONFIG_DIR",
+            "SIGIT_PERMISSIONS",
+            "SIGIT_LOCAL_INFERENCE",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored below.
+        unsafe {
+            std::env::set_var("SIGIT_CONFIG_DIR", &config);
+            std::env::remove_var("SIGIT_PERMISSIONS");
+            std::env::remove_var("SIGIT_LOCAL_INFERENCE");
+        }
+        let outcome = std::panic::catch_unwind(acp_config_option_labels_once);
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn acp_config_option_labels_once() {
         let current = GgufModelConfig {
             model_id: "sigit-cloud:oke".to_string(),
             files: Vec::new(),
@@ -7600,7 +8232,6 @@ mod tests {
         let content = serde_json::to_value(tool_result_content(
             "Edited file: /repo/src/lib.rs (4 bytes written)",
             Some(&change),
-            None,
         ))
         .unwrap();
         assert_eq!(
@@ -7624,16 +8255,7 @@ mod tests {
         assert!(diff.get("oldText").is_none_or(serde_json::Value::is_null));
 
         // Every other tool keeps the result text alone.
-        // A command that ran in the client's terminal keeps the terminal,
-        // which already shows its output.
-        let ran = serde_json::to_value(tool_result_content("Exit code 0:\nhi", None, Some("t-1")))
-            .unwrap();
-        assert_eq!(
-            ran,
-            serde_json::json!([{ "type": "terminal", "terminalId": "t-1" }])
-        );
-
-        let plain = serde_json::to_value(tool_result_content("ok", None, None)).unwrap();
+        let plain = serde_json::to_value(tool_result_content("ok", None)).unwrap();
         assert_eq!(plain.as_array().unwrap().len(), 1);
         assert_eq!(plain[0]["type"], "content");
     }

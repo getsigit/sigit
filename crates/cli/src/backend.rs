@@ -19,6 +19,7 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use onde::inference::{ChatEngine, ChatMessage, ChatRole, EngineStatus, ToolDefinition};
@@ -61,6 +62,10 @@ pub struct TurnResult {
     /// Why the model stopped. Only the last round of a turn decides how the
     /// turn is reported; a round that goes on to run tools is not the end.
     pub finish: FinishReason,
+    /// The context in use once this reply is in, as the endpoint counted it:
+    /// prompt plus completion tokens. `None` when nothing was reported, which
+    /// is always the case on-device.
+    pub context_tokens: Option<u64>,
 }
 
 /// Why the model stopped generating, reduced to what the agent loop acts on.
@@ -914,6 +919,7 @@ async fn drain_onde_stream(
         text,
         tool_calls: Vec::new(),
         finish,
+        context_tokens: None,
     })
 }
 
@@ -921,6 +927,7 @@ async fn drain_onde_stream(
 fn onde_result_to_turn(result: onde::inference::ToolAwareResult) -> TurnResult {
     TurnResult {
         finish: FinishReason::from_wire(Some(&result.finish_reason)),
+        context_tokens: None,
         text: result.text,
         tool_calls: result
             .tool_calls
@@ -955,6 +962,9 @@ pub struct OpenAiBackend {
     /// Whether `model` takes audio (see `provider::model_accepts_audio`), with
     /// the same effect on audio already in `history`.
     accepts_audio: bool,
+    /// Set once the endpoint has refused `stream_options`, so streamed
+    /// requests stop asking it for token usage.
+    stream_usage_refused: Arc<AtomicBool>,
 }
 
 impl OpenAiBackend {
@@ -980,6 +990,7 @@ impl OpenAiBackend {
             model,
             http: reqwest::Client::new(),
             history: Mutex::new(history),
+            stream_usage_refused: Arc::default(),
         }
     }
 
@@ -1059,6 +1070,7 @@ impl OpenAiBackend {
             text: join_reply_text(&result.text, &retry.text),
             tool_calls: retry.tool_calls,
             finish: retry.finish,
+            context_tokens: retry.context_tokens,
         })
     }
 
@@ -1091,6 +1103,12 @@ impl OpenAiBackend {
             "messages": messages,
             "stream": streaming,
         });
+        // A stream reports no token usage unless asked to. It comes in a last
+        // chunk with no choices, which feeds the client's context meter.
+        let ask_for_usage = streaming && !self.stream_usage_refused.load(Ordering::Relaxed);
+        if ask_for_usage {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
         if allow_tool_calls && !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(Self::tools_json(tools));
             // OpenAI specifies `auto` as the default when tools are present,
@@ -1101,7 +1119,7 @@ impl OpenAiBackend {
             body["tool_choice"] = serde_json::Value::String("auto".to_string());
         }
 
-        let response = self
+        let mut response = self
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
@@ -1112,8 +1130,30 @@ impl OpenAiBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(describe_api_error(status, &body));
+            let error_body = response.text().await.unwrap_or_default();
+            // Usage is a nicety; an endpoint that does not know the option is
+            // asked again without it, and never asked for it again.
+            if !(ask_for_usage && refuses_stream_options(status, &error_body)) {
+                return Err(describe_api_error(status, &error_body));
+            }
+            log::info!("{url} refused stream_options; streaming without token usage");
+            self.stream_usage_refused.store(true, Ordering::Relaxed);
+            if let Some(fields) = body.as_object_mut() {
+                fields.remove("stream_options");
+            }
+            response = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| format!("request to {url} failed: {error}"))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_body = response.text().await.unwrap_or_default();
+                return Err(describe_api_error(status, &error_body));
+            }
         }
 
         if let Some(sink) = sink {
@@ -1189,6 +1229,7 @@ impl OpenAiBackend {
             .json()
             .await
             .map_err(|error| format!("response parse error: {error}"))?;
+        let context_tokens = parsed.usage.as_ref().map(Usage::context_tokens);
 
         let choice = parsed
             .choices
@@ -1243,6 +1284,7 @@ impl OpenAiBackend {
                     text,
                     tool_calls: Vec::new(),
                     finish,
+                    context_tokens,
                 },
                 malformed,
             ));
@@ -1282,6 +1324,7 @@ impl OpenAiBackend {
                         text: cleaned,
                         tool_calls,
                         finish,
+                        context_tokens,
                     },
                     malformed,
                 ));
@@ -1295,6 +1338,7 @@ impl OpenAiBackend {
                     text: cleaned,
                     tool_calls,
                     finish,
+                    context_tokens,
                 },
                 malformed,
             ));
@@ -1324,6 +1368,7 @@ impl OpenAiBackend {
                     text: extracted.text,
                     tool_calls,
                     finish,
+                    context_tokens,
                 },
                 malformed,
             ));
@@ -1343,6 +1388,7 @@ impl OpenAiBackend {
                 text,
                 tool_calls,
                 finish,
+                context_tokens,
             },
             0,
         ))
@@ -1381,6 +1427,8 @@ impl OpenAiBackend {
         let mut done = false;
         // Arrives on a late chunk, usually one with an empty delta.
         let mut finish = FinishReason::default();
+        // Arrives on the last chunk, which has no choices, when asked for.
+        let mut context_tokens = None;
         // Recovers a tool call the model wrote as literal `<tool_call>` text
         // instead of a structured delta. Scanning here (rather than after the
         // stream) keeps the tag off the UI: content goes straight to `sink` as
@@ -1435,6 +1483,9 @@ impl OpenAiBackend {
                     Err(_) => continue,
                 };
 
+                if let Some(usage) = &chunk.usage {
+                    context_tokens = Some(usage.context_tokens());
+                }
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
@@ -1603,6 +1654,7 @@ impl OpenAiBackend {
                 text,
                 tool_calls,
                 finish,
+                context_tokens,
             },
             malformed,
         ))
@@ -1781,6 +1833,8 @@ impl InferenceBackend for OpenAiBackend {
             history: Mutex::new(Vec::new()),
             accepts_images: self.accepts_images,
             accepts_audio: self.accepts_audio,
+            // It is the same endpoint, so what it refused it refuses here.
+            stream_usage_refused: Arc::clone(&self.stream_usage_refused),
         }))
     }
 
@@ -2012,6 +2066,33 @@ fn is_probable_html(body: &str) -> bool {
 struct ChatCompletion {
     #[serde(default)]
     choices: Vec<CompletionChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+/// Token usage as an OpenAI-compatible endpoint reports it.
+#[derive(Debug, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// The context in use once the reply is in.
+    fn context_tokens(&self) -> u64 {
+        self.total_tokens
+            .unwrap_or(self.prompt_tokens + self.completion_tokens)
+    }
+}
+
+/// Whether a failed request was turned down for carrying `stream_options`,
+/// which some OpenAI-compatible servers predate and reject as unknown.
+fn refuses_stream_options(status: reqwest::StatusCode, body: &str) -> bool {
+    matches!(status.as_u16(), 400 | 422) && body.contains("stream_options")
 }
 
 #[derive(Debug, Deserialize)]
@@ -2076,6 +2157,8 @@ struct ResponseFunction {
 struct StreamCompletion {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2997,6 +3080,162 @@ mod tests {
             }
         }
         assert!(shown.contains("stopped this reply"), "{shown}");
+    }
+
+    /// Serves `responses` in order, one per connection, as `(status,
+    /// content type, body)`, and hands back each request body.
+    fn spawn_scripted_stub(
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, content_type, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(headers_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..headers_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= headers_end + 4 + content_length {
+                            let _ = sender.send(
+                                String::from_utf8_lossy(&request[headers_end + 4..]).into_owned(),
+                            );
+                            break;
+                        }
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (addr, receiver)
+    }
+
+    fn sse(events: &[serde_json::Value]) -> String {
+        let mut body: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// A stream asks for token usage and reads it off the last chunk, the
+    /// one with no choices, for the client's context meter (issue #194).
+    #[tokio::test]
+    async fn a_stream_reports_the_usage_it_was_asked_for() {
+        let (addr, requests) = spawn_scripted_stub(vec![(
+            200,
+            "text/event-stream",
+            sse(&[
+                serde_json::json!({"choices": [{"delta": {"content": "Hi."}}]}),
+                serde_json::json!({
+                    "choices": [],
+                    "usage": {"prompt_tokens": 1200, "completion_tokens": 34, "total_tokens": 1234},
+                }),
+            ]),
+        )]);
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+        let (sink, _chunks) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = backend
+            .send_message_with_tools("hello", &[], Some(&sink))
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "Hi.");
+        assert_eq!(result.context_tokens, Some(1234));
+        let request: serde_json::Value = serde_json::from_str(&requests.recv().unwrap()).unwrap();
+        assert_eq!(request["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn a_json_reply_reports_its_usage() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "Hi."}}],
+            "usage": {"prompt_tokens": 90, "completion_tokens": 10},
+        })
+        .to_string();
+        let (addr, requests) = spawn_scripted_stub(vec![(200, "application/json", body)]);
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+
+        let result = backend
+            .send_message_with_tools("hello", &[], None)
+            .await
+            .unwrap();
+
+        // No total given: prompt plus completion.
+        assert_eq!(result.context_tokens, Some(100));
+        let request: serde_json::Value = serde_json::from_str(&requests.recv().unwrap()).unwrap();
+        assert!(request.get("stream_options").is_none(), "{request}");
+    }
+
+    /// An endpoint that predates `stream_options` is asked again without it,
+    /// and not asked for usage again after that.
+    #[tokio::test]
+    async fn an_endpoint_that_refuses_stream_options_still_streams() {
+        let refusal = serde_json::json!({
+            "error": {"message": "Unrecognized request argument supplied: stream_options"},
+        })
+        .to_string();
+        let reply = sse(&[serde_json::json!({"choices": [{"delta": {"content": "Hi."}}]})]);
+        let (addr, requests) = spawn_scripted_stub(vec![
+            (400, "application/json", refusal),
+            (200, "text/event-stream", reply.clone()),
+            (200, "text/event-stream", reply),
+        ]);
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+        let (sink, _chunks) = tokio::sync::mpsc::unbounded_channel();
+
+        let first = backend
+            .send_message_with_tools("hello", &[], Some(&sink))
+            .await
+            .unwrap();
+        assert_eq!(first.text, "Hi.");
+        assert_eq!(first.context_tokens, None);
+        let second = backend
+            .send_message_with_tools("again", &[], Some(&sink))
+            .await
+            .unwrap();
+        assert_eq!(second.text, "Hi.");
+
+        let bodies: Vec<serde_json::Value> = requests
+            .try_iter()
+            .map(|body| serde_json::from_str(&body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[0].get("stream_options").is_some());
+        assert!(bodies[1].get("stream_options").is_none());
+        assert!(bodies[2].get("stream_options").is_none());
     }
 
     #[test]

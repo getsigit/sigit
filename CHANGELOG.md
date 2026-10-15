@@ -1,5 +1,84 @@
 # Changelog
 
+## 1.7.0
+
+Finishes the Agent Client Protocol v1 surface. An editor can now delete a
+thread, show a context meter, tell one message from the next, cancel a request
+by its id and page through a long thread list, and a reopened thread comes back
+with its reasoning and attachments.
+
+### Added
+
+- **`session/delete`.** A thread removed in the editor is removed from disk, so
+  it no longer comes back in "Import Threads". A turn still running on it is
+  stopped first, and deleting an id that is already gone succeeds (#192).
+- **A saved thread reports its title and time as they change.** Each save sends
+  a `session_info_update` with a fresh `updatedAt`, and the title the first time
+  there is one. A new thread used to stay untitled in the sidebar until the next
+  `session/list` (#193).
+- **Context usage.** A `usage_update` follows every model response, so an editor
+  can show how full the context window is. `used` is the endpoint's own token
+  count when it gives one and an estimate otherwise, which is always the case
+  on-device (#194).
+- **Message ids.** Every message chunk carries a `messageId`. An inference round
+  is one message, so its reply and its reasoning share an id and the round after
+  a tool call starts a new one (#195).
+- **Sign-in through the editor.** For a client that advertises URL-mode
+  elicitation, `authenticate` hands it the sign-in page instead of launching a
+  browser from the agent. The user sees where they are being sent, and sign-in
+  works where siGit Code has no browser to open (#197).
+- **The Inference switch is a toggle** for a client that renders boolean config
+  options. Other clients keep the two-value select (#198).
+- **Deny for the session.** A permission prompt offers "deny for this session"
+  next to "allow for this session", so a tool the user does not want is not
+  asked about again in that thread (#199).
+- **`$/cancel_request`.** A client can cancel a request by its JSON-RPC id. For
+  `session/prompt` that stops the turn and the command it is running exactly as
+  `session/cancel` does, and the prompt is answered with the `cancelled` stop
+  reason. For `authenticate` it ends the wait on the browser and the request is
+  answered `-32800`. The notification used to be ignored.
+- **`session/list` is paged.** A reply holds at most 100 threads and a
+  `nextCursor` when there are more. The cursor names the last thread on the
+  page instead of counting an offset, so the next page is right when a thread is
+  saved or deleted in between. A cursor the agent did not hand out is rejected
+  with `-32602`; `cursor` used to be ignored.
+
+### Fixed
+
+- **A reopened thread shows its reasoning and attachments.** `session/load`
+  replayed only the text of each message. The model's reasoning now comes back
+  as `agent_thought_chunk` under the reply's `messageId`, and the images and
+  audio clips of a user message come back as `image` and `audio` blocks.
+- **Cancelling a turn stops the command it is running.** A foreground
+  `run_command` used to run to its own end (up to two minutes) before the turn
+  noticed the cancel. A cancel or `session/close` now kills the process tree, or
+  sends `terminal/kill` when the command runs in the editor's terminal, and the
+  turn ends `cancelled` within a moment.
+- **Switching permission mode works while a turn is running.** `session/set_mode`
+  and the Permissions config option queued behind the turn's session lock, so
+  choosing Auto while a permission prompt was open did nothing until the turn
+  ended. They now take no lock, are answered at once, and the pending call's
+  successors follow the new mode. Model and Inference changes still wait for
+  the turn.
+- **`authenticate` checks the method id.** An id that `initialize` never offered
+  is now rejected with `invalid_params` (`-32602`) instead of starting a
+  browser sign-in. A sign-in that fails reports `-32603`, since `-32000` means
+  authentication is required before a call.
+- **A session the agent does not know is `-32002`.** `session/prompt`,
+  `session/set_mode` and `session/set_config_option` answered `-32602` for an
+  unknown id; they now say resource not found, as `session/load` and
+  `session/resume` already did.
+- **A finished terminal command no longer names a released terminal.** The
+  closing `tool_call_update` of a command that ran in the editor's terminal
+  re-sent the terminal id after `terminal/release`. It now leaves the content
+  alone, so the embedded terminal stays as it was, and the result still goes out
+  as `rawOutput`.
+- **`session/list` rejects a relative `cwd` filter** with `-32602`, as
+  `session/new` does.
+- **An embedded binary resource is read when the model can read it.** An image
+  blob becomes an image input and an audio blob an audio input. Any other blob
+  keeps its placeholder, now with its MIME type.
+
 ## 1.6.9
 
 ### Fixed
@@ -1198,4 +1277,4 @@ ACP and editor mode work on Windows. The part that is still missing is the inter
 
 ---
 
-*© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)), distributed by [Splitfire AB](https://5mb.app).*
+*© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](NOTICE) for the rights holder and distributor.*
