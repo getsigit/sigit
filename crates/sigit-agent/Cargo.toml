@@ -7,6 +7,7 @@ documentation.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
 keywords = ["sigit", "acp", "agent", "llm", "coding-agent"]
 categories = ["development-tools"]
 authors.workspace = true
