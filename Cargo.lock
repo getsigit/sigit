@@ -5921,12 +5921,28 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sigit-agent",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
  "tracing-subscriber",
  "url",
  "uuid 1.26.0",
+]
+
+[[package]]
+name = "sigit-agent"
+version = "1.7.0"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "rand 0.9.5",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]

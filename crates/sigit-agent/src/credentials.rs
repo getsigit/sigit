@@ -5,6 +5,7 @@
 //! `~/.config/sigit/credentials.toml`, with `0600` permissions on Unix.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +19,24 @@ pub struct Credentials {
     pub email: Option<String>,
 }
 
-/// Config directory: `$SIGIT_CONFIG_DIR` or `~/.config/sigit`.
+/// Where an embedding host keeps the session, set once at startup by
+/// [`use_config_dir`]. Unset for the command-line agent.
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep the session in `dir` instead of `$SIGIT_CONFIG_DIR` or `~/.config/sigit`.
+///
+/// An app that embeds the agent calls this with its own data directory, which is inside the
+/// container in a sandboxed app, so the app and the CLI never share or overwrite a session.
+/// The first call wins; later calls are ignored.
+pub fn use_config_dir(dir: PathBuf) {
+    let _ = CONFIG_DIR.set(dir);
+}
+
+/// Config directory: the host's, else `$SIGIT_CONFIG_DIR`, else `~/.config/sigit`.
 fn config_dir() -> Option<PathBuf> {
+    if let Some(dir) = CONFIG_DIR.get() {
+        return Some(dir.clone());
+    }
     if let Ok(dir) = std::env::var("SIGIT_CONFIG_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -81,9 +98,8 @@ mod tests {
 
     #[test]
     fn round_trips_credentials_via_temp_dir() {
-        let _guard = crate::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("sigit_creds_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: single-threaded test; restores below.

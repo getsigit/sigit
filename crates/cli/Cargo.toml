@@ -22,6 +22,7 @@ name = "sigit"
 path = "src/main.rs"
 
 [dependencies]
+sigit-agent.workspace = true
 agent-client-protocol.workspace = true
 ed-mcp.workspace = true
 onde.workspace = true
