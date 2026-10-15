@@ -1,0 +1,23 @@
+[package]
+name = "sigit-agent"
+version.workspace = true
+edition.workspace = true
+description = "Shared siGit Code internals: the prompt, the sign-in and the cloud session, for the CLI and for apps that embed it."
+documentation.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["sigit", "acp", "agent", "llm", "coding-agent"]
+categories = ["development-tools"]
+authors.workspace = true
+
+[dependencies]
+base64.workspace = true
+log.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true

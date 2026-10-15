@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cli"]
+members = ["crates/cli", "crates/sigit-*"]
 
 [workspace.package]
 version = "1.7.0"
@@ -12,6 +12,10 @@ documentation = "https://github.com/getsigit/sigit"
 authors = ["Seto Elkahfi <seto@sigit.si>", "paydii <193906237+paydii@users.noreply.github.com>", "keypair34 <216233964+keypair34@users.noreply.github.com>"]
 
 [workspace.dependencies]
+# Shared siGit Code internals (prompt, sign-in, cloud session), used by the CLI and by hosts
+# that embed the agent.
+sigit-agent = { version = "1.7.0", default-features = false, path = "crates/sigit-agent" }
+
 # ACP protocol SDK
 agent-client-protocol = { version = "2.2", features = ["unstable_session_fork"] }
 
