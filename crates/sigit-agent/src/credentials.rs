@@ -27,9 +27,15 @@ static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 ///
 /// An app that embeds the agent calls this with its own data directory, which is inside the
 /// container in a sandboxed app, so the app and the CLI never share or overwrite a session.
-/// The first call wins; later calls are ignored.
+/// The first call wins, because one process settles its config dir once: a later call is
+/// ignored, and logged, so a second host cannot relocate the session out from under the first.
 pub fn use_config_dir(dir: PathBuf) {
-    let _ = CONFIG_DIR.set(dir);
+    if let Err(rejected) = CONFIG_DIR.set(dir) {
+        log::warn!(
+            "session config dir is already {:?}; ignoring {rejected:?}",
+            CONFIG_DIR.get().cloned().unwrap_or_default()
+        );
+    }
 }
 
 /// Config directory: the host's, else `$SIGIT_CONFIG_DIR`, else `~/.config/sigit`.
