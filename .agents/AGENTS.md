@@ -79,7 +79,8 @@ the repo is a symlink into it, never a copy:
 ## Workspace layout
 
 The repo root is a Cargo workspace (`members = ["crates/cli"]`, with `crates/sigit-*` added as
-they land). The `sigit` binary crate lives in `crates/cli`: its `src/` and `tests/` are what the
+they land). `crates/sigit-agent` is siGit Code as an `ed-acp` agent profile for apps that embed it (see
+below). The `sigit` binary crate lives in `crates/cli`: its `src/` and `tests/` are what the
 architecture section below calls `src/` and `tests/`, and it publishes as `sigit` from there.
 Shared package fields and every dependency version are declared once in the root
 `Cargo.toml` (`[workspace.package]`, `[workspace.dependencies]`) and inherited with
@@ -120,6 +121,21 @@ The agent loop is backend-agnostic. The flow: a turn (messages + tool specs) goe
 `InferenceBackend`, which returns assistant text and/or tool calls; the loop executes tools and
 feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete backend.
 
+- **`crates/sigit-agent`** — siGit Code as a library for hosts that embed the agent (sigit-app
+  serves it in-process with `ed_acp::serve` over `Channel::duplex`, through `ed-acp-tauri`).
+  `SiGitCode` is the `ed_acp::Profile`: the workspace tools (or `SiGitCode::without_shell()` for
+  a host that cannot start processes), `/init`, and `SiGitAuth` as its `AuthProvider`.
+  `SiGitAuth` is the browser sign-in `sigit` runs in an editor (`browser_auth`, public OAuth
+  client `sigit-code-cli`, PKCE) over the same stored session (`credentials`); the CLI imports
+  both from here so there is one OAuth client. A host calls `credentials::use_config_dir` with
+  its own data directory, which is inside the container in a sandboxed app, so the app and the
+  CLI never share or overwrite a session. `llm_config()` is siGit Code Cloud
+  (`SIGIT_CLOUD_URL`, default `https://sigit.si/api/v1`) with the stored token as bearer.
+  `prompt.rs` holds `SYSTEM_PROMPT` and `INIT_PROMPT`; the CLI imports them. The official MCP
+  server reaches a session through `official_mcp_servers()` in the host's `mcpServers`, not as
+  a process-wide built-in: a shared server would keep its first bearer across a sign-out. It
+  depends on `ed-acp` 1.3.0 from crates.io (the release that carries `Profile::auth`; see the
+  root `Cargo.toml`). `release-crates.yml` publishes it before `sigit`.
 - **`crates/cli/src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
   new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`.
   ACP session state owns its roots, conversation, and selected model even though the process has
