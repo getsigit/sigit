@@ -109,27 +109,70 @@ pub enum ModelCacheHealth {
     NotDownloaded,
 }
 
+/// Where the model store lives, resolved once and handed to the readers.
+///
+/// Resolving it from the environment is a global decision, so a caller that
+/// needs a store of its own — a test pointing at a scratch directory — passes
+/// the roots in rather than mutating `HF_HUB_CACHE`, `HF_HOME` and `HOME` out
+/// from under whatever else is running in the same process.
+#[derive(Debug, Clone, Default)]
+struct ModelRoots {
+    /// Onde App Group model hub, when the signed app has run at least once.
+    app_group: Option<PathBuf>,
+    /// `HF_HUB_CACHE`, or `HF_HOME/hub`, when set and present.
+    configured_cache: Option<PathBuf>,
+    /// `~/.cache/huggingface/hub`, when present.
+    default_cache: Option<PathBuf>,
+    /// File holding the persisted selection.
+    selected_model_file: Option<PathBuf>,
+}
+
+impl ModelRoots {
+    fn from_env() -> Self {
+        Self {
+            app_group: app_group_models_root(),
+            configured_cache: hf_cache_root(),
+            default_cache: default_hf_cache_root(),
+            selected_model_file: selected_model_file_path(),
+        }
+    }
+
+    /// One cache dir and one selection file, with no environment lookups at all.
+    #[cfg(test)]
+    fn in_dir(cache_root: &Path, selected_model_file: &Path) -> Self {
+        Self {
+            configured_cache: Some(cache_root.to_path_buf()),
+            selected_model_file: Some(selected_model_file.to_path_buf()),
+            ..Self::default()
+        }
+    }
+}
+
 /// find all GGUF models on disk. checks Onde app group first, then HF cache.
 pub fn discover_local_models() -> Vec<DiscoveredModel> {
+    discover_local_models_in(&ModelRoots::from_env())
+}
+
+fn discover_local_models_in(roots: &ModelRoots) -> Vec<DiscoveredModel> {
     let mut models = Vec::new();
     let mut seen_roots = Vec::new();
 
-    if let Some(app_group_models) = app_group_models_root() {
+    if let Some(app_group_models) = roots.app_group.as_ref() {
         seen_roots.push(app_group_models.clone());
-        collect_models_from_cache_root(&app_group_models, true, &mut models);
+        collect_models_from_cache_root(app_group_models, true, &mut models);
     }
 
-    if let Some(hf_cache) = hf_cache_root()
-        && !seen_roots.iter().any(|root| root == &hf_cache)
+    if let Some(hf_cache) = roots.configured_cache.as_ref()
+        && !seen_roots.iter().any(|root| root == hf_cache)
     {
         seen_roots.push(hf_cache.clone());
-        collect_models_from_cache_root(&hf_cache, false, &mut models);
+        collect_models_from_cache_root(hf_cache, false, &mut models);
     }
 
-    if let Some(default_hf_cache) = default_hf_cache_root()
-        && !seen_roots.iter().any(|root| root == &default_hf_cache)
+    if let Some(default_hf_cache) = roots.default_cache.as_ref()
+        && !seen_roots.iter().any(|root| root == default_hf_cache)
     {
-        collect_models_from_cache_root(&default_hf_cache, false, &mut models);
+        collect_models_from_cache_root(default_hf_cache, false, &mut models);
     }
 
     models.sort_by(|left, right| {
@@ -300,7 +343,10 @@ fn default_hf_cache_root() -> Option<PathBuf> {
 }
 
 pub fn load_selected_model() -> Option<SelectedModel> {
-    let path = selected_model_file_path()?;
+    load_selected_model_from(&selected_model_file_path()?)
+}
+
+fn load_selected_model_from(path: &Path) -> Option<SelectedModel> {
     let contents = std::fs::read_to_string(path).ok()?;
     let trimmed = contents.trim();
     if trimmed.is_empty() {
@@ -333,9 +379,16 @@ pub fn load_selected_model_name() -> Option<String> {
 /// pick a model for startup: saved selection > first local model > none.
 /// if we fall back to a local model, persist it so ACP and TUI agree next time.
 pub fn startup_model_selection() -> Option<StartupModelSelection> {
-    let discovered = discover_local_models();
+    startup_model_selection_in(&ModelRoots::from_env())
+}
 
-    if let Some(saved_model) = load_selected_model()
+fn startup_model_selection_in(roots: &ModelRoots) -> Option<StartupModelSelection> {
+    let discovered = discover_local_models_in(roots);
+
+    if let Some(saved_model) = roots
+        .selected_model_file
+        .as_deref()
+        .and_then(load_selected_model_from)
         && let Some(model) = discovered.iter().find(|model| {
             saved_model.matches(model) && model.cache_health == ModelCacheHealth::Complete
         })
@@ -351,7 +404,9 @@ pub fn startup_model_selection() -> Option<StartupModelSelection> {
         .find(|model| model.cache_health == ModelCacheHealth::Complete)
         .map(|model| {
             let selected_model = SelectedModel::from_discovered(&model);
-            let _ = save_selected_model(&selected_model);
+            if let Some(path) = roots.selected_model_file.as_deref() {
+                let _ = save_selected_model_to(path, &selected_model);
+            }
             StartupModelSelection {
                 display_name: model.display_name.clone(),
                 selected_model: Some(selected_model),
@@ -363,6 +418,10 @@ pub fn save_selected_model(selected_model: &SelectedModel) -> Result<(), String>
     let path = selected_model_file_path()
         .ok_or_else(|| "Could not determine where to store the selected model.".to_string())?;
 
+    save_selected_model_to(&path, selected_model)
+}
+
+fn save_selected_model_to(path: &Path, selected_model: &SelectedModel) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.exists()
     {
@@ -375,7 +434,7 @@ pub fn save_selected_model(selected_model: &SelectedModel) -> Result<(), String>
         selected_model.model_id, selected_model.gguf_file
     );
 
-    std::fs::write(&path, contents)
+    std::fs::write(path, contents)
         .map_err(|error| format!("Could not save selected model: {error}"))
 }
 
@@ -431,22 +490,32 @@ fn resolve_shared_container() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// The crate-wide lock, not one of this module's own: the model picker
-    /// reads this cache from other modules' tests, and they must not see it
-    /// pointed at a scratch directory halfway through.
-    fn env_lock() -> &'static Mutex<()> {
-        &crate::ENV_TEST_LOCK
+    /// A cache dir and selection file owned by this test. The model store is
+    /// resolved from `HF_HUB_CACHE`/`HF_HOME`/`HOME`, which are process-global
+    /// and read by the picker on other threads, so tests hand their roots in
+    /// instead of aiming those variables at a scratch directory.
+    fn test_roots(cache_root: &Path, selection_dir: &Path) -> ModelRoots {
+        ModelRoots::in_dir(cache_root, &selection_dir.join(SELECTED_MODEL_FILE_NAME))
     }
 
+    /// A scratch directory no other test in this run can land on. The clock
+    /// alone is not enough: its resolution is coarse on some platforms and
+    /// parallel test threads can read the same tick, so the pid and a
+    /// process-local counter are mixed in.
     fn unique_temp_dir(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_nanos();
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        std::env::temp_dir().join(format!("sigit-setup-tests-{name}-{nanos}"))
+        std::env::temp_dir().join(format!(
+            "sigit-setup-tests-{name}-{}-{seq}-{nanos}",
+            std::process::id()
+        ))
     }
 
     fn create_snapshot(
@@ -474,48 +543,11 @@ mod tests {
         snapshot_dir
     }
 
-    fn with_test_env<T>(hf_hub_cache: &Path, hf_home: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = env_lock().lock().expect("lock env");
-
-        let old_hf_hub_cache = std::env::var_os("HF_HUB_CACHE");
-        let old_hf_home = std::env::var_os("HF_HOME");
-        let old_home = std::env::var_os("HOME");
-
-        // SAFETY: tests serialize environment mutation with a process-wide mutex.
-        unsafe {
-            std::env::set_var("HF_HUB_CACHE", hf_hub_cache);
-            std::env::set_var("HF_HOME", hf_home);
-            std::env::set_var("HOME", hf_home);
-        }
-
-        let result = f();
-
-        // SAFETY: tests serialize environment mutation with a process-wide mutex.
-        unsafe {
-            match old_hf_hub_cache {
-                Some(value) => std::env::set_var("HF_HUB_CACHE", value),
-                None => std::env::remove_var("HF_HUB_CACHE"),
-            }
-            match old_hf_home {
-                Some(value) => std::env::set_var("HF_HOME", value),
-                None => std::env::remove_var("HF_HOME"),
-            }
-            match old_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-
-        result
-    }
-
     #[test]
     fn discover_local_models_marks_complete_and_incomplete_snapshots() {
         let root = unique_temp_dir("discover-health");
         let cache_root = root.join("hf-cache");
-        let hf_home = root.join("hf-home");
         std::fs::create_dir_all(&cache_root).expect("create cache root");
-        std::fs::create_dir_all(&hf_home).expect("create hf home");
 
         create_snapshot(
             &cache_root,
@@ -532,7 +564,7 @@ mod tests {
             false,
         );
 
-        let models = with_test_env(&cache_root, &hf_home, discover_local_models);
+        let models = discover_local_models_in(&test_roots(&cache_root, &root));
 
         assert_eq!(models.len(), 2);
 
@@ -557,9 +589,7 @@ mod tests {
     fn startup_model_selection_skips_saved_incomplete_model_and_picks_complete_one() {
         let root = unique_temp_dir("startup-selection");
         let cache_root = root.join("hf-cache");
-        let hf_home = root.join("hf-home");
         std::fs::create_dir_all(&cache_root).expect("create cache root");
-        std::fs::create_dir_all(&hf_home).expect("create hf home");
 
         create_snapshot(
             &cache_root,
@@ -576,20 +606,18 @@ mod tests {
             true,
         );
 
-        let selection = with_test_env(&cache_root, &hf_home, || {
-            let selected_path = selected_model_file_path().expect("selected model path");
-            if let Some(parent) = selected_path.parent() {
-                std::fs::create_dir_all(parent).expect("create selected model parent");
-            }
+        let roots = test_roots(&cache_root, &root);
+        let selected_path = roots
+            .selected_model_file
+            .clone()
+            .expect("selected model path");
+        std::fs::write(
+            &selected_path,
+            "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF\nQwen2.5-Coder-3B-Instruct-Q4_K_M.gguf\n",
+        )
+        .expect("write selected model");
 
-            std::fs::write(
-                &selected_path,
-                "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF\nQwen2.5-Coder-3B-Instruct-Q4_K_M.gguf\n",
-            )
-            .expect("write selected model");
-
-            startup_model_selection().expect("startup selection")
-        });
+        let selection = startup_model_selection_in(&roots).expect("startup selection");
 
         assert_eq!(
             selection.display_name,
@@ -606,11 +634,9 @@ mod tests {
     fn discover_empty_cache_returns_no_models() {
         let root = unique_temp_dir("discover-empty");
         let cache_root = root.join("hf-cache");
-        let hf_home = root.join("hf-home");
         std::fs::create_dir_all(&cache_root).expect("create cache root");
-        std::fs::create_dir_all(&hf_home).expect("create hf home");
 
-        let models = with_test_env(&cache_root, &hf_home, discover_local_models);
+        let models = discover_local_models_in(&test_roots(&cache_root, &root));
         assert!(models.is_empty());
 
         std::fs::remove_dir_all(root).expect("remove temp dir");
@@ -620,9 +646,7 @@ mod tests {
     fn complete_models_sort_before_incomplete() {
         let root = unique_temp_dir("sort-order");
         let cache_root = root.join("hf-cache");
-        let hf_home = root.join("hf-home");
         std::fs::create_dir_all(&cache_root).expect("create cache root");
-        std::fs::create_dir_all(&hf_home).expect("create hf home");
 
         create_snapshot(
             &cache_root,
@@ -639,7 +663,7 @@ mod tests {
             true,
         );
 
-        let models = with_test_env(&cache_root, &hf_home, discover_local_models);
+        let models = discover_local_models_in(&test_roots(&cache_root, &root));
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].cache_health, ModelCacheHealth::Complete);
         assert_eq!(models[1].cache_health, ModelCacheHealth::Incomplete);
@@ -650,21 +674,19 @@ mod tests {
     #[test]
     fn load_selected_model_roundtrip() {
         let root = unique_temp_dir("persistence-roundtrip");
-        let hf_home = root.join("hf-home");
-        std::fs::create_dir_all(&hf_home).expect("create hf home");
+        let path = root.join(SELECTED_MODEL_FILE_NAME);
 
-        with_test_env(&hf_home, &hf_home, || {
-            let original = SelectedModel {
-                model_id: "bartowski/Qwen_Qwen3-4B-GGUF".to_string(),
-                gguf_file: "Qwen_Qwen3-4B-Q4_K_M.gguf".to_string(),
-            };
+        let original = SelectedModel {
+            model_id: "bartowski/Qwen_Qwen3-4B-GGUF".to_string(),
+            gguf_file: "Qwen_Qwen3-4B-Q4_K_M.gguf".to_string(),
+        };
 
-            save_selected_model(&original).expect("save");
-            let loaded = load_selected_model().expect("load");
+        // The parent dir does not exist yet: saving has to create it.
+        save_selected_model_to(&path, &original).expect("save");
+        let loaded = load_selected_model_from(&path).expect("load");
 
-            assert_eq!(loaded.model_id, original.model_id);
-            assert_eq!(loaded.gguf_file, original.gguf_file);
-        });
+        assert_eq!(loaded.model_id, original.model_id);
+        assert_eq!(loaded.gguf_file, original.gguf_file);
 
         std::fs::remove_dir_all(root).expect("remove temp dir");
     }
@@ -672,18 +694,11 @@ mod tests {
     #[test]
     fn load_selected_model_empty_file_returns_none() {
         let root = unique_temp_dir("persistence-empty");
-        let hf_home = root.join("hf-home");
-        std::fs::create_dir_all(&hf_home).expect("create hf home");
+        let path = root.join(SELECTED_MODEL_FILE_NAME);
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(&path, "").expect("write empty");
 
-        with_test_env(&hf_home, &hf_home, || {
-            let path = selected_model_file_path().expect("path");
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create parent");
-            }
-            std::fs::write(&path, "").expect("write empty");
-
-            assert!(load_selected_model().is_none());
-        });
+        assert!(load_selected_model_from(&path).is_none());
 
         std::fs::remove_dir_all(root).expect("remove temp dir");
     }
