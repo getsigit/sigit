@@ -577,7 +577,9 @@ fn execute_sync_tool(name: &str, arguments: &str, owner: Option<&str>) -> ToolOu
         "read_website" => exec_read_website(arguments),
         "create_directory" => exec_create_directory(arguments),
         "glob" => exec_glob(arguments),
-        "write_todos" => exec_write_todos(arguments),
+        // A missing owner is a session-less call (the headless runner sets
+        // one too), and its list is scoped to that same empty key.
+        "write_todos" => exec_write_todos(arguments, owner.unwrap_or("")),
         "remember" => exec_remember(arguments),
         "delete_file" => exec_delete_file(arguments),
         "run_command" => exec_run_command(arguments, owner),
@@ -2081,43 +2083,58 @@ impl TodoStatus {
     }
 }
 
-/// Process-global todo store. The model owns the list conceptually, but when
-/// it forgets to re-send the full list — an error turn, a context shift, a
-/// simple omission — the panel goes empty with nothing to fall back on. This
-/// keeps the last-known list so `main.rs` can re-emit it.
-/// (`todos_arguments_to_plan` + `SessionUpdate::Plan`) without the model's
-/// help.
-static TODOS: RwLock<Option<Vec<Todo>>> = RwLock::new(None);
-
-/// Read the persisted todo list, if any. Returns `None` when no `write_todos`
-/// call has succeeded yet (or the list was cleared).
-pub fn get_todos() -> Option<Vec<Todo>> {
-    TODOS
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+/// Per-session todo store. The model owns the list conceptually, but when it
+/// forgets to re-send the full list — an error turn, a context shift, a simple
+/// omission — the panel goes empty with nothing to fall back on. This keeps
+/// the last-known list so `main.rs` can re-emit it (`todos_arguments_to_plan` +
+/// `SessionUpdate::Plan`) without the model's help.
+///
+/// Keyed by session, like `permissions::sessions()`: one process serves every
+/// thread an editor has open, and a plan belonging to one conversation must
+/// never surface in another.
+fn todo_sessions() -> &'static Mutex<HashMap<String, Vec<Todo>>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Vec<Todo>>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Serializes tests that touch the process-global `TODOS` store. Without
-/// this, parallel `cargo test` runs clobber each other's list.
-#[cfg(test)]
-static TODOS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Read the session's persisted todo list, if any. Returns `None` when no
+/// `write_todos` call has succeeded yet (or the list was cleared).
+pub fn get_todos(session: &str) -> Option<Vec<Todo>> {
+    todo_sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session)
+        .cloned()
+}
 
-/// Reset the store. Used by tests so one test's list doesn't leak into the
-/// next — the store is process-global.
-#[cfg(test)]
-fn reset_todos() {
-    let mut guard = TODOS
-        .write()
+/// Store the session's list, or drop the key when `None`. Dropping it rather
+/// than storing an empty list keeps "no plan" a single state the map doesn't
+/// accumulate entries for.
+fn set_todos(session: &str, todos: Option<Vec<Todo>>) {
+    let mut map = todo_sessions()
+        .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = None;
+    match todos {
+        Some(todos) => {
+            map.insert(session.to_string(), todos);
+        }
+        None => {
+            map.remove(session);
+        }
+    }
+}
+
+/// Forget a session's list (session teardown, a wiped conversation) so a plan
+/// never outlives the conversation it belongs to.
+pub fn clear_todos(session: &str) {
+    set_todos(session, None);
 }
 
 /// Renders the model's task checklist back as the tool result so the surface
 /// (TUI / ACP client) can show live progress. Also persists the list so the
 /// panel survives model omissions and error turns — the list is still owned
 /// by the model, but the last-known state is kept as a fallback.
-fn exec_write_todos(arguments: &str) -> String {
+fn exec_write_todos(arguments: &str, session: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(err) => return format!("Error: failed to parse arguments: {err}"),
@@ -2132,10 +2149,7 @@ fn exec_write_todos(arguments: &str) -> String {
     // restate at least one step. Clear the store too so a later omission
     // doesn't bring the old list back from the dead.
     if todos.is_empty() {
-        let mut guard = TODOS
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = None;
+        set_todos(session, None);
         return "Task list cleared.".to_string();
     }
 
@@ -2172,10 +2186,7 @@ fn exec_write_todos(arguments: &str) -> String {
     // Persist the parsed list so the panel survives a later turn that omits
     // `write_todos` or errors out before reaching it. The store is the
     // fallback `get_todos()` reads.
-    let mut guard = TODOS
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some(persisted);
+    set_todos(session, Some(persisted));
 
     format!(
         "Task list updated ({completed}/{} done):\n{}",
@@ -3569,7 +3580,7 @@ mod tests {
             ]
         })
         .to_string();
-        let result = exec_write_todos(&args);
+        let result = exec_write_todos(&args, "todos-test-render");
         assert!(result.contains("1/3 done"), "{result}");
         assert!(result.contains("[x] Read code"), "{result}");
         assert!(result.contains("[~] Make change"), "{result}");
@@ -3578,7 +3589,7 @@ mod tests {
 
     #[test]
     fn test_write_todos_accepts_an_empty_list_to_clear() {
-        let result = exec_write_todos(r#"{"todos":[]}"#);
+        let result = exec_write_todos(r#"{"todos":[]}"#, "todos-test-empty-clear");
         assert_eq!(result, "Task list cleared.");
     }
 
@@ -5378,15 +5389,14 @@ mod tests {
     }
 
     // ── write_todos persistence ───────────────────────────────────────────
-    // The store is process-global, so every test acquires `TODOS_TEST_LOCK`
-    // and calls `reset_todos()` first or it inherits whatever the previous
-    // test left behind.
+    // Each test owns a distinct session key, so the store's per-session
+    // scoping is what keeps parallel `cargo test` runs out of each other's
+    // lists — no shared lock needed.
 
     #[test]
     fn write_todos_persists_list() {
-        let _guard = TODOS_TEST_LOCK.lock().unwrap();
-        reset_todos();
-        assert!(get_todos().is_none());
+        let session = "todos-test-persists";
+        assert!(get_todos(session).is_none());
 
         let output = exec_write_todos(
             r#"{"todos":[
@@ -5394,10 +5404,11 @@ mod tests {
                 {"content":"step two","status":"in_progress"},
                 {"content":"step three","status":"pending"}
             ]}"#,
+            session,
         );
         assert!(output.contains("Task list updated (1/3 done)"));
 
-        let todos = get_todos().expect("list should be persisted");
+        let todos = get_todos(session).expect("list should be persisted");
         assert_eq!(todos.len(), 3);
         assert_eq!(todos[0].content, "step one");
         assert_eq!(todos[0].status, TodoStatus::Completed);
@@ -5406,63 +5417,105 @@ mod tests {
     }
 
     #[test]
-    fn get_todos_returns_none_after_reset() {
-        let _guard = TODOS_TEST_LOCK.lock().unwrap();
-        reset_todos();
-        assert!(get_todos().is_none());
+    fn write_todos_is_scoped_to_one_session() {
+        exec_write_todos(
+            r#"{"todos":[{"content":"mine","status":"pending"}]}"#,
+            "todos-test-scope-a",
+        );
+
+        // A second session starts empty rather than inheriting the first
+        // session's plan, and writing there leaves the first untouched.
+        assert!(get_todos("todos-test-scope-b").is_none());
+        exec_write_todos(
+            r#"{"todos":[{"content":"theirs","status":"completed"}]}"#,
+            "todos-test-scope-b",
+        );
+
+        let mine = get_todos("todos-test-scope-a").expect("first session keeps its list");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].content, "mine");
+        let theirs = get_todos("todos-test-scope-b").expect("second session has its own");
+        assert_eq!(theirs[0].content, "theirs");
+    }
+
+    #[test]
+    fn get_todos_returns_none_for_unknown_session() {
+        assert!(get_todos("todos-test-unknown").is_none());
+    }
+
+    #[test]
+    fn clear_todos_forgets_only_that_session() {
+        exec_write_todos(
+            r#"{"todos":[{"content":"gone","status":"pending"}]}"#,
+            "todos-test-clear",
+        );
+        exec_write_todos(
+            r#"{"todos":[{"content":"kept","status":"pending"}]}"#,
+            "todos-test-clear-other",
+        );
+
+        clear_todos("todos-test-clear");
+
+        assert!(get_todos("todos-test-clear").is_none());
+        assert!(get_todos("todos-test-clear-other").is_some());
     }
 
     #[test]
     fn write_todos_empty_list_clears_store() {
-        let _guard = TODOS_TEST_LOCK.lock().unwrap();
+        let session = "todos-test-empty";
         // Seed the store so we can prove the empty call wipes it.
-        exec_write_todos(r#"{"todos":[{"content":"seed","status":"pending"}]}"#);
-        assert!(get_todos().is_some());
+        exec_write_todos(
+            r#"{"todos":[{"content":"seed","status":"pending"}]}"#,
+            session,
+        );
+        assert!(get_todos(session).is_some());
 
-        let output = exec_write_todos(r#"{"todos":[]}"#);
+        let output = exec_write_todos(r#"{"todos":[]}"#, session);
         assert_eq!(output, "Task list cleared.");
-        assert!(get_todos().is_none());
+        assert!(get_todos(session).is_none());
     }
 
     #[test]
     fn write_todos_unknown_status_falls_back_to_pending() {
-        let _guard = TODOS_TEST_LOCK.lock().unwrap();
-        reset_todos();
-        exec_write_todos(r#"{"todos":[{"content":"weird","status":"bogus"}]}"#);
-        let todos = get_todos().expect("list should be persisted");
+        let session = "todos-test-unknown-status";
+        exec_write_todos(
+            r#"{"todos":[{"content":"weird","status":"bogus"}]}"#,
+            session,
+        );
+        let todos = get_todos(session).expect("list should be persisted");
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].status, TodoStatus::Pending);
     }
 
     #[test]
     fn write_todos_missing_status_defaults_to_pending() {
-        let _guard = TODOS_TEST_LOCK.lock().unwrap();
-        reset_todos();
-        exec_write_todos(r#"{"todos":[{"content":"no status"}]}"#);
-        let todos = get_todos().expect("list should be persisted");
+        let session = "todos-test-missing-status";
+        exec_write_todos(r#"{"todos":[{"content":"no status"}]}"#, session);
+        let todos = get_todos(session).expect("list should be persisted");
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].status, TodoStatus::Pending);
     }
 
     #[test]
     fn write_todos_overwrites_previous_list() {
-        let _guard = TODOS_TEST_LOCK.lock().unwrap();
-        reset_todos();
+        let session = "todos-test-overwrite";
         exec_write_todos(
             r#"{"todos":[
                 {"content":"a","status":"pending"},
                 {"content":"b","status":"pending"}
             ]}"#,
+            session,
         );
-        assert_eq!(get_todos().unwrap().len(), 2);
+        assert_eq!(get_todos(session).unwrap().len(), 2);
 
         // A second call with a different list replaces, not appends.
         exec_write_todos(
             r#"{"todos":[
                 {"content":"only","status":"completed"}
             ]}"#,
+            session,
         );
-        let todos = get_todos().unwrap();
+        let todos = get_todos(session).unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].content, "only");
         assert_eq!(todos[0].status, TodoStatus::Completed);
