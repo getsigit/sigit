@@ -519,6 +519,7 @@ mod tui {
     use crate::models::{
         InferenceKind, ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items,
     };
+    use crate::program_status::{Reporter, Status};
     use crate::session_store::SessionEntry;
     use ratatui::{
         Frame,
@@ -731,6 +732,8 @@ mod tui {
     // ── App state ─────────────────────────────────────────────────────────────
 
     struct App {
+        program_status: Reporter,
+        outcome: Status,
         messages: Vec<ChatMessage>,
         input: String,
         cursor: usize,
@@ -855,7 +858,11 @@ mod tui {
     }
 
     impl App {
-        fn new(load_model_name: String, backend: Arc<dyn InferenceBackend>) -> Self {
+        fn new(
+            load_model_name: String,
+            backend: Arc<dyn InferenceBackend>,
+            program_status: Reporter,
+        ) -> Self {
             let is_remote = backend.is_remote();
             let items = build_model_picker_items();
             let tool_calling = items
@@ -890,6 +897,8 @@ mod tui {
                 model_load_cancelled: false,
                 switching_model_id: None,
                 download_progress: None,
+                program_status,
+                outcome: Status::Idle,
                 is_loading: true,
                 load_tick: 0,
                 load_error: None,
@@ -959,6 +968,34 @@ mod tui {
             self.history_sessions.get(self.history_index)
         }
 
+        fn finish_login(&mut self, result: Result<String, String>) {
+            self.outcome = if result.is_ok() {
+                Status::Done
+            } else {
+                Status::Error
+            };
+            self.program_status.report(self.outcome);
+            self.messages.push(ChatMessage::system(
+                result.unwrap_or_else(|message| message),
+            ));
+        }
+
+        fn status(&self) -> Status {
+            if self.quit {
+                Status::Idle
+            } else if self.load_error.is_some() {
+                Status::Error
+            } else if self.pending_approval.is_some() {
+                Status::Permission
+            } else if self.is_loading || self.is_busy() || self.inference_rx.is_some() {
+                Status::Working
+            } else if self.show_model_picker || self.history_pending_delete.is_some() {
+                Status::Question
+            } else {
+                self.outcome
+            }
+        }
+
         fn is_busy(&self) -> bool {
             self.is_streaming() || self.thinking || self.switching_model
         }
@@ -1000,11 +1037,13 @@ mod tui {
         }
 
         fn start_thinking(&mut self) {
+            self.outcome = Status::Idle;
             self.thinking = true;
             self.thinking_tick = 0;
         }
 
         fn stop_thinking(&mut self) {
+            self.outcome = Status::Idle;
             self.thinking = false;
             self.inference_rx = None;
             // Dropping a pending reply channel reads as a denial on the
@@ -2984,6 +3023,7 @@ mod tui {
                                         )));
                                     }
                                     None => {
+                                        app.outcome = Status::Auth;
                                         app.messages.push(ChatMessage::system(
                                             "siGit Code Cloud needs an account. Use \
                                              `/login <email> <password>`, or create one at sigit.si.",
@@ -3035,13 +3075,22 @@ mod tui {
                 }
             },
             SlashCommand::Login(arg) => {
-                let message = match arg.as_deref().and_then(crate::account::parse_login_args) {
+                let password_login = arg
+                    .as_deref()
+                    .and_then(crate::account::parse_login_args)
+                    .is_some();
+                app.program_status.report(if password_login {
+                    Status::Working
+                } else {
+                    Status::Auth
+                });
+                let result = match arg.as_deref().and_then(crate::account::parse_login_args) {
                     Some((email, password)) => {
                         match crate::account::authenticate(&email, &password).await {
-                            Ok(email) => format!(
+                            Ok(email) => Ok(format!(
                                 "Signed in as {email}. siGit Code Cloud applies to your next session."
-                            ),
-                            Err(error) => format!("Login failed: {error}"),
+                            )),
+                            Err(error) => Err(format!("Login failed: {error}")),
                         }
                     }
                     // A bare `/login` opens the browser instead of asking for
@@ -3053,7 +3102,7 @@ mod tui {
                         crate::browser_login_message().await
                     }
                 };
-                app.messages.push(ChatMessage::system(message));
+                app.finish_login(result);
             }
             SlashCommand::Logout => {
                 let message = crate::account::end_session().await;
@@ -3430,13 +3479,22 @@ mod tui {
         backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
+        program_status: Reporter,
     ) -> Result<()>
     where
         // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
         // to be thread-safe.
         B::Error: Send + Sync + 'static,
     {
-        event_loop(terminal, engine, backend, load_rx, load_model_name).await
+        event_loop(
+            terminal,
+            engine,
+            backend,
+            load_rx,
+            load_model_name,
+            program_status,
+        )
+        .await
     }
 
     async fn event_loop<B: ratatui::backend::Backend>(
@@ -3445,13 +3503,14 @@ mod tui {
         backend: Arc<dyn InferenceBackend>,
         load_rx: std_mpsc::Receiver<Result<(), String>>,
         load_model_name: String,
+        program_status: Reporter,
     ) -> Result<()>
     where
         // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
         // to be thread-safe.
         B::Error: Send + Sync + 'static,
     {
-        let mut app = App::new(load_model_name, backend);
+        let mut app = App::new(load_model_name, backend, program_status);
         let mut event_stream = EventStream::new();
 
         // 10 fps is plenty for spinners
@@ -3476,6 +3535,7 @@ mod tui {
             if let Some(rx) = app.model_load_rx.as_mut() {
                 match rx.try_recv() {
                     Ok(ModelLoadUpdate::Loaded(model_name)) => {
+                        app.outcome = Status::Done;
                         engine.clear_history().await;
                         app.context_tokens_used = None;
                         if let Some(tc) = app.pending_tool_calling.take() {
@@ -3521,6 +3581,7 @@ mod tui {
                         }
                     }
                     Ok(ModelLoadUpdate::Error(error)) => {
+                        app.outcome = Status::Error;
                         app.switching_model = false;
                         app.switching_model_id = None;
                         app.download_progress = None;
@@ -3538,6 +3599,7 @@ mod tui {
                         app.model_load_cancelled = false;
                         app.model_load_rx = None;
                         if !was_cancelled {
+                            app.outcome = Status::Error;
                             app.messages.push(ChatMessage::system(
                                 "error loading model: loader task disconnected".to_string(),
                             ));
@@ -3545,6 +3607,10 @@ mod tui {
                     }
                 }
             }
+
+            // Polling model loads can change state immediately before select
+            // goes idle, so report after applying those updates.
+            app.program_status.report(app.status());
 
             if app.quit {
                 break;
@@ -3593,6 +3659,7 @@ mod tui {
                         }
                         Some(InferenceUpdate::Response(text)) => {
                             app.stop_thinking();
+                            app.outcome = Status::Done;
                             app.messages.push(ChatMessage::assistant(text));
                         }
                         Some(InferenceUpdate::ContextUsage(tokens)) => {
@@ -3601,6 +3668,7 @@ mod tui {
                         Some(InferenceUpdate::Error(msg)) => {
                             app.finalize_stream();
                             app.stop_thinking();
+                            app.outcome = Status::Error;
                             app.messages.push(ChatMessage::system(format!("error: {msg}")));
                         }
                         Some(InferenceUpdate::ApprovalRequest { tool, args, reply }) => {
@@ -3621,6 +3689,7 @@ mod tui {
                             // task finished, possibly with no text to show
                             app.finalize_stream();
                             app.stop_thinking();
+                            app.outcome = Status::Done;
                         }
                     }
                 }
@@ -3703,6 +3772,9 @@ mod tui {
                     };
 
                     if let Event::Key(key) = event {
+                        if key.kind == KeyEventKind::Press {
+                            app.outcome = Status::Idle;
+                        }
                         // loading phase — only quit keys work
                         if app.is_loading {
                             if key.kind == KeyEventKind::Press {
@@ -3810,6 +3882,10 @@ mod tui {
                                         app.stop_thinking();
                                         app.messages.push(ChatMessage::system("(cancelled)"));
                                     }
+                                    // A visible stream can have cleared `thinking`;
+                                    // cancellation must drop its receiver and clear
+                                    // thinking so the tab cannot stay on working.
+                                    app.stop_thinking();
                                     if app.switching_model {
                                         // flag before drop so Disconnected handler stays quiet
                                         app.model_load_cancelled = true;
@@ -3947,8 +4023,62 @@ mod tui {
     }
     #[cfg(test)]
     mod tui_tests {
-        use super::{compact_tokens, context_gauge_color, context_gauge_label};
+        use super::{
+            App, OpenAiBackend, Status, compact_tokens, context_gauge_color, context_gauge_label,
+        };
         use ratatui::style::Color;
+        use std::sync::Arc;
+
+        #[test]
+        fn login_status_uses_the_result_instead_of_message_wording() {
+            let backend = Arc::new(OpenAiBackend::new("http://localhost/v1", "", "test", None));
+            let mut app = App::new(
+                "test".into(),
+                backend,
+                super::Reporter::new(std::io::sink()),
+            );
+            app.finish_loading();
+            app.finish_login(Ok("Welcome back.".into()));
+            assert_eq!(app.status(), Status::Done);
+            app.finish_login(Err("Signed in could not be completed.".into()));
+            assert_eq!(app.status(), Status::Error);
+        }
+
+        #[test]
+        fn program_status_tracks_loading_approval_completion_and_cancellation() {
+            let backend = Arc::new(OpenAiBackend::new("http://localhost/v1", "", "test", None));
+            let mut app = App::new(
+                "test".into(),
+                backend,
+                super::Reporter::new(std::io::sink()),
+            );
+            assert_eq!(app.status(), Status::Working);
+            app.finish_loading();
+            assert_eq!(app.status(), Status::Idle);
+            app.start_thinking();
+            assert_eq!(app.status(), Status::Working);
+            let (reply, _) = tokio::sync::oneshot::channel();
+            app.pending_approval = Some(("edit_file".into(), reply));
+            assert_eq!(app.status(), Status::Permission);
+            app.pending_approval = None;
+            assert_eq!(app.status(), Status::Working);
+            app.stop_thinking();
+            assert_eq!(app.status(), Status::Idle);
+            app.outcome = Status::Done;
+            assert_eq!(app.status(), Status::Done);
+            app.outcome = Status::Error;
+            assert_eq!(app.status(), Status::Error);
+            app.start_thinking();
+            assert_eq!(app.status(), Status::Working);
+            app.stop_thinking();
+            app.show_model_picker = true;
+            assert_eq!(app.status(), Status::Question);
+            app.show_model_picker = false;
+            app.set_load_error("failed".into());
+            assert_eq!(app.status(), Status::Error);
+            app.quit = true;
+            assert_eq!(app.status(), Status::Idle);
+        }
 
         #[test]
         fn context_gauge_reports_share_of_the_window() {
