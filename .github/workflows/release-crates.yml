@@ -55,7 +55,51 @@ jobs:
         with:
           key: crates-publish
 
-      - name: Check whether version already exists on crates.io
+      # sigit depends on sigit-agent, so the library goes first, each behind its own
+      # "already published" check: a re-run publishes only what is missing.
+      - name: Check whether sigit-agent already exists on crates.io
+        id: agent-check
+        shell: bash
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | \
+            python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; \
+            print(next(p['version'] for p in pkgs if p['name']=='sigit-agent'))")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          # crates.io answers 403 to requests without a descriptive
+          # User-Agent, so curl's default one makes this look like a 404 and
+          # the publish below runs into "crate already exists on the index".
+          # Branch on the status code rather than on curl's exit status, so an
+          # answer we do not understand stops the job instead of quietly
+          # degrading into that same failure.
+          # Retry first, so a timeout or a 5xx costs a few seconds instead of
+          # the whole release.
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --retry 3 --retry-delay 2 --retry-all-errors \
+            -H "User-Agent: ${GITHUB_REPOSITORY} release workflow (https://github.com/${GITHUB_REPOSITORY})" \
+            "https://crates.io/api/v1/crates/sigit-agent/${VERSION}")
+
+          case "$STATUS" in
+            200)
+              echo "sigit-agent ${VERSION} already exists on crates.io, skipping publish"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected ${STATUS} from crates.io while checking whether sigit-agent ${VERSION} is published" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Publish sigit-agent to crates.io
+        if: steps.agent-check.outputs.exists != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p sigit-agent
+
+      - name: Check whether sigit already exists on crates.io
         id: crates-check
         shell: bash
         run: |
@@ -91,8 +135,8 @@ jobs:
               ;;
           esac
 
-      - name: Publish to crates.io
+      - name: Publish sigit to crates.io
         if: steps.crates-check.outputs.exists != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+        run: cargo publish --locked -p sigit

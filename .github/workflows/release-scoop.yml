@@ -83,8 +83,8 @@ jobs:
           cat > scoop-bucket/bucket/sigit.json <<MANIFEST
           {
               "version": "${VERSION}",
-              "description": "siGit Code, an AI coding agent that runs on your machine.",
-              "homepage": "https://sigit.si",
+              "description": "A modular local inference LLM coding agent. Core component of siGit Factory.",
+              "homepage": "https://sigit.si/code",
               "license": "Apache-2.0",
               "architecture": {
                   "64bit": {

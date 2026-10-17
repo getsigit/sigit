@@ -1,27 +1,23 @@
-[package]
-name = "sigit"
-version = "1.6.8"
+[workspace]
+resolver = "3"
+members = ["crates/cli", "crates/sigit-*"]
+
+[workspace.package]
+version = "1.7.0"
 edition = "2024"
-description = "siGit Code — ACP-compatible AI coding agent. Sí, git."
-documentation = "https://github.com/getsigit/sigit"
 license = "Apache-2.0"
 repository = "https://github.com/getsigit/sigit"
-homepage = "https://sigit.si"
-readme = "README.md"
-keywords = ["sigit", "cli", "ai", "coding-agent", "llm"]
-categories = ["command-line-utilities"]
+homepage = "https://sigit.si/code"
+documentation = "https://github.com/getsigit/sigit"
 authors = ["Seto Elkahfi <seto@sigit.si>", "paydii <193906237+paydii@users.noreply.github.com>", "keypair34 <216233964+keypair34@users.noreply.github.com>"]
-# `src/bin/` holds test-only helper binaries (the MCP stdio stub used by the
-# integration tests). Excluding it keeps them out of the published crate, so
-# `cargo install sigit` installs exactly one binary. The integration test that
-# spawns the stub goes with it, or the packaged crate's tests wouldn't compile.
-exclude = ["src/bin/", "tests/mcp_stdio.rs"]
 
-[[bin]]
-name = "sigit"
-path = "src/main.rs"
+[workspace.dependencies]
+# The ACP server `sigit-agent` is a profile for. `Profile::auth` landed in ed-acp 1.3.0, now on
+# crates.io, so this resolves from the registry rather than the onde-ed checkout next door.
+ed-acp = { version = "1.3.0", default-features = false }
+ed-acp-testkit = "1.3.0"
+sigit-agent = { version = "1.7.0", default-features = false, path = "crates/sigit-agent" }
 
-[dependencies]
 # ACP protocol SDK
 agent-client-protocol = { version = "2.2", features = ["unstable_session_fork"] }
 

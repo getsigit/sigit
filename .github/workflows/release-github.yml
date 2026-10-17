@@ -94,7 +94,7 @@ jobs:
 
       - name: Build binary
         shell: bash
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release -p sigit --target ${{ matrix.target }}
 
       - name: Check Windows binary has no VC++ runtime dependency
         if: contains(matrix.target, 'windows')

@@ -16,14 +16,14 @@ platform: linux
 version: ${PKG_VERSION}
 section: devel
 priority: optional
-maintainer: smbCloud <seto@sigit.si>
-vendor: PT Sigit Mitra Bangun
-homepage: https://sigit.si
+maintainer: Seto Elkahfi <seto@sigit.si>
+vendor: Seto Elkahfi, trading as siGit Code & Deploy
+homepage: https://sigit.si/code
 license: Apache-2.0
 description: |
-  siGit Code, an AI coding agent that runs on your machine.
-  Speaks the Agent Client Protocol for editor integration, and runs inference
-  either on-device or against a hosted endpoint.
+  siGit Code, a modular local inference LLM coding agent and core
+  component of siGit Factory. Speaks the Agent Client Protocol for editor
+  integration.
 contents:
   - src: ${PKG_BINARY}
     dst: /usr/bin/sigit

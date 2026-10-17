@@ -1,0 +1,49 @@
+[package]
+name = "sigit"
+version.workspace = true
+edition.workspace = true
+description = "A modular local inference LLM coding agent. Core component of siGit Factory."
+documentation.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["cli", "ai", "coding-agent", "llm", "acp"]
+categories = ["command-line-utilities"]
+authors.workspace = true
+# `src/bin/` holds test-only helper binaries (the MCP stdio stub used by the
+# integration tests). Excluding it keeps them out of the published crate, so
+# `cargo install sigit` installs exactly one binary. The integration test that
+# spawns the stub goes with it, or the packaged crate's tests wouldn't compile.
+exclude = ["src/bin/", "tests/mcp_stdio.rs"]
+
+[[bin]]
+name = "sigit"
+path = "src/main.rs"
+
+[dependencies]
+sigit-agent.workspace = true
+agent-client-protocol.workspace = true
+ed-mcp.workspace = true
+onde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+log.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+rpassword.workspace = true
+base64.workspace = true
+rand.workspace = true
+sha2.workspace = true
+url.workspace = true

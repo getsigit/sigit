@@ -30,12 +30,10 @@
 
 mod account;
 mod backend;
-mod browser_auth;
 mod chat;
 mod client_fs;
 mod client_terminal;
 mod commands;
-mod credentials;
 mod frontmatter;
 mod harness_markup;
 mod headless;
@@ -57,6 +55,10 @@ mod subagents;
 mod tools;
 mod workspace;
 
+// Sign-in and the stored session live in `sigit-agent`, where an embedding host reaches them
+// too; the rest of this crate keeps its `crate::` paths.
+pub(crate) use sigit_agent::{browser_auth, credentials};
+
 /// Serializes tests that mutate process-global state: env vars
 /// (`SIGIT_CONFIG_DIR` etc.) and the current directory. `cargo test` runs
 /// tests in parallel within a binary, so without this the credentials and
@@ -76,31 +78,34 @@ use onde::inference::SamplingConfig;
 // schema types moved under `schema::v1` in agent-client-protocol 1.0.
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
-    AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    CancelNotification, CloseSessionRequest, CloseSessionResponse, CompleteElicitationNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, CreateElicitationRequest,
-    CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, Diff,
-    ElicitationAction, ElicitationRequestScope, ElicitationUrlMode, EmbeddedResourceResource,
-    ErrorCode, ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest,
-    InitializeResponse, KillTerminalRequest, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, MessageId, Meta, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest, ReleaseTerminalRequest,
-    RequestId, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionDeleteCapabilities,
-    SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
-    SessionMode, SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput, UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
+    AgentAuthCapabilities, AgentCapabilities, AudioContent, AuthMethod, AuthMethodAgent,
+    AuthenticateRequest, AuthenticateResponse, AvailableCommand, AvailableCommandInput,
+    AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    CompleteElicitationNotification, ConfigOptionUpdate, ContentBlock, ContentChunk,
+    CreateElicitationRequest, CreateTerminalRequest, CurrentModeUpdate, DeleteSessionRequest,
+    DeleteSessionResponse, Diff, ElicitationAction, ElicitationRequestScope, ElicitationUrlMode,
+    EmbeddedResourceResource, ErrorCode, ForkSessionRequest, ForkSessionResponse, ImageContent,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, MessageId, Meta,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    ReadTextFileRequest, ReleaseTerminalRequest, RequestId, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeState,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
+    WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
+
+use sigit_agent::prompt::{CO_AUTHOR_TRAILER_PLACEHOLDER, SYSTEM_PROMPT};
 
 use crate::backend::{
     AudioInput, ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, TokenChunk,
@@ -113,169 +118,6 @@ use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-
-/// Stands in for the commit trailer inside [`SYSTEM_PROMPT`]; see
-/// [`system_prompt_for_model`].
-const CO_AUTHOR_TRAILER_PLACEHOLDER: &str = "{commit_co_author_trailer}";
-
-const SYSTEM_PROMPT: &str = concat!(
-    "\
-Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
-Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
-
-You are a strong general-purpose coding agent. smbCloud is your home turf, \
-but you should still be useful in any codebase. When the project is clearly \
-about smbCloud, use that context directly instead of falling back to vague \
-cloud-platform advice.
-
-smbCloud context you should know and use when it helps:
-- smbCloud is a platform for deploying and managing projects
-- the main CLI is a Rust workspace with focused crates rather than one giant crate
-- common areas include auth, project management, deploy flows, networking, \
-  shared models, release tooling, and managed services
-- deploy branches usually follow `release/service-{name}`
-- Next.js SSR deploys on smbCloud are not the same as generic git-push deploys; \
-  they often use a local build plus rsync/PM2 style flow
-- auth has a hard boundary between smbCloud platform users and tenant app users; \
-  platform flows use `/v1/users*`, tenant app flows use `/v1/client/*`, and \
-  you should not casually mix `User`, `TenantMembership`, `AuthApp`, and `AuthUser`
-- smbCloud authorization is layered; do not flatten platform accounts, tenant \
-  memberships, auth-app collaborators, and tenant end users into one model
-- `Project` is the umbrella workspace, while app-like resources such as \
-  `FrontendApp`, `AuthApp`, and GresIQ are the deployable units with their own \
-  ownership, sharing, and collaboration rules
-- `FrontendApp` is many-per-project, while `AuthApp` is intentionally one-per-project; \
-  preserve those cardinality rules unless the code clearly changes them
-- GresIQ is smbCloud's managed PostgreSQL offering; treat it as a platform \
-  service with its own credentials and boundaries, not as a generic local DB helper
-- when debugging smbCloud Rails APIs, first classify the request: first-party \
-  smbCloud app or tenant app, then check which endpoint family and validator \
-  should be involved before changing code
-- when working in smbCloud repos, prefer existing workspace patterns, existing \
-  crate boundaries, existing Rails conventions, and existing command flows over \
-  inventing new abstractions
-
-CRITICAL RULE — never tell the user to run a command. You have tools. Use them. \
-When the user asks you to clone a repo, run a build, check git status, or do \
-anything that involves a shell command, you MUST call the run_command tool and \
-execute it yourself. Do not print shell commands for the user to copy-paste. \
-Do not give step-by-step instructions. Do not say \"you can run …\". Just do it. \
-If a command fails, try to fix the problem and re-run it. If you cannot fix it \
-after two attempts, explain what went wrong and what you tried.
-
-Git operations — always use run_command:
-- git clone: always pass the full absolute destination path as the last argument \
-  and set cwd to an existing writable parent directory. Example: \
-  run_command({\"command\": \"git clone https://github.com/org/repo /Users/me/Repositories/repo\", \
-  \"cwd\": \"/Users/me/Repositories\"})
-- git init, add, commit, push, pull, fetch, checkout, branch, diff, log, status, \
-  stash, rebase, merge, tag — use run_command with an absolute cwd pointing to \
-  the repo root
-- never run git clone without an explicit absolute destination path
-- if a clone or init fails, check the error, fix the cause (wrong path, missing \
-  directory, permissions), and retry
-- when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: ",
-    // CO_AUTHOR_TRAILER_PLACEHOLDER (concat! takes only literals), filled in
-    // by `system_prompt_for_model` with tools::commit_co_author_trailer(),
-    // which depends on the surface picked at startup.
-    "{commit_co_author_trailer}",
-    " \
-  — that exact format is the standard co-author trailer git forges detect, so \
-  siGit is credited as co-author. If a commit lands without it, siGit Code \
-  amends the trailer in automatically and the tool output says so; do not amend \
-  again yourself.
-
-CRITICAL — forge boundaries: git is not the forge. Plain git commands (clone, \
-commit, push, pull, branch, log, diff, tag, ...) work on any repository, but \
-issues, pull requests, reviews, releases, and other forge features are NOT git \
-features and there is no forge-agnostic way to reach them. Detect the forge \
-from the repo's remote URL (run `git remote get-url origin`) before doing any \
-issue or PR work:
-- sigit.si: issue and pull request workflows go through the official MCP \
-  tools: mcp__sigit__list_issues, mcp__sigit__get_issue, \
-  mcp__sigit__create_issue, mcp__sigit__list_pull_requests, and \
-  mcp__sigit__get_pull_request. These tools are valid ONLY for repositories \
-  hosted on sigit.si. Prefer them over shelling out to git or fetching web \
-  pages for issue and PR queries on sigit.si repos.
-- any other host (github.com, gitlab.com, bitbucket.org, self-hosted forges, \
-  ...): the mcp__sigit__* tools do NOT work there. Use the forge's own CLI via \
-  run_command when it is installed (`gh` for GitHub, `glab` for GitLab, `tea` \
-  for Gitea/Forgejo), its web API via read_website when that is practical, or \
-  ask the user how they want to interact with the forge.
-Never assume a repo is on GitHub, and never use the mcp__sigit__* tools \
-against a repo whose remote is not sigit.si.
-
-Never introduce yourself unless asked. Jump straight into the answer. \
-Keep answers short. Write idiomatic code. \
-Fix root causes, not symptoms.
-
-You have access to tools that let you read files, read websites directly from \
-http and https URLs, create directories, list directories, search code, create \
-new files, edit existing files, delete files, and run shell commands. You can \
-also use git directly through shell commands, including `git init` and normal \
-git workflows. Use them proactively. Read the code or website before answering. \
-Prefer absolute paths when referring to files and directories, especially in \
-protocol-facing output and tool arguments. Create directories when needed. Run \
-builds, tests, and git commands after making changes. Ground your answers in \
-the actual code or fetched page content, not in guesses.
-
-CRITICAL — you CAN access websites. You are NOT a typical LLM without internet \
-access. You have a read_website tool that fetches any http or https URL and \
-returns the page text. When the user gives you a URL or asks you to read, \
-summarize, or inspect a web page, you MUST call the read_website tool with that \
-URL. Never say \"I cannot access websites\" or \"I cannot browse the internet\". \
-You can. Use the tool.
-
-CRITICAL — before every edit_file call, you MUST call read_file on the target \
-file first (or the specific line range if one was given). Never rely on file \
-content you saw in a previous turn — the user may have reverted, edited, or \
-changed the file externally since then. Always re-read to get the current state \
-before constructing old_text. \
-When the user corrects a previous edit (e.g. \"don't remove X, append instead\"), \
-treat it as a fresh task: re-read the file, identify the current content, and \
-plan the edit from scratch. Do not assume the file still reflects your last edit.
-
-Tool-use heuristics:
-- when the user provides a URL or asks about a web page, ALWAYS call \
-  read_website — never refuse or claim you lack internet access
-- prefer absolute paths over relative paths when you mention, return, or pass \
-  file and directory paths
-- if a path does not exist yet, create the directory before creating files in it
-- if the user asks to clone a repo, immediately call run_command with git clone \
-  and an absolute destination path — do not ask where to put it unless the \
-  request is ambiguous; default to the user's home Repositories directory
-- if the user asks for a new repo, scaffold, or scratch project, create the \
-  directory, create the first files, and run `git init` without waiting unless \
-  the request says otherwise
-- if the repo looks like smbCloud CLI code, respect workspace crate boundaries, \
-  shared models, and existing command handlers before adding new abstractions
-- if the repo looks like smbCloud Rails code, check routes, controllers, \
-  validators, and model boundaries before changing business logic
-- if the task touches smbCloud auth, first decide whether it is a platform-user \
-  flow or a tenant-app flow, then follow the right endpoint family and model layer
-- if the task touches smbCloud deploy code, check whether it is the generic \
-  deploy path or the Next.js SSR path before proposing changes
-- after edits, prefer running the smallest useful verification step first, then \
-  widen to broader checks if needed
-- use git commands naturally for status checks, repo setup, diffs, and normal \
-  developer workflows when they help move the task forward
-- if a tool call fails, read the error, try to fix it, and retry — do not \
-  fall back to telling the user what to type
-
-Replies are plain Markdown. Never wrap a reply, or any part of it, in XML-style \
-tags you made up, and never write a system message, warning, or notice as if it \
-came from siGit Code or the system: only siGit Code speaks for itself, and \
-nothing renders those tags. To offer the user a choice, list the options as \
-plain text.
-
-When the repo is not about smbCloud, act like a normal coding agent and do not \
-force smbCloud-specific advice into the answer. When it is about smbCloud, be \
-specific and practical.
-
-Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever."
-);
 
 /// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
 /// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
@@ -651,6 +493,107 @@ fn history_message_text(message: &serde_json::Value) -> String {
     }
 }
 
+/// The images and audio clips a saved user message carries, as the ACP
+/// content blocks the client sent them in. History keeps them as OpenAI
+/// content parts (see `backend::user_message`): an image as a base64 `data:`
+/// URL and a clip as `input_audio` with a bare format name. Anything that does
+/// not turn back into a block (an image by remote URL, say) is left out.
+fn history_message_attachments(message: &serde_json::Value) -> Vec<ContentBlock> {
+    let Some(parts) = message["content"].as_array() else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| match part["type"].as_str()? {
+            "image_url" => {
+                let url = part["image_url"]["url"].as_str()?;
+                let (mime_type, data) = url.strip_prefix("data:")?.split_once(";base64,")?;
+                Some(ContentBlock::Image(ImageContent::new(data, mime_type)))
+            }
+            "input_audio" => {
+                let data = part["input_audio"]["data"].as_str()?;
+                let mime_type = match part["input_audio"]["format"].as_str()? {
+                    "mp3" => "audio/mpeg".to_string(),
+                    format => format!("audio/{format}"),
+                };
+                Some(ContentBlock::Audio(AudioContent::new(data, mime_type)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many sessions one `session/list` reply carries. A client asks for the
+/// rest with the `nextCursor` of the page before.
+const SESSION_LIST_PAGE_SIZE: usize = 100;
+
+/// Where a `session/list` page ended: the last session on it, by the two
+/// things the list is sorted on. Naming the entry instead of counting an
+/// offset keeps the next page right when a thread is saved or deleted between
+/// the two requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionListCursor {
+    modified_nanos: u128,
+    id: String,
+}
+
+impl SessionListCursor {
+    fn after(entry: &session_store::SessionEntry) -> Self {
+        Self {
+            modified_nanos: modified_nanos(entry.modified),
+            id: entry.id.clone(),
+        }
+    }
+
+    /// The cursor as the client carries it. Clients must treat it as opaque.
+    fn encode(&self) -> String {
+        format!("{}:{}", self.modified_nanos, self.id)
+    }
+
+    fn decode(cursor: &str) -> Option<Self> {
+        let (modified_nanos, id) = cursor.split_once(':')?;
+        if id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            modified_nanos: modified_nanos.parse().ok()?,
+            id: id.to_string(),
+        })
+    }
+
+    /// Does `entry` come after this cursor in `session_store::list` order
+    /// (newest first, then by id)?
+    fn precedes(&self, entry: &session_store::SessionEntry) -> bool {
+        let modified = modified_nanos(entry.modified);
+        modified < self.modified_nanos
+            || (modified == self.modified_nanos && entry.id.as_str() > self.id.as_str())
+    }
+}
+
+fn modified_nanos(time: std::time::SystemTime) -> u128 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
+}
+
+/// One page of `sessions` (already in list order) starting after `cursor`,
+/// and the cursor for the page after it when there is one.
+fn session_list_page(
+    sessions: Vec<session_store::SessionEntry>,
+    cursor: Option<&SessionListCursor>,
+    page_size: usize,
+) -> (Vec<session_store::SessionEntry>, Option<String>) {
+    let mut rest = sessions
+        .into_iter()
+        .filter(|entry| cursor.is_none_or(|cursor| cursor.precedes(entry)));
+    let page: Vec<_> = rest.by_ref().take(page_size).collect();
+    let next_cursor = match (rest.next(), page.last()) {
+        (Some(_), Some(last)) => Some(SessionListCursor::after(last).encode()),
+        _ => None,
+    };
+    (page, next_cursor)
+}
+
 /// Do two paths name the same directory, for `session/list` filtering?
 ///
 /// Canonicalizing resolves the symlinks and `..` segments that make a client's
@@ -697,18 +640,34 @@ fn history_replay_updates(history: &[serde_json::Value]) -> Vec<SessionUpdate> {
             // Seeded context and project instructions were never on screen.
             "system" => {}
             "user" => {
+                // The text and the attachments were one message when they
+                // were sent, so they replay under one id.
+                let message_id = new_message_id();
                 let text = history_message_text(message);
                 if !text.trim().is_empty() {
                     updates.push(SessionUpdate::UserMessageChunk(
-                        ContentChunk::new(ContentBlock::from(text)).message_id(new_message_id()),
+                        ContentChunk::new(ContentBlock::from(text)).message_id(message_id.clone()),
+                    ));
+                }
+                for attachment in history_message_attachments(message) {
+                    updates.push(SessionUpdate::UserMessageChunk(
+                        ContentChunk::new(attachment).message_id(message_id.clone()),
                     ));
                 }
             }
             "assistant" => {
-                let (_think, visible) = chat::strip_think_blocks(&history_message_text(message));
+                // Reasoning went out as thought chunks under the reply's id
+                // while the turn ran; it comes back the same way.
+                let message_id = new_message_id();
+                let (think, visible) = chat::strip_think_blocks(&history_message_text(message));
+                if !think.trim().is_empty() {
+                    updates.push(SessionUpdate::AgentThoughtChunk(
+                        ContentChunk::new(ContentBlock::from(think)).message_id(message_id.clone()),
+                    ));
+                }
                 if !visible.trim().is_empty() {
                     updates.push(SessionUpdate::AgentMessageChunk(
-                        ContentChunk::new(ContentBlock::from(visible)).message_id(new_message_id()),
+                        ContentChunk::new(ContentBlock::from(visible)).message_id(message_id),
                     ));
                 }
                 for call in message["tool_calls"].as_array().into_iter().flatten() {
@@ -2851,19 +2810,34 @@ impl SiGitAgent {
                 format!("cwd must be an absolute path, got {}", cwd.display()),
             ));
         }
+        // A cursor is one this agent handed out. Anything else is a client
+        // error, not a reason to start again from the first page.
+        let cursor = match args.cursor.as_deref() {
+            Some(cursor) => Some(SessionListCursor::decode(cursor).ok_or_else(|| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InvalidParams.into(),
+                    "cursor is not one this agent returned from session/list",
+                )
+            })?),
+            None => None,
+        };
         let filter = args.cwd.clone();
-        let sessions: Vec<SessionInfo> = session_store::list()
+        let entries: Vec<session_store::SessionEntry> = session_store::list()
             .into_iter()
             .filter(|entry| entry.message_count > 0)
+            .filter(|entry| match (&entry.cwd, &filter) {
+                (None, _) => false,
+                (Some(cwd), Some(filter)) => same_dir(cwd, filter),
+                (Some(_), None) => true,
+            })
+            .collect();
+        let (page, next_cursor) =
+            session_list_page(entries, cursor.as_ref(), SESSION_LIST_PAGE_SIZE);
+        let sessions: Vec<SessionInfo> = page
+            .into_iter()
             .filter_map(|entry| {
-                let cwd = entry.cwd?;
-                if let Some(filter) = &filter
-                    && !same_dir(&cwd, filter)
-                {
-                    return None;
-                }
                 Some(
-                    SessionInfo::new(SessionId::new(entry.id), cwd)
+                    SessionInfo::new(SessionId::new(entry.id), entry.cwd?)
                         .additional_directories(entry.additional_directories)
                         .title(entry.title)
                         .updated_at(session_store::iso8601(entry.modified)),
@@ -2872,15 +2846,20 @@ impl SiGitAgent {
             .collect();
 
         log::info!(
-            "list_sessions: {} session(s){}",
+            "list_sessions: {} session(s){}{}",
             sessions.len(),
             args.cwd
                 .as_ref()
                 .map(|cwd| format!(" for cwd={}", cwd.display()))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if next_cursor.is_some() {
+                ", more to come"
+            } else {
+                ""
+            }
         );
 
-        Ok(ListSessionsResponse::new(sessions))
+        Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
     }
 
     async fn handle_load_session(
@@ -4315,18 +4294,25 @@ impl SiGitAgent {
 
     async fn handle_cancel(&self, args: CancelNotification) -> agent_client_protocol::Result<()> {
         log::info!("cancel requested for session {}", args.session_id);
+        self.cancel_turn(&args.session_id);
+        Ok(())
+    }
+
+    /// Stop the turn running on `session_id`, if there is one, and whatever
+    /// command it is running. Reached from `session/cancel` and from a
+    /// `$/cancel_request` naming the prompt.
+    fn cancel_turn(&self, session_id: &SessionId) {
         if let Some(cancellation) = self
             .prompt_cancellations
             .lock()
             .unwrap()
-            .get(&args.session_id.to_string())
+            .get(&session_id.to_string())
             .cloned()
         {
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
         }
-        tools::abort_session_tools(&args.session_id.to_string());
-        Ok(())
+        tools::abort_session_tools(&session_id.to_string());
     }
 
     /// Swap the active backend to a siGit Code Cloud tier and reflect it as the
@@ -5780,7 +5766,9 @@ async fn exec_slash_acp(
                 },
                 // A bare `/login` takes the browser route, same as the editor's
                 // sign-in button.
-                None => browser_login_message().await,
+                None => browser_login_message()
+                    .await
+                    .unwrap_or_else(|message| message),
             };
             agent.send_assistant_message(cx, session_id, message).ok();
         }
@@ -6195,11 +6183,17 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     let request_id = responder.id().clone();
+                    // A sign-in waits on the browser for minutes. Dropping it
+                    // on `$/cancel_request` closes the loopback listener, and
+                    // the request is answered `-32800`.
+                    let cancellation = responder.cancellation();
                     cx.spawn(async move {
-                        handle_response(
-                            responder,
-                            state.handle_authenticate(&task_cx, request_id, req).await,
-                        )
+                        let result = cancellation
+                            .run_until_cancelled(state.handle_authenticate(
+                                &task_cx, request_id, req,
+                            ))
+                            .await;
+                        handle_response(responder, result)
                     })
                 }
             },
@@ -6336,9 +6330,29 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                 async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
+                    let cancellation = responder.cancellation();
                     cx.spawn(async move {
                         let _session = state.lock_session(&req.session_id).await;
-                        handle_response(responder, state.handle_prompt(&task_cx, req).await)
+                        let session_id = req.session_id.clone();
+                        let turn = state.handle_prompt(&task_cx, req);
+                        tokio::pin!(turn);
+                        // `$/cancel_request` for the prompt's own id stops the
+                        // turn the way `session/cancel` does, and the request
+                        // is still answered with a `cancelled` stop reason so
+                        // the client keeps what was streamed. The turn is
+                        // polled first: it registers for cancellation on its
+                        // first poll, which a cancel that arrived while the
+                        // prompt was queued would otherwise beat.
+                        let result = tokio::select! {
+                            biased;
+                            result = &mut turn => result,
+                            () = cancellation.cancelled() => {
+                                log::info!("$/cancel_request for the prompt on session {session_id}");
+                                state.cancel_turn(&session_id);
+                                turn.await
+                            }
+                        };
+                        handle_response(responder, result)
                     })
                 }
             },
@@ -6475,20 +6489,24 @@ async fn sign_in_via_client(
 /// Both the TUI and an ACP session reach this from a bare `/login`. Neither can
 /// prompt for a pasted code mid-command, so a box with no bindable port is told
 /// to use `sigit login`, which can.
-pub(crate) async fn browser_login_message() -> String {
+pub(crate) async fn browser_login_message() -> Result<String, String> {
     let flow = browser_auth::begin();
     if !flow.is_loopback() {
-        return "Could not open a local port to receive the sign-in. \
+        return Err("Could not open a local port to receive the sign-in. \
                 Run `sigit login` in a terminal instead."
-            .to_string();
+            .to_string());
     }
 
     browser_auth::open_browser(flow.authorize_url());
     let url = flow.authorize_url().to_string();
 
     match browser_auth::complete_loopback(flow).await {
-        Ok(email) => format!("Signed in as {email}. Pick a siGit Code Cloud tier in /models."),
-        Err(error) => format!("Login failed: {error}\nYou can also open {url} by hand."),
+        Ok(email) => Ok(format!(
+            "Signed in as {email}. Pick a siGit Code Cloud tier in /models."
+        )),
+        Err(error) => Err(format!(
+            "Login failed: {error}\nYou can also open {url} by hand."
+        )),
     }
 }
 
@@ -7614,7 +7632,7 @@ mod tests {
         let updates = history_replay_updates(&history);
 
         // The system message seeded the model; it was never on screen.
-        assert_eq!(updates.len(), 4, "{updates:#?}");
+        assert_eq!(updates.len(), 5, "{updates:#?}");
 
         match &updates[0] {
             SessionUpdate::UserMessageChunk(chunk) => {
@@ -7622,16 +7640,23 @@ mod tests {
             }
             other => panic!("expected the user message first, got {other:?}"),
         }
+        // Reasoning comes back as a thought, apart from the reply, exactly
+        // as it went out live.
         match &updates[1] {
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                assert!(format!("{:?}", chunk.content).contains("which file?"));
+            }
+            other => panic!("expected the reasoning, got {other:?}"),
+        }
+        match &updates[2] {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let rendered = format!("{:?}", chunk.content);
                 assert!(rendered.contains("Reading it now."));
-                // Reasoning stays hidden on replay, exactly as it did live.
                 assert!(!rendered.contains("which file?"));
             }
             other => panic!("expected the assistant reply, got {other:?}"),
         }
-        match &updates[2] {
+        match &updates[3] {
             SessionUpdate::ToolCall(call) => {
                 assert_eq!(call.title, format!("read_file · {changelog_path_text}"));
                 assert_eq!(call.kind, ToolKind::Read);
@@ -7654,7 +7679,7 @@ mod tests {
             }
             other => panic!("expected the tool call, got {other:?}"),
         }
-        assert!(matches!(updates[3], SessionUpdate::AgentMessageChunk(_)));
+        assert!(matches!(updates[4], SessionUpdate::AgentMessageChunk(_)));
 
         // Each replayed message has an id of its own.
         let ids: Vec<_> = updates
@@ -7758,6 +7783,144 @@ mod tests {
             serde_json::json!({ "role": "assistant", "content": "" }),
         ];
         assert!(history_replay_updates(&history).is_empty());
+    }
+
+    #[test]
+    fn history_replay_sends_reasoning_as_a_thought_under_the_reply_id() {
+        let history = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "<think>check the lockfile first</think>The lockfile is stale.",
+        })];
+        match history_replay_updates(&history).as_slice() {
+            [
+                SessionUpdate::AgentThoughtChunk(thought),
+                SessionUpdate::AgentMessageChunk(reply),
+            ] => {
+                assert!(
+                    matches!(&thought.content, ContentBlock::Text(t) if t.text.contains("check the lockfile first"))
+                );
+                assert!(
+                    matches!(&reply.content, ContentBlock::Text(t) if t.text == "The lockfile is stale.")
+                );
+                assert!(thought.message_id.is_some());
+                assert_eq!(thought.message_id, reply.message_id);
+            }
+            other => panic!("expected a thought and a reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_replay_gives_back_the_attachments_of_a_user_message() {
+        let history = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in these?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } },
+                { "type": "input_audio", "input_audio": { "data": "BBBB", "format": "mp3" } },
+                { "type": "input_audio", "input_audio": { "data": "CCCC", "format": "wav" } },
+            ],
+        })];
+        match history_replay_updates(&history).as_slice() {
+            [
+                SessionUpdate::UserMessageChunk(text),
+                SessionUpdate::UserMessageChunk(image),
+                SessionUpdate::UserMessageChunk(mp3),
+                SessionUpdate::UserMessageChunk(wav),
+            ] => {
+                assert!(
+                    matches!(&text.content, ContentBlock::Text(t) if t.text == "what is in these?")
+                );
+                assert!(
+                    matches!(&image.content, ContentBlock::Image(i) if i.data == "AAAA" && i.mime_type == "image/png")
+                );
+                assert!(
+                    matches!(&mp3.content, ContentBlock::Audio(a) if a.data == "BBBB" && a.mime_type == "audio/mpeg")
+                );
+                assert!(
+                    matches!(&wav.content, ContentBlock::Audio(a) if a.data == "CCCC" && a.mime_type == "audio/wav")
+                );
+                assert!(text.message_id.is_some());
+                for chunk in [image, mp3, wav] {
+                    assert_eq!(chunk.message_id, text.message_id);
+                }
+            }
+            other => panic!("expected the text and three attachments, got {other:?}"),
+        }
+    }
+
+    fn listed(id: &str, modified_secs: u64) -> session_store::SessionEntry {
+        session_store::SessionEntry {
+            id: id.to_string(),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs),
+            message_count: 1,
+            cwd: Some(PathBuf::from("/project")),
+            additional_directories: Vec::new(),
+            model_id: None,
+            title: None,
+        }
+    }
+
+    fn ids(page: &[session_store::SessionEntry]) -> Vec<&str> {
+        page.iter().map(|entry| entry.id.as_str()).collect()
+    }
+
+    #[test]
+    fn session_list_pages_follow_one_another_without_gaps_or_repeats() {
+        // In `session_store::list` order: newest first, ties by id.
+        let sessions = || {
+            vec![
+                listed("e", 50),
+                listed("a", 40),
+                listed("b", 40),
+                listed("c", 40),
+                listed("d", 10),
+            ]
+        };
+
+        let (first, cursor) = session_list_page(sessions(), None, 2);
+        assert_eq!(ids(&first), ["e", "a"]);
+        let cursor = SessionListCursor::decode(&cursor.expect("more pages follow")).unwrap();
+
+        let (second, cursor) = session_list_page(sessions(), Some(&cursor), 2);
+        assert_eq!(ids(&second), ["b", "c"]);
+        let cursor = SessionListCursor::decode(&cursor.expect("one more page")).unwrap();
+
+        let (third, cursor) = session_list_page(sessions(), Some(&cursor), 2);
+        assert_eq!(ids(&third), ["d"]);
+        assert_eq!(cursor, None, "the last page carries no cursor");
+    }
+
+    #[test]
+    fn session_list_has_no_cursor_when_everything_fits_on_one_page() {
+        let (page, cursor) = session_list_page(vec![listed("a", 2), listed("b", 1)], None, 2);
+        assert_eq!(ids(&page), ["a", "b"]);
+        assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn session_list_cursor_survives_the_session_it_names_being_deleted() {
+        let (_, cursor) = session_list_page(
+            vec![listed("a", 30), listed("b", 20), listed("c", 10)],
+            None,
+            2,
+        );
+        let cursor = SessionListCursor::decode(&cursor.unwrap()).unwrap();
+        // "b" ended the first page and is gone by the second request.
+        let (page, _) = session_list_page(vec![listed("a", 30), listed("c", 10)], Some(&cursor), 2);
+        assert_eq!(ids(&page), ["c"]);
+    }
+
+    #[test]
+    fn session_list_cursor_rejects_what_it_did_not_write() {
+        for cursor in ["", "abc", "12", "12:", "x:session", ":session"] {
+            assert_eq!(SessionListCursor::decode(cursor), None, "{cursor:?}");
+        }
+        let cursor = SessionListCursor {
+            modified_nanos: 1_700_000_000_123_456_789,
+            id: "a:b".to_string(),
+        };
+        assert_eq!(SessionListCursor::decode(&cursor.encode()), Some(cursor));
     }
 
     #[test]

@@ -100,14 +100,20 @@ pub enum Decision {
 /// `tools.rs`'s `web_search` module doc for why it isn't classified by that
 /// `mcp__` prefix).
 ///
-/// Two MCP exceptions, both baked-in first-party servers. The *official*
+/// Three MCP exceptions, all baked-in first-party servers. The *official*
 /// sigit.si server's (`mcp__sigit__*`) query tools — names starting `list_`
 /// or `get_`, plus `search_code` and `web_search` — are read-only and never
 /// prompt (the TUI's Repo tab depends on this). The smbCloud CLI server's
 /// (`mcp__smbcloud__*`) read tools are exempted by an explicit allow-list
 /// rather than a name shape, since its names don't follow the `list_`/`get_`
 /// convention — a tool the list doesn't know (e.g. from a newer smb) fails
-/// safe to mutating. Every other `mcp__*` tool stays mutating.
+/// safe to mutating. The Ascapi (the App Stores Coolest API) server
+/// (`mcp__ascapi__*`) works the same way as the smbCloud one: a fixed
+/// allow-list of the read-only `asc apps *`/`asc certificates list`/etc.
+/// tool names exempts them, and any other name on that server (or an empty
+/// one, or a name on a different-but-similar server like
+/// `mcp__ascapix__*`) stays mutating. Every other `mcp__*` tool stays
+/// mutating.
 pub fn classify(tool_name: &str) -> ToolRisk {
     match tool_name {
         "read_file" | "list_directory" | "search_files" | "glob" | "read_website"
@@ -123,6 +129,27 @@ pub fn classify(tool_name: &str) -> ToolRisk {
             }
             if let Some(bare) = crate::mcp::smbcloud_tool_suffix(tool_name)
                 && matches!(bare, "me" | "deployments" | "project_list" | "project_show")
+            {
+                return ToolRisk::ReadOnly;
+            }
+            if let Some(bare) = crate::mcp::ascapi_tool_suffix(tool_name)
+                && matches!(
+                    bare,
+                    "app_list"
+                        | "app_get"
+                        | "app_info_list"
+                        | "build_list"
+                        | "bundle_id_list"
+                        | "app_store_version_list"
+                        | "app_store_version_get"
+                        | "app_info_localization_list"
+                        | "app_store_version_localization_list"
+                        | "app_screenshot_set_list"
+                        | "app_screenshot_list"
+                        | "certificate_list"
+                        | "beta_group_list"
+                        | "beta_app_review_detail_get"
+                )
             {
                 return ToolRisk::ReadOnly;
             }
@@ -596,6 +623,64 @@ mod tests {
             "mcp__other__me",
             // `smbcloud` must match the whole server name
             "mcp__smbcloudx__project_list",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
+        }
+    }
+
+    #[test]
+    fn ascapi_mcp_read_tools_are_read_only() {
+        let _guard = env_guard();
+        for tool in [
+            "mcp__ascapi__app_list",
+            "mcp__ascapi__app_get",
+            "mcp__ascapi__app_info_list",
+            "mcp__ascapi__build_list",
+            "mcp__ascapi__bundle_id_list",
+            "mcp__ascapi__app_store_version_list",
+            "mcp__ascapi__app_store_version_get",
+            "mcp__ascapi__app_info_localization_list",
+            "mcp__ascapi__app_store_version_localization_list",
+            "mcp__ascapi__app_screenshot_set_list",
+            "mcp__ascapi__app_screenshot_list",
+            "mcp__ascapi__certificate_list",
+            "mcp__ascapi__beta_group_list",
+            "mcp__ascapi__beta_app_review_detail_get",
+        ] {
+            assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
+            assert_eq!(
+                decision_for("t-ascapi", tool, "{}"),
+                Decision::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn ascapi_mcp_mutating_and_unknown_tools_stay_gated() {
+        for tool in [
+            // ascapi server, but not on the read allow-list
+            "mcp__ascapi__app_create",
+            "mcp__ascapi__app_update",
+            "mcp__ascapi__app_delete",
+            "mcp__ascapi__upload",
+            "mcp__ascapi__review_submissions_submit",
+            "mcp__ascapi__certificate_revoke",
+            "mcp__ascapi__profiles_create",
+            "mcp__ascapi__profiles_delete",
+            "mcp__ascapi__devices_register",
+            "mcp__ascapi__bundle_id_delete",
+            "mcp__ascapi__beta_group_delete",
+            "mcp__ascapi__beta_tester_invite",
+            "mcp__ascapi__app_store_version_submit",
+            "mcp__ascapi__pre_release_version_delete",
+            "mcp__ascapi__build_expire",
+            "mcp__ascapi__app_screenshot_delete",
+            // empty/unknown names on the ascapi server
+            "mcp__ascapi__",
+            "mcp__ascapi__not_a_real_tool",
+            // `ascapi` must match the whole server name
+            "mcp__ascapix__app_list",
         ] {
             assert_eq!(classify(tool), ToolRisk::Mutating, "{tool}");
         }

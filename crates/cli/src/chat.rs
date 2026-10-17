@@ -858,7 +858,11 @@ mod tui {
     }
 
     impl App {
-        fn new(load_model_name: String, backend: Arc<dyn InferenceBackend>) -> Self {
+        fn new(
+            load_model_name: String,
+            backend: Arc<dyn InferenceBackend>,
+            program_status: Reporter,
+        ) -> Self {
             let is_remote = backend.is_remote();
             let items = build_model_picker_items();
             let tool_calling = items
@@ -893,7 +897,7 @@ mod tui {
                 model_load_cancelled: false,
                 switching_model_id: None,
                 download_progress: None,
-                program_status: Reporter::new(std::io::sink()),
+                program_status,
                 outcome: Status::Idle,
                 is_loading: true,
                 load_tick: 0,
@@ -962,6 +966,18 @@ mod tui {
         /// The History entry the cursor is on, if any.
         fn selected_session(&self) -> Option<&SessionEntry> {
             self.history_sessions.get(self.history_index)
+        }
+
+        fn finish_login(&mut self, result: Result<String, String>) {
+            self.outcome = if result.is_ok() {
+                Status::Done
+            } else {
+                Status::Error
+            };
+            self.program_status.report(self.outcome);
+            self.messages.push(ChatMessage::system(
+                result.unwrap_or_else(|message| message),
+            ));
         }
 
         fn status(&self) -> Status {
@@ -3068,13 +3084,13 @@ mod tui {
                 } else {
                     Status::Auth
                 });
-                let message = match arg.as_deref().and_then(crate::account::parse_login_args) {
+                let result = match arg.as_deref().and_then(crate::account::parse_login_args) {
                     Some((email, password)) => {
                         match crate::account::authenticate(&email, &password).await {
-                            Ok(email) => format!(
+                            Ok(email) => Ok(format!(
                                 "Signed in as {email}. siGit Code Cloud applies to your next session."
-                            ),
-                            Err(error) => format!("Login failed: {error}"),
+                            )),
+                            Err(error) => Err(format!("Login failed: {error}")),
                         }
                     }
                     // A bare `/login` opens the browser instead of asking for
@@ -3086,13 +3102,7 @@ mod tui {
                         crate::browser_login_message().await
                     }
                 };
-                app.outcome = if message.starts_with("Signed in") {
-                    Status::Done
-                } else {
-                    Status::Error
-                };
-                app.program_status.report(app.outcome);
-                app.messages.push(ChatMessage::system(message));
+                app.finish_login(result);
             }
             SlashCommand::Logout => {
                 let message = crate::account::end_session().await;
@@ -3500,8 +3510,7 @@ mod tui {
         // to be thread-safe.
         B::Error: Send + Sync + 'static,
     {
-        let mut app = App::new(load_model_name, backend);
-        app.program_status = program_status;
+        let mut app = App::new(load_model_name, backend, program_status);
         let mut event_stream = EventStream::new();
 
         // 10 fps is plenty for spinners
@@ -4021,9 +4030,28 @@ mod tui {
         use std::sync::Arc;
 
         #[test]
+        fn login_status_uses_the_result_instead_of_message_wording() {
+            let backend = Arc::new(OpenAiBackend::new("http://localhost/v1", "", "test", None));
+            let mut app = App::new(
+                "test".into(),
+                backend,
+                super::Reporter::new(std::io::sink()),
+            );
+            app.finish_loading();
+            app.finish_login(Ok("Welcome back.".into()));
+            assert_eq!(app.status(), Status::Done);
+            app.finish_login(Err("Signed in could not be completed.".into()));
+            assert_eq!(app.status(), Status::Error);
+        }
+
+        #[test]
         fn program_status_tracks_loading_approval_completion_and_cancellation() {
             let backend = Arc::new(OpenAiBackend::new("http://localhost/v1", "", "test", None));
-            let mut app = App::new("test".into(), backend);
+            let mut app = App::new(
+                "test".into(),
+                backend,
+                super::Reporter::new(std::io::sink()),
+            );
             assert_eq!(app.status(), Status::Working);
             app.finish_loading();
             assert_eq!(app.status(), Status::Idle);

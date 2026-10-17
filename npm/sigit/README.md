@@ -1,8 +1,8 @@
 <h1 align="center">siGit Code</h1>
 
 <p align="center">
-  A local coding agent powered by <a href="https://ondeinference.com">Onde Inference</a>.<br>
-  Runs on your machine. No API keys. No cloud round-trips.
+  A modular local inference LLM coding agent. Core component of siGit Factory.<br>
+  Runs on your machine by default, with optional cloud inference when you choose it.
 </p>
 
 <p align="center">
@@ -111,4 +111,4 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 
 ## Copyright
 
-© 2026 PT Sigit Mitra Bangun ([siGit Code & Deploy](https://sigit.si)), distributed by [Splitfire AB](https://5mb.app).
+© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](https://github.com/getsigit/sigit/blob/main/NOTICE) for the rights holder and distributor.

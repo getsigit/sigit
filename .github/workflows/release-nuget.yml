@@ -90,7 +90,7 @@ jobs:
 
       - name: Build binary
         shell: bash
-        run: cargo build --locked --release --target ${{ matrix.build.TARGET }}
+        run: cargo build --locked --release -p sigit --target ${{ matrix.build.TARGET }}
 
       - name: Prepare artifact
         shell: bash
