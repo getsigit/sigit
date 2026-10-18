@@ -11,11 +11,14 @@ is a TTY:
 
 - **ACP mode** (stdin not a TTY): speaks the Agent Client Protocol over stdio for editor
   integration (Zed, VS Code ACP Client). Cross-platform.
-- **Interactive terminal mode** (stdin is a TTY): a full-screen ratatui chat UI. **Unix-only** —
-  it relies on fd redirection to keep logs out of the TUI, so Windows gets ACP mode only.
+- **Interactive terminal mode** (stdin is a TTY): a full-screen ratatui chat UI, on **every
+  platform**. It is not a second agent: it is an ACP client of this same binary (see
+  `acp_client.rs` and `chat.rs` below). `sigit code` opens it everywhere; a bare `sigit` in a TTY
+  opens it on macOS and Linux only. On Windows a bare `sigit.exe` prints usage and exits 0, which
+  keeps winget validation (`Validation-Executable-Error`) safe.
 
 Before the TTY/ACP split, `main` also dispatches the account subcommands `sigit login`,
-`sigit logout`, `sigit whoami` (see `crates/cli/src/main.rs` `main()`).
+`sigit logout`, `sigit whoami`, and `sigit code` (see `crates/cli/src/main.rs` `main()`).
 
 ## Working in this repo
 
@@ -104,16 +107,28 @@ CI (`.github/workflows/ci.yml`) runs fmt + clippy + test across four targets:
 
 Run a single test: `cargo test <test_name>`.
 
-## Critical platform constraint: `#[cfg(unix)]` dead code
+## Platform constraints
 
-The interactive client is `#[cfg(unix)]`-only. The `InferenceBackend` seam (`backend.rs`) and
-provider resolution (`provider.rs`) are consumed by both the interactive client and the ACP
-server, but several of their items are reached only through the Unix-only interactive paths, so
-the dead-code lint is suppressed *on non-Unix targets only*.
+The terminal UI runs everywhere, so there is no longer a Unix-only island of live code: whatever
+it uses is live on every target, and the `cfg_attr(not(unix), allow(dead_code))` gates that used
+to hide the difference are gone. The `InferenceBackend` seam (`backend.rs`) and provider
+resolution (`provider.rs`) are used by the agent process (ACP server, headless) only; the TUI
+reaches them through that process, never directly.
 
-Consequence: code can pass clippy on macOS/Linux but fail on the Windows target (or vice versa).
-When touching `backend.rs`, `provider.rs`, or the interactive path, keep the `cfg` gates intact —
-don't "fix" an unused-warning by deleting code that's live on Unix.
+What is still platform-specific:
+
+- `redirect_output_to_log` (Unix only) dup2s stdout and stderr onto `$TMPDIR/sigit.log` as a safety
+  net. Windows has no equivalent and needs none, because the TUI process runs no library that
+  prints.
+- Child processes the agent starts (`spawn_shell`, the `git` helpers, hooks) go through
+  `tools::no_console_window` (`CREATE_NO_WINDOW` on Windows) so a command never flashes a console
+  window. The one exception is a stdio MCP server, which `ed-mcp` spawns itself.
+- Quitting sends `session/close` first, because on Windows dropping the connection kills only the
+  agent's immediate child, not its process group.
+
+The CI matrix still runs clippy and tests on all four targets; a Windows-only failure is possible
+whenever you touch `cfg(windows)` code. `cargo xwin clippy --target x86_64-pc-windows-msvc
+--tests -p sigit -- -D warnings` checks it locally.
 
 ## Architecture
 
@@ -169,7 +184,23 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   (`tools::kill_session_tasks`). It leaves `session_store` alone, so a closed thread still lists
   and reopens. `session/delete` is the one that removes it from disk: it runs the same two halves
   (`begin_close`, then `handle_close_session` from `handle_delete_session`) and then
-  `session_store::delete`, and succeeds for an id that is already gone. The
+  `session_store::delete`, and succeeds for an id that is already gone.
+  An on-device load cannot be aborted, so what a request does while it waits is separate from what
+  the load does. `begin_model_switch` starts the loader (`model_loader`, a seam tests replace) and
+  returns the receiver its outcome arrives on; a task of its own then runs
+  `complete_model_switch` (the model becomes current, the choice is saved, the conversation is
+  replayed past the reload, inference is routed on-device), which needs the agent behind an `Arc`
+  (`SiGitAgent::share`). A request that stops waiting (`/models N` or `/load` cancelled with the
+  turn, `$/cancel_request` for `session/set_config_option`, which `handle_set_session_config_option`
+  watches through its `RequestCancellation`) leaves the agent consistent, and the completion task
+  tells the user ("✓ Switched to X" and a fresh `ConfigOptionUpdate`) when nobody is waiting.
+  While it runs `model_ready` is false, so a prompt gets "still loading". Progress is one helper,
+  `model_load_progress` (spinner, percentage bar from `dir_size_recursive` against
+  `SUPPORTED_MODEL_INFO.expected_size_bytes`, elapsed time), keyed on the model actually being
+  loaded; its cards have ids starting `model-load-`, which the TUI reads as "loaded". A local model
+  without tool calling (`local_tool_calling`, set wherever a model loads) is sent no tools
+  (`tools_for_turn`), which also lets its first round stream. `SIGIT_SURFACE=tui` makes the ACP
+  branch report `Surface::Tui` so commit trailers read `-tui`. The
   `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
   smbCloud, and stay general otherwise.
 - **`crates/cli/src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
@@ -389,7 +420,7 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   (most specific) wins. In a multi-root project that walk is repeated for every root
   (`load_workspace_instructions`). The combined block is injected via `session_context_message`
   in `main.rs` — pushed as a system message at every ACP session entry point (new/load/fork +
-  model switch) and appended to the system prompt on the cloud and TUI-startup paths.
+  model switch) and appended to the system prompt on the cloud path.
 - **`crates/cli/src/workspace.rs`** — the directories the session treats as project roots. An editor can
   open several at once (Zed calls it a multi-root project) and ACP carries the extras as
   `additional_directories` on every session request; the headless CLI takes them as repeatable
@@ -447,8 +478,40 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   effects. The finished card keeps the terminal and drops the result text, which still goes out
   as `raw_output`. `SIGIT_CLIENT_TERMINAL=off` turns the routing off. Covered by
   `crates/cli/tests/acp_client_terminal.rs`.
-- **`crates/cli/src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
-  `tokio::select!` to multiplex terminal events with streaming tokens.
+- **`crates/cli/src/acp_client.rs`** — the TUI's connection to its agent, with no UI code. It starts
+  `current_exe()` as a subprocess (`SIGIT_SURFACE=tui`, stdin piped, so `main` takes the ACP
+  branch with `auto_load_local_model = false`) through `AcpAgent`, which makes the child a process
+  group leader and kills the group on drop; the child's stderr lines go to `log::info!(target:
+  "agent")`. There is deliberately no `--agent` flag: the client relies on sigit's own config ids
+  (`MODEL_CONFIG_ID`, `LOCAL_INFERENCE_CONFIG_ID`, `PERMISSION_MODE_CONFIG_ID`), slash commands and
+  `_meta`. It advertises `session.configOptions.boolean` and `elicitation.url`, and *not* `fs` or
+  `terminal`: the agent shares the disk and runs commands itself. Everything arrives as an
+  `AgentEvent` on one unbounded channel (updates, permission requests, sign-in elicitations, turn
+  ends, config/list/load/delete answers); requests go out through `AgentConn`. Slow requests run on
+  their own tasks and answer on the same channel, and a permission request is answered from a
+  spawned task so the dispatch loop never blocks. Dropping a `SentRequest` sends
+  `$/cancel_request`, which is how `cancel_config` stops waiting for a model switch. Startup
+  (`initialize`, `session/new`) has a 30 s timeout. `connect_to` takes the executable and extra
+  environment and exists for `crates/cli/tests/tui_acp_client.rs`, which compiles this file into
+  the test binary with `#[path]`.
+- **`crates/cli/src/chat.rs`** — the ratatui TUI, an ACP client built on `acp_client`. `Chat` holds
+  everything a `session/update` can change (so the mapping is testable without an agent) and
+  `apply_update` is that mapping: message chunks by `messageId` (a new id finalizes the previous
+  message), thought chunks wrapped in `<think>…</think>` so `strip_think_blocks` and `/thinking`
+  work, tool calls and their updates matched by id, diffs as a short `-`/`+` preview, the plan as
+  one entry replaced in place, usage as the context gauge, config options as the model label and
+  picker. An out-of-turn message (a load that finished after its request was cancelled) is
+  finalized at once. Only `/exit`, `/thinking`, `/tools`, bare `/models` (the picker) and `/resume`
+  are handled locally (`parse_local`); every other line, `/init` and custom commands included, goes
+  out as a prompt. `/help` forwards and the client appends its own lines when the reply ends. The
+  y/a/n/d prompt maps to `PermissionOptionKind`; Ctrl+C or Esc while busy sends `session/cancel`
+  (or stops waiting for a model switch) and the turn stays busy until the agent answers it. The
+  picker is built from the `Model` select option, grouped by the `sigit-cloud:` id prefix; a cloud
+  tier picked while signed out comes back unchanged, which is how the client knows to run
+  `authenticate`. The History tab is `session/list` (filtered to the cwd), `session/load` (which
+  replays the scrollback) and `session/delete`; the Repo tab still calls the official MCP server
+  itself (`mcp::init_official_only`). On-device state in the title ("not loaded") comes from the
+  `model-load-` cards the agent shows.
 - **`crates/cli/src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory
   clients. The legacy `-p` form reaches the same parser. Every new run gets a UUID session id;
   `--resume <id>` restores that session through `session_store`, and `--output jsonl` emits a
@@ -514,16 +577,18 @@ downloads a GGUF model (~1–2 GB) from Hugging Face.
 
 ## Logging
 
-In TTY (interactive) mode, *all* output — `log`, `tracing`, stray `println!` — is redirected to
-`$TMPDIR/sigit.log` so the ratatui surface stays clean; the TUI holds a separate fd to the real
-terminal. In ACP mode, stdout is reserved for protocol JSON and logs go to stderr. Control
-verbosity with `RUST_LOG`.
+In TTY (interactive) mode the TUI process logs through a `tracing` file writer to
+`$TMPDIR/sigit.log` (`init_tui_logging`), on every platform, so the ratatui surface stays clean. On
+Unix all output, stray `println!` too, is also redirected there at the fd level, and the TUI
+holds a separate fd to the real terminal. The agent it starts is in ACP mode, whose logs go to
+stderr; the client pipes them into the same file. In ACP mode, stdout is reserved for protocol
+JSON and logs go to stderr. Control verbosity with `RUST_LOG`.
 
 ## Relevant env vars
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `SIGIT_MAX_TOOL_ROUNDS` (1 to 500, default 24; the tool-round cap of a
+`SIGIT_MODEL`, `SIGIT_SURFACE` (`tui`: set by the terminal UI on the agent it starts, so commit trailers say `-tui`), `SIGIT_MAX_TOOL_ROUNDS` (1 to 500, default 24; the tool-round cap of a
 headless run or an ACP prompt turn), `SIGIT_MCP` (`off` disables MCP), `SIGIT_CLIENT_FS` (`off` keeps the file tools on disk even when the
 ACP client offers `fs/read_text_file` / `fs/write_text_file`), `SIGIT_CLIENT_TERMINAL` (`off` runs
 `run_command` locally even when the ACP client offers a terminal), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in

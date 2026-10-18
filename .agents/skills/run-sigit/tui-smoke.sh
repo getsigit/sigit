@@ -4,7 +4,9 @@
 #
 # The TUI only starts when stdin is a real TTY, so it must run inside a terminal
 # multiplexer — tmux gives us one plus `capture-pane` to read what it drew.
-# Requires tmux (`brew install tmux`). Unix only (the TUI is #[cfg(unix)]).
+# Requires tmux (`brew install tmux`), so this script is Unix only; the TUI itself
+# runs on every platform (`sigit code`). It starts its own agent: a child
+# `sigit` in ACP mode, killed when the TUI quits.
 #
 # Usage: .claude/skills/run-sigit/tui-smoke.sh [path-to-binary]
 set -euo pipefail

@@ -153,9 +153,9 @@ As of 1.7.0 it implements the whole stable v1 surface an agent can offer:
 
 ## Terminal mode
 
-Run `sigit` in a terminal and you get the same model and system prompt as the editor integration, just in a full-screen chat UI.
+Run `sigit code` (or just `sigit` on macOS and Linux) in a terminal and you get the same model and system prompt as the editor integration, just in a full-screen chat UI. The UI is an ACP client of the same binary, so it behaves like an editor does.
 
-Terminal mode currently needs Unix terminal behavior, so it works on macOS and Linux only.
+It runs on macOS, Linux and Windows. On Windows a bare `sigit.exe` prints a short usage text and exits, so `sigit code` is the way in. Logs go to `sigit.log` in your temp directory, the agent's included.
 
 ## Headless and CI mode
 

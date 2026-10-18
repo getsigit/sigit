@@ -10,7 +10,7 @@ PackageUrl: https://sigit.si/code
 License: Apache-2.0
 LicenseUrl: https://github.com/@REPO@/blob/main/LICENSE
 Copyright: Copyright 2026 Seto Elkahfi, trading as siGit Code & Deploy
-ShortDescription: A modular local inference LLM coding agent. Core component of siGit Factory.
+ShortDescription: A coding agent for your terminal and editor. Runs on your machine or in siGit Code Cloud.
 Description: |-
   siGit Code is a modular local inference LLM coding agent and the core
   component of siGit Factory. It runs on your machine by default, with
@@ -19,11 +19,11 @@ Description: |-
 
   It works two ways from the same binary. Zed and other ACP-compatible
   editors start it over stdio and talk the Agent Client Protocol to it. Run
-  it from a terminal and you get an interactive chat UI instead. On Windows
-  it speaks ACP; the full-screen terminal UI is Unix-only.
+  `sigit code` in a terminal and you get a full-screen chat UI instead.
 
-  Inference runs on-device against a GGUF model, or against siGit Code Cloud
-  or any OpenAI-compatible endpoint you point it at.
+  Inference is hybrid: on-device against a GGUF model on your own hardware,
+  or in siGit Code Cloud, or against any OpenAI-compatible endpoint you point
+  it at. One conversation can move between them.
 Moniker: sigit
 Tags:
   - acp

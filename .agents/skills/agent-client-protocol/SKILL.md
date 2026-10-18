@@ -496,8 +496,10 @@ corrupt the ratatui screen. ACP mode keeps stdout pristine for protocol JSON.
 
 `main()` decides mode from `std::io::stdin().is_terminal()`:
 
-- **TTY** → interactive ratatui chat (`run_interactive`, Unix-only — needs fd
-  redirection).
+- **TTY** → interactive ratatui chat (`run_interactive`, via `launch_tui`). It is
+  an ACP client of this binary (`acp_client.rs`): it starts a child `sigit` with
+  `SIGIT_SURFACE=tui` and drives it over `session/*`. `sigit code` opens it on
+  every platform; a bare `sigit` does so on Unix only.
 - **non-TTY** → `run_acp_server()` (editor launched it over a pipe).
 
 Account verbs (`sigit login` / `logout` / `whoami`) are handled before the split,

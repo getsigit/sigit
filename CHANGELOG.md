@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+The terminal UI is now an ACP client of siGit Code itself, and it runs on Windows.
+
+### Changed
+
+- **The terminal UI starts its own agent.** `sigit` in a terminal launches this binary as an ACP
+  agent (`SIGIT_SURFACE=tui`) and renders its `session/update`s, the way an editor does. The agent
+  loop lives in one place now: the tool-round cap and its closing message, the repetition guard,
+  stop reasons and refusal rollback, cancellation, plan and diff updates, per-session permission
+  grants and `/compact` all reach the terminal because they are the agent's. The TUI had its own
+  older copy of that loop and kept falling behind it.
+- **History and `/resume` replay the thread.** The History tab is `session/list` for the current
+  directory, Enter is `session/load` and brings the scrollback back, and `d d` is
+  `session/delete`. The same threads show up in an editor's thread list.
+- **Signing in from the terminal shows the page.** The URL is printed (it has to be copyable over
+  ssh) and the browser is tried too. Picking a cloud tier while signed out, or a turn that comes
+  back `auth_required`, starts the sign-in. A bare `/login` prints the URL before it waits.
+- **Loads can be cancelled.** Ctrl+C during a model download or load stops the waiting and leaves
+  chat usable on the previous backend. The load itself cannot be aborted, so it finishes in the
+  background, applies its result and says so ("✓ Switched to X"). A prompt sent meanwhile is told
+  the model is still loading instead of failing with a GPU "does not fit". `/load` and `/models N`
+  show the same download progress card as the model picker, titled after the model that is loading
+  rather than the one the process started with.
+- **A local model without tool calling is sent no tools,** as the old terminal UI did. That keeps
+  such models usable, and with no tools to watch for, their first round streams.
+
+### Added
+
+- **`sigit code`** opens the terminal UI on every platform, Windows included. A bare `sigit` in a
+  terminal still opens it on macOS and Linux; on Windows it prints usage and exits 0, as before.
+- **Quitting closes the thread first** (`session/close`), so background commands the agent started
+  are stopped, which the process group kill does not do on Windows.
+- **`CREATE_NO_WINDOW` for the commands the agent runs** (shell, `git`, hooks) on Windows, so an
+  editor or terminal that starts `sigit` without a console does not get a window flashing up per
+  command. A stdio MCP server is spawned by `ed-mcp` and is not covered.
+
+### Removed
+
+- The terminal UI's own inference loop, backend switching, permission prompt and model loader, and
+  the `#[cfg(unix)]` gates around code that only it reached.
+
 ## 1.7.0
 
 Finishes the Agent Client Protocol v1 surface. An editor can now delete a

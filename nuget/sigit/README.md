@@ -42,8 +42,8 @@ This .NET tool bundles native `sigit` binaries for:
 - Linux `arm64`, `x64` (glibc)
 - Windows `arm64`, `x64`
 
-The terminal chat UI is Unix-only. On Windows the binary runs in ACP mode (`sigit --acp`), so use
-it through an editor rather than directly.
+Run `sigit code` for the terminal chat UI. An editor starts the same binary in ACP mode
+(`sigit --acp`).
 
 Because all six binaries ship in one package, the install is large. If that matters, the Homebrew,
 npm, and PyPI packages each download only the binary for your platform.

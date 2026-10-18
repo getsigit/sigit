@@ -11,7 +11,9 @@ is a TTY:
 - **ACP mode** (stdin not a TTY): newline-delimited JSON-RPC 2.0 over stdio — the
   Agent Client Protocol surface that Zed / VS Code drive. This is the primary
   programmatic handle. Drive it with **`.claude/skills/run-sigit/driver.mjs`**.
-- **Interactive TUI** (stdin is a TTY): a full-screen ratatui chat, Unix-only.
+- **Interactive TUI** (stdin is a TTY; `sigit code` on every platform): a full-screen
+  ratatui chat. It is an ACP client of this same binary: it starts a child `sigit`
+  (`SIGIT_SURFACE=tui`) and renders its `session/update`s.
   Drive it under tmux with **`.claude/skills/run-sigit/tui-smoke.sh`**.
 - **CLI subcommands**: `sigit login | logout | whoami`, handled before the split.
 
