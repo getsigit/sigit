@@ -2317,6 +2317,9 @@ const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// On Unix the child also leads its own process group, so a timeout can kill
 /// the whole tree. `sh -c` may fork rather than exec (dash does), and a
 /// surviving grandchild keeps the pipe write ends open.
+///
+/// On Windows it also never opens a console window of its own (see
+/// [`no_console_window`]).
 fn spawn_shell(command_str: &str, cwd_path: &Path) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     let (shell, flag) = ("sh", "-c");
@@ -2333,7 +2336,21 @@ fn spawn_shell(command_str: &str, cwd_path: &Path) -> std::io::Result<std::proce
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    command.spawn()
+    no_console_window(&mut command).spawn()
+}
+
+/// Keep a child from opening a console window of its own on Windows. The agent
+/// is started without a console when an editor or the terminal UI launches it,
+/// and a console program started from there can otherwise flash a window for
+/// every command. A no-op elsewhere.
+pub(crate) fn no_console_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW
+        command.creation_flags(0x0800_0000);
+    }
+    command
 }
 
 /// SIGKILL a shell spawned by [`spawn_shell`] and everything it started, then
@@ -2385,9 +2402,7 @@ fn co_author_trailer_for(surface: Option<Surface>) -> String {
 pub enum Surface {
     /// Agent Client Protocol over stdio (editors).
     Acp,
-    /// The interactive terminal UI.
-    // Unix-only, like the TUI itself.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The agent process the interactive terminal UI launches (`SIGIT_SURFACE=tui`).
     Tui,
     /// `sigit run` / `sigit -p`.
     Headless,
@@ -2417,7 +2432,8 @@ pub fn set_surface(surface: Surface) {
 /// (a credential, a signing passphrase), and inheriting the ACP pipe would let
 /// it read the editor's next request instead.
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let mut git = Command::new("git");
+    let output = no_console_window(&mut git)
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -2492,7 +2508,7 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
     // `whitespace` is what git already applied to a message it didn't edit.
     let trailer = commit_co_author_trailer();
     let mut amend = Command::new("git");
-    amend
+    no_console_window(&mut amend)
         .args(["commit", "--amend", "--cleanup=whitespace", "-m"])
         .arg(cleaned);
     if !has_trailer {

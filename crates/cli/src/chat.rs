@@ -1,8 +1,9 @@
 //! Full-screen terminal chat UI.
 //!
-//! Two phases: a loading spinner while the model initializes, then
-//! interactive chat. Uses `tokio::select!` to multiplex terminal events
-//! with streaming LLM tokens.
+//! An ACP client of siGit Code itself (see `acp_client`): the agent runs in a
+//! subprocess, and this renders its `session/update`s. It runs on every
+//! platform. Uses `tokio::select!` to multiplex terminal events with the
+//! agent's updates.
 
 // ── Think-block stripping ─────────────────────────────────────────────────────
 
@@ -121,19 +122,15 @@ pub(crate) fn parse_rich_text_segments(text: &str) -> Vec<(String, bool)> {
 // ── Tool-call display helpers ─────────────────────────────────────────────────
 //
 // Pure helpers for the TUI's collapsible tool-call entries. Top-level (not in
-// `mod tui`) so they are testable on every target; only the Unix TUI consumes
-// them, hence the non-Unix dead-code allowance.
+// `mod tui`) so they stay testable without a terminal.
 
 /// Max characters for the summary half of a tool-call title line.
-#[cfg_attr(not(unix), allow(dead_code))]
 const TOOL_TITLE_SUMMARY_MAX: usize = 60;
 
 /// Max characters of tool output kept for the expanded-entry result preview.
-#[cfg_attr(not(unix), allow(dead_code))]
 const TOOL_RESULT_PREVIEW_MAX: usize = 2000;
 
 /// Truncate to `max_chars` characters, ending with an ellipsis when cut.
-#[cfg_attr(not(unix), allow(dead_code))]
 fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -148,7 +145,6 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
 /// `edit_file · src/main.rs`, `sigit · list_issues` for MCP tools). Falls back
 /// to the bare tool name when the arguments are malformed or carry nothing
 /// summarizable.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn tool_title(name: &str, arguments_json: &str) -> String {
     let args: Option<serde_json::Value> = serde_json::from_str(arguments_json).ok();
     let str_arg =
@@ -187,7 +183,6 @@ pub(crate) fn tool_title(name: &str, arguments_json: &str) -> String {
 
 /// Pretty-print a tool call's JSON arguments for the expanded view; malformed
 /// JSON is logged and shown raw.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn pretty_tool_arguments(arguments_json: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(arguments_json) {
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|e| {
@@ -204,7 +199,6 @@ pub(crate) fn pretty_tool_arguments(arguments_json: &str) -> String {
 /// The tail of a tool's output for display under an expanded tool entry,
 /// capped at [`TOOL_RESULT_PREVIEW_MAX`] chars with a truncation note. Display
 /// only — the model always receives the full output.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn cap_output_preview(output: &str) -> String {
     let total = output.chars().count();
     if total <= TOOL_RESULT_PREVIEW_MAX {
@@ -220,7 +214,6 @@ pub(crate) fn cap_output_preview(output: &str) -> String {
 /// The display lines of one tool-call entry. Collapsed: a single `▸ 🔧 title`
 /// line. Expanded: `▾ 🔧 title`, the indented argument detail, and the result
 /// preview under a `result:` label when present.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn tool_entry_lines(
     title: &str,
     detail: &str,
@@ -248,15 +241,12 @@ pub(crate) fn tool_entry_lines(
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 //
 // The top-level tab bar (GitHub Copilot CLI-style). Defined outside `mod tui`
-// so the pure cycling/formatting logic is testable on every target; only the
-// Unix-only TUI consumes it at runtime, hence the non-Unix dead-code gates
-// (same pattern as `permissions::TUI_SESSION`).
+// so the pure cycling logic is testable without a terminal.
 
 /// The top-level TUI tabs, cycled with the Tab key. `Repo` only exists when
 /// the session cwd's `origin` remote points at the sigit.si host (see
 /// [`parse_repo_remote`]); every method takes `repo_visible` so the hidden tab
 /// is skipped entirely and the bar renders exactly three tabs without it.
-#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
     /// The chat itself (default).
@@ -269,7 +259,6 @@ pub(crate) enum Tab {
     Cloud,
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
 impl Tab {
     /// Tab-bar titles, in cycle order.
     pub(crate) fn titles(repo_visible: bool) -> Vec<&'static str> {
@@ -313,52 +302,20 @@ impl Tab {
     }
 }
 
-/// Coarse "how long ago" label for the History tab (no date dependency).
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn format_age(age: std::time::Duration) -> String {
-    let secs = age.as_secs();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    }
-}
-
-/// One History-tab row: id, age, message count. `age` is `None` when the
-/// file's mtime could not be read (or lies in the future).
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn history_row(
-    id: &str,
-    age: Option<std::time::Duration>,
-    message_count: usize,
-) -> String {
-    let when = age
-        .map(format_age)
-        .unwrap_or_else(|| "age unknown".to_string());
-    format!("{id}  ·  {when}  ·  {message_count} message(s)")
-}
-
 // ── Repo tab: remote detection and data parsing ───────────────────────────────
 //
 // Pure helpers for the Repo tab (issues / pull requests of a sigit.si-hosted
-// repo). Kept at the top level so they compile and test on every target; only
-// the Unix-only TUI consumes them at runtime.
+// repo). Kept at the top level so they test without a terminal.
 
 /// Host of the sigit.si instance this build talks to: the host of
 /// `SIGIT_API_URL` when set (same variable `account.rs` uses for the account
 /// API), else the production default.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn sigit_host() -> String {
     host_from_api_url(std::env::var("SIGIT_API_URL").ok().as_deref())
 }
 
 /// Pure core of [`sigit_host`]: derive the host from an optional
 /// `SIGIT_API_URL` value, defaulting to `sigit.si`.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn host_from_api_url(api_url: Option<&str>) -> String {
     api_url
         .and_then(url_host)
@@ -367,7 +324,6 @@ pub(crate) fn host_from_api_url(api_url: Option<&str>) -> String {
 
 /// Extract the hostname (no scheme, userinfo, port, or path) from an http(s)
 /// URL. `None` for anything else.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn url_host(url: &str) -> Option<String> {
     let url = url.trim();
     let rest = url
@@ -390,7 +346,6 @@ pub(crate) fn url_host(url: &str) -> Option<String> {
 ///
 /// A different host, extra path segments, or anything unparsable → `None`,
 /// which hides the Repo tab.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn parse_repo_remote(remote: &str, host: &str) -> Option<String> {
     let remote = remote.trim();
 
@@ -430,7 +385,6 @@ fn repo_owner_name(path: &str) -> Option<String> {
 }
 
 /// One row of the Repo tab's Issues / Pull requests lists.
-#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoItem {
     pub(crate) number: u64,
@@ -444,7 +398,6 @@ pub(crate) struct RepoItem {
 /// `title` are skipped. Unparsable input (e.g. an `Error: …` string from
 /// `mcp::call_tool`) comes back as `Err` with the original text so the tab can
 /// show it verbatim.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn parse_repo_items(text: &str) -> Result<Vec<RepoItem>, String> {
     let trimmed = text.trim();
     let value: serde_json::Value =
@@ -478,7 +431,6 @@ pub(crate) fn parse_repo_items(text: &str) -> Result<Vec<RepoItem>, String> {
 }
 
 /// One list row: number, state, title.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn repo_row(item: &RepoItem) -> String {
     if item.state.is_empty() {
         format!("#{}  {}", item.number, item.title)
@@ -489,7 +441,6 @@ pub(crate) fn repo_row(item: &RepoItem) -> String {
 
 /// Render a `get_issue` / `get_pull_request` result for the detail view:
 /// pretty-print when it's JSON, pass anything else (e.g. error text) through.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn format_repo_detail(text: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(text.trim()) {
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_string()),
@@ -497,29 +448,27 @@ pub(crate) fn format_repo_detail(text: &str) -> String {
     }
 }
 
-// ── Unix-only TUI ─────────────────────────────────────────────────────────────
+// ── The terminal UI ───────────────────────────────────────────────────────────
 //
-// macOS + Linux only. Windows uses ACP mode instead.
+// An ACP client of siGit Code itself: `acp_client` starts this binary as the
+// agent, and everything the user sees is a rendering of its `session/update`s.
+// The agent loop lives in `main.rs` only. Runs on every platform.
 
-#[cfg(unix)]
 mod tui {
     use std::future::pending;
-    use std::sync::Arc;
-    use std::sync::mpsc as std_mpsc;
+    use std::path::Path;
 
+    use agent_client_protocol::schema::MaybeUndefined;
+    use agent_client_protocol::schema::v1::{
+        AvailableCommand, ContentBlock, ContentChunk, Diff, PermissionOption, PermissionOptionKind,
+        Plan, PlanEntryStatus, RequestPermissionOutcome, RequestPermissionRequest,
+        SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+        SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionInfo,
+        SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    };
     use anyhow::Result;
     use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use futures::StreamExt;
-    use onde::inference::{ChatEngine, SamplingConfig};
-
-    use super::{RepoItem, Tab};
-    use crate::backend::{
-        InferenceBackend, LocalBackend, OpenAiBackend, TokenChunk, ToolResult, ToolSpec,
-    };
-    use crate::models::{
-        InferenceKind, ModelCacheHealth, ModelPickerItem, ModelSource, build_model_picker_items,
-    };
-    use crate::session_store::SessionEntry;
     use ratatui::{
         Frame,
         layout::{Constraint, Layout, Position},
@@ -528,11 +477,14 @@ mod tui {
         widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
     };
     use tokio::sync::{mpsc, oneshot};
-    use tokio::time::{Duration, Instant, interval};
+    use tokio::time::{Duration, Instant};
+
+    use super::{RepoItem, Tab};
+    use crate::acp_client::{self, AgentConn, AgentError, AgentEvent, ConfigValue, Started};
 
     // ── Message types ─────────────────────────────────────────────────────────
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Role {
         User,
         Assistant,
@@ -541,8 +493,11 @@ mod tui {
         Banner,
         /// a collapsible tool-call entry (`text` holds the title line)
         Tool,
+        /// the agent's plan, replaced in place as it changes
+        Plan,
     }
 
+    #[derive(Debug)]
     struct ChatMessage {
         role: Role,
         text: String,
@@ -550,120 +505,686 @@ mod tui {
         think_block: Option<String>,
         /// pretty-printed tool arguments (Role::Tool only)
         tool_detail: Option<String>,
-        /// tail of the tool output, filled in when the call finishes
+        /// tail of the tool output, filled in as the call progresses
         /// (Role::Tool only)
         tool_result: Option<String>,
+        /// the ACP id of the call, so its updates find it (Role::Tool only)
+        tool_call_id: Option<String>,
+        /// where the call stands (Role::Tool only)
+        status: Option<ToolCallStatus>,
     }
 
     impl ChatMessage {
-        fn user(text: impl Into<String>) -> Self {
+        fn plain(role: Role, text: String) -> Self {
             Self {
-                role: Role::User,
-                text: text.into(),
+                role,
+                text,
                 think_block: None,
                 tool_detail: None,
                 tool_result: None,
+                tool_call_id: None,
+                status: None,
             }
+        }
+
+        fn user(text: impl Into<String>) -> Self {
+            Self::plain(Role::User, text.into())
         }
 
         fn assistant(text: impl Into<String>) -> Self {
             let raw = text.into();
             let (think, visible) = super::strip_think_blocks(&raw);
-            Self {
-                role: Role::Assistant,
-                text: visible,
-                think_block: if think.is_empty() { None } else { Some(think) },
-                tool_detail: None,
-                tool_result: None,
-            }
+            let mut message = Self::plain(Role::Assistant, visible);
+            message.think_block = if think.is_empty() { None } else { Some(think) };
+            message
         }
 
         fn system(text: impl Into<String>) -> Self {
-            Self {
-                role: Role::System,
-                text: text.into(),
-                think_block: None,
-                tool_detail: None,
-                tool_result: None,
-            }
+            Self::plain(Role::System, text.into())
         }
 
         fn banner(text: impl Into<String>) -> Self {
-            Self {
-                role: Role::Banner,
-                text: text.into(),
-                think_block: None,
-                tool_detail: None,
-                tool_result: None,
-            }
+            Self::plain(Role::Banner, text.into())
+        }
+
+        fn plan(text: impl Into<String>) -> Self {
+            Self::plain(Role::Plan, text.into())
         }
 
         fn tool_call(title: impl Into<String>, detail: impl Into<String>) -> Self {
-            Self {
-                role: Role::Tool,
-                text: title.into(),
-                think_block: None,
-                tool_detail: Some(detail.into()),
-                tool_result: None,
-            }
+            let mut message = Self::plain(Role::Tool, title.into());
+            message.tool_detail = Some(detail.into());
+            message
         }
     }
 
-    // ── Inference updates from background task ────────────────────────────────
+    // ── The transcript ────────────────────────────────────────────────────────
+    //
+    // Everything a `session/update` can change, apart from the connection
+    // itself, so the mapping can be tested without an agent.
 
-    enum InferenceUpdate {
-        /// a tool call started — show a collapsible entry in the transcript
-        ToolUse {
-            name: String,
-            /// raw JSON arguments, pretty-printed by the UI for the expanded view
-            arguments: String,
-        },
-        /// the most recent tool call finished; attach a display-only preview of
-        /// the tail of its output (the model always gets the full output)
-        ToolDone {
-            output_preview: String,
-        },
-        /// a streamed token fragment of the assistant's reply
-        Delta(String),
-        /// the streamed reply is complete; commit the accumulated buffer
-        StreamEnd,
-        /// a complete (non-streamed) assistant reply
-        Response(String),
-        /// estimated tokens the conversation now occupies; drives the context
-        /// gauge in the title bar. Sent after compaction and at end of turn.
-        ContextUsage(usize),
-        Error(String),
-        /// the inference task wants to run a mutating tool and is paused on
-        /// `reply`; the user answers with y (once) / a (session) / n (deny)
-        ApprovalRequest {
-            tool: String,
-            /// arguments preview so the user can see what they are approving
-            args: String,
-            reply: oneshot::Sender<ApprovalChoice>,
-        },
+    /// Id prefix of the cards the agent shows while an on-device model downloads
+    /// or loads (`model_load_progress` in `main.rs`).
+    const MODEL_LOAD_CARD_PREFIX: &str = "model-load-";
+
+    /// Id of the picker's group of cloud tiers (`sigit-cloud:<tier>`).
+    const CLOUD_ID_PREFIX: &str = "sigit-cloud:";
+
+    struct Chat {
+        messages: Vec<ChatMessage>,
+        /// true while assistant tokens are streaming into `stream_buf`
+        streaming: bool,
+        stream_buf: String,
+        /// the `messageId` of the reply being streamed; a new one starts a new
+        /// message
+        stream_message_id: Option<String>,
+        /// a `<think>` block is open in `stream_buf`
+        in_thought: bool,
+        thinking: bool,
+        /// toggled periodically so the streaming cursor blinks
+        blink_on: bool,
+        blink_counter: u8,
+        /// index of the plan entry in `messages`, once there is one
+        plan_index: Option<usize>,
+        /// `(used, size)` of the context window, as the agent last reported it
+        context: Option<(u64, u64)>,
+        session_title: Option<String>,
+        config_options: Vec<SessionConfigOption>,
+        /// the session mode id the agent last announced
+        mode_id: Option<String>,
+        /// slash commands the agent advertises, as `(name, description)`
+        commands: Vec<(String, String)>,
+        /// an on-device model finished loading in this run
+        local_loaded: bool,
+        /// A configured endpoint (`OPENAI_BASE_URL`, a `providers.toml`
+        /// profile) serves every turn whatever the picker says, so it is the
+        /// model the title shows.
+        endpoint: Option<String>,
     }
 
-    /// The user's answer to a tool-approval prompt. Dropping the reply channel
-    /// (quit, cancel) counts as a denial on the inference side.
-    enum ApprovalChoice {
-        /// run this one call
-        Once,
-        /// run it and stop asking for this tool for the rest of the session
-        Session,
-        /// skip the call; the model gets an explanatory tool result
-        Deny,
-        /// skip it and stop asking: deny calls like it for the rest of the
-        /// session
-        DenySession,
+    impl Chat {
+        fn new() -> Self {
+            Self {
+                messages: Vec::new(),
+                streaming: false,
+                stream_buf: String::new(),
+                stream_message_id: None,
+                in_thought: false,
+                thinking: false,
+                blink_on: true,
+                blink_counter: 0,
+                plan_index: None,
+                context: None,
+                session_title: None,
+                config_options: Vec::new(),
+                mode_id: None,
+                commands: Vec::new(),
+                local_loaded: false,
+                endpoint: None,
+            }
+        }
+
+        /// Map one `session/update` onto the transcript.
+        fn apply_update(&mut self, update: SessionUpdate) {
+            match update {
+                SessionUpdate::AgentMessageChunk(chunk) => self.message_chunk(chunk, false),
+                SessionUpdate::AgentThoughtChunk(chunk) => self.message_chunk(chunk, true),
+                SessionUpdate::UserMessageChunk(chunk) => {
+                    // Only a replayed thread sends these.
+                    self.finalize_stream();
+                    if let Some(text) = chunk_text(&chunk.content) {
+                        self.messages.push(ChatMessage::user(text));
+                    }
+                }
+                SessionUpdate::ToolCall(call) => self.tool_call(call),
+                SessionUpdate::ToolCallUpdate(update) => self.tool_update(update),
+                SessionUpdate::Plan(plan) => self.set_plan(&plan),
+                SessionUpdate::UsageUpdate(usage) => {
+                    self.context = Some((usage.used, usage.size));
+                }
+                SessionUpdate::ConfigOptionUpdate(update) => {
+                    self.config_options = update.config_options;
+                }
+                SessionUpdate::CurrentModeUpdate(update) => {
+                    self.mode_id = Some(update.current_mode_id.0.to_string());
+                }
+                SessionUpdate::SessionInfoUpdate(update) => match update.title {
+                    MaybeUndefined::Value(title) => self.session_title = Some(title),
+                    MaybeUndefined::Null => self.session_title = None,
+                    MaybeUndefined::Undefined => {}
+                },
+                SessionUpdate::AvailableCommandsUpdate(update) => {
+                    self.commands = update
+                        .available_commands
+                        .into_iter()
+                        .map(
+                            |AvailableCommand {
+                                 name, description, ..
+                             }| (name, description),
+                        )
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+
+        fn message_chunk(&mut self, chunk: ContentChunk, thought: bool) {
+            let Some(text) = chunk_text(&chunk.content) else {
+                return;
+            };
+            let message_id = chunk.message_id.map(|id| id.0.to_string());
+            // A new `messageId` is a new message; the server gives each
+            // inference round one, and a standalone notice one of its own.
+            if message_id.is_some() && message_id != self.stream_message_id {
+                self.finalize_stream();
+            }
+            if message_id.is_some() {
+                self.stream_message_id = message_id;
+            }
+            if thought {
+                if !self.in_thought {
+                    self.in_thought = true;
+                    self.push_stream_delta("<think>");
+                }
+                self.push_stream_delta(&text);
+            } else {
+                self.close_thought();
+                self.push_stream_delta(&text);
+            }
+        }
+
+        fn close_thought(&mut self) {
+            if self.in_thought {
+                self.in_thought = false;
+                self.push_stream_delta("</think>");
+            }
+        }
+
+        fn tool_call(&mut self, call: ToolCall) {
+            self.finalize_stream();
+            let detail = call
+                .raw_input
+                .as_ref()
+                .and_then(|value| serde_json::to_string_pretty(value).ok())
+                .unwrap_or_default();
+            let mut message = ChatMessage::tool_call(call.title, detail);
+            message.tool_call_id = Some(call.tool_call_id.0.to_string());
+            message.tool_result = content_preview(&call.content);
+            self.note_status(message.tool_call_id.as_deref(), call.status);
+            message.status = Some(call.status);
+            self.messages.push(message);
+        }
+
+        fn tool_update(&mut self, update: ToolCallUpdate) {
+            let id = update.tool_call_id.0.to_string();
+            let fields = update.fields;
+            if let Some(status) = fields.status {
+                self.note_status(Some(&id), status);
+            }
+            let Some(entry) =
+                self.messages.iter_mut().rev().find(|m| {
+                    m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id.as_str())
+                })
+            else {
+                return;
+            };
+            if let Some(title) = fields.title {
+                entry.text = title;
+            }
+            if let Some(status) = fields.status {
+                entry.status = Some(status);
+            }
+            if let Some(input) = fields.raw_input.as_ref()
+                && let Ok(pretty) = serde_json::to_string_pretty(input)
+            {
+                entry.tool_detail = Some(pretty);
+            }
+            if let Some(content) = fields.content.as_deref()
+                && let Some(preview) = content_preview(content)
+            {
+                entry.tool_result = Some(preview);
+            }
+        }
+
+        /// A load card finishing is how the UI learns an on-device model is in
+        /// memory.
+        fn note_status(&mut self, id: Option<&str>, status: ToolCallStatus) {
+            if id.is_some_and(|id| id.starts_with(MODEL_LOAD_CARD_PREFIX))
+                && status == ToolCallStatus::Completed
+            {
+                self.local_loaded = true;
+            }
+        }
+
+        /// The plan is one entry, replaced in place as the agent revises it.
+        fn set_plan(&mut self, plan: &Plan) {
+            let mut lines = vec!["plan".to_string()];
+            for entry in &plan.entries {
+                let mark = match entry.status {
+                    PlanEntryStatus::Completed => "☑",
+                    PlanEntryStatus::InProgress => "◐",
+                    _ => "☐",
+                };
+                lines.push(format!("  {mark} {}", entry.content));
+            }
+            let text = lines.join("\n");
+            match self.plan_index {
+                Some(index)
+                    if self
+                        .messages
+                        .get(index)
+                        .is_some_and(|message| message.role == Role::Plan) =>
+                {
+                    self.messages[index].text = text;
+                }
+                _ => {
+                    self.finalize_stream();
+                    self.plan_index = Some(self.messages.len());
+                    self.messages.push(ChatMessage::plan(text));
+                }
+            }
+        }
+
+        fn finalize_stream(&mut self) {
+            self.close_thought();
+            self.streaming = false;
+            self.stream_message_id = None;
+            if !self.stream_buf.is_empty() {
+                let text = std::mem::take(&mut self.stream_buf);
+                self.messages.push(ChatMessage::assistant(text));
+            }
+            self.blink_on = false;
+        }
+
+        fn push_stream_delta(&mut self, delta: &str) {
+            self.streaming = true;
+            self.stream_buf.push_str(delta);
+            // Hide reasoning the way the rest of the app does: keep the "thinking"
+            // spinner until visible (non-<think>) text appears, then show the
+            // live reply.
+            let (_think, visible) = super::strip_think_blocks(&self.stream_buf);
+            self.thinking = visible.trim().is_empty();
+            self.blink_counter = self.blink_counter.wrapping_add(1);
+            self.blink_on = self.blink_counter % 4 < 2;
+        }
+
+        /// The portion of the streaming buffer to show live, with reasoning hidden.
+        fn visible_stream(&self) -> String {
+            let (_think, visible) = super::strip_think_blocks(&self.stream_buf);
+            visible
+        }
+
+        /// Forget the conversation on screen, keeping what describes the
+        /// session itself (options, commands, whether a model is in memory).
+        fn fresh_transcript(&mut self) -> Chat {
+            let mut fresh = Chat::new();
+            fresh.config_options = self.config_options.clone();
+            fresh.mode_id = self.mode_id.clone();
+            fresh.commands = self.commands.clone();
+            fresh.local_loaded = self.local_loaded;
+            fresh.endpoint = self.endpoint.clone();
+            std::mem::replace(self, fresh)
+        }
+
+        // ── Reading the agent's config options ────────────────────────────────
+
+        fn option(&self, id: &str) -> Option<&SessionConfigOption> {
+            self.config_options
+                .iter()
+                .find(|option| option.id.0.as_ref() == id)
+        }
+
+        /// The value id the `Model` option currently holds.
+        fn current_model_value(&self) -> Option<String> {
+            match &self.option(crate::MODEL_CONFIG_ID)?.kind {
+                SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+                _ => None,
+            }
+        }
+
+        fn model_row(&self) -> Option<PickerRow> {
+            let current = self.current_model_value()?;
+            picker_rows(&self.config_options)
+                .into_iter()
+                .find(|row| row.value == current)
+        }
+
+        /// The model label for the title bar, with the on-device state next to
+        /// it: a local model is "not loaded" until a load card completes.
+        fn model_label(&self) -> String {
+            if let Some(endpoint) = &self.endpoint {
+                return endpoint.clone();
+            }
+            match self.model_row() {
+                Some(row) if !row.cloud && !self.local_loaded => {
+                    format!("{} (not loaded)", row.name)
+                }
+                Some(row) => row.name,
+                None => "siGit Code".to_string(),
+            }
+        }
+
+        fn on_cloud(&self) -> bool {
+            self.current_model_value()
+                .is_some_and(|value| value.starts_with(CLOUD_ID_PREFIX))
+        }
+
+        fn tool_calling(&self) -> bool {
+            if self.endpoint.is_some() {
+                return true;
+            }
+            self.model_row()
+                .map(|row| row.description.contains("tool calling"))
+                .unwrap_or(true)
+        }
+
+        /// `Local inference` as the agent reports it. A toggle is a boolean, a
+        /// select (an older client path) carries the two ids.
+        fn local_inference(&self) -> Option<bool> {
+            match &self.option(crate::LOCAL_INFERENCE_CONFIG_ID)?.kind {
+                SessionConfigKind::Boolean(toggle) => Some(toggle.current_value),
+                SessionConfigKind::Select(select) => {
+                    Some(select.current_value.0.as_ref() == crate::LOCAL_INFERENCE_ON)
+                }
+                _ => None,
+            }
+        }
+
+        /// The permission mode id: the config option when there is one, the
+        /// last `current_mode_update` otherwise.
+        fn permission_mode(&self) -> Option<String> {
+            match self
+                .option(crate::PERMISSION_MODE_CONFIG_ID)
+                .map(|option| &option.kind)
+            {
+                Some(SessionConfigKind::Select(select)) => Some(select.current_value.0.to_string()),
+                _ => self.mode_id.clone(),
+            }
+        }
+
+        fn plan_mode(&self) -> bool {
+            self.permission_mode().as_deref() == Some(crate::PERMISSION_MODE_PLAN)
+        }
     }
 
-    enum ModelLoadUpdate {
-        Loaded(String),
-        Error(String),
+    /// Plain text of a content block; images, audio and the like have none.
+    fn chunk_text(block: &ContentBlock) -> Option<String> {
+        match block {
+            ContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Lines of a diff kept in a tool card; the full change is on disk.
+    const DIFF_PREVIEW_LINES: usize = 6;
+
+    /// A short `-`/`+` preview of a file change.
+    fn diff_preview(diff: &Diff) -> String {
+        fn push(out: &mut Vec<String>, sign: char, text: &str) {
+            let total = text.lines().count();
+            for line in text.lines().take(DIFF_PREVIEW_LINES) {
+                out.push(format!("{sign} {line}"));
+            }
+            if total > DIFF_PREVIEW_LINES {
+                out.push(format!(
+                    "{sign} … (+{} more lines)",
+                    total - DIFF_PREVIEW_LINES
+                ));
+            }
+        }
+        let mut out = vec![diff.path.display().to_string()];
+        if let Some(old) = diff.old_text.as_deref() {
+            push(&mut out, '-', old);
+        }
+        push(&mut out, '+', &diff.new_text);
+        out.join("\n")
+    }
+
+    /// What a tool card shows of its content: text through the usual output
+    /// cap, a diff as its preview.
+    fn content_preview(content: &[ToolCallContent]) -> Option<String> {
+        let parts: Vec<String> = content
+            .iter()
+            .filter_map(|item| match item {
+                ToolCallContent::Content(content) => {
+                    chunk_text(&content.content).map(|text| super::cap_output_preview(&text))
+                }
+                ToolCallContent::Diff(diff) => Some(diff_preview(diff)),
+                _ => None,
+            })
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
+
+    // ── Model picker rows ─────────────────────────────────────────────────────
+
+    /// One row of the picker, read off the agent's `Model` option.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PickerRow {
+        value: String,
+        name: String,
+        description: String,
+        /// a siGit Code Cloud tier rather than an on-device model
+        cloud: bool,
+        current: bool,
+    }
+
+    fn picker_rows(options: &[SessionConfigOption]) -> Vec<PickerRow> {
+        let Some(option) = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == crate::MODEL_CONFIG_ID)
+        else {
+            return Vec::new();
+        };
+        let SessionConfigKind::Select(select) = &option.kind else {
+            return Vec::new();
+        };
+        let flat: Vec<&SessionConfigSelectOption> = match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .collect(),
+            _ => Vec::new(),
+        };
+        flat.into_iter()
+            .map(|item| {
+                let value = item.value.0.to_string();
+                PickerRow {
+                    cloud: value.starts_with(CLOUD_ID_PREFIX),
+                    current: item.value == select.current_value,
+                    name: item.name.clone(),
+                    description: item.description.clone().unwrap_or_default(),
+                    value,
+                }
+            })
+            .collect()
+    }
+
+    // ── Permission prompts ────────────────────────────────────────────────────
+
+    /// A tool call waiting on the user's y/a/n/d answer; the agent's turn is
+    /// paused on the other end.
+    struct PermissionPrompt {
+        title: String,
+        options: Vec<PermissionOption>,
+        answer: oneshot::Sender<RequestPermissionOutcome>,
+    }
+
+    /// The kind of answer a key gives: y once, a for the session, n (or Esc)
+    /// no, d no for the session.
+    fn permission_kind_for_key(code: KeyCode) -> Option<PermissionOptionKind> {
+        match code {
+            KeyCode::Char('y' | 'Y') => Some(PermissionOptionKind::AllowOnce),
+            KeyCode::Char('a' | 'A') => Some(PermissionOptionKind::AllowAlways),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(PermissionOptionKind::RejectOnce),
+            KeyCode::Char('d' | 'D') => Some(PermissionOptionKind::RejectAlways),
+            _ => None,
+        }
+    }
+
+    /// The outcome for `kind` among the options the agent offered. The agent
+    /// offers all four; if an "always" one is missing the single-use answer
+    /// stands in, and an answer with nothing to match is a cancellation.
+    fn permission_outcome(
+        options: &[PermissionOption],
+        kind: PermissionOptionKind,
+    ) -> RequestPermissionOutcome {
+        let fallback = match kind {
+            PermissionOptionKind::AllowAlways => PermissionOptionKind::AllowOnce,
+            PermissionOptionKind::RejectAlways => PermissionOptionKind::RejectOnce,
+            other => other,
+        };
+        options
+            .iter()
+            .find(|option| option.kind == kind)
+            .or_else(|| options.iter().find(|option| option.kind == fallback))
+            .map(|option| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    option.option_id.clone(),
+                ))
+            })
+            .unwrap_or(RequestPermissionOutcome::Cancelled)
+    }
+
+    /// The ⚠ line (and the change it would make) for a permission request.
+    fn permission_notice(request: &RequestPermissionRequest) -> String {
+        let title = request
+            .tool_call
+            .fields
+            .title
+            .clone()
+            .unwrap_or_else(|| "a tool call".to_string());
+        let mut notice = format!(
+            "⚠ permission — allow {title}?  [y]es · [a]lways this session · [n]o · [d]eny this session"
+        );
+        if let Some(content) = request.tool_call.fields.content.as_deref() {
+            for item in content {
+                if let ToolCallContent::Diff(diff) = item {
+                    notice.push('\n');
+                    notice.push_str(&diff_preview(diff));
+                }
+            }
+        }
+        notice
+    }
+
+    // ── Input routing ─────────────────────────────────────────────────────────
+
+    /// The commands only this client knows. Everything else, built-ins and
+    /// user-defined commands alike, is the agent's, and goes out as a prompt.
+    #[derive(Debug, PartialEq, Eq)]
+    enum LocalCommand {
+        Exit,
+        /// expand or collapse model reasoning; `None` flips it
+        Thinking(Option<bool>),
+        /// expand or collapse tool entries; `None` flips it
+        Tools(Option<bool>),
+        /// `/models` with no argument opens the picker
+        Models,
+        /// load the newest saved session of this directory
+        Resume,
+    }
+
+    fn parse_local(input: &str) -> Option<LocalCommand> {
+        let trimmed = input.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let command = parts.next()?;
+        let argument = parts.next().map(str::trim).filter(|a| !a.is_empty());
+        match command {
+            "/exit" | "/quit" | "/q" => Some(LocalCommand::Exit),
+            "/thinking" => Some(LocalCommand::Thinking(parse_on_off(argument))),
+            "/tools" => Some(LocalCommand::Tools(parse_on_off(argument))),
+            "/models" if argument.is_none() => Some(LocalCommand::Models),
+            "/resume" => Some(LocalCommand::Resume),
+            _ => None,
+        }
+    }
+
+    /// `on`/`off` (and synonyms) → `Some(bool)`; missing or unrecognized → `None`
+    /// (meaning "toggle the current value").
+    fn parse_on_off(arg: Option<&str>) -> Option<bool> {
+        match arg.map(|s| s.trim().to_ascii_lowercase())?.as_str() {
+            "on" | "true" | "1" | "yes" => Some(true),
+            "off" | "false" | "0" | "no" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The client-only lines `/help` ends with, since the agent's reply knows
+    /// nothing of them.
+    const CLIENT_HELP: &str = "/thinking [on|off] - show or hide the model's reasoning\n\
+         /tools [on|off]    - expand or collapse tool-call entries\n\
+         /models            - open the model picker (/models N still switches by number)\n\
+         /resume            - load the newest saved session of this directory\n\
+         /exit              - quit (so does Ctrl+C when idle)\n\
+         Ctrl+C / Esc       - cancel the running turn or stop waiting for a model load";
+
+    /// The line shown for a turn that ended some way other than normally.
+    fn stop_notice(stop: StopReason) -> Option<&'static str> {
+        match stop {
+            StopReason::Cancelled => Some("(cancelled)"),
+            StopReason::MaxTokens => Some("(the reply was cut off: the model hit its token limit)"),
+            StopReason::MaxTurnRequests => {
+                Some("(stopped: the tool-round limit for one turn was reached)")
+            }
+            StopReason::Refusal => Some("(the model declined this request; it is not kept)"),
+            _ => None,
+        }
+    }
+
+    /// The text of a failed turn: the agent's message as it came, plus a
+    /// `/login` hint when the endpoint turned the session down.
+    fn turn_error_text(error: &AgentError) -> String {
+        let lowered = error.message.to_ascii_lowercase();
+        let unauthorized = error.auth_required
+            || lowered.contains("401")
+            || lowered.contains("unauthorized")
+            || lowered.contains("session expired");
+        if unauthorized {
+            format!("error: {} — sign in with /login", error.message)
+        } else {
+            format!("error: {}", error.message)
+        }
+    }
+
+    /// An ISO 8601 timestamp as `2026-10-18 10:15`; anything shorter as it is.
+    fn session_when(updated_at: Option<&str>) -> String {
+        match updated_at {
+            Some(stamp) if stamp.len() >= 16 && stamp.is_char_boundary(16) => {
+                stamp[..16].replace('T', " ")
+            }
+            Some(stamp) => stamp.to_string(),
+            None => "time unknown".to_string(),
+        }
+    }
+
+    /// One History-tab row: title (or id), when, and the id.
+    fn session_row(info: &SessionInfo) -> String {
+        let id = info.session_id.0.as_ref();
+        let when = session_when(info.updated_at.as_deref());
+        match info.title.as_deref().filter(|title| !title.is_empty()) {
+            Some(title) => format!("{title}  ·  {when}  ·  {id}"),
+            None => format!("{id}  ·  {when}"),
+        }
+    }
+
+    /// Whether `a` and `b` name the same directory, tolerating a symlinked path
+    /// on one side.
+    fn same_dir(a: &Path, b: &Path) -> bool {
+        a == b
+            || match (a.canonicalize(), b.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
     }
 
     // ── Repo tab types ────────────────────────────────────────────────────────
-
     /// Which list the Repo tab is showing.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum RepoSection {
@@ -728,76 +1249,84 @@ mod tui {
         Detail { target: RepoTarget, text: String },
     }
 
+    // ── Startup screen ────────────────────────────────────────────────────────
+
+    /// What shows while the agent process starts, and why it did not.
+    struct Startup {
+        tick: u32,
+        /// keeps the screen up so the user can read the error
+        error: Option<String>,
+        started: Instant,
+    }
+
+    impl Startup {
+        fn new() -> Self {
+            Self {
+                tick: 0,
+                error: None,
+                started: Instant::now(),
+            }
+        }
+    }
+
     // ── App state ─────────────────────────────────────────────────────────────
 
+    struct Picker {
+        index: usize,
+        rows: Vec<PickerRow>,
+    }
+
     struct App {
-        messages: Vec<ChatMessage>,
+        chat: Chat,
+        agent: AgentConn,
         input: String,
         cursor: usize,
-        /// true while assistant tokens are streaming into `stream_buf`
-        streaming: bool,
-        stream_buf: String,
-        inference_rx: Option<mpsc::Receiver<InferenceUpdate>>,
-        model_load_rx: Option<mpsc::Receiver<ModelLoadUpdate>>,
-        /// a tool call waiting on the user's y/a/n/d answer; the inference task is
-        /// paused on the other end of the channel
-        pending_approval: Option<(String, oneshot::Sender<ApprovalChoice>)>,
-        thinking: bool,
         thinking_tick: u8,
         quit: bool,
-        /// toggled periodically so the streaming cursor blinks
-        blink_on: bool,
-        blink_counter: u8,
-        switching_model: bool,
-        /// stashed until ModelLoadUpdate::Loaded applies it to `app.tool_calling`
-        pending_tool_calling: Option<bool>,
-        /// suppresses the spurious "disconnected" error when we drop model_load_rx on cancel
-        model_load_cancelled: bool,
-
-        // ── Loading-phase state ───────────────────────────────────────────────
-        is_loading: bool,
-        load_tick: u32,
-        /// keeps the loading view visible so the user can read the error
-        load_error: Option<String>,
-        load_start: Instant,
-        load_model_name: String,
-
-        // ── Model picker state ────────────────────────────────────────────────
-        show_model_picker: bool,
-        model_picker_index: usize,
-        model_picker_items: Vec<ModelPickerItem>,
-        current_model_name: String,
-        tool_calling: bool,
-        /// Estimated tokens the conversation currently occupies, as of the last
-        /// completed turn. `None` until the first turn finishes.
-        context_tokens_used: Option<usize>,
+        /// a `session/prompt` is in flight; stays set until the agent answers it
+        turn_active: bool,
+        /// waiting on a model switch (`session/set_config_option`)
+        config_inflight: bool,
+        /// waiting on `session/load`
+        loading_session: bool,
         /// `/thinking` — expand the model's reasoning on rendered messages.
         /// Display-only: never changes what is sent to the model or saved.
         show_thinking: bool,
         /// `/tools` — expand every tool-call entry (default: collapsed titles)
         tools_expanded: bool,
 
-        // ── Model-switch download progress ────────────────────────────────────
-        switching_model_id: Option<String>,
-        /// (downloaded, expected) bytes — polled every tick during a model switch
-        download_progress: Option<(u64, u64)>,
+        // ── Model picker ──────────────────────────────────────────────────────
+        picker: Option<Picker>,
+        /// the model the user last asked for, to notice a cloud tier that did
+        /// not take because nobody is signed in
+        model_request: Option<String>,
+        /// a cloud tier to pick once the sign-in it waits on is done
+        pending_cloud_pick: Option<String>,
 
-        // ── Active inference backend ──────────────────────────────────────────
-        /// The backend serving inference. Swapped in place when the user picks a
-        /// different model or cloud tier via `/models`.
-        backend: Arc<dyn InferenceBackend>,
+        // ── Tool approval ─────────────────────────────────────────────────────
+        permission: Option<PermissionPrompt>,
+
+        // ── Client-side follow-ups of a forwarded command ─────────────────────
+        /// `/help` was sent; the client's own lines follow the reply
+        help_pending: bool,
+        /// `/resume` asked for the list; load the newest when it arrives
+        resume_pending: bool,
+        /// the transcript and session a `session/load` replaced, kept until it
+        /// is known to have worked
+        restore_on_load_failure: Option<(Chat, SessionId)>,
 
         // ── Tab bar state ─────────────────────────────────────────────────────
-        /// Which top-level tab is showing. Inference keeps running while the
-        /// user is on History/Cloud; updates land in `messages` regardless.
+        /// Which top-level tab is showing. A turn keeps running while the
+        /// user is on History/Cloud; updates land in `chat` regardless.
         active_tab: Tab,
 
-        // History tab: saved sessions from the session store.
-        history_sessions: Vec<SessionEntry>,
+        // History tab: this directory's threads, from `session/list`.
+        history_sessions: Vec<SessionInfo>,
         history_index: usize,
+        history_loading: bool,
         /// Session id awaiting the confirming second `d`; any other key clears it.
         history_pending_delete: Option<String>,
-        /// One-shot notice shown under the session list (e.g. a failed restore).
+        /// One-shot notice shown under the session list (e.g. a failed load).
         history_notice: Option<String>,
 
         // Cloud tab: status text is fetched async when the tab opens and cached.
@@ -855,58 +1384,36 @@ mod tui {
     }
 
     impl App {
-        fn new(load_model_name: String, backend: Arc<dyn InferenceBackend>) -> Self {
-            let is_remote = backend.is_remote();
-            let items = build_model_picker_items();
-            let tool_calling = items
-                .iter()
-                .find(|m| m.display_name == load_model_name)
-                .map(|m| m.tool_calling)
-                .unwrap_or(true);
-            // For a remote provider the passed-in name is authoritative; the
-            // persisted local selection must not override it (or the title would
-            // show an on-device model while requests go to the cloud).
-            let current_model_name = if is_remote {
-                load_model_name.clone()
-            } else {
-                crate::setup::load_selected_model_name().unwrap_or_else(|| load_model_name.clone())
-            };
-            Self {
-                messages: Vec::new(),
+        fn new(agent: AgentConn, started: Started) -> Self {
+            let mut chat = Chat::new();
+            chat.endpoint = crate::provider::active_provider().map(|p| p.display_name);
+            chat.config_options = started.config_options;
+            chat.mode_id = started
+                .modes
+                .map(|modes| modes.current_mode_id.0.to_string());
+            let mut app = Self {
+                chat,
+                agent,
                 input: String::new(),
                 cursor: 0,
-                streaming: false,
-                stream_buf: String::new(),
-                inference_rx: None,
-                model_load_rx: None,
-                pending_approval: None,
-                thinking: false,
                 thinking_tick: 0,
                 quit: false,
-                blink_on: true,
-                blink_counter: 0,
-                switching_model: false,
-                pending_tool_calling: None,
-                model_load_cancelled: false,
-                switching_model_id: None,
-                download_progress: None,
-                is_loading: true,
-                load_tick: 0,
-                load_error: None,
-                load_start: Instant::now(),
-                load_model_name: load_model_name.clone(),
-                show_model_picker: false,
-                model_picker_index: 0,
-                model_picker_items: items,
-                current_model_name,
-                tool_calling,
-                context_tokens_used: None,
+                turn_active: false,
+                config_inflight: false,
+                loading_session: false,
                 show_thinking: false,
                 tools_expanded: false,
-                backend,
+                picker: None,
+                model_request: None,
+                pending_cloud_pick: None,
+                permission: None,
+                help_pending: false,
+                resume_pending: false,
+                restore_on_load_failure: None,
                 active_tab: Tab::Session,
                 history_sessions: Vec::new(),
                 history_index: 0,
+                history_loading: false,
                 history_pending_delete: None,
                 history_notice: None,
                 cloud_lines: None,
@@ -920,7 +1427,58 @@ mod tui {
                 repo_detail: None,
                 repo_tx: None,
                 repo_rx: None,
+            };
+            app.show_welcome();
+            app
+        }
+
+        /// the welcome banner and where the agent stands
+        fn show_welcome(&mut self) {
+            for line in BANNER_ART.lines() {
+                self.chat.messages.push(ChatMessage::banner(line));
             }
+            self.chat.messages.push(ChatMessage::system(""));
+            self.chat.messages.push(ChatMessage::system(
+                "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
+            ));
+            let model = self.chat.model_label();
+            if let Some(provider) = crate::provider::active_provider() {
+                self.chat.messages.push(ChatMessage::system(format!(
+                    "Using {} (model {}).",
+                    provider.display_name, provider.model
+                )));
+            } else if self.chat.on_cloud() {
+                self.chat
+                    .messages
+                    .push(ChatMessage::system(format!("Current model: {model}")));
+            } else {
+                // On-device models are never loaded implicitly; prompt the user to
+                // load one explicitly before their first message.
+                let name = self
+                    .chat
+                    .model_row()
+                    .map(|row| row.name)
+                    .unwrap_or_else(|| "the selected model".to_string());
+                self.chat.messages.push(ChatMessage::system(format!(
+                    "No on-device model loaded. Run /load to load {name}, or /models to choose one."
+                )));
+            }
+            self.chat
+                .messages
+                .push(ChatMessage::system("Type /help for commands."));
+        }
+
+        /// Whether the app is waiting on the agent for something.
+        fn is_busy(&self) -> bool {
+            self.turn_active || self.config_inflight || self.loading_session
+        }
+
+        fn spinner_frame(&self) -> &'static str {
+            THINKING_FRAMES[(self.thinking_tick as usize) % THINKING_FRAMES.len()]
+        }
+
+        fn tick_thinking(&mut self) {
+            self.thinking_tick = self.thinking_tick.wrapping_add(1);
         }
 
         /// Whether the Repo tab exists for this session.
@@ -944,215 +1502,284 @@ mod tui {
             }
         }
 
-        /// Reload the History tab's session list, keeping the selection in
-        /// bounds and dropping any pending delete confirmation.
-        fn refresh_history(&mut self) {
-            self.history_sessions = crate::session_store::list();
-            self.history_index = self
-                .history_index
-                .min(self.history_sessions.len().saturating_sub(1));
-            self.history_pending_delete = None;
-        }
-
         /// The History entry the cursor is on, if any.
-        fn selected_session(&self) -> Option<&SessionEntry> {
+        fn selected_session(&self) -> Option<&SessionInfo> {
             self.history_sessions.get(self.history_index)
         }
 
-        fn is_busy(&self) -> bool {
-            self.is_streaming() || self.thinking || self.switching_model
+        /// Ask the agent for this directory's threads.
+        fn refresh_history(&mut self) {
+            self.history_loading = true;
+            self.history_pending_delete = None;
+            self.agent.list_sessions();
         }
 
-        fn switching_frame(&self) -> &'static str {
-            let idx = (self.thinking_tick as usize) % THINKING_FRAMES.len();
-            THINKING_FRAMES[idx]
+        fn say(&mut self, text: impl Into<String>) {
+            self.chat.messages.push(ChatMessage::system(text));
         }
 
-        fn is_streaming(&self) -> bool {
-            self.streaming
-        }
+        // ── Model picker ──────────────────────────────────────────────────────
 
-        fn finalize_stream(&mut self) {
-            self.streaming = false;
-            if !self.stream_buf.is_empty() {
-                let text = std::mem::take(&mut self.stream_buf);
-                self.messages.push(ChatMessage::assistant(text));
+        fn open_model_picker(&mut self) {
+            let rows = picker_rows(&self.chat.config_options);
+            if rows.is_empty() {
+                self.say(
+                    "The agent has not offered a model list yet. Try /models for the text list.",
+                );
+                return;
             }
-            self.blink_on = false;
+            let index = rows.iter().position(|row| row.current).unwrap_or(0);
+            self.picker = Some(Picker { index, rows });
         }
 
-        fn push_stream_delta(&mut self, delta: &str) {
-            self.streaming = true;
-            self.stream_buf.push_str(delta);
-            // Hide reasoning the way the rest of the app does: keep the "thinking"
-            // spinner until visible (non-<think>) text appears, then show the
-            // live reply. Don't call stop_thinking() — that drops the channel.
-            let (_think, visible) = super::strip_think_blocks(&self.stream_buf);
-            self.thinking = visible.trim().is_empty();
-            self.blink_counter = self.blink_counter.wrapping_add(1);
-            self.blink_on = self.blink_counter % 4 < 2;
-        }
-
-        /// The portion of the streaming buffer to show live, with reasoning hidden.
-        fn visible_stream(&self) -> String {
-            let (_think, visible) = super::strip_think_blocks(&self.stream_buf);
-            visible
-        }
-
-        fn start_thinking(&mut self) {
-            self.thinking = true;
-            self.thinking_tick = 0;
-        }
-
-        fn stop_thinking(&mut self) {
-            self.thinking = false;
-            self.inference_rx = None;
-            // Dropping a pending reply channel reads as a denial on the
-            // inference side, so a cancelled turn can't leave a tool waiting.
-            self.pending_approval = None;
-        }
-
-        fn tick_thinking(&mut self) {
-            self.thinking_tick = self.thinking_tick.wrapping_add(1);
-        }
-
-        fn thinking_frame(&self) -> &'static str {
-            let idx = (self.thinking_tick as usize) % THINKING_FRAMES.len();
-            THINKING_FRAMES[idx]
-        }
-
-        /// Context window of the model currently serving inference, falling back
-        /// to the compaction budget when the model isn't in the picker list
-        /// (e.g. a provider-supplied name we don't ship a config for).
-        ///
-        /// An env-configured provider names itself after its model id rather
-        /// than a catalogue display name, so match either. Getting this wrong
-        /// is silent: the gauge just divides by the wrong number.
-        fn context_window_tokens(&self) -> u64 {
-            self.model_picker_items
-                .iter()
-                .find(|item| {
-                    item.display_name == self.current_model_name
-                        || item.config.model_id == self.current_model_name
-                })
-                .map(|item| item.context_window_tokens)
-                .unwrap_or(crate::backend::DEFAULT_CONTEXT_TOKEN_BUDGET as u64)
-        }
-
-        fn tick(&mut self) {
-            self.load_tick = self.load_tick.wrapping_add(1);
-        }
-
-        /// check how much of the model has landed on disk so far
-        fn poll_download_progress(&mut self) {
-            let Some(ref model_id) = self.switching_model_id else {
+        fn move_picker(&mut self, forward: bool) {
+            let Some(picker) = self.picker.as_mut() else {
                 return;
             };
-            let cache_path = onde::hf_cache::model_cache_path(model_id);
-            let downloaded = cache_path
-                .as_ref()
-                .filter(|p| p.exists())
-                .map(|p| dir_size_recursive(p))
-                .unwrap_or(0);
-            let expected = onde::inference::models::SUPPORTED_MODEL_INFO
+            let len = picker.rows.len();
+            if len == 0 {
+                return;
+            }
+            picker.index = if forward {
+                (picker.index + 1) % len
+            } else {
+                (picker.index + len - 1) % len
+            };
+        }
+
+        /// Pick the highlighted row. A download or load arrives as a card from
+        /// the agent; a cloud tier chosen while signed out comes back as the
+        /// agent's sign-in prompt, which `ConfigSet` notices.
+        fn choose_model(&mut self) {
+            let Some(picker) = self.picker.take() else {
+                return;
+            };
+            let Some(row) = picker.rows.get(picker.index) else {
+                return;
+            };
+            if row.current {
+                return;
+            }
+            self.model_request = Some(row.value.clone());
+            self.config_inflight = true;
+            self.agent
+                .set_config(crate::MODEL_CONFIG_ID, ConfigValue::Id(row.value.clone()));
+        }
+
+        /// Start the browser sign-in; the agent sends the URL back as an
+        /// elicitation.
+        fn start_sign_in(&mut self) {
+            self.say("Signing in to siGit Code Cloud…");
+            self.agent.authenticate();
+        }
+    }
+
+    // ── Agent events ──────────────────────────────────────────────────────────
+
+    fn handle_agent_event(app: &mut App, event: AgentEvent) {
+        match event {
+            AgentEvent::Update(session_id, update) => {
+                // What a thread we have since left still sends.
+                if session_id != app.agent.session_id {
+                    return;
+                }
+                app.chat.apply_update(*update);
+                // Outside a turn (a load that landed later, a notice) every
+                // chunk is a whole message; nothing is going to continue it.
+                if !app.turn_active && !app.loading_session {
+                    app.chat.finalize_stream();
+                }
+            }
+            AgentEvent::Permission(request, answer) => {
+                // The y/a/n/d prompt lives on the Session tab; make sure the
+                // user can see what they're answering.
+                app.active_tab = Tab::Session;
+                app.chat.finalize_stream();
+                let notice = permission_notice(&request);
+                app.chat.messages.push(ChatMessage::system(notice));
+                app.permission = Some(PermissionPrompt {
+                    title: request
+                        .tool_call
+                        .fields
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "a tool call".to_string()),
+                    options: request.options,
+                    answer,
+                });
+            }
+            AgentEvent::SignIn {
+                url,
+                message,
+                answer,
+            } => {
+                app.active_tab = Tab::Session;
+                // The URL has to be visible and copyable (ssh), and the
+                // browser is tried too.
+                let opened = crate::browser_auth::open_browser(&url);
+                let hint = if opened {
+                    "Your browser should open. If it does not, go to"
+                } else {
+                    "Open this page in a browser"
+                };
+                app.say(format!("{message}\n{hint}:\n{url}"));
+                let _ = answer.send(true);
+            }
+            AgentEvent::SignInComplete => app.say("✓ Signed in to siGit Code Cloud."),
+            AgentEvent::TurnDone(result) => finish_turn(app, result),
+            AgentEvent::ConfigSet(result) => {
+                app.config_inflight = false;
+                match result {
+                    Ok(options) => {
+                        app.chat.config_options = options;
+                        let asked = app.model_request.take();
+                        if let Some(asked) = asked
+                            && asked.starts_with(CLOUD_ID_PREFIX)
+                            && app.chat.current_model_value().as_deref() != Some(asked.as_str())
+                        {
+                            // The agent kept the model and answered with its
+                            // sign-in prompt: nobody is signed in.
+                            app.pending_cloud_pick = Some(asked);
+                            app.start_sign_in();
+                        }
+                    }
+                    Err(error) => {
+                        app.model_request = None;
+                        app.say(format!("error: {error}"));
+                    }
+                }
+            }
+            AgentEvent::Sessions(result) => finish_listing(app, result),
+            AgentEvent::Loaded(session_id, result) => finish_load(app, session_id, result),
+            AgentEvent::Deleted(id, result) => {
+                app.history_notice = Some(match result {
+                    Ok(()) => format!("Deleted session '{id}'."),
+                    Err(error) => format!("Could not delete '{id}': {error}"),
+                });
+                app.refresh_history();
+            }
+            AgentEvent::Authenticated(result) => match result {
+                Ok(()) => {
+                    app.say("✓ Signed in.");
+                    if let Some(tier) = app.pending_cloud_pick.take() {
+                        app.model_request = Some(tier.clone());
+                        app.config_inflight = true;
+                        app.agent
+                            .set_config(crate::MODEL_CONFIG_ID, ConfigValue::Id(tier));
+                    }
+                }
+                Err(error) => {
+                    app.pending_cloud_pick = None;
+                    app.say(format!("Sign-in failed: {error}"));
+                }
+            },
+        }
+    }
+
+    /// A `session/prompt` ended.
+    fn finish_turn(app: &mut App, result: Result<StopReason, AgentError>) {
+        app.chat.finalize_stream();
+        app.chat.thinking = false;
+        app.turn_active = false;
+        // Dropping a pending prompt answers it `Cancelled` on the agent's side,
+        // so a turn that ended can't leave a tool waiting.
+        app.permission = None;
+        match result {
+            Ok(stop) => {
+                if let Some(notice) = stop_notice(stop) {
+                    app.say(notice);
+                }
+                if std::mem::take(&mut app.help_pending) {
+                    app.say(CLIENT_HELP);
+                }
+            }
+            Err(error) => {
+                app.help_pending = false;
+                app.say(turn_error_text(&error));
+                if error.auth_required {
+                    app.start_sign_in();
+                }
+            }
+        }
+    }
+
+    /// `session/list` answered.
+    fn finish_listing(app: &mut App, result: Result<Vec<SessionInfo>, String>) {
+        app.history_loading = false;
+        let cwd = app.agent.roots.first().cloned().unwrap_or_default();
+        let sessions = match result {
+            Ok(sessions) => sessions
+                .into_iter()
+                .filter(|info| same_dir(&info.cwd, &cwd))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                app.resume_pending = false;
+                app.history_notice = Some(format!("Could not list sessions: {error}"));
+                return;
+            }
+        };
+        if std::mem::take(&mut app.resume_pending) {
+            let current = app.agent.session_id.0.to_string();
+            match sessions
                 .iter()
-                .find(|m| m.id == model_id.as_str())
-                .map(|m| m.expected_size_bytes)
-                .unwrap_or(0);
-            self.download_progress = Some((downloaded, expected));
-        }
-
-        /// switch to chat phase and show the welcome banner
-        fn finish_loading(&mut self) {
-            self.is_loading = false;
-            for line in BANNER_ART.lines() {
-                self.messages.push(ChatMessage::banner(line));
-            }
-            self.messages.push(ChatMessage::system(""));
-            self.messages.push(ChatMessage::system(
-                "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
-            ));
-            if self.backend.is_remote() {
-                self.messages.push(ChatMessage::system(format!(
-                    "Current model: {}",
-                    self.current_model_name
-                )));
-            } else {
-                // On-device models are never loaded implicitly; prompt the user to
-                // load one explicitly before their first message.
-                self.messages.push(ChatMessage::system(format!(
-                    "No on-device model loaded. Run /load to load {}, or /models to choose one.",
-                    self.current_model_name
-                )));
-            }
-            self.messages
-                .push(ChatMessage::system("Type /help for commands."));
-        }
-
-        /// store the error but stay in loading view so the user can read it
-        fn set_load_error(&mut self, error: String) {
-            self.load_error = Some(error);
-            // is_loading stays true so render_loading() keeps rendering.
-        }
-
-        fn open_model_picker(&mut self, engine: &ChatEngine) {
-            let current = crate::setup::load_selected_model();
-            let current_name = crate::setup::load_selected_model_name().unwrap_or_else(|| {
-                futures::executor::block_on(engine.info())
-                    .model_name
-                    .unwrap_or_else(|| self.current_model_name.clone())
-            });
-
-            self.model_picker_items = build_model_picker_items();
-            self.model_picker_index = current
-                .as_ref()
-                .and_then(|selected| {
-                    self.model_picker_items.iter().position(|item| {
-                        item.config.model_id == selected.model_id
-                            && item
-                                .config
-                                .files
-                                .iter()
-                                .any(|file| file == &selected.gguf_file)
-                    })
-                })
-                .or_else(|| {
-                    self.model_picker_items
-                        .iter()
-                        .position(|item| item.display_name == current_name)
-                })
-                .unwrap_or(0);
-            self.show_model_picker = true;
-        }
-
-        fn close_model_picker(&mut self) {
-            self.show_model_picker = false;
-        }
-
-        fn move_model_picker_up(&mut self) {
-            if self.model_picker_items.is_empty() {
-                return;
-            }
-            if self.model_picker_index == 0 {
-                self.model_picker_index = self.model_picker_items.len().saturating_sub(1);
-            } else {
-                self.model_picker_index -= 1;
+                .find(|info| info.session_id.0.as_ref() != current)
+            {
+                Some(info) => start_load(app, info.session_id.clone()),
+                None => app.say("No earlier session of this directory to resume."),
             }
         }
+        app.history_sessions = sessions;
+        app.history_index = app
+            .history_index
+            .min(app.history_sessions.len().saturating_sub(1));
+    }
 
-        fn move_model_picker_down(&mut self) {
-            if self.model_picker_items.is_empty() {
-                return;
+    /// Switch to another saved thread. The agent replays it as updates, so the
+    /// scrollback starts over, and comes back if the load fails.
+    fn start_load(app: &mut App, session_id: SessionId) {
+        let previous = app.agent.session_id.clone();
+        let old = app.chat.fresh_transcript();
+        app.restore_on_load_failure = Some((old, previous));
+        app.loading_session = true;
+        app.active_tab = Tab::Session;
+        app.agent.load_session(session_id);
+    }
+
+    fn finish_load(
+        app: &mut App,
+        session_id: SessionId,
+        result: Result<Vec<agent_client_protocol::schema::v1::SessionConfigOption>, String>,
+    ) {
+        app.loading_session = false;
+        app.chat.finalize_stream();
+        match result {
+            Ok(options) => {
+                app.restore_on_load_failure = None;
+                if !options.is_empty() {
+                    app.chat.config_options = options;
+                }
+                app.say(format!(
+                    "Loaded session '{}'. The scrollback above is its history.",
+                    session_id.0
+                ));
             }
-            self.model_picker_index = (self.model_picker_index + 1) % self.model_picker_items.len();
+            Err(error) => {
+                if let Some((old, previous)) = app.restore_on_load_failure.take() {
+                    app.chat = old;
+                    app.agent.session_id = previous;
+                }
+                app.history_notice = Some(format!("Could not load '{}': {error}", session_id.0));
+                app.active_tab = Tab::History;
+            }
         }
     }
 
     // ── Model picker ─────────────────────────────────────────────────────────
-    //
-    // picker data types live in crate::models so Windows (ACP-only) can use them too
 
     fn render_model_picker(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        let Some(picker) = app.picker.as_ref() else {
+            return;
+        };
         let popup = centered_rect(82, 72, area);
 
         // clear the background so text doesn't bleed through
@@ -1167,241 +1794,130 @@ mod tui {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        let active_kind = crate::models::active_inference_kind();
-        let mut lines = Vec::new();
-
-        // State banner: which mode is active, and how to flip it.
-        let (state_word, state_style) = match active_kind {
-            InferenceKind::Local => (
-                "ON  (on-device)",
-                Style::default().fg(Color::Green).bg(Color::Black),
-            ),
-            InferenceKind::Cloud => (
+        let on_black = Style::default().bg(Color::Black);
+        let local_on = app.chat.local_inference().unwrap_or(true);
+        let (state_word, state_style) = if local_on {
+            ("ON  (on-device)", Style::default().fg(Color::Green))
+        } else {
+            (
                 "OFF (siGit Code Cloud)",
-                Style::default().fg(Color::Magenta).bg(Color::Black),
-            ),
+                Style::default().fg(Color::Magenta),
+            )
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Local inference: ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(state_word, state_style.add_modifier(Modifier::BOLD)),
-            Span::styled(
-                "    toggle with /local on|off",
-                Style::default().fg(Color::DarkGray).bg(Color::Black),
-            ),
-        ]));
-        lines.push(Line::from("").style(Style::default().bg(Color::Black)));
-
-        let mut last_section: Option<ModelSource> = None;
-        let mut last_kind: Option<InferenceKind> = None;
-
-        for (index, item) in app.model_picker_items.iter().enumerate() {
-            let item_kind = item.source.kind();
-            let item_active = item_kind == active_kind;
-
-            // Top-level group header (Local / Cloud) whenever the nature changes.
-            if last_kind != Some(item_kind) {
-                if last_kind.is_some() {
-                    lines.push(Line::from("").style(Style::default().bg(Color::Black)));
-                }
-                let group_label = match item_kind {
-                    InferenceKind::Local => "LOCAL — on-device inference",
-                    InferenceKind::Cloud => "CLOUD — siGit Code Cloud",
-                };
-                let group_style = if item_active {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "Local inference: ",
                     Style::default()
                         .fg(Color::White)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    state_word,
+                    state_style.bg(Color::Black).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "    toggle with /local on|off",
+                    Style::default().fg(Color::DarkGray).bg(Color::Black),
+                ),
+            ]),
+            Line::from("").style(on_black),
+        ];
+
+        let mut last_cloud: Option<bool> = None;
+        let mut selected_line = 0;
+        for (index, row) in picker.rows.iter().enumerate() {
+            // One header per group, whenever the group changes.
+            if last_cloud != Some(row.cloud) {
+                if last_cloud.is_some() {
+                    lines.push(Line::from("").style(on_black));
+                }
+                let (mark, label, color) = if row.cloud {
+                    ("☁", "siGit Code Cloud", Color::Magenta)
+                } else {
+                    ("◉", "On this machine", Color::Green)
+                };
+                let active = row.cloud != local_on;
+                let style = if active {
+                    Style::default()
+                        .fg(color)
                         .bg(Color::Black)
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                 } else {
                     Style::default().fg(Color::DarkGray).bg(Color::Black)
                 };
                 lines.push(
-                    Line::from(vec![Span::styled(group_label, group_style)])
-                        .style(Style::default().bg(Color::Black)),
+                    Line::from(vec![Span::styled(format!("{mark} {label}"), style)])
+                        .style(on_black),
                 );
-                last_kind = Some(item_kind);
-                last_section = None;
+                last_cloud = Some(row.cloud);
             }
 
-            if last_section != Some(item.source) {
-                if last_section.is_some() {
-                    lines.push(Line::from("").style(Style::default().bg(Color::Black)));
-                }
-
-                let (section_mark, section_name, section_style) = match item.source {
-                    ModelSource::Onde => (
-                        "◉",
-                        "Onde Inference",
-                        Style::default()
-                            .fg(Color::Green)
-                            .bg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    ModelSource::HuggingFace => (
-                        "○",
-                        "Hugging Face cache",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .bg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    ModelSource::Available => (
-                        "↓",
-                        "Available for download",
-                        Style::default()
-                            .fg(Color::Blue)
-                            .bg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    ModelSource::Fallback => (
-                        "◎",
-                        "Fallback",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .bg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    ModelSource::Cloud => (
-                        "☁",
-                        "siGit Code Cloud",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .bg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                };
-
-                // Dim the section header when it belongs to the inactive group.
-                let section_style = if item_active {
-                    section_style
-                } else {
-                    Style::default().fg(Color::DarkGray).bg(Color::Black)
-                };
-
-                lines.push(
-                    Line::from(vec![
-                        Span::styled(format!("  {section_mark} "), section_style),
-                        Span::styled(section_name, section_style),
-                    ])
-                    .style(Style::default().bg(Color::Black)),
-                );
-                last_section = Some(item.source);
+            let selected = index == picker.index;
+            if selected {
+                selected_line = lines.len();
             }
-
-            let selected = index == app.model_picker_index;
-            let current = item.display_name == app.current_model_name;
-            let marker = if selected { "› " } else { "  " };
-            let tool_badge = if item.tool_calling {
-                "  ✓ tool calling"
-            } else {
-                ""
-            };
-            let health_badge = match item.cache_health {
-                ModelCacheHealth::Complete => "",
-                ModelCacheHealth::Incomplete => "  ! incomplete cache",
-                ModelCacheHealth::NotDownloaded => "  ↓ download",
-            };
-            let current_badge = if current { "  ← current" } else { "" };
-            let context_badge = format!(
-                "  {}",
-                crate::models::format_context_window(item.context_window_tokens)
-            );
-            let disabled_badge = match item.cache_health {
-                ModelCacheHealth::Complete | ModelCacheHealth::NotDownloaded => "",
-                ModelCacheHealth::Incomplete => "  (unselectable)",
-            };
-            let brand_mark = match item.source {
-                ModelSource::Onde => "◉",
-                ModelSource::HuggingFace => "○",
-                ModelSource::Available => "↓",
-                ModelSource::Fallback => "◎",
-                ModelSource::Cloud => "☁",
-            };
-            let source = format!("  [{} {}]", brand_mark, item.source_label);
-
-            let base_style = if selected {
+            let active = row.cloud != local_on;
+            let base = if selected {
                 Style::default().fg(Color::Black).bg(Color::Green)
-            } else if item_active {
+            } else if active {
                 Style::default().fg(Color::White).bg(Color::Black)
             } else {
                 // Inactive group: still visible (we surface the offering) but dimmed.
                 Style::default().fg(Color::DarkGray).bg(Color::Black)
             };
-
-            let source_style = if selected {
-                Style::default().fg(Color::Black).bg(Color::Green)
-            } else if !item_active {
-                Style::default().fg(Color::DarkGray).bg(Color::Black)
-            } else {
-                match item.source {
-                    ModelSource::Onde => Style::default().fg(Color::Green).bg(Color::Black),
-                    ModelSource::HuggingFace => Style::default().fg(Color::Cyan).bg(Color::Black),
-                    ModelSource::Available => Style::default().fg(Color::Blue).bg(Color::Black),
-                    ModelSource::Fallback => Style::default().fg(Color::Yellow).bg(Color::Black),
-                    ModelSource::Cloud => Style::default().fg(Color::Magenta).bg(Color::Black),
-                }
-            };
-
-            let health_style = if selected {
-                Style::default().fg(Color::Red).bg(Color::Green)
-            } else {
-                Style::default().fg(Color::Red).bg(Color::Black)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{marker}{}  {}", item.display_name, item.description),
-                    base_style,
-                ),
-                Span::styled(
-                    tool_badge.to_string(),
+            let marker = if selected { "› " } else { "  " };
+            let mut spans = vec![Span::styled(format!("{marker}{}", row.name), base)];
+            if row.description.contains("tool calling") {
+                spans.push(Span::styled(
+                    "  ✓ tool calling",
                     if selected {
-                        Style::default().fg(Color::Black).bg(Color::Green)
+                        base
                     } else {
                         Style::default().fg(Color::Green).bg(Color::Black)
                     },
-                ),
-                Span::styled(
-                    context_badge,
+                ));
+            }
+            if row.description.contains("download on select") {
+                spans.push(Span::styled(
+                    "  ↓ download",
                     if selected {
-                        Style::default().fg(Color::Black).bg(Color::Green)
-                    } else if item_active {
-                        Style::default().fg(Color::Gray).bg(Color::Black)
+                        base
                     } else {
-                        Style::default().fg(Color::DarkGray).bg(Color::Black)
+                        Style::default().fg(Color::Blue).bg(Color::Black)
                     },
-                ),
-                Span::styled(health_badge.to_string(), health_style),
-                Span::styled(
-                    disabled_badge.to_string(),
+                ));
+            }
+            if row.current {
+                spans.push(Span::styled(
+                    "  ← current",
                     if selected {
-                        Style::default().fg(Color::Black).bg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::DarkGray).bg(Color::Black)
-                    },
-                ),
-                Span::styled(
-                    current_badge.to_string(),
-                    if selected {
-                        Style::default().fg(Color::Black).bg(Color::Green)
+                        base
                     } else {
                         Style::default().fg(Color::Cyan).bg(Color::Black)
                     },
-                ),
-                Span::styled(source, source_style),
-            ]));
+                ));
+            }
+            lines.push(Line::from(spans).style(on_black));
+            if selected && !row.description.is_empty() {
+                lines.push(
+                    Line::from(Span::styled(
+                        format!("    {}", row.description),
+                        Style::default().fg(Color::Gray).bg(Color::Black),
+                    ))
+                    .style(on_black),
+                );
+            }
         }
 
+        // Keep the highlighted row visible when the list outgrows the popup.
+        let scroll = selected_line.saturating_sub(inner.height.saturating_sub(3) as usize) as u16;
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .style(Style::default().bg(Color::Black)),
+                .scroll((scroll, 0))
+                .style(on_black),
             inner,
         );
     }
@@ -1426,12 +1942,12 @@ mod tui {
         .split(vertical[1])[1]
     }
 
-    // ── Tab bar (Session / History / Cloud) ───────────────────────────────────
+    // ── Tab bar (Session / History / Repo / Cloud) ────────────────────────────
 
-    /// Switch to `tab`, refreshing the data it shows. Entering History rescans
-    /// the sessions dir; entering Cloud kicks off the async status fetch;
+    /// Switch to `tab`, refreshing the data it shows. Entering History asks the
+    /// agent for the threads; entering Cloud kicks off the async status fetch;
     /// entering Repo fetches the issue/PR lists on first visit.
-    fn switch_tab(app: &mut App, tab: Tab, engine: &Arc<ChatEngine>) {
+    fn switch_tab(app: &mut App, tab: Tab) {
         app.active_tab = tab;
         match tab {
             Tab::Session => {}
@@ -1445,66 +1961,71 @@ mod tui {
                     refresh_repo(app);
                 }
             }
-            Tab::Cloud => refresh_cloud(app, engine),
+            Tab::Cloud => refresh_cloud(app),
         }
     }
 
     /// Fetch the Cloud tab's status text on a background task and cache it.
-    /// Account status and engine info are async (the account check may hit the
-    /// network), so the tab shows "fetching…" until the oneshot resolves in
-    /// the event loop.
-    fn refresh_cloud(app: &mut App, engine: &Arc<ChatEngine>) {
+    /// The account check may hit the network, so the tab shows "fetching…"
+    /// until the oneshot resolves in the event loop. The rest is what the agent
+    /// last told us, read now.
+    fn refresh_cloud(app: &mut App) {
         let (tx, rx) = oneshot::channel();
         app.cloud_rx = Some(rx);
         app.cloud_lines = None;
 
-        let engine = Arc::clone(engine);
-        let is_remote = app.backend.is_remote();
-        let model_name = app.current_model_name.clone();
+        let on_cloud = app.chat.on_cloud();
+        let model = app.chat.model_label();
+        let local_inference = app.chat.local_inference();
+        let permission_mode = app.chat.permission_mode();
         tokio::spawn(async move {
             // `status_line` already folds failures into its message, so a dead
             // network degrades to an error string rather than a stuck tab.
             let account = crate::account::status_line().await;
-            let info = engine.info().await;
 
             let mut lines = Vec::new();
             lines.push(format!("Account:          {account}"));
             lines.push(format!(
                 "Inference:        {}",
-                if is_remote {
-                    "remote (siGit Code Cloud / hosted endpoint)"
+                if on_cloud {
+                    "siGit Code Cloud"
                 } else {
                     "on-device"
                 }
             ));
-            lines.push(format!("Model:            {model_name}"));
-            lines.push(format!(
-                "Engine:           status: {:?}  model: {}  memory: {}  history: {} turns",
-                info.status,
-                info.model_name.as_deref().unwrap_or("(none)"),
-                info.approx_memory.as_deref().unwrap_or("unknown"),
-                info.history_length,
-            ));
+            lines.push(format!("Model:            {model}"));
             lines.push(format!(
                 "Local inference:  {}",
-                if crate::settings::local_inference_enabled() {
-                    "on"
-                } else {
-                    "off"
+                match local_inference {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "unknown",
                 }
             ));
+            lines.push(format!(
+                "Permissions:      {}",
+                permission_mode_name(permission_mode.as_deref())
+            ));
             let config_dir = std::env::var("SIGIT_CONFIG_DIR").unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| "~".to_string());
                 format!("{home}/.config/sigit")
             });
             lines.push(format!("Config dir:       {config_dir}"));
-            lines.push(String::new());
-            for perm_line in crate::permissions::describe(crate::permissions::TUI_SESSION).lines() {
-                lines.push(perm_line.to_string());
-            }
 
             let _ = tx.send(lines);
         });
+    }
+
+    /// The name the permission dropdown gives a mode id.
+    fn permission_mode_name(mode: Option<&str>) -> &'static str {
+        match mode {
+            Some(crate::PERMISSION_MODE_AUTO) => "Auto — tools run without asking",
+            Some(crate::PERMISSION_MODE_PLAN) => "Plan — research only, no edits or commands",
+            Some(_) => "Manual — the agent asks before mutating tools",
+            None => "unknown",
+        }
     }
 
     // ── Repo tab (issues / pull requests via the official MCP server) ─────────
@@ -1601,10 +2122,10 @@ mod tui {
         });
     }
 
-    /// Keys on the History and Cloud tabs (the Session tab keeps `handle_key`).
-    /// Tab/Esc navigation is handled earlier in the event loop; this gets the
-    /// rest.
-    async fn handle_tab_key(app: &mut App, key: KeyEvent, engine: &Arc<ChatEngine>) {
+    /// Keys on the History, Repo and Cloud tabs (the Session tab keeps
+    /// `handle_key`). Tab/Esc navigation is handled earlier in the event loop;
+    /// this gets the rest.
+    fn handle_tab_key(app: &mut App, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
             app.quit = true;
@@ -1629,39 +2150,23 @@ mod tui {
                     app.history_notice = None;
                 }
                 KeyCode::Char('d') => {
-                    let Some(id) = app.selected_session().map(|e| e.id.clone()) else {
+                    let Some(id) = app.selected_session().map(|e| e.session_id.0.to_string())
+                    else {
                         return;
                     };
                     if app.history_pending_delete.as_deref() == Some(id.as_str()) {
-                        crate::session_store::delete(&id);
-                        app.refresh_history();
-                        app.history_notice = Some(format!("Deleted session '{id}'."));
+                        app.history_pending_delete = None;
+                        app.agent.delete_session(id);
                     } else {
                         app.history_pending_delete = Some(id);
                     }
                 }
                 KeyCode::Enter => {
                     app.history_pending_delete = None;
-                    let Some(id) = app.selected_session().map(|e| e.id.clone()) else {
+                    let Some(id) = app.selected_session().map(|e| e.session_id.clone()) else {
                         return;
                     };
-                    match crate::session_store::load(&id) {
-                        Some(history) if !history.is_empty() => {
-                            let restored = history.len();
-                            app.backend.restore_history(history).await;
-                            app.messages.push(ChatMessage::system(format!(
-                                "Restored {restored} message(s) from session '{id}'. \
-                                 The model remembers the conversation; the scrollback \
-                                 above does not replay it."
-                            )));
-                            app.active_tab = Tab::Session;
-                        }
-                        _ => {
-                            app.history_notice = Some(format!(
-                                "Could not restore '{id}': the session is empty or unreadable."
-                            ));
-                        }
-                    }
+                    start_load(app, id);
                 }
                 // Any other key cancels a pending delete confirmation.
                 _ => app.history_pending_delete = None,
@@ -1711,17 +2216,27 @@ mod tui {
             }
             Tab::Cloud => match key.code {
                 KeyCode::Char('l') => {
-                    let enabled = !crate::settings::local_inference_enabled();
-                    match crate::settings::set_local_inference(enabled) {
-                        Ok(()) => refresh_cloud(app, engine),
-                        Err(error) => {
-                            app.cloud_lines
-                                .get_or_insert_with(Vec::new)
-                                .push(format!("error: could not save the setting: {error}"));
-                        }
-                    }
+                    // Flip the agent's own setting; it answers with fresh options.
+                    let enabled = !app.chat.local_inference().unwrap_or(true);
+                    let boolean = matches!(
+                        app.chat
+                            .option(crate::LOCAL_INFERENCE_CONFIG_ID)
+                            .map(|option| &option.kind),
+                        Some(SessionConfigKind::Boolean(_))
+                    );
+                    let value = if boolean {
+                        ConfigValue::Bool(enabled)
+                    } else if enabled {
+                        ConfigValue::Id(crate::LOCAL_INFERENCE_ON.to_string())
+                    } else {
+                        ConfigValue::Id(crate::LOCAL_INFERENCE_OFF.to_string())
+                    };
+                    app.config_inflight = true;
+                    app.agent
+                        .set_config(crate::LOCAL_INFERENCE_CONFIG_ID, value);
+                    app.active_tab = Tab::Session;
                 }
-                KeyCode::Char('r') => refresh_cloud(app, engine),
+                KeyCode::Char('r') => refresh_cloud(app),
                 _ => {}
             },
         }
@@ -1755,23 +2270,28 @@ mod tui {
         let mut lines: Vec<Line> = Vec::new();
 
         if app.history_sessions.is_empty() {
+            let text = if app.history_loading {
+                "  fetching sessions…"
+            } else {
+                "  No saved sessions of this directory yet. Sessions are saved after each turn."
+            };
             lines.push(Line::from(Span::styled(
-                "  No saved sessions yet. Sessions are saved after each turn.",
+                text,
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
-            let now = std::time::SystemTime::now();
-            for (index, entry) in app.history_sessions.iter().enumerate() {
+            for (index, info) in app.history_sessions.iter().enumerate() {
                 let selected = index == app.history_index;
                 let marker = if selected { "› " } else { "  " };
-                let age = now.duration_since(entry.modified).ok();
-                let row = super::history_row(&entry.id, age, entry.message_count);
                 let style = if selected {
                     Style::default().fg(Color::Black).bg(Color::Green)
                 } else {
                     Style::default().fg(Color::White)
                 };
-                lines.push(Line::from(Span::styled(format!("{marker}{row}"), style)));
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}{}", session_row(info)),
+                    style,
+                )));
             }
         }
 
@@ -1968,125 +2488,17 @@ mod tui {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Note: toggling Local Inference takes effect for the next model \
-             selection (/models); the running backend is not swapped.",
+            "  l flips local inference; pick a model with /models. Sign in or out with /login and /logout.",
             Style::default().fg(Color::DarkGray),
         )));
 
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    // ── Slash commands ────────────────────────────────────────────────────────
-
-    enum SlashCommand {
-        Help,
-        Clear,
-        Status,
-        /// picker UI, or jump straight to model N
-        Models(Option<usize>),
-        /// toggle on-device inference mode. `Some(true/false)` sets it, `None` flips it.
-        Local(Option<bool>),
-        /// List discovered Agent Skills.
-        Skills,
-        /// List configured subagent types (`.sigit/agents/*.md`) for `task`.
-        Agents,
-        /// List discovered user-defined commands (`.sigit/commands/*.md`).
-        Commands,
-        /// List configured MCP servers and their tools.
-        Mcp,
-        /// explicitly load the selected (or default) on-device model
-        Load,
-        /// `/login` (browser) or `/login <email> <password>` — the raw argument,
-        /// parsed when executed.
-        Login(Option<String>),
-        Logout,
-        Whoami,
-        /// Toggle plan mode (research only; mutating tools are denied with a
-        /// prompt to present a plan). `Some(true/false)` sets it, `None` flips it.
-        Plan(Option<bool>),
-        /// Show the effective permission policy for this session.
-        Permissions,
-        /// Expand or collapse model reasoning on rendered messages.
-        /// `Some(true/false)` sets it, `None` flips it.
-        Thinking(Option<bool>),
-        /// Expand or collapse all tool-call entries in the transcript.
-        /// `Some(true/false)` sets it, `None` flips it. TUI-only.
-        Tools(Option<bool>),
-        /// Summarize-and-shrink the conversation history on demand.
-        Compact,
-        /// Restore the saved TUI session from disk.
-        Resume,
-        /// Generate (or improve) the repo's AGENTS.md by running an agent
-        /// turn with [`crate::instructions::INIT_PROMPT`] as the user text.
-        Init,
-        Exit,
-        /// An unrecognized command word, plus whatever followed it on the
-        /// line — a caller may still resolve it as a user-defined command
-        /// before falling back to "unknown command".
-        Unknown(String, Option<String>),
-    }
-
-    fn parse_slash(input: &str) -> Option<SlashCommand> {
-        let trimmed = input.trim();
-        if !trimmed.starts_with('/') {
-            return None;
-        }
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let cmd = parts.next().unwrap_or("");
-        let arg = parts.next().map(|s| s.trim());
-        Some(match cmd {
-            "/help" => SlashCommand::Help,
-            "/clear" => SlashCommand::Clear,
-            "/status" => SlashCommand::Status,
-            "/models" => SlashCommand::Models(arg.and_then(|s| s.parse::<usize>().ok())),
-            "/local" => SlashCommand::Local(parse_on_off(arg)),
-            "/skills" => SlashCommand::Skills,
-            "/agents" => SlashCommand::Agents,
-            "/commands" => SlashCommand::Commands,
-            "/mcp" => SlashCommand::Mcp,
-            "/load" => SlashCommand::Load,
-            "/login" => SlashCommand::Login(arg.map(str::to_string)),
-            "/logout" => SlashCommand::Logout,
-            "/whoami" => SlashCommand::Whoami,
-            "/plan" => SlashCommand::Plan(parse_on_off(arg)),
-            "/permissions" => SlashCommand::Permissions,
-            "/thinking" => SlashCommand::Thinking(parse_on_off(arg)),
-            "/tools" => SlashCommand::Tools(parse_on_off(arg)),
-            "/compact" => SlashCommand::Compact,
-            "/resume" => SlashCommand::Resume,
-            "/init" => SlashCommand::Init,
-            "/exit" | "/quit" | "/q" => SlashCommand::Exit,
-            other => SlashCommand::Unknown(other.to_string(), arg.map(str::to_string)),
-        })
-    }
-
-    /// `on`/`off` (and synonyms) → `Some(bool)`; missing or unrecognized → `None`
-    /// (meaning "toggle the current value").
-    fn parse_on_off(arg: Option<&str>) -> Option<bool> {
-        match arg.map(|s| s.trim().to_ascii_lowercase())?.as_str() {
-            "on" | "true" | "1" | "yes" => Some(true),
-            "off" | "false" | "0" | "no" => Some(false),
-            _ => None,
-        }
-    }
-
     // ── Rendering ─────────────────────────────────────────────────────────────
 
     fn render(frame: &mut Frame, app: &mut App) {
         let area = frame.area();
-
-        if app.is_loading {
-            let zones = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-            render_loading_title(frame, app, zones[0]);
-            render_loading(frame, app, zones[1]);
-            render_loading_footer(frame, zones[2]);
-            return;
-        }
 
         match app.active_tab {
             Tab::Session => {
@@ -2126,21 +2538,20 @@ mod tui {
             }
         }
 
-        if app.show_model_picker {
+        if app.picker.is_some() {
             render_model_picker(frame, app, area);
         }
     }
 
     fn render_title(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-        let model_label = format!(" siGit — {} ", app.current_model_name);
-        let tool_label = if app.tool_calling {
+        let model_label = format!(" siGit — {} ", app.chat.model_label());
+        let tool_label = if app.chat.tool_calling() {
             " [tools on] "
         } else {
             " [tools off] "
         };
-        let window = app.context_window_tokens();
-        let used = app.context_tokens_used.unwrap_or(0) as u64;
-        let line = Line::from(vec![
+        let (used, window) = app.chat.context.unwrap_or((0, 0));
+        let mut spans = vec![
             Span::styled(
                 model_label,
                 Style::default()
@@ -2158,12 +2569,22 @@ mod tui {
                     .fg(Color::Black)
                     .bg(context_gauge_color(used, window)),
             ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        ];
+        if app.chat.plan_mode() {
+            spans.push(Span::styled(
+                " [plan mode] ",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ));
+        }
+        if let Some(title) = app.chat.session_title.as_deref() {
+            spans.push(Span::styled(
+                format!(" {title}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// `"84% · 168K/200K ctx"` — the share of the active model's context window
-    /// the conversation occupies, as of the last completed turn.
     fn context_gauge_label(used: u64, window: u64) -> String {
         if window == 0 {
             return "ctx —".to_string();
@@ -2197,10 +2618,10 @@ mod tui {
         }
     }
 
-    fn render_loading_title(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    fn render_startup_title(frame: &mut Frame, startup: &Startup, area: ratatui::layout::Rect) {
         const SPINNER: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-        let spin = SPINNER[(app.load_tick as usize) % SPINNER.len()];
-        let label = format!(" siGit {} loading {}… ", spin, app.load_model_name);
+        let spin = SPINNER[(startup.tick as usize) % SPINNER.len()];
+        let label = format!(" siGit {spin} Starting siGit Code… ");
         let line = Line::from(Span::styled(
             label,
             Style::default()
@@ -2211,46 +2632,45 @@ mod tui {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn render_loading(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-        let elapsed = app.load_start.elapsed().as_secs();
+    fn render_startup(frame: &mut Frame, startup: &Startup) {
+        let zones = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+        render_startup_title(frame, startup, zones[0]);
+
+        let elapsed = startup.started.elapsed().as_secs();
         let elapsed_str = if elapsed < 60 {
-            format!("{}s", elapsed)
+            format!("{elapsed}s")
         } else {
             format!("{}m {}s", elapsed / 60, elapsed % 60)
         };
-
-        let content = if let Some(ref err) = app.load_error {
+        let content = if let Some(ref err) = startup.error {
             format!(
-                "\n\n  ✗ Failed to load model after {}.\n\n  {}\n\n  Press Ctrl+C to exit.",
-                elapsed_str, err
+                "\n\n  ✗ siGit Code did not start ({elapsed_str}).\n\n  {err}\n\n  Press Ctrl+C to exit."
             )
         } else {
-            format!(
-                "\n\n  Loading model, please wait… ({})\n\n  The model is being initialised. This may take a moment on first run.",
-                elapsed_str
-            )
+            format!("\n\n  Starting the agent… ({elapsed_str})")
         };
-
-        let style = if app.load_error.is_some() {
+        let style = if startup.error.is_some() {
             Style::default().fg(Color::Red)
         } else {
             Style::default().fg(Color::White)
         };
-
         frame.render_widget(
             Paragraph::new(content)
                 .style(style)
                 .wrap(Wrap { trim: false }),
-            area,
+            zones[1],
         );
-    }
 
-    fn render_loading_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
         let line = Line::from(vec![
             Span::styled(" Ctrl+C ", Style::default().fg(Color::Black).bg(Color::Red)),
             Span::styled(" quit", Style::default().fg(Color::DarkGray)),
         ]);
-        frame.render_widget(Paragraph::new(line), area);
+        frame.render_widget(Paragraph::new(line), zones[2]);
     }
 
     fn render_messages(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -2266,7 +2686,7 @@ mod tui {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        for msg in &app.messages {
+        for msg in &app.chat.messages {
             render_chat_message(
                 &mut lines,
                 msg,
@@ -2276,15 +2696,9 @@ mod tui {
             );
         }
 
-        let streamed_visible = app.visible_stream();
+        let streamed_visible = app.chat.visible_stream();
         if !streamed_visible.is_empty() {
-            let fake = ChatMessage {
-                role: Role::Assistant,
-                text: streamed_visible,
-                think_block: None,
-                tool_detail: None,
-                tool_result: None,
-            };
+            let fake = ChatMessage::plain(Role::Assistant, streamed_visible);
             render_chat_message(
                 &mut lines,
                 &fake,
@@ -2292,7 +2706,7 @@ mod tui {
                 app.tools_expanded,
                 app.show_thinking,
             );
-            if app.blink_on
+            if app.chat.blink_on
                 && let Some(last) = lines.last_mut()
             {
                 last.spans
@@ -2300,15 +2714,15 @@ mod tui {
             }
         }
 
-        if app.thinking {
+        if app.chat.thinking {
             lines.push(Line::from(Span::styled(
-                format!("  {} thinking…", app.thinking_frame()),
+                format!("  {} thinking…", app.spinner_frame()),
                 Style::default().fg(Color::DarkGray),
             )));
             // While the stream buffer holds only reasoning, show its live tail
             // under the label so the user watches the model think.
             let tail_width = (inner_width as usize).saturating_sub(4).max(8);
-            for tail_line in super::streaming_think_tail(&app.stream_buf, tail_width, 3) {
+            for tail_line in super::streaming_think_tail(&app.chat.stream_buf, tail_width, 3) {
                 lines.push(Line::from(Span::styled(
                     format!("    {tail_line}"),
                     Style::default()
@@ -2316,47 +2730,26 @@ mod tui {
                         .add_modifier(Modifier::DIM | Modifier::ITALIC),
                 )));
             }
-        } else if app.switching_model {
-            // Once the weights have fully landed on disk, swap the spinner for a
-            // checkmark so it's clear the download finished and we're now loading
-            // the model into memory (which can still take a while).
-            let download_complete = matches!(
-                app.download_progress,
-                Some((downloaded, expected)) if expected > 0 && downloaded >= expected
-            );
-
-            if download_complete {
-                let size_str = app
-                    .download_progress
-                    .map(|(_, expected)| format!(" ({})", format_size_human(expected)))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled("  ✓ ", Style::default().fg(Color::Green)),
-                    Span::styled(
-                        format!("model downloaded{size_str} — loading into memory…"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-            } else {
-                let progress_str = if let Some((downloaded, expected)) = app.download_progress {
-                    if expected > 0 {
-                        let pct = (downloaded as f64 / expected as f64 * 100.0).min(100.0) as u8;
-                        let dl_str = format_size_human(downloaded.min(expected));
-                        let ex_str = format_size_human(expected);
-                        format!(" — {dl_str} / {ex_str} ({pct}%)")
-                    } else if downloaded > 0 {
-                        format!(" — {} downloaded", format_size_human(downloaded))
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("  {} switching model{progress_str}…", app.switching_frame()),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+        } else if app.turn_active && !app.chat.streaming {
+            // The agent is working (a tool is running, the model is loading
+            // into a round); its cards above say what.
+            lines.push(Line::from(Span::styled(
+                format!("  {} working…", app.spinner_frame()),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if app.config_inflight {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} waiting for the model… (Ctrl+C stops waiting; it keeps loading)",
+                    app.spinner_frame()
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if app.loading_session {
+            lines.push(Line::from(Span::styled(
+                format!("  {} loading the session…", app.spinner_frame()),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
         // Always pin to the bottom so the latest message stays visible. There is
@@ -2372,6 +2765,16 @@ mod tui {
         frame.render_widget(paragraph.scroll((scroll, 0)), inner);
     }
 
+    /// The glyph after a tool title that says where the call stands.
+    fn status_suffix(status: Option<ToolCallStatus>) -> &'static str {
+        match status {
+            Some(ToolCallStatus::Failed) => " ✗",
+            Some(ToolCallStatus::Pending) => " (waiting for approval)",
+            Some(ToolCallStatus::InProgress) => " …",
+            _ => "",
+        }
+    }
+
     fn render_chat_message(
         lines: &mut Vec<Line<'static>>,
         msg: &ChatMessage,
@@ -2385,12 +2788,24 @@ mod tui {
                     .fg(Color::Rgb(132, 132, 145))
                     .add_modifier(Modifier::DIM);
                 for entry_line in super::tool_entry_lines(
-                    &msg.text,
+                    &format!("{}{}", msg.text, status_suffix(msg.status)),
                     msg.tool_detail.as_deref().unwrap_or(""),
                     msg.tool_result.as_deref(),
                     tools_expanded,
                 ) {
                     lines.push(Line::from(Span::styled(format!("  {entry_line}"), dim)));
+                }
+            }
+            Role::Plan => {
+                for (index, text_line) in msg.text.split('\n').enumerate() {
+                    let style = if index == 0 {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(Span::styled(format!("  {text_line}"), style)));
                 }
             }
             Role::Banner => {
@@ -2485,6 +2900,11 @@ mod tui {
                     }
                 }
 
+                // Reasoning with no reply after it (a turn that ended in a tool
+                // call) leaves nothing to put behind the prefix.
+                if msg.text.is_empty() {
+                    return;
+                }
                 let prefix = Span::styled(
                     "siGit > ".to_string(),
                     Style::default()
@@ -2541,8 +2961,8 @@ mod tui {
             let hints: &[(&str, &str)] = match app.active_tab {
                 Tab::History => &[
                     (" ↑/↓ ", " select  "),
-                    (" Enter ", " resume  "),
-                    (" d ", " delete  "),
+                    (" Enter ", " load  "),
+                    (" d d ", " delete  "),
                     (" r ", " refresh  "),
                     (" Tab ", " next tab  "),
                     (" Esc ", " session"),
@@ -2591,12 +3011,15 @@ mod tui {
             Span::styled(" quit", Style::default().fg(Color::DarkGray)),
         ];
 
-        if let Some((tool, _)) = &app.pending_approval {
+        if let Some(prompt) = &app.permission {
             spans.push(Span::styled(
-                format!("  allow {tool}? [y]es · [a]lways · [n]o · [d]eny always"),
+                format!(
+                    "  allow {}? [y]es · [a]lways · [n]o · [d]eny always",
+                    prompt.title
+                ),
                 Style::default().fg(Color::Yellow),
             ));
-        } else if app.thinking || app.switching_model || app.is_streaming() {
+        } else if app.is_busy() {
             spans.push(Span::styled(
                 "  (busy — Ctrl+C to cancel)",
                 Style::default().fg(Color::Yellow),
@@ -2606,38 +3029,24 @@ mod tui {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    // ── Keys ──────────────────────────────────────────────────────────────────
+
+    /// What a key does on the Session tab when nothing is running. Returns the
+    /// line to send when Enter ends one.
     fn handle_key(app: &mut App, key: KeyEvent) -> Option<String> {
-        if key.kind != KeyEventKind::Press {
+        if app.picker.is_some() {
+            match key.code {
+                KeyCode::Esc => app.picker = None,
+                KeyCode::Up => app.move_picker(false),
+                KeyCode::Down => app.move_picker(true),
+                KeyCode::Enter => app.choose_model(),
+                _ => {}
+            }
             return None;
         }
 
-        if app.show_model_picker {
-            match key.code {
-                KeyCode::Esc => {
-                    app.close_model_picker();
-                    return None;
-                }
-                KeyCode::Up => {
-                    app.move_model_picker_up();
-                    return None;
-                }
-                KeyCode::Down => {
-                    app.move_model_picker_down();
-                    return None;
-                }
-                KeyCode::Enter => {
-                    return Some(format!("/models {}", app.model_picker_index + 1));
-                }
-                _ => return None,
-            }
-        }
-
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.quit = true;
-                None
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.quit = true;
                 None
             }
@@ -2689,939 +3098,223 @@ mod tui {
         }
     }
 
-    // ── Explicit on-device model loading ──────────────────────────────────────
+    /// The reaction to one key press, whatever the app is doing.
+    fn handle_terminal_key(app: &mut App, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let quit_key = ctrl && matches!(key.code, KeyCode::Char('c' | 'd'));
 
-    /// The local model `/load` should bring up: the persisted selection if it
-    /// still resolves to a known model, otherwise the first on-device (non-cloud)
-    /// entry in the picker.
-    fn default_local_model_item(app: &App) -> Option<ModelPickerItem> {
-        if let Some(selected) = crate::setup::load_selected_model()
-            && let Some(item) = app.model_picker_items.iter().find(|item| {
-                item.config.model_id == selected.model_id
-                    && item
-                        .config
-                        .files
-                        .iter()
-                        .any(|file| file == &selected.gguf_file)
-            })
-        {
-            return Some(item.clone());
-        }
-        app.model_picker_items
-            .iter()
-            .find(|item| item.cloud_tier.is_none())
-            .cloned()
-    }
-
-    /// Load `model` on-device on a dedicated loader thread, routing inference to a
-    /// fresh `LocalBackend` and driving the switch-progress UI. The caller is
-    /// responsible for any cloud-tier handling; this path is on-device only.
-    fn start_local_model_load<B: ratatui::backend::Backend>(
-        app: &mut App,
-        model: ModelPickerItem,
-        engine: Arc<ChatEngine>,
-        terminal: &mut ratatui::Terminal<B>,
-    ) {
-        if model.cache_health == ModelCacheHealth::Incomplete {
-            app.messages.push(ChatMessage::system(format!(
-                "error: {} has an incomplete local cache and cannot be selected yet.",
-                model.display_name
-            )));
+        // A tool waiting on y/a/n/d. Checked before the busy gate because the
+        // app *is* busy here: the turn is paused on the answer.
+        if app.permission.is_some() {
+            if quit_key {
+                // cancel the whole turn; `Cancelled` is what an unanswered
+                // request means to the agent
+                app.permission = None;
+                app.agent.cancel();
+            } else if let Some(kind) = permission_kind_for_key(key.code)
+                && let Some(prompt) = app.permission.take()
+            {
+                let verdict = match kind {
+                    PermissionOptionKind::AllowOnce => "allowed once",
+                    PermissionOptionKind::AllowAlways => "allowed for this session",
+                    PermissionOptionKind::RejectOnce => "denied",
+                    _ => "denied for this session",
+                };
+                app.say(format!("{}: {verdict}", prompt.title));
+                let _ = prompt
+                    .answer
+                    .send(permission_outcome(&prompt.options, kind));
+            }
             return;
         }
 
-        // Loading an on-device model puts us in local inference mode.
-        let _ = crate::settings::set_local_inference(true);
-
-        // Route inference on-device; the loader thread below fills the engine the
-        // LocalBackend reads from.
-        app.backend = Arc::new(LocalBackend::new(Arc::clone(&engine)));
-
-        let loading_msg = if model.cache_health == ModelCacheHealth::NotDownloaded {
-            format!(
-                "Downloading and loading {} ({})… this may take a few minutes.",
-                model.display_name, model.description
-            )
-        } else {
-            format!("Loading {}…", model.display_name)
-        };
-
-        app.messages.push(ChatMessage::system(loading_msg));
-        terminal.draw(|frame| render(frame, app)).ok();
-
-        let (tx, rx) = mpsc::channel(1);
-        app.model_load_rx = Some(rx);
-        app.switching_model = true;
-        app.switching_model_id = Some(model.config.model_id.clone());
-        // Only show download progress for models not yet cached.
-        app.download_progress = if model.cache_health == ModelCacheHealth::NotDownloaded {
-            Some((0, 0))
-        } else {
-            None
-        };
-
-        let sampling = SamplingConfig {
-            max_tokens: Some(model.max_tokens),
-            ..SamplingConfig::default()
-        };
-
-        // own thread + runtime so block_in_place doesn't starve the TUI loop.
-        // Fold in the launch directory and its project instruction files
-        // (AGENTS.md / CLAUDE.md) so the on-device model gets the same always-on
-        // context the cloud and ACP paths get.
-        let system_prompt =
-            crate::with_launch_context(&crate::system_prompt_for_model(model.tool_calling));
-        let engine_handle = Arc::clone(&engine);
-        let tool_calling = model.tool_calling;
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("failed to create model-loader runtime");
-            let update = rt.block_on(async move {
-                match engine_handle
-                    .load_gguf_model(
-                        model.config.clone(),
-                        Some(system_prompt.to_string()),
-                        Some(sampling),
-                    )
-                    .await
-                {
-                    Ok(_) => ModelLoadUpdate::Loaded(model.display_name.clone()),
-                    Err(err) => ModelLoadUpdate::Error(err.to_string()),
-                }
-            });
-            // capacity-1 channel, receiver alive while switching
-            let _ = tx.blocking_send(update);
-        });
-        // applied on ModelLoadUpdate::Loaded
-        app.pending_tool_calling = Some(tool_calling);
-    }
-
-    // ── Slash command execution ───────────────────────────────────────────────
-
-    async fn exec_slash<B: ratatui::backend::Backend>(
-        app: &mut App,
-        cmd: SlashCommand,
-        engine: Arc<ChatEngine>,
-        terminal: &mut ratatui::Terminal<B>,
-    ) {
-        match cmd {
-            SlashCommand::Help => {
-                app.messages.push(ChatMessage::system(
-                    "/help          — show this message\n\
-                     /models        — open the model picker\n\
-                     /models N      — switch to model N\n\
-                     /local [on|off]— toggle on-device inference mode\n\
-                     /skills        — list available Agent Skills\n\
-                     /agents        — list configured subagent types (.sigit/agents/*.md)\n\
-                     /commands      — list user-defined commands (.sigit/commands/*.md)\n\
-                     /mcp           — list MCP servers and their tools\n\
-                     /load          — load the selected on-device model\n\
-                     /login         — sign in via your browser\n\
-                     /login E P     — sign in with an email and password\n\
-                     /logout        — sign out\n\
-                     /whoami        — show the signed-in account\n\
-                     /plan [on|off] — plan mode: research only, no edits or commands\n\
-                     /permissions   — show the tool permission policy\n\
-                     /thinking [on|off] — expand or collapse model reasoning\n\
-                     /tools [on|off]— expand or collapse tool-call details\n\
-                     /compact       — summarize and shrink conversation history\n\
-                     /resume        — restore the saved session from disk\n\
-                     /init          — generate or improve the repo's AGENTS.md\n\
-                     /clear         — wipe conversation history\n\
-                     /status        — show engine status\n\
-                     /exit          — quit chat",
-                ));
-            }
-            SlashCommand::Clear => {
-                let cleared = engine.clear_history().await;
-                app.messages.clear();
-                crate::permissions::reset_session(crate::permissions::TUI_SESSION);
-                // The saved session must not resurrect what the user just wiped.
-                crate::session_store::delete(TUI_STORE_SESSION);
-                app.context_tokens_used = None;
-                app.messages.push(ChatMessage::system(format!(
-                    "Cleared {cleared} turn(s). History is empty.",
-                )));
-            }
-            SlashCommand::Compact => {
-                let before = crate::backend::estimate_tokens(&app.backend.history_snapshot().await);
-                match app
-                    .backend
-                    .compact_history(crate::backend::COMPACT_KEEP_LAST)
-                    .await
-                {
-                    Ok(()) => {
-                        let snapshot = app.backend.history_snapshot().await;
-                        let after = crate::backend::estimate_tokens(&snapshot);
-                        // Keep the saved session in step with the compacted state.
-                        if let Err(error) = crate::session_store::save(TUI_STORE_SESSION, &snapshot)
-                        {
-                            log::warn!("session save after /compact failed: {error}");
-                        }
-                        app.context_tokens_used = Some(after);
-                        app.messages.push(ChatMessage::system(format!(
-                            "Compacted history: ~{before} → ~{after} tokens (estimated)."
-                        )));
-                    }
-                    Err(error) => {
-                        app.messages
-                            .push(ChatMessage::system(format!("Compaction failed: {error}")));
-                    }
-                }
-            }
-            SlashCommand::Resume => match crate::session_store::load(TUI_STORE_SESSION) {
-                Some(history) if !history.is_empty() => {
-                    let restored = history.len();
-                    app.context_tokens_used = Some(crate::backend::estimate_tokens(&history));
-                    app.backend.restore_history(history).await;
-                    app.messages.push(ChatMessage::system(format!(
-                        "Restored {restored} message(s) from the saved session. \
-                         The model remembers the conversation; the scrollback above does not \
-                         replay it."
-                    )));
-                }
-                _ => {
-                    app.messages.push(ChatMessage::system(
-                        "No saved session to resume. Sessions are saved after each turn.",
-                    ));
-                }
-            },
-            SlashCommand::Plan(value) => {
-                use crate::permissions::{self, TUI_SESSION};
-                let enabled = value.unwrap_or_else(|| !permissions::plan_mode(TUI_SESSION));
-                permissions::set_plan_mode(TUI_SESSION, enabled);
-                app.messages.push(ChatMessage::system(if enabled {
-                    "Plan mode ON — research with read-only tools only; edits and commands \
-                     are blocked until /plan off."
-                } else {
-                    "Plan mode OFF — tools may execute again (subject to the permission \
-                     policy)."
-                }));
-            }
-            SlashCommand::Permissions => {
-                app.messages
-                    .push(ChatMessage::system(crate::permissions::describe(
-                        crate::permissions::TUI_SESSION,
-                    )));
-            }
-            SlashCommand::Thinking(value) => {
-                app.show_thinking = value.unwrap_or(!app.show_thinking);
-                app.messages.push(ChatMessage::system(if app.show_thinking {
-                    "Thinking display ON — model reasoning is shown above each reply."
-                } else {
-                    "Thinking display OFF — replies show a one-line indicator; \
-                     /thinking to expand."
-                }));
-            }
-            SlashCommand::Tools(value) => {
-                app.tools_expanded = value.unwrap_or(!app.tools_expanded);
-                app.messages
-                    .push(ChatMessage::system(if app.tools_expanded {
-                        "Tool calls expanded — /tools off to collapse them."
-                    } else {
-                        "Tool calls collapsed — /tools on to expand them."
-                    }));
-            }
-            SlashCommand::Status => {
-                let info = engine.as_ref().info().await;
-                let model = info.model_name.as_deref().unwrap_or("(none)");
-                let mem = info.approx_memory.as_deref().unwrap_or("unknown");
-                app.messages.push(ChatMessage::system(format!(
-                    "status: {:?}  model: {}  memory: {}  history: {} turns",
-                    info.status, model, mem, info.history_length,
-                )));
-            }
-            SlashCommand::Skills => {
-                app.messages
-                    .push(ChatMessage::system(crate::skills::format_skills_list()));
-            }
-            SlashCommand::Agents => {
-                app.messages.push(ChatMessage::system(
-                    crate::subagents::format_agent_types_list(),
-                ));
-            }
-            SlashCommand::Commands => {
-                app.messages
-                    .push(ChatMessage::system(crate::commands::format_commands_list()));
-            }
-            SlashCommand::Mcp => {
-                app.messages
-                    .push(ChatMessage::system(crate::mcp::status_summary()));
-            }
-            SlashCommand::Models(selection) => match selection {
-                None => {
-                    app.open_model_picker(&engine);
-                }
-                Some(n) => {
-                    let idx = n.saturating_sub(1);
-                    match app.model_picker_items.get(idx).cloned() {
-                        None => {
-                            app.messages.push(ChatMessage::system(format!(
-                                "error: no model #{n} — type /models to see the list."
-                            )));
-                        }
-                        Some(model) => {
-                            // ── siGit Code Cloud tier: no local load; sign-in gated ──
-                            if let Some(tier) = model.cloud_tier.clone() {
-                                app.close_model_picker();
-                                match crate::provider::cloud_tier_provider(&tier) {
-                                    Some(provider) => {
-                                        let system_prompt = crate::with_launch_context(
-                                            &crate::system_prompt_for_model(true),
-                                        );
-                                        app.backend = Arc::new(OpenAiBackend::new(
-                                            provider.base_url,
-                                            provider.api_key,
-                                            provider.model,
-                                            Some(system_prompt),
-                                        ));
-                                        app.current_model_name = provider.display_name.clone();
-                                        app.tool_calling = true;
-                                        // Selecting a cloud tier puts us in cloud mode.
-                                        let _ = crate::settings::set_local_inference(false);
-                                        app.messages.push(ChatMessage::system(format!(
-                                            "Switched to {}.",
-                                            provider.display_name
-                                        )));
-                                    }
-                                    None => {
-                                        app.messages.push(ChatMessage::system(
-                                            "siGit Code Cloud needs an account. Use \
-                                             `/login <email> <password>`, or create one at sigit.si.",
-                                        ));
-                                    }
-                                }
-                                return;
-                            }
-
-                            app.close_model_picker();
-                            start_local_model_load(app, model, Arc::clone(&engine), terminal);
-                        }
-                    }
-                }
-            },
-            SlashCommand::Local(value) => {
-                let enabled = value.unwrap_or(!crate::settings::local_inference_enabled());
-                match crate::settings::set_local_inference(enabled) {
-                    Ok(()) => {
-                        let state = if enabled { "on" } else { "off" };
-                        let hint = if enabled {
-                            "On-device models are highlighted. Type /models to pick one."
-                        } else {
-                            "siGit Code Cloud tiers are highlighted. Type /models to pick one."
-                        };
-                        app.messages.push(ChatMessage::system(format!(
-                            "Local inference is {state}. {hint}"
-                        )));
-                        // Refresh the picker so emphasis/order reflects the new mode.
-                        if app.show_model_picker {
-                            app.open_model_picker(&engine);
-                        }
-                    }
-                    Err(error) => {
-                        app.messages.push(ChatMessage::system(format!(
-                            "error: could not save local inference setting: {error}"
-                        )));
-                    }
-                }
-            }
-            SlashCommand::Load => match default_local_model_item(app) {
-                None => {
-                    app.messages.push(ChatMessage::system(
-                        "No local model available to load. Use /models to see the list.",
-                    ));
-                }
-                Some(model) => {
-                    start_local_model_load(app, model, Arc::clone(&engine), terminal);
-                }
-            },
-            SlashCommand::Login(arg) => {
-                let message = match arg.as_deref().and_then(crate::account::parse_login_args) {
-                    Some((email, password)) => {
-                        match crate::account::authenticate(&email, &password).await {
-                            Ok(email) => format!(
-                                "Signed in as {email}. siGit Code Cloud applies to your next session."
-                            ),
-                            Err(error) => format!("Login failed: {error}"),
-                        }
-                    }
-                    // A bare `/login` opens the browser instead of asking for
-                    // a password in the chat box.
-                    None => {
-                        app.messages.push(ChatMessage::system(
-                            "Opening your browser to sign in to siGit Code Cloud...",
-                        ));
-                        crate::browser_login_message().await
-                    }
-                };
-                app.messages.push(ChatMessage::system(message));
-            }
-            SlashCommand::Logout => {
-                let message = crate::account::end_session().await;
-                app.messages.push(ChatMessage::system(message));
-            }
-            SlashCommand::Whoami => {
-                let message = crate::account::status_line().await;
-                app.messages.push(ChatMessage::system(message));
-            }
-            SlashCommand::Init => {
-                // Handled in the input loop (it runs a real turn); reaching
-                // this arm means a caller forgot that special case.
-                app.messages
-                    .push(ChatMessage::system("Type /init in the chat to run it."));
-            }
-            SlashCommand::Exit => {
-                app.quit = true;
-            }
-            SlashCommand::Unknown(cmd, _) => {
-                app.messages.push(ChatMessage::system(format!(
-                    "unknown command: {cmd}. Type /commands to list user-defined commands."
-                )));
-            }
-        }
-    }
-
-    // ── Background inference task ─────────────────────────────────────────────
-
-    /// cap tool rounds so a confused model can't loop forever; auto-compaction
-    /// keeps long runs inside the context window, so the cap can be generous
-    const MAX_TOOL_ROUNDS: usize = 24;
-
-    /// The TUI is a single conversation, so it persists under one fixed
-    /// session-store id (ACP sessions use their protocol-assigned ids).
-    const TUI_STORE_SESSION: &str = "tui";
-
-    fn build_tool_specs() -> Vec<ToolSpec> {
-        let mut specs: Vec<ToolSpec> = crate::tools::all_tools()
-            .into_iter()
-            .map(|t| ToolSpec {
-                name: t.name.to_string(),
-                description: t.description.to_string(),
-                parameters_schema: t.parameters_schema.to_string(),
-            })
-            .collect();
-
-        // Advertise the Agent Skills `skill` tool only when skills exist on disk
-        // (https://agentskills.io). The tool description carries the discovery
-        // list (name + description) for progressive disclosure.
-        let discovered = crate::skills::discover_skills();
-        if !discovered.is_empty() {
-            specs.push(ToolSpec {
-                name: crate::skills::SKILL_TOOL_NAME.to_string(),
-                description: crate::skills::skill_tool_description(&discovered),
-                parameters_schema: crate::skills::skill_tool_schema().to_string(),
-            });
-        }
-
-        // Delegated research (`task`) is offered only when a subagent backend
-        // can actually be built — same conditional pattern as `skill` above.
-        if crate::tools::subagent_available() {
-            specs.push(crate::tools::task_tool_spec());
-        }
-
-        // `web_search` is a native wrapper around the official MCP server's
-        // `web_search` tool, offered only when that MCP tool was actually
-        // discovered (i.e. the user is signed in to siGit Code Cloud).
-        let web_search_offered = crate::tools::web_search_available();
-        if web_search_offered {
-            specs.push(crate::tools::web_search_tool_spec());
-        }
-
-        // Tools discovered from configured MCP servers (incl. the official
-        // one). Exclude the raw web_search delegate when the native wrapper
-        // above is already offered, so the model sees one clean option, not
-        // two names for the same tool.
-        specs.extend(crate::mcp::tool_specs().into_iter().filter(|spec| {
-            !(web_search_offered && crate::tools::is_web_search_delegate(&spec.name))
-        }));
-
-        specs
-    }
-
-    /// Close out a cancelled round in backend history: the results of tools
-    /// that already ran this round, plus cancellation notes for `unreached`
-    /// calls. Leaving a round's tool calls unanswered breaks strict
-    /// OpenAI-compatible endpoints on the session's next request.
-    async fn abandon_round(
-        backend: &dyn InferenceBackend,
-        mut tool_results: Vec<ToolResult>,
-        unreached: &[crate::backend::ToolCall],
-    ) {
-        for pending in unreached {
-            tool_results.push(ToolResult {
-                tool_call_id: pending.id.clone(),
-                content: format!(
-                    "`{}` was not executed: the user cancelled the turn.",
-                    pending.name
-                ),
-            });
-        }
-        backend.record_cancelled_tool_results(tool_results).await;
-    }
-
-    /// run the tool-calling loop off the main thread, posting updates via `tx`.
-    /// dropping `tx` signals completion to the event loop.
-    async fn run_inference_task(
-        backend: Arc<dyn InferenceBackend>,
-        text: String,
-        tx: mpsc::Sender<InferenceUpdate>,
-        tools_enabled: bool,
-    ) {
-        let tools = if tools_enabled {
-            build_tool_specs()
-        } else {
-            vec![]
-        };
-
-        // Bridge the backend's token sink onto the UI update channel as `Delta`
-        // messages. The forwarder lives for the whole turn. The TUI's
-        // `push_stream_delta` runs `strip_think_blocks` on its own buffer, so
-        // `Visible` chunks are forwarded raw (any inline `<think>` markers kept
-        // intact) while `Reasoning` chunks — which come from a dedicated field
-        // and carry no markers — are wrapped in `<think>…</think>` so the same
-        // splitter treats them as reasoning rather than visible reply text.
-        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<TokenChunk>();
-        let forward_tx = tx.clone();
-        let forwarder = tokio::spawn(async move {
-            while let Some(chunk) = delta_rx.recv().await {
-                let piece = match chunk {
-                    TokenChunk::Visible(text) => text,
-                    TokenChunk::Reasoning(text) => format!("<think>{text}</think>"),
-                };
-                if forward_tx
-                    .send(InferenceUpdate::Delta(piece))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        // The first round offers tools, so on-device inference can't stream it
-        // (it must buffer to detect tool calls). With tools disabled there are
-        // none to offer, so it streams directly.
-        let first_sink = if tools.is_empty() {
-            Some(&delta_tx)
-        } else {
-            None
-        };
-        let mut streamed = first_sink.is_some();
-
-        let mut result = match backend
-            .send_message_with_tools(&text, &tools, first_sink)
-            .await
-        {
-            Ok(r) => r,
-            Err(err) => {
-                let _ = tx.send(InferenceUpdate::Error(err)).await;
-                return;
-            }
-        };
-
-        let mut round = 0;
-
-        while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
-            // any tool call means the first round didn't produce a final answer
-            streamed = false;
-            round += 1;
-            log::info!("tool round {} — {} call(s)", round, result.tool_calls.len());
-
-            // Auto-compaction: long tool runs grow history fast; fold it into
-            // a summary before the next round rather than blowing the window.
-            let estimate = crate::backend::estimate_tokens(&backend.history_snapshot().await);
-            if estimate > crate::backend::DEFAULT_CONTEXT_TOKEN_BUDGET {
-                log::info!(
-                    "history ≈{estimate} tokens exceeds budget {} — compacting",
-                    crate::backend::DEFAULT_CONTEXT_TOKEN_BUDGET
-                );
-                match backend
-                    .compact_history(crate::backend::COMPACT_KEEP_LAST)
-                    .await
-                {
-                    Ok(()) => {
-                        let after =
-                            crate::backend::estimate_tokens(&backend.history_snapshot().await);
-                        log::info!("compacted history to ≈{after} tokens");
-                        let _ = tx.send(InferenceUpdate::ContextUsage(after)).await;
-                    }
-                    Err(error) => log::warn!("history compaction failed: {error}"),
-                }
-            }
-
-            let mut tool_results = Vec::new();
-
-            for (call_index, tc) in result.tool_calls.iter().enumerate() {
-                // The UI drops the receiver on Ctrl+C or quit. Stop the turn
-                // at the next boundary instead of burning model rounds (and
-                // possibly running granted tools) in the background.
-                if tx.is_closed() {
-                    log::info!("turn cancelled by the user — stopping the tool loop");
-                    abandon_round(&*backend, tool_results, &result.tool_calls[call_index..]).await;
-                    return;
-                }
-
-                log::info!(
-                    "  → {}({})",
-                    tc.name,
-                    tc.arguments.chars().take(120).collect::<String>()
-                );
-
-                let _ = tx
-                    .send(InferenceUpdate::ToolUse {
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                    })
-                    .await;
-
-                // Permission gate: read-only tools pass straight through; a
-                // mutating tool consults policy and may pause on the user's
-                // y/a/n/d answer (delivered over a oneshot from the event loop).
-                use crate::permissions::{self, Decision, TUI_SESSION};
-                let output = match permissions::decision_for(TUI_SESSION, &tc.name, &tc.arguments) {
-                    Decision::Allow => crate::tools::execute_tool(&tc.name, &tc.arguments).await,
-                    Decision::Deny(reason) => {
-                        log::info!("  ✗ {} denied by policy", tc.name);
-                        reason
-                    }
-                    Decision::Ask => {
-                        let (reply_tx, reply_rx) = oneshot::channel();
-                        let _ = tx
-                            .send(InferenceUpdate::ApprovalRequest {
-                                tool: tc.name.clone(),
-                                args: permissions::approval_preview(&tc.arguments),
-                                reply: reply_tx,
-                            })
-                            .await;
-                        match reply_rx.await {
-                            Ok(ApprovalChoice::Once) => {
-                                crate::tools::execute_tool(&tc.name, &tc.arguments).await
-                            }
-                            Ok(ApprovalChoice::Session) => {
-                                permissions::grant_for_session(
-                                    TUI_SESSION,
-                                    &tc.name,
-                                    &tc.arguments,
-                                );
-                                crate::tools::execute_tool(&tc.name, &tc.arguments).await
-                            }
-                            Ok(ApprovalChoice::Deny) => {
-                                log::info!("  ✗ {} denied by user", tc.name);
-                                permissions::user_denial(&tc.name)
-                            }
-                            Ok(ApprovalChoice::DenySession) => {
-                                log::info!("  ✗ {} denied by user for the session", tc.name);
-                                permissions::deny_for_session(TUI_SESSION, &tc.name, &tc.arguments);
-                                permissions::user_denial(&tc.name)
-                            }
-                            // The UI dropped the reply channel (Ctrl+C or
-                            // quit): the whole turn is over, not just this
-                            // call. Close out the round and stop instead of
-                            // continuing rounds in the background.
-                            Err(_) => {
-                                log::info!(
-                                    "turn cancelled at the approval prompt — stopping the tool loop"
-                                );
-                                abandon_round(
-                                    &*backend,
-                                    tool_results,
-                                    &result.tool_calls[call_index..],
-                                )
-                                .await;
-                                return;
-                            }
-                        }
-                    }
-                };
-                log::info!("  ← {} chars", output.len());
-
-                // Display-only preview of the output tail; the model gets the
-                // full output through `tool_results` below.
-                let _ = tx
-                    .send(InferenceUpdate::ToolDone {
-                        output_preview: super::cap_output_preview(&output),
-                    })
-                    .await;
-
-                tool_results.push(ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: output,
-                });
-            }
-
-            // Cancelled while the round's tools ran: record what executed and
-            // stop before paying for another model round nobody will see.
-            if tx.is_closed() {
-                log::info!("turn cancelled by the user — skipping the next model round");
-                abandon_round(&*backend, tool_results, &[]).await;
-                return;
-            }
-
-            // on the last round, pass no tools so the model must produce text —
-            // that's also the round we can stream on-device.
-            let allow_tool_calls = round < MAX_TOOL_ROUNDS;
-            let sink = if !allow_tool_calls {
-                streamed = true;
-                Some(&delta_tx)
-            } else {
-                None
-            };
-
-            match backend
-                .send_tool_results(tool_results, &tools, allow_tool_calls, sink)
-                .await
+        // ── Tab-bar navigation ────────────────────────────────────────────────
+        // Handled before the busy gate so the user can look at History/Cloud
+        // while a turn runs (updates keep landing in the Session tab's
+        // transcript). The Tab key only cycles when the input buffer is empty,
+        // so pasted text containing tabs can't fight it; on non-Session tabs
+        // the input is hidden, so it always cycles there.
+        if app.picker.is_none() {
+            if key.code == KeyCode::Tab && (app.active_tab != Tab::Session || app.input.is_empty())
             {
-                Ok(r) => result = r,
-                Err(err) => {
-                    let _ = tx.send(InferenceUpdate::Error(err)).await;
-                    return;
+                let next = app.active_tab.next(app.repo_visible());
+                switch_tab(app, next);
+                return;
+            }
+            if app.active_tab != Tab::Session && key.code == KeyCode::Esc {
+                // On the Repo tab, Esc first closes an open detail view (back
+                // to the list).
+                if app.active_tab == Tab::Repo && app.repo_detail.is_some() {
+                    app.repo_detail = None;
+                } else {
+                    app.active_tab = Tab::Session;
                 }
+                return;
             }
         }
 
-        // Drop the sink so the forwarder finishes draining any buffered tokens
-        // before we commit the reply.
-        drop(delta_tx);
-        let _ = forwarder.await;
-
-        if result.tool_calls.is_empty() {
-            if result.text.is_empty() {
-                log::warn!(
-                    "model returned empty reply — may have exhausted max_tokens on thinking"
-                );
-                let _ = tx
-                    .send(InferenceUpdate::Error(
-                        "(empty response — the model may have used all tokens on internal reasoning. \
-                         Try a shorter or simpler prompt.)"
-                            .to_string(),
-                    ))
-                    .await;
-            } else if streamed {
-                // tokens already went out as deltas; just commit the buffer
-                let _ = tx.send(InferenceUpdate::StreamEnd).await;
-            } else {
-                let _ = tx.send(InferenceUpdate::Response(result.text)).await;
+        // busy — only the cancel keys work
+        if app.is_busy() {
+            if quit_key || key.code == KeyCode::Esc {
+                cancel_busy(app);
             }
+            return;
         }
 
-        // Persist the completed turn so /resume (or a restart) can pick the
-        // conversation back up.
-        let snapshot = backend.history_snapshot().await;
-        let _ = tx
-            .send(InferenceUpdate::ContextUsage(
-                crate::backend::estimate_tokens(&snapshot),
-            ))
-            .await;
-        if let Err(error) = crate::session_store::save(TUI_STORE_SESSION, &snapshot) {
-            log::warn!("session save failed: {error}");
+        // History / Repo / Cloud have their own key handling; the chat input is
+        // inactive there.
+        if app.active_tab != Tab::Session {
+            handle_tab_key(app, key);
+            return;
         }
 
-        log::info!("inference complete — {} tool round(s)", round);
-        // tx drops here — event loop gets None from rx.recv()
+        if let Some(text) = handle_key(app, key) {
+            submit(app, text);
+        }
+    }
+
+    /// Ctrl+C / Esc while the agent is working. A turn stays busy until the
+    /// agent answers it, so the transcript and the server agree on what
+    /// happened; waiting for a model switch is given up on the spot.
+    fn cancel_busy(app: &mut App) {
+        if app.config_inflight {
+            app.agent.cancel_config();
+            app.config_inflight = false;
+            app.model_request = None;
+            app.say(
+                "(stopped waiting — the model keeps loading in the background and you will \
+                 be told when it is ready; chat continues on the previous backend)",
+            );
+        }
+        if app.turn_active {
+            app.agent.cancel();
+        }
+    }
+
+    /// An input line: the few commands only this client knows are handled
+    /// here, everything else goes to the agent as a prompt.
+    fn submit(app: &mut App, text: String) {
+        match parse_local(&text) {
+            Some(LocalCommand::Exit) => app.quit = true,
+            Some(LocalCommand::Thinking(value)) => {
+                app.show_thinking = value.unwrap_or(!app.show_thinking);
+                let state = if app.show_thinking { "shown" } else { "hidden" };
+                app.say(format!("Model reasoning is now {state}."));
+            }
+            Some(LocalCommand::Tools(value)) => {
+                app.tools_expanded = value.unwrap_or(!app.tools_expanded);
+                let state = if app.tools_expanded {
+                    "expanded"
+                } else {
+                    "collapsed"
+                };
+                app.say(format!("Tool-call entries are now {state}."));
+            }
+            Some(LocalCommand::Models) => app.open_model_picker(),
+            Some(LocalCommand::Resume) => {
+                app.resume_pending = true;
+                app.refresh_history();
+            }
+            None => send_prompt(app, text),
+        }
+    }
+
+    fn send_prompt(app: &mut App, text: String) {
+        app.chat.messages.push(ChatMessage::user(&text));
+        if text.trim() == "/help" {
+            app.help_pending = true;
+        }
+        app.turn_active = true;
+        app.chat.thinking = true;
+        app.agent.prompt(text);
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
 
-    /// entry point — blocks until the user quits.
-    /// caller owns terminal init/restore. `load_rx` delivers the model-load result
-    /// from a dedicated OS thread; we poll it non-blocking each tick.
+    /// entry point — blocks until the user quits. The caller owns terminal
+    /// init/restore.
     pub async fn run_with<B: ratatui::backend::Backend>(
         terminal: &mut ratatui::Terminal<B>,
-        engine: Arc<ChatEngine>,
-        backend: Arc<dyn InferenceBackend>,
-        load_rx: std_mpsc::Receiver<Result<(), String>>,
-        load_model_name: String,
     ) -> Result<()>
     where
         // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
         // to be thread-safe.
         B::Error: Send + Sync + 'static,
     {
-        event_loop(terminal, engine, backend, load_rx, load_model_name).await
+        let mut startup = Startup::new();
+        terminal.draw(|frame| render_startup(frame, &startup))?;
+
+        let cwd = std::env::current_dir()?;
+        let mut running = false;
+        let outcome = acp_client::connect(vec![cwd], async |agent, started, agent_rx| {
+            running = true;
+            let mut app = App::new(agent, started);
+            event_loop(terminal, &mut app, agent_rx).await
+        })
+        .await;
+
+        match outcome {
+            Err(error) if !running => {
+                // The agent never came up: keep the reason on screen.
+                startup.error = Some(format!("{error:#}"));
+                show_startup_error(terminal, &mut startup).await
+            }
+            other => other,
+        }
+    }
+
+    /// Hold the startup failure on screen until the user quits.
+    async fn show_startup_error<B: ratatui::backend::Backend>(
+        terminal: &mut ratatui::Terminal<B>,
+        startup: &mut Startup,
+    ) -> Result<()>
+    where
+        B::Error: Send + Sync + 'static,
+    {
+        let mut event_stream = EventStream::new();
+        loop {
+            terminal.draw(|frame| render_startup(frame, startup))?;
+            let Some(Ok(event)) = event_stream.next().await else {
+                return Ok(());
+            };
+            if let Event::Key(key) = event
+                && key.kind == KeyEventKind::Press
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c' | 'd'))
+            {
+                return Ok(());
+            }
+        }
     }
 
     async fn event_loop<B: ratatui::backend::Backend>(
         terminal: &mut ratatui::Terminal<B>,
-        engine: Arc<ChatEngine>,
-        backend: Arc<dyn InferenceBackend>,
-        load_rx: std_mpsc::Receiver<Result<(), String>>,
-        load_model_name: String,
+        app: &mut App,
+        mut agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) -> Result<()>
     where
-        // ratatui 0.30 gives each backend its own error type; `?` into anyhow needs it
-        // to be thread-safe.
         B::Error: Send + Sync + 'static,
     {
-        let mut app = App::new(load_model_name, backend);
         let mut event_stream = EventStream::new();
 
-        // 10 fps is plenty for spinners
-        let mut ticker = interval(Duration::from_millis(100));
-
         loop {
-            // ── Poll the loader channel (non-blocking) ────────────────────────
-            if app.is_loading {
-                match load_rx.try_recv() {
-                    Ok(Ok(())) => app.finish_loading(),
-                    Ok(Err(e)) => app.set_load_error(e),
-                    Err(std_mpsc::TryRecvError::Empty) => {}
-                    Err(std_mpsc::TryRecvError::Disconnected) => {
-                        app.set_load_error("Model loader thread crashed.".to_string());
-                    }
-                }
-            }
-
             // redraw every iteration
-            terminal.draw(|frame| render(frame, &mut app))?;
-
-            if let Some(rx) = app.model_load_rx.as_mut() {
-                match rx.try_recv() {
-                    Ok(ModelLoadUpdate::Loaded(model_name)) => {
-                        engine.clear_history().await;
-                        app.context_tokens_used = None;
-                        if let Some(tc) = app.pending_tool_calling.take() {
-                            app.tool_calling = tc;
-                        }
-                        app.switching_model = false;
-                        app.switching_model_id = None;
-                        app.download_progress = None;
-                        app.model_load_cancelled = false;
-                        app.model_load_rx = None;
-                        app.current_model_name = model_name.clone();
-
-                        let save_result = app
-                            .model_picker_items
-                            .iter()
-                            .find(|item| item.display_name == model_name)
-                            .map(|item| crate::setup::SelectedModel {
-                                model_id: item.config.model_id.clone(),
-                                gguf_file: item
-                                    .config
-                                    .files
-                                    .first()
-                                    .cloned()
-                                    .unwrap_or_else(String::new),
-                            })
-                            .filter(|selected| !selected.gguf_file.is_empty())
-                            .map(|selected| crate::setup::save_selected_model(&selected))
-                            .unwrap_or_else(|| {
-                                Err(format!(
-                                    "could not determine a stable identifier for {}",
-                                    model_name
-                                ))
-                            });
-
-                        if let Err(error) = save_result {
-                            app.messages.push(ChatMessage::system(format!(
-                                "warning: switched to {} but could not save the selection: {}",
-                                model_name, error
-                            )));
-                        } else {
-                            app.messages
-                                .push(ChatMessage::system(format!("✓ Switched to {}", model_name)));
-                        }
-                    }
-                    Ok(ModelLoadUpdate::Error(error)) => {
-                        app.switching_model = false;
-                        app.switching_model_id = None;
-                        app.download_progress = None;
-                        app.model_load_cancelled = false;
-                        app.model_load_rx = None;
-                        app.messages
-                            .push(ChatMessage::system(format!("error loading model: {error}")));
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        let was_cancelled = app.model_load_cancelled;
-                        app.switching_model = false;
-                        app.switching_model_id = None;
-                        app.download_progress = None;
-                        app.model_load_cancelled = false;
-                        app.model_load_rx = None;
-                        if !was_cancelled {
-                            app.messages.push(ChatMessage::system(
-                                "error loading model: loader task disconnected".to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
+            terminal.draw(|frame| render(frame, app))?;
 
             if app.quit {
                 break;
             }
 
-            // multiplex terminal events, streaming tokens, inference updates,
-            // and the thinking-spinner timer.
+            let animate = app.is_busy() || app.chat.thinking;
+
+            // multiplex terminal events, the agent's updates, the tab fetches,
+            // and the spinner timer.
             tokio::select! {
-                biased;
-
-                // ── Spinner tick (loading phase only) ─────────────────────────
-                _ = ticker.tick(), if app.is_loading => {
-                    app.tick();
-                }
-
-                // ── inference updates from background task ───────────────────
-                update = async {
-                    match app.inference_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => pending().await,
-                    }
-                } => {
-                    match update {
-                        Some(InferenceUpdate::ToolUse { name, arguments }) => {
-                            let title = super::tool_title(&name, &arguments);
-                            let detail = super::pretty_tool_arguments(&arguments);
-                            app.messages.push(ChatMessage::tool_call(title, detail));
-                        }
-                        Some(InferenceUpdate::ToolDone { output_preview }) => {
-                            // Attach to the most recent tool entry still
-                            // waiting for its result.
-                            if let Some(entry) = app
-                                .messages
-                                .iter_mut()
-                                .rev()
-                                .find(|m| m.role == Role::Tool && m.tool_result.is_none())
-                            {
-                                entry.tool_result = Some(output_preview);
-                            }
-                        }
-                        Some(InferenceUpdate::Delta(delta)) => {
-                            app.push_stream_delta(&delta);
-                        }
-                        Some(InferenceUpdate::StreamEnd) => {
-                            app.finalize_stream();
-                        }
-                        Some(InferenceUpdate::Response(text)) => {
-                            app.stop_thinking();
-                            app.messages.push(ChatMessage::assistant(text));
-                        }
-                        Some(InferenceUpdate::ContextUsage(tokens)) => {
-                            app.context_tokens_used = Some(tokens);
-                        }
-                        Some(InferenceUpdate::Error(msg)) => {
-                            app.finalize_stream();
-                            app.stop_thinking();
-                            app.messages.push(ChatMessage::system(format!("error: {msg}")));
-                        }
-                        Some(InferenceUpdate::ApprovalRequest { tool, args, reply }) => {
-                            // The y/a/n/d prompt lives on the Session tab; make
-                            // sure the user can see what they're answering.
-                            app.active_tab = Tab::Session;
-                            let call = if args.is_empty() {
-                                tool.clone()
-                            } else {
-                                format!("{tool}({args})")
-                            };
-                            app.messages.push(ChatMessage::system(format!(
-                                "⚠ permission — allow {call}?  [y]es · [a]lways this session · [n]o · [d]eny this session"
-                            )));
-                            app.pending_approval = Some((tool, reply));
-                        }
-                        None => {
-                            // task finished, possibly with no text to show
-                            app.finalize_stream();
-                            app.stop_thinking();
-                        }
+                // ── the agent ─────────────────────────────────────────────────
+                event = agent_rx.recv() => {
+                    match event {
+                        Some(event) => handle_agent_event(app, event),
+                        None => break,
                     }
                 }
 
@@ -3681,19 +3374,15 @@ mod tui {
                     }
                 }
 
-                // ── thinking / switching spinner tick (100ms) ────────────────
+                // ── spinner tick (100ms) ──────────────────────────────────────
                 _ = async {
-                    if app.thinking || app.switching_model {
+                    if animate {
                         tokio::time::sleep(Duration::from_millis(100)).await
                     } else {
                         pending().await
                     }
                 } => {
                     app.tick_thinking();
-                    // keep the progress display fresh
-                    if app.switching_model {
-                        app.poll_download_progress();
-                    }
                 }
 
                 // ── Terminal events ───────────────────────────────────────────
@@ -3701,209 +3390,11 @@ mod tui {
                     let Some(Ok(event)) = maybe_event else {
                         break;
                     };
-
-                    if let Event::Key(key) = event {
-                        // loading phase — only quit keys work
-                        if app.is_loading {
-                            if key.kind == KeyEventKind::Press {
-                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                if ctrl
-                                    && (key.code == KeyCode::Char('c')
-                                        || key.code == KeyCode::Char('d'))
-                                {
-                                    app.quit = true;
-                                }
-                            }
-                            continue;
-                        }
-
-                        // pending tool approval — y/a/n/d answer the prompt; the
-                        // inference task is paused on the reply channel. Checked
-                        // before the busy gate because the app *is* busy here.
-                        if app.pending_approval.is_some() {
-                            if key.kind == KeyEventKind::Press {
-                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                let choice = if ctrl
-                                    && (key.code == KeyCode::Char('c')
-                                        || key.code == KeyCode::Char('d'))
-                                {
-                                    // cancel the whole turn: denying is implicit
-                                    // in dropping the reply channel
-                                    app.pending_approval = None;
-                                    app.stop_thinking();
-                                    app.messages.push(ChatMessage::system("(cancelled)"));
-                                    continue;
-                                } else {
-                                    match key.code {
-                                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                            Some(ApprovalChoice::Once)
-                                        }
-                                        KeyCode::Char('a') | KeyCode::Char('A') => {
-                                            Some(ApprovalChoice::Session)
-                                        }
-                                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                            Some(ApprovalChoice::Deny)
-                                        }
-                                        KeyCode::Char('d') | KeyCode::Char('D') => {
-                                            Some(ApprovalChoice::DenySession)
-                                        }
-                                        _ => None,
-                                    }
-                                };
-                                if let Some(choice) = choice
-                                    && let Some((tool, reply)) = app.pending_approval.take()
-                                {
-                                    let verdict = match &choice {
-                                        ApprovalChoice::Once => "allowed once",
-                                        ApprovalChoice::Session => "allowed for this session",
-                                        ApprovalChoice::Deny => "denied",
-                                        ApprovalChoice::DenySession => "denied for this session",
-                                    };
-                                    app.messages.push(ChatMessage::system(format!(
-                                        "{tool}: {verdict}"
-                                    )));
-                                    let _ = reply.send(choice);
-                                }
-                            }
-                            continue;
-                        }
-
-                        // ── Tab-bar navigation ────────────────────────────────
-                        // Handled before the busy gate so the user can look at
-                        // History/Cloud while inference runs (updates keep
-                        // landing in the Session tab's message list). The Tab
-                        // key only cycles when the input buffer is empty, so
-                        // pasted text containing tabs can't fight it; on
-                        // non-Session tabs the input is hidden, so it always
-                        // cycles there.
-                        if key.kind == KeyEventKind::Press && !app.show_model_picker {
-                            if key.code == KeyCode::Tab
-                                && (app.active_tab != Tab::Session || app.input.is_empty())
-                            {
-                                let next = app.active_tab.next(app.repo_visible());
-                                switch_tab(&mut app, next, &engine);
-                                continue;
-                            }
-                            if app.active_tab != Tab::Session && key.code == KeyCode::Esc {
-                                // On the Repo tab, Esc first closes an open
-                                // detail view (back to the list).
-                                if app.active_tab == Tab::Repo && app.repo_detail.is_some() {
-                                    app.repo_detail = None;
-                                } else {
-                                    app.active_tab = Tab::Session;
-                                }
-                                continue;
-                            }
-                        }
-
-                        // busy — only cancel keys work
-                        if app.is_busy() {
-                            if key.kind == KeyEventKind::Press {
-                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                if ctrl && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d')) {
-                                    if app.is_streaming() {
-                                        app.finalize_stream();
-                                        app.messages.push(ChatMessage::system("(cancelled)"));
-                                    }
-                                    if app.thinking {
-                                        // dropping rx kills the background task
-                                        app.stop_thinking();
-                                        app.messages.push(ChatMessage::system("(cancelled)"));
-                                    }
-                                    if app.switching_model {
-                                        // flag before drop so Disconnected handler stays quiet
-                                        app.model_load_cancelled = true;
-                                        app.switching_model = false;
-                                        app.switching_model_id = None;
-                                        app.download_progress = None;
-                                        app.model_load_rx = None;
-                                        app.messages
-                                            .push(ChatMessage::system("(download cancelled — model switch aborted)"));
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-
-                        // History / Cloud tabs have their own key handling; the
-                        // chat input is inactive there.
-                        if app.active_tab != Tab::Session {
-                            if key.kind == KeyEventKind::Press {
-                                handle_tab_key(&mut app, key, &engine).await;
-                            }
-                            continue;
-                        }
-
-                        if let Some(text) = handle_key(&mut app, key) {
-                            // `/init` runs a real agent turn: the transcript
-                            // shows the command the user typed, but the model
-                            // receives the canned AGENTS.md-generation prompt.
-                            // User-defined commands (`.sigit/commands/*.md`)
-                            // get the same treatment once `parse_slash`
-                            // reports the word unrecognized.
-                            let mut inference_text = text.clone();
-                            match parse_slash(&text) {
-                                Some(SlashCommand::Init) => {
-                                    inference_text =
-                                        crate::instructions::INIT_PROMPT.to_string();
-                                }
-                                Some(SlashCommand::Unknown(command, argument)) => {
-                                    match crate::commands::resolve_command(&command) {
-                                        Some(custom) => {
-                                            inference_text = crate::commands::render(
-                                                &custom.body,
-                                                argument.as_deref(),
-                                            );
-                                        }
-                                        None => {
-                                            exec_slash(
-                                                &mut app,
-                                                SlashCommand::Unknown(command, argument),
-                                                Arc::clone(&engine),
-                                                terminal,
-                                            )
-                                            .await;
-                                            continue;
-                                        }
-                                    }
-                                }
-                                Some(cmd) => {
-                                    exec_slash(&mut app, cmd, Arc::clone(&engine), terminal)
-                                        .await;
-                                    continue;
-                                }
-                                None => {}
-                            }
-
-                            // On-device inference needs a model in memory, and we
-                            // never load one implicitly: the user loads it with
-                            // /load (or /models). Refuse rather than erroring out
-                            // deep in the backend.
-                            if !app.backend.is_remote()
-                                && engine.info().await.status == onde::inference::EngineStatus::Unloaded
-                            {
-                                app.messages.push(ChatMessage::user(&text));
-                                app.messages.push(ChatMessage::system(
-                                    "No on-device model is loaded. Run /load to load the selected \
-                                     model, or /models to choose one.",
-                                ));
-                                continue;
-                            }
-
-                            // ── spawn inference ──────────────────────────────
-                            app.messages.push(ChatMessage::user(&text));
-                            app.start_thinking();
-
-                            let (tx, rx) = mpsc::channel::<InferenceUpdate>(64);
-                            app.inference_rx = Some(rx);
-
-                            let backend_handle = Arc::clone(&app.backend);
-                            let user_text = inference_text;
-                            let tools_enabled = app.tool_calling;
-                            tokio::spawn(async move {
-                                run_inference_task(backend_handle, user_text, tx, tools_enabled).await;
-                            });
-                        }
+                    // Windows reports both Press and Release; only a press acts.
+                    if let Event::Key(key) = event
+                        && key.kind == KeyEventKind::Press
+                    {
+                        handle_terminal_key(app, key);
                     }
                 }
             }
@@ -3912,41 +3403,8 @@ mod tui {
         Ok(())
     }
 
-    // ── Download progress helpers (TUI) ──────────────────────────────────────
-
-    /// total bytes under `path`, following symlinks (hf-hub uses blobs + symlinks)
-    fn dir_size_recursive(path: &std::path::Path) -> u64 {
-        let mut total: u64 = 0;
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return 0;
-        };
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                total += dir_size_recursive(&entry_path);
-            } else if let Ok(meta) = entry_path.metadata() {
-                total += meta.len();
-            }
-        }
-        total
-    }
-
-    fn format_size_human(bytes: u64) -> String {
-        const GB: u64 = 1_073_741_824;
-        const MB: u64 = 1_048_576;
-        const KB: u64 = 1_024;
-        if bytes >= GB {
-            format!("{:.2} GB", bytes as f64 / GB as f64)
-        } else if bytes >= MB {
-            format!("{:.1} MB", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.0} KB", bytes as f64 / KB as f64)
-        } else {
-            format!("{bytes} B")
-        }
-    }
     #[cfg(test)]
-    mod tui_tests {
+    mod gauge_tests {
         use super::{compact_tokens, context_gauge_color, context_gauge_label};
         use ratatui::style::Color;
 
@@ -3977,23 +3435,524 @@ mod tui {
             assert_eq!(compact_tokens(1_500), "1K");
         }
     }
-} // end #[cfg(unix)] mod tui
 
-// re-export so callers write `chat::run_with(...)` on all platforms
-#[cfg(unix)]
+    // ── Behaviour tests ───────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod behaviour_tests {
+        use agent_client_protocol::schema::v1::{
+            ContentChunk, Diff, MessageId, PermissionOption, PermissionOptionId,
+            PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+            RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
+            SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionUpdate, StopReason,
+            ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+            UsageUpdate,
+        };
+        use crossterm::event::KeyCode;
+
+        use super::{
+            AgentError, Chat, LocalCommand, Role, diff_preview, parse_local,
+            permission_kind_for_key, permission_notice, permission_outcome, picker_rows,
+            session_row, session_when, stop_notice, turn_error_text,
+        };
+
+        fn text_chunk(text: &str, id: &str) -> ContentChunk {
+            ContentChunk::new(text.into()).message_id(MessageId::new(id))
+        }
+
+        fn agent_chunk(chat: &mut Chat, text: &str, id: &str) {
+            chat.apply_update(SessionUpdate::AgentMessageChunk(text_chunk(text, id)));
+        }
+
+        fn model_option(current: &str) -> SessionConfigOption {
+            SessionConfigOption::select(
+                crate::MODEL_CONFIG_ID,
+                "Model",
+                SessionConfigValueId::new(current),
+                vec![
+                    SessionConfigSelectOption::new(
+                        SessionConfigValueId::new("onde/qwen"),
+                        "Qwen 3B - 32K [Onde]",
+                    )
+                    .description("tool calling - 32K context - download on select"),
+                    SessionConfigSelectOption::new(
+                        SessionConfigValueId::new("onde/small"),
+                        "Small 1B - 8K [Onde]",
+                    )
+                    .description("8K context"),
+                    SessionConfigSelectOption::new(
+                        SessionConfigValueId::new("sigit-cloud:balanced"),
+                        "Balanced - 200K",
+                    )
+                    .description("tool calling - 200K context"),
+                ],
+            )
+        }
+
+        // ── updates → transcript ──────────────────────────────────────────────
+
+        #[test]
+        fn chunks_with_one_message_id_are_one_message() {
+            let mut chat = Chat::new();
+            agent_chunk(&mut chat, "Hel", "m1");
+            agent_chunk(&mut chat, "lo", "m1");
+            chat.finalize_stream();
+            assert_eq!(chat.messages.len(), 1);
+            assert_eq!(chat.messages[0].role, Role::Assistant);
+            assert_eq!(chat.messages[0].text, "Hello");
+        }
+
+        #[test]
+        fn a_new_message_id_starts_a_new_message() {
+            let mut chat = Chat::new();
+            agent_chunk(&mut chat, "first", "m1");
+            agent_chunk(&mut chat, "second", "m2");
+            chat.finalize_stream();
+            let texts: Vec<_> = chat.messages.iter().map(|m| m.text.as_str()).collect();
+            assert_eq!(texts, ["first", "second"]);
+        }
+
+        #[test]
+        fn thought_chunks_become_a_think_block_on_the_reply() {
+            let mut chat = Chat::new();
+            chat.apply_update(SessionUpdate::AgentThoughtChunk(text_chunk("hmm, ", "m1")));
+            chat.apply_update(SessionUpdate::AgentThoughtChunk(text_chunk(
+                "the file", "m1",
+            )));
+            agent_chunk(&mut chat, "Done.", "m1");
+            chat.finalize_stream();
+            assert_eq!(chat.messages.len(), 1);
+            assert_eq!(chat.messages[0].text, "Done.");
+            assert_eq!(
+                chat.messages[0].think_block.as_deref(),
+                Some("hmm, the file")
+            );
+        }
+
+        #[test]
+        fn reasoning_alone_keeps_the_thinking_spinner_up() {
+            let mut chat = Chat::new();
+            chat.apply_update(SessionUpdate::AgentThoughtChunk(text_chunk(
+                "pondering",
+                "m1",
+            )));
+            assert!(chat.thinking);
+            assert!(chat.visible_stream().is_empty());
+            agent_chunk(&mut chat, "Answer", "m1");
+            assert!(!chat.thinking);
+        }
+
+        #[test]
+        fn replayed_user_text_is_a_user_message() {
+            let mut chat = Chat::new();
+            chat.apply_update(SessionUpdate::UserMessageChunk(text_chunk("fix it", "u1")));
+            assert_eq!(chat.messages.len(), 1);
+            assert_eq!(chat.messages[0].role, Role::User);
+            assert_eq!(chat.messages[0].text, "fix it");
+        }
+
+        #[test]
+        fn a_tool_call_and_its_updates_meet_by_id() {
+            let mut chat = Chat::new();
+            agent_chunk(&mut chat, "Let me look.", "m1");
+            chat.apply_update(SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "run_command · ls")
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::json!({ "command": "ls" })),
+            ));
+            // The reply before the call is kept, the call follows it.
+            assert_eq!(chat.messages.len(), 2);
+            assert_eq!(chat.messages[1].role, Role::Tool);
+            assert_eq!(chat.messages[1].status, Some(ToolCallStatus::InProgress));
+            assert!(
+                chat.messages[1]
+                    .tool_detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("\"command\"")
+            );
+
+            chat.apply_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "call-1",
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .title("run_command · ls (done)")
+                    .content(vec!["Cargo.toml\nsrc".into()]),
+            )));
+            assert_eq!(chat.messages.len(), 2);
+            let entry = &chat.messages[1];
+            assert_eq!(entry.status, Some(ToolCallStatus::Completed));
+            assert_eq!(entry.text, "run_command · ls (done)");
+            assert_eq!(entry.tool_result.as_deref(), Some("Cargo.toml\nsrc"));
+        }
+
+        #[test]
+        fn an_update_for_an_unknown_call_is_dropped() {
+            let mut chat = Chat::new();
+            chat.apply_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "ghost",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Failed),
+            )));
+            assert!(chat.messages.is_empty());
+        }
+
+        #[test]
+        fn a_diff_in_a_tool_update_shows_a_short_preview() {
+            let diff = Diff::new("src/lib.rs", "let a = 2;\nlet b = 3;").old_text("let a = 1;");
+            let preview = diff_preview(&diff);
+            assert_eq!(
+                preview,
+                "src/lib.rs\n- let a = 1;\n+ let a = 2;\n+ let b = 3;"
+            );
+
+            let mut chat = Chat::new();
+            chat.apply_update(SessionUpdate::ToolCall(ToolCall::new(
+                "c",
+                "edit_file · src/lib.rs",
+            )));
+            chat.apply_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "c",
+                ToolCallUpdateFields::new().content(vec![ToolCallContent::Diff(diff)]),
+            )));
+            assert_eq!(
+                chat.messages[0].tool_result.as_deref(),
+                Some(preview.as_str())
+            );
+        }
+
+        #[test]
+        fn a_long_diff_is_cut_with_a_count() {
+            let new_text = (1..=10)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let preview = diff_preview(&Diff::new("big.txt", new_text));
+            assert!(preview.contains("+ line 6"));
+            assert!(!preview.contains("+ line 7"));
+            assert!(preview.ends_with("+ … (+4 more lines)"));
+        }
+
+        #[test]
+        fn the_plan_is_one_entry_replaced_in_place() {
+            let plan = |status| {
+                Plan::new(vec![
+                    PlanEntry::new("write tests", PlanEntryPriority::High, status),
+                    PlanEntry::new("ship", PlanEntryPriority::Low, PlanEntryStatus::Pending),
+                ])
+            };
+            let mut chat = Chat::new();
+            chat.apply_update(SessionUpdate::Plan(plan(PlanEntryStatus::Pending)));
+            agent_chunk(&mut chat, "working", "m1");
+            chat.apply_update(SessionUpdate::Plan(plan(PlanEntryStatus::Completed)));
+            chat.finalize_stream();
+
+            let plans: Vec<_> = chat
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Plan)
+                .collect();
+            assert_eq!(plans.len(), 1);
+            assert!(plans[0].text.contains("☑ write tests"));
+            assert!(plans[0].text.contains("☐ ship"));
+        }
+
+        #[test]
+        fn usage_drives_the_context_gauge() {
+            let mut chat = Chat::new();
+            chat.apply_update(SessionUpdate::UsageUpdate(UsageUpdate::new(1_200, 32_000)));
+            assert_eq!(chat.context, Some((1_200, 32_000)));
+        }
+
+        #[test]
+        fn config_options_drive_the_model_label_and_flags() {
+            let mut chat = Chat::new();
+            assert_eq!(chat.model_label(), "siGit Code");
+
+            chat.config_options = vec![model_option("onde/qwen")];
+            // On-device, and nothing has finished loading yet.
+            assert_eq!(chat.model_label(), "Qwen 3B - 32K [Onde] (not loaded)");
+            assert!(chat.tool_calling());
+            assert!(!chat.on_cloud());
+
+            chat.config_options = vec![model_option("onde/small")];
+            assert!(!chat.tool_calling());
+
+            chat.config_options = vec![model_option("sigit-cloud:balanced")];
+            assert_eq!(chat.model_label(), "Balanced - 200K");
+            assert!(chat.on_cloud());
+        }
+
+        #[test]
+        fn a_finished_load_card_clears_not_loaded() {
+            let mut chat = Chat::new();
+            chat.config_options = vec![model_option("onde/qwen")];
+            chat.apply_update(SessionUpdate::ToolCall(
+                ToolCall::new("model-load-1", "Loading Qwen").status(ToolCallStatus::InProgress),
+            ));
+            assert!(chat.model_label().ends_with("(not loaded)"));
+            chat.apply_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "model-load-1",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )));
+            assert_eq!(chat.model_label(), "Qwen 3B - 32K [Onde]");
+        }
+
+        #[test]
+        fn the_picker_groups_by_the_cloud_prefix_and_marks_the_current_row() {
+            let rows = picker_rows(&[model_option("sigit-cloud:balanced")]);
+            assert_eq!(rows.len(), 3);
+            assert!(!rows[0].cloud && !rows[1].cloud && rows[2].cloud);
+            assert_eq!(rows.iter().filter(|r| r.current).count(), 1);
+            assert!(rows[2].current);
+            assert!(rows[0].description.contains("download on select"));
+        }
+
+        #[test]
+        fn a_session_switch_keeps_the_options_but_not_the_conversation() {
+            let mut chat = Chat::new();
+            chat.config_options = vec![model_option("onde/qwen")];
+            chat.local_loaded = true;
+            agent_chunk(&mut chat, "old", "m1");
+            chat.finalize_stream();
+            let old = chat.fresh_transcript();
+            assert_eq!(old.messages.len(), 1);
+            assert!(chat.messages.is_empty());
+            assert!(chat.local_loaded);
+            assert_eq!(chat.config_options.len(), 1);
+        }
+
+        // ── permission prompt ─────────────────────────────────────────────────
+
+        fn four_options() -> Vec<PermissionOption> {
+            vec![
+                PermissionOption::new("once", "Allow once", PermissionOptionKind::AllowOnce),
+                PermissionOption::new(
+                    "always",
+                    "Allow for session",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                PermissionOption::new("no", "Deny", PermissionOptionKind::RejectOnce),
+                PermissionOption::new(
+                    "never",
+                    "Deny for session",
+                    PermissionOptionKind::RejectAlways,
+                ),
+            ]
+        }
+
+        fn selected(outcome: &RequestPermissionOutcome) -> Option<&str> {
+            match outcome {
+                RequestPermissionOutcome::Selected(s) => Some(s.option_id.0.as_ref()),
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn keys_map_to_permission_kinds() {
+            assert_eq!(
+                permission_kind_for_key(KeyCode::Char('y')),
+                Some(PermissionOptionKind::AllowOnce)
+            );
+            assert_eq!(
+                permission_kind_for_key(KeyCode::Char('A')),
+                Some(PermissionOptionKind::AllowAlways)
+            );
+            assert_eq!(
+                permission_kind_for_key(KeyCode::Char('n')),
+                Some(PermissionOptionKind::RejectOnce)
+            );
+            assert_eq!(
+                permission_kind_for_key(KeyCode::Esc),
+                Some(PermissionOptionKind::RejectOnce)
+            );
+            assert_eq!(
+                permission_kind_for_key(KeyCode::Char('d')),
+                Some(PermissionOptionKind::RejectAlways)
+            );
+            assert_eq!(permission_kind_for_key(KeyCode::Char('x')), None);
+        }
+
+        #[test]
+        fn an_answer_selects_the_option_of_its_kind() {
+            let options = four_options();
+            for (kind, id) in [
+                (PermissionOptionKind::AllowOnce, "once"),
+                (PermissionOptionKind::AllowAlways, "always"),
+                (PermissionOptionKind::RejectOnce, "no"),
+                (PermissionOptionKind::RejectAlways, "never"),
+            ] {
+                assert_eq!(selected(&permission_outcome(&options, kind)), Some(id));
+            }
+        }
+
+        #[test]
+        fn a_missing_always_option_falls_back_to_the_single_use_one() {
+            let options = vec![
+                PermissionOption::new("once", "Allow", PermissionOptionKind::AllowOnce),
+                PermissionOption::new("no", "Deny", PermissionOptionKind::RejectOnce),
+            ];
+            let always = permission_outcome(&options, PermissionOptionKind::AllowAlways);
+            assert_eq!(selected(&always), Some("once"));
+            let never = permission_outcome(&options, PermissionOptionKind::RejectAlways);
+            assert_eq!(selected(&never), Some("no"));
+            // Nothing to match at all is a cancellation.
+            assert!(matches!(
+                permission_outcome(&[], PermissionOptionKind::AllowOnce),
+                RequestPermissionOutcome::Cancelled
+            ));
+        }
+
+        #[test]
+        fn the_permission_notice_names_the_call_and_shows_its_diff() {
+            let diff = Diff::new("a.txt", "new").old_text("old");
+            let request = RequestPermissionRequest::new(
+                "s",
+                ToolCallUpdate::new(
+                    "c",
+                    ToolCallUpdateFields::new()
+                        .title("edit_file · a.txt")
+                        .content(vec![ToolCallContent::Diff(diff)]),
+                ),
+                four_options(),
+            );
+            let notice = permission_notice(&request);
+            assert!(notice.starts_with("⚠ permission — allow edit_file · a.txt?"));
+            assert!(notice.contains("[y]es · [a]lways this session · [n]o · [d]eny this session"));
+            assert!(notice.contains("- old\n+ new"));
+        }
+
+        // ── input routing ─────────────────────────────────────────────────────
+
+        #[test]
+        fn only_client_commands_are_handled_locally() {
+            assert_eq!(parse_local("/exit"), Some(LocalCommand::Exit));
+            assert_eq!(parse_local("/q"), Some(LocalCommand::Exit));
+            assert_eq!(parse_local("/thinking"), Some(LocalCommand::Thinking(None)));
+            assert_eq!(
+                parse_local("/thinking on"),
+                Some(LocalCommand::Thinking(Some(true)))
+            );
+            assert_eq!(
+                parse_local("/tools off"),
+                Some(LocalCommand::Tools(Some(false)))
+            );
+            assert_eq!(parse_local("/models"), Some(LocalCommand::Models));
+            assert_eq!(parse_local("/resume"), Some(LocalCommand::Resume));
+        }
+
+        #[test]
+        fn everything_else_goes_to_the_agent() {
+            for forwarded in [
+                "/help",
+                "/clear",
+                "/status",
+                "/models 3",
+                "/models list",
+                "/local on",
+                "/skills",
+                "/agents",
+                "/commands",
+                "/mcp",
+                "/load",
+                "/login",
+                "/logout",
+                "/whoami",
+                "/reload",
+                "/plan",
+                "/permissions",
+                "/compact",
+                "/init",
+                "/git:commit fix",
+                "hello there",
+                "explain /exit",
+            ] {
+                assert_eq!(
+                    parse_local(forwarded),
+                    None,
+                    "{forwarded} must be forwarded"
+                );
+            }
+        }
+
+        // ── turn ends ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn only_unusual_stops_get_a_notice() {
+            assert_eq!(stop_notice(StopReason::EndTurn), None);
+            assert_eq!(stop_notice(StopReason::Cancelled), Some("(cancelled)"));
+            for stop in [
+                StopReason::MaxTokens,
+                StopReason::MaxTurnRequests,
+                StopReason::Refusal,
+            ] {
+                assert!(stop_notice(stop).is_some());
+            }
+        }
+
+        #[test]
+        fn errors_come_through_verbatim_with_a_login_hint_for_a_401() {
+            let plain = AgentError {
+                message: "quota exceeded".into(),
+                auth_required: false,
+            };
+            assert_eq!(turn_error_text(&plain), "error: quota exceeded");
+
+            let expired = AgentError {
+                message: "HTTP 401: token expired".into(),
+                auth_required: false,
+            };
+            assert!(turn_error_text(&expired).ends_with("sign in with /login"));
+
+            let gate = AgentError {
+                message: "Authentication required".into(),
+                auth_required: true,
+            };
+            assert!(turn_error_text(&gate).contains("/login"));
+        }
+
+        // ── history rows ──────────────────────────────────────────────────────
+
+        #[test]
+        fn session_rows_show_title_time_and_id() {
+            assert_eq!(
+                session_when(Some("2026-10-18T10:15:30Z")),
+                "2026-10-18 10:15"
+            );
+            assert_eq!(session_when(Some("today")), "today");
+            assert_eq!(session_when(None), "time unknown");
+
+            let mut info =
+                agent_client_protocol::schema::v1::SessionInfo::new(SessionId::new("abc"), "/work");
+            assert_eq!(session_row(&info), "abc  ·  time unknown");
+            info.title = Some("Fix the build".into());
+            info.updated_at = Some("2026-10-18T10:15:30Z".into());
+            assert_eq!(
+                session_row(&info),
+                "Fix the build  ·  2026-10-18 10:15  ·  abc"
+            );
+        }
+
+        #[test]
+        fn permission_option_ids_are_opaque() {
+            // The agent chooses the ids; only the kind matters to the client.
+            let id = PermissionOptionId::new("anything");
+            assert_eq!(id.0.as_ref(), "anything");
+        }
+    }
+} // end mod tui
+
+// re-export so callers write `chat::run_with(...)`
 pub use tui::run_with;
 
 // ── Tests (platform-agnostic) ─────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::{
-        RepoItem, TOOL_RESULT_PREVIEW_MAX, Tab, cap_output_preview, format_age, format_repo_detail,
-        history_row, host_from_api_url, parse_repo_items, parse_repo_remote,
-        parse_rich_text_segments, pretty_tool_arguments, repo_row, streaming_think_tail,
-        strip_think_blocks, think_indicator, tool_entry_lines, tool_title, url_host,
+        RepoItem, TOOL_RESULT_PREVIEW_MAX, Tab, cap_output_preview, format_repo_detail,
+        host_from_api_url, parse_repo_items, parse_repo_remote, parse_rich_text_segments,
+        pretty_tool_arguments, repo_row, streaming_think_tail, strip_think_blocks, think_indicator,
+        tool_entry_lines, tool_title, url_host,
     };
 
     // ── tool_title ────────────────────────────────────────────────────────────
@@ -4157,7 +4116,7 @@ mod tests {
         assert_eq!(lines, vec!["▾ 🔧 glob · **/*.rs", "    {}"]);
     }
 
-    // ── Tab / format_age / history_row ────────────────────────────────────────
+    // ── Tab ────────────────────────────────────────
 
     #[test]
     fn tab_next_without_repo_cycles_three_tabs() {
@@ -4354,30 +4313,6 @@ mod tests {
         assert_eq!(
             format_repo_detail("Error: server 'sigit' returned 401"),
             "Error: server 'sigit' returned 401"
-        );
-    }
-
-    #[test]
-    fn format_age_picks_the_coarsest_sensible_unit() {
-        assert_eq!(format_age(Duration::from_secs(0)), "0s ago");
-        assert_eq!(format_age(Duration::from_secs(59)), "59s ago");
-        assert_eq!(format_age(Duration::from_secs(60)), "1m ago");
-        assert_eq!(format_age(Duration::from_secs(3_599)), "59m ago");
-        assert_eq!(format_age(Duration::from_secs(3_600)), "1h ago");
-        assert_eq!(format_age(Duration::from_secs(86_399)), "23h ago");
-        assert_eq!(format_age(Duration::from_secs(86_400)), "1d ago");
-        assert_eq!(format_age(Duration::from_secs(3 * 86_400)), "3d ago");
-    }
-
-    #[test]
-    fn history_row_formats_id_age_and_count() {
-        assert_eq!(
-            history_row("tui", Some(Duration::from_secs(120)), 7),
-            "tui  ·  2m ago  ·  7 message(s)"
-        );
-        assert_eq!(
-            history_row("sess-1", None, 0),
-            "sess-1  ·  age unknown  ·  0 message(s)"
         );
     }
 

@@ -11,12 +11,9 @@
 //! The trait exposes neither `onde` nor OpenAI types, so the loop does not depend
 //! on a specific backend.
 //!
-//! The seam is consumed by both surfaces: the interactive client (`#[cfg(unix)]`,
-//! see `run_interactive` in `main.rs` and `mod tui` in `chat.rs`) and the ACP
-//! server's prompt loop. Some items are still reached only through the
-//! Unix-only interactive paths, so the dead-code lint stays suppressed on
-//! non-Unix targets only — Unix builds keep full coverage.
-#![cfg_attr(not(unix), allow(dead_code))]
+//! The seam is consumed by the ACP server's prompt loop and the headless runner.
+//! The terminal UI does not use it: it is an ACP client of the agent process,
+//! which does (see `acp_client`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

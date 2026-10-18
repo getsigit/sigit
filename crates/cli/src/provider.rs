@@ -8,12 +8,9 @@
 //!    endpoint and tier are built in, and the session token is the credential.
 //! 3. On-device: no login and no override, so inference runs locally.
 //!
-//! Provider resolution runs at startup in both modes: the interactive client
-//! picks its whole backend from it, and `run_acp_server` applies the explicit
-//! override (env or `providers.toml`) the same way. Some items are still wired
-//! up only through `#[cfg(unix)]` interactive paths, so the dead-code lint
-//! stays suppressed on non-Unix targets only — Unix builds keep full coverage.
-#![cfg_attr(not(unix), allow(dead_code))]
+//! Provider resolution runs in the agent process: `run_acp_server` applies the
+//! explicit override (env or `providers.toml`), and the picker offers the rest.
+//! The terminal UI reads it only to say which endpoint it is talking through.
 
 use std::path::PathBuf;
 

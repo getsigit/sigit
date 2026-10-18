@@ -210,7 +210,7 @@ fn run_hook(cmd: &str, context: &HookContext, cwd: &Path, timeout: Duration) {
     // below until it exits on its own.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = match command.spawn() {
+    let mut child = match crate::tools::no_console_window(&mut command).spawn() {
         Ok(child) => child,
         Err(err) => {
             log::warn!("Failed to run hook: {err}");

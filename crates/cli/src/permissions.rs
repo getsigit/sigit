@@ -61,12 +61,6 @@ use regex::Regex;
 use crate::settings::{self, PermissionMode};
 use crate::tools::glob_to_regex;
 
-/// Session key used by the interactive TUI, which only ever has one session.
-/// The TUI (`chat.rs`) is `#[cfg(unix)]`, so this is its only consumer and is
-/// dead on non-Unix targets — the rest of the module is used on all platforms.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub const TUI_SESSION: &str = "tui";
-
 /// How risky a tool is to run without the user's sign-off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRisk {

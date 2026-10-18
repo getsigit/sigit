@@ -62,10 +62,8 @@
 //! built-in tools or with each other across servers. This mirrors the
 //! convention used by other MCP-aware agents.
 //!
-//! Like the rest of the backend seam, MCP is wired up only through the
-//! interactive client and the ACP agent loop. On non-Unix targets a few helpers
-//! are unused, so the dead-code lint is suppressed there only.
-#![cfg_attr(not(unix), allow(dead_code))]
+//! The agent process connects every server (`init`). The terminal UI connects
+//! only the official one (`init_official_only`), for its Repo tab.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -579,13 +577,30 @@ fn sanitize(raw: &str) -> String {
 /// contributes no tools. Safe to call from either entry point; only the first
 /// call does work.
 pub async fn init() {
+    connect_all(load_configs()).await;
+}
+
+/// Like [`init`], but for the official sigit.si server only. The terminal UI
+/// calls the official server's lookups itself (the Repo tab), while every MCP
+/// server the agent uses runs in the agent process it starts; connecting the
+/// rest here would start a second `smb --mcp` and a second copy of every
+/// stdio server. Honors the same opt-outs and overrides as [`init`].
+pub async fn init_official_only() {
+    let defs = load_configs()
+        .into_iter()
+        .filter(|def| def.name == OFFICIAL_SERVER_NAME)
+        .collect();
+    connect_all(defs).await;
+}
+
+async fn connect_all(defs: Vec<ServerDef>) {
     if MCP.get().is_some() {
         return;
     }
 
     // Contact servers concurrently so one slow/unreachable host doesn't serialize
     // the rest. Each handshake is bounded by HANDSHAKE_TIMEOUT.
-    let servers = futures::future::join_all(load_configs().into_iter().map(connect)).await;
+    let servers = futures::future::join_all(defs.into_iter().map(connect)).await;
 
     for server in &servers {
         match &server.error {

@@ -29,6 +29,7 @@
 //! ```
 
 mod account;
+mod acp_client;
 mod backend;
 mod chat;
 mod client_fs;
@@ -65,9 +66,7 @@ pub(crate) use sigit_agent::{browser_auth, credentials};
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-use std::io::IsTerminal;
-#[cfg(unix)]
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::sync::Arc;
 
 use onde::inference::SamplingConfig;
@@ -782,22 +781,6 @@ fn remote_system_prompt(session_context: &str) -> String {
     format!("{}\n\n{session_context}", system_prompt_for_model(true))
 }
 
-/// `base` followed by the session context for the directory sigit was launched
-/// in. The terminal UI has no ACP session to carry a cwd, so it uses this for
-/// every system prompt it builds. Without the working directory the model has no
-/// idea where the project is, and a small on-device model will happily invent
-/// one (`/path/to/repo/AGENTS.md` on `/init`).
-#[cfg(unix)]
-pub(crate) fn with_launch_context(base: &str) -> String {
-    match std::env::current_dir() {
-        Ok(cwd) => format!(
-            "{base}\n\n{}",
-            session_context_message(&cwd, &workspace::additional_roots())
-        ),
-        Err(_) => base.to_string(),
-    }
-}
-
 fn session_context_message(cwd: &std::path::Path, additional_roots: &[PathBuf]) -> String {
     let mut message = if additional_roots.is_empty() {
         format!(
@@ -1254,21 +1237,28 @@ struct SiGitAgent {
     /// `session_info_update`, so an unchanged title is not sent again.
     announced_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
     current_model: std::sync::Mutex<GgufModelConfig>,
+    /// Whether the on-device model in `current_model` supports tool calling.
+    /// A model that does not is sent no tools (see [`tools_for_turn`]), which
+    /// is also what lets its first round stream. Set wherever a local model is
+    /// loaded, next to `current_model`.
+    local_tool_calling: AtomicBool,
+    /// How weights get into the engine. The real one runs a thread of its own;
+    /// tests swap in a fake so a load can be held open or finished at will.
+    model_loader: ModelLoader,
+    /// This agent as an `Arc`, set by [`SiGitAgent::share`]. A model switch
+    /// finishes its bookkeeping on a task of its own, so that a load whose
+    /// requester gave up still leaves the agent consistent, and that task
+    /// needs an owner that outlives the request.
+    self_ref: std::sync::OnceLock<std::sync::Weak<SiGitAgent>>,
     /// flipped once the startup model finishes (success or failure)
     model_ready: Arc<AtomicBool>,
     /// guards the one-time lazy startup load for ACP mode
     startup_model_load_started: Arc<AtomicBool>,
     /// set if the startup load failed
     model_load_error: Arc<std::sync::Mutex<Option<String>>>,
-    /// true when the startup model isn't cached yet
-    startup_needs_download: bool,
     /// Xcode launches custom agents with `--acp`; that mode should be ready to
     /// answer the first prompt without requiring an editor slash command.
     auto_load_local_model: bool,
-    /// for progress UI
-    startup_model_name: String,
-    /// for download-progress polling
-    startup_model_id: String,
     /// Guards everything one session installs process-wide: the working
     /// directory, workspace roots, session MCP servers, the live `backend`
     /// slot and the on-device engine's conversation. Session lifecycle and
@@ -1292,11 +1282,8 @@ impl SiGitAgent {
         model_ready: Arc<AtomicBool>,
         startup_model_load_started: Arc<AtomicBool>,
         model_load_error: Arc<std::sync::Mutex<Option<String>>>,
-        startup_needs_download: bool,
         auto_load_local_model: bool,
     ) -> Self {
-        let startup_model_name = initial_model.display_name.clone();
-        let startup_model_id = initial_model.model_id.clone();
         let backend: Arc<dyn InferenceBackend> = Arc::new(LocalBackend::new(Arc::clone(&engine)));
         Self {
             engine,
@@ -1308,16 +1295,24 @@ impl SiGitAgent {
             closing_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             announced_titles: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_model: std::sync::Mutex::new(initial_model),
+            local_tool_calling: AtomicBool::new(true),
+            model_loader: thread_model_loader(),
+            self_ref: std::sync::OnceLock::new(),
             model_ready,
             startup_model_load_started,
             model_load_error,
-            startup_needs_download,
             auto_load_local_model,
-            startup_model_name,
-            startup_model_id,
             workspace_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Put the agent behind an `Arc` and let it know. Everything that serves
+    /// requests goes through here.
+    fn share(self) -> Arc<Self> {
+        let shared = Arc::new(self);
+        let _ = shared.self_ref.set(Arc::downgrade(&shared));
+        shared
     }
 
     fn start_startup_model_load_if_needed(&self) {
@@ -1350,6 +1345,9 @@ impl SiGitAgent {
             .map(|item| (item.max_tokens, item.tool_calling))
             .unwrap_or((4096, false));
 
+        self.local_tool_calling
+            .store(tool_calling, Ordering::Release);
+
         let sampling = SamplingConfig {
             max_tokens: Some(max_tokens),
             ..SamplingConfig::default()
@@ -1380,7 +1378,9 @@ impl SiGitAgent {
         });
     }
 
-    /// block until the startup model is ready, showing progress in the session.
+    /// Block until the on-device model that is loading is ready, showing
+    /// progress in the session. The card is titled after the model that is
+    /// actually loading (`current_model`), not the one the process started with.
     async fn await_model_ready(
         &self,
         cx: &ConnectionTo<Client>,
@@ -1397,161 +1397,117 @@ impl SiGitAgent {
             return Ok(());
         }
 
-        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let model_id = self.current_model.lock().unwrap().model_id.clone();
+        let mut progress = self.model_load_progress(cx, session_id, &model_id);
 
-        let tool_call_id = format!("startup-load-{}", uuid::Uuid::new_v4());
-        let title = if self.startup_needs_download {
-            format!("Downloading {}", self.startup_model_name)
-        } else {
-            format!("Loading {}", self.startup_model_name)
-        };
-
-        self.send_tool_call_update(
-            cx,
-            session_id.clone(),
-            SessionUpdate::ToolCall(
-                ToolCall::new(tool_call_id.clone(), &title)
-                    .kind(ToolKind::Think)
-                    .status(ToolCallStatus::InProgress)
-                    .content(vec![format!("{}…", title).into()]),
-            ),
-        )
-        .ok();
-
-        let expected_bytes = if self.startup_needs_download {
-            onde::inference::models::SUPPORTED_MODEL_INFO
-                .iter()
-                .find(|m| m.id == self.startup_model_id)
-                .map(|m| m.expected_size_bytes)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        let load_start = std::time::Instant::now();
-        let mut tick: usize = 0;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        interval.tick().await;
-
-        loop {
-            interval.tick().await;
-            tick += 1;
-
-            if self.model_ready.load(Ordering::Acquire) {
-                break;
-            }
-
-            let frame = SPINNER[tick % SPINNER.len()];
-            let elapsed = load_start.elapsed();
-            let elapsed_str = if elapsed.as_secs() >= 60 {
-                format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
-            } else {
-                format!("{}s", elapsed.as_secs())
-            };
-
-            let (update_title, update_content) =
-                if self.startup_needs_download && expected_bytes > 0 {
-                    let cache_path = onde::hf_cache::model_cache_path(&self.startup_model_id);
-                    let downloaded = cache_path
-                        .as_ref()
-                        .filter(|p| p.exists())
-                        .map(|p| dir_size_recursive(p))
-                        .unwrap_or(0);
-                    let pct = ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
-                    let bar = progress_bar(pct, 20);
-                    let size_hint = format!(" (~{})", format_size_human(expected_bytes));
-                    (
-                        format!(
-                            "{frame} Downloading {}{size_hint} ({pct}%)",
-                            self.startup_model_name
-                        ),
-                        format!(
-                            "{} — {bar} {pct}%  ({} / {})",
-                            self.startup_model_name,
-                            format_size_human(downloaded),
-                            format_size_human(expected_bytes),
-                        ),
-                    )
-                } else if self.startup_needs_download {
-                    let cache_path = onde::hf_cache::model_cache_path(&self.startup_model_id);
-                    let downloaded = cache_path
-                        .as_ref()
-                        .filter(|p| p.exists())
-                        .map(|p| dir_size_recursive(p))
-                        .unwrap_or(0);
-                    (
-                        format!("{frame} Downloading {}", self.startup_model_name),
-                        format!(
-                            "{} — {} downloaded… ({elapsed_str})",
-                            self.startup_model_name,
-                            format_size_human(downloaded),
-                        ),
-                    )
-                } else {
-                    (
-                        format!("{frame} Loading {}", self.startup_model_name),
-                        format!(
-                            "{frame} Loading {}… ({elapsed_str})",
-                            self.startup_model_name
-                        ),
-                    )
-                };
-
-            self.send_tool_call_update(
-                cx,
-                session_id.clone(),
-                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                    tool_call_id.clone(),
-                    ToolCallUpdateFields::new()
-                        .title(update_title)
-                        .status(ToolCallStatus::InProgress)
-                        .content(vec![update_content.into()]),
-                )),
-            )
-            .ok();
+        while !self.model_ready.load(Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         // done — check if it blew up
         let load_error = self.model_load_error.lock().unwrap().clone();
         if let Some(err) = load_error {
-            self.send_tool_call_update(
-                cx,
-                session_id.clone(),
-                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                    tool_call_id,
-                    ToolCallUpdateFields::new()
-                        .title("Model load failed".to_string())
-                        .status(ToolCallStatus::Failed)
-                        .content(vec![format!("error: {err}").into()]),
-                )),
-            )
-            .ok();
-
+            progress.finish(LoadOutcome::Failed(err.clone()));
             return Err(agent_client_protocol::Error::new(
                 ErrorCode::InternalError.into(),
                 format!("model load failed: {err}"),
             ));
         }
 
-        let done_title = if self.startup_needs_download {
-            format!("✓ {} downloaded and loaded", self.startup_model_name)
-        } else {
-            format!("✓ {} loaded", self.startup_model_name)
-        };
+        progress.finish(LoadOutcome::Loaded);
+        Ok(())
+    }
 
+    /// Show a load in the session as a tool card with a spinner, elapsed time
+    /// and, for a model that has to be downloaded first, a percentage bar. One
+    /// helper serves `/load`, `/models N` and the picker, keyed on the model
+    /// that is actually being loaded.
+    fn model_load_progress(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        model_id: &str,
+    ) -> LoadProgress {
+        let target = LoadTarget::resolve(model_id);
+        let tool_call_id = format!("model-load-{}", uuid::Uuid::new_v4());
+        let opening = load_progress_text(&target, 0, '⠋', 0).0;
         self.send_tool_call_update(
             cx,
             session_id.clone(),
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                tool_call_id,
-                ToolCallUpdateFields::new()
-                    .title(done_title)
-                    .status(ToolCallStatus::Completed),
-            )),
+            SessionUpdate::ToolCall(
+                ToolCall::new(tool_call_id.clone(), &opening)
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![format!("{opening}…").into()]),
+            ),
         )
         .ok();
 
-        Ok(())
+        let stop = Arc::new(AtomicBool::new(false));
+        let poller_cx = cx.clone();
+        let poller_session = session_id.clone();
+        let poller_id = tool_call_id.clone();
+        let poller_target = target.clone();
+        let poller_stop = Arc::clone(&stop);
+        cx.spawn(async move {
+            const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let started = std::time::Instant::now();
+            let mut tick: usize = 0;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                if poller_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                tick += 1;
+                let downloaded = if poller_target.needs_download {
+                    onde::hf_cache::model_cache_path(&poller_target.model_id)
+                        .filter(|path| path.exists())
+                        .map(|path| dir_size_recursive(&path))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let (title, body) = load_progress_text(
+                    &poller_target,
+                    downloaded,
+                    SPINNER[tick % SPINNER.len()],
+                    started.elapsed().as_secs(),
+                );
+                // The final update may have landed while the directory was
+                // being sized; an in-progress one after it would undo it.
+                if poller_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let notification = SessionNotification::new(
+                    poller_session.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        poller_id.clone(),
+                        ToolCallUpdateFields::new()
+                            .title(title)
+                            .status(ToolCallStatus::InProgress)
+                            .content(vec![body.into()]),
+                    )),
+                );
+                if poller_cx.send_notification(notification).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        })
+        .ok();
+
+        LoadProgress {
+            cx: cx.clone(),
+            session_id: session_id.clone(),
+            card: LoadCard {
+                tool_call_id,
+                target,
+                stop,
+            },
+            finished: false,
+        }
     }
 
     /// Send a message of its own: a notice, a slash command's answer. It gets
@@ -1817,15 +1773,65 @@ impl SiGitAgent {
         .ok();
     }
 
+    /// Switch to the on-device model `model_id` and wait for it, with nothing to
+    /// tell the user along the way. For switches nobody asked for in so many
+    /// words, like restoring the model a thread was last on.
     async fn switch_model_by_id(
         &self,
         model_id: &str,
     ) -> agent_client_protocol::Result<GgufModelConfig> {
+        let done = self.begin_model_switch(model_id, None).await?;
+        done.await
+            .map_err(|_| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    "model loader thread crashed",
+                )
+            })?
+            .map_err(|error| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    format!("model switch failed: {error}"),
+                )
+            })
+    }
+
+    /// Start loading the on-device model `model_id` and return at once with
+    /// the receiver its outcome arrives on.
+    ///
+    /// The load cannot be aborted (`onde` has no way to), so what a request
+    /// does while it waits is separate from what the load does. The loader runs
+    /// on a thread of its own, and a task of its own applies the result once it
+    /// lands: the model becomes current, the choice is saved, the conversation
+    /// is replayed past the reload and inference is routed on-device. A request
+    /// that gives up waiting (a cancelled prompt, `$/cancel_request`) therefore
+    /// leaves the agent consistent, and tells the user when the load lands.
+    ///
+    /// Until then `model_ready` is false, so a prompt that arrives meanwhile is
+    /// told the model is still loading instead of running into a GPU that
+    /// "does not fit" two models.
+    async fn begin_model_switch(
+        &self,
+        model_id: &str,
+        notify: Option<SwitchNotice>,
+    ) -> agent_client_protocol::Result<
+        tokio::sync::oneshot::Receiver<Result<GgufModelConfig, String>>,
+    > {
         let (new_config, max_tokens, new_tool_calling) = resolve_model_config(model_id)
             .ok_or_else(|| {
                 agent_client_protocol::Error::new(
                     ErrorCode::InvalidParams.into(),
                     format!("unknown or unavailable model: {model_id}"),
+                )
+            })?;
+        let owner = self
+            .self_ref
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::new(
+                    ErrorCode::InternalError.into(),
+                    "the agent is not shared; a model switch cannot outlive its request",
                 )
             })?;
 
@@ -1836,7 +1842,7 @@ impl SiGitAgent {
 
         // Loading weights resets the engine's history, which would restart the
         // conversation under the new model. Keep the turns so far and replay
-        // them below, once the new prompt and session context are seeded.
+        // them once the new prompt and session context are seeded.
         let carried = self
             .engine
             .history()
@@ -1845,54 +1851,62 @@ impl SiGitAgent {
             .filter(|message| message.role != onde::inference::ChatRole::System)
             .collect::<Vec<_>>();
 
+        self.startup_model_load_started
+            .store(true, Ordering::Release);
+        self.model_ready.store(false, Ordering::Release);
+
         let sampling = SamplingConfig {
             max_tokens: Some(max_tokens),
             ..SamplingConfig::default()
         };
+        // load_gguf_model already unloads the old model internally; calling
+        // unload first would leave a gap where prompts fail
+        let loaded = (self.model_loader)(
+            Arc::clone(&self.engine),
+            new_config.clone(),
+            system_prompt_for_model(new_tool_calling),
+            sampling,
+        );
 
-        // block_in_place inside spawn_local panics, so run the load on a
-        // dedicated thread with its own runtime (same trick as startup)
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let loader_engine = Arc::clone(&self.engine);
-        let loader_config = new_config.clone();
-        let loader_system_prompt = system_prompt_for_model(new_tool_calling);
-        let loader_sampling = sampling;
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("failed to create loader runtime");
-            let result = rt.block_on(async move {
-                // load_gguf_model already unloads the old model internally;
-                // calling unload first would leave a gap where prompts fail
-                loader_engine
-                    .load_gguf_model(
-                        loader_config,
-                        Some(loader_system_prompt),
-                        Some(loader_sampling),
-                    )
-                    .await
-            });
-            let _ = result_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let loaded = loaded
+                .await
+                .unwrap_or_else(|_| Err("model loader thread crashed".to_string()));
+            let result = owner
+                .complete_model_switch(loaded, new_config, new_tool_calling, carried)
+                .await;
+            if let Some(notice) = &notify {
+                notice.finish_card(&result);
+            }
+            let delivered = done_tx.send(result.clone()).is_ok();
+            if let Some(notice) = notify {
+                let abandoned = !delivered || notice.abandoned.load(Ordering::Acquire);
+                if abandoned {
+                    owner.announce_abandoned_switch(&notice, &result);
+                }
+            }
         });
+        Ok(done_rx)
+    }
 
-        result_rx
-            .await
-            .map_err(|_| {
-                agent_client_protocol::Error::new(
-                    ErrorCode::InternalError.into(),
-                    "model loader thread crashed",
-                )
-            })?
-            .map_err(|error| {
-                log::error!("model switch failed: {error}");
-                agent_client_protocol::Error::new(
-                    ErrorCode::InternalError.into(),
-                    format!("model switch failed: {error}"),
-                )
-            })?;
+    /// The bookkeeping of a model switch, run when the loader finishes whether
+    /// or not anyone is still waiting for it.
+    async fn complete_model_switch(
+        &self,
+        loaded: Result<(), String>,
+        new_config: GgufModelConfig,
+        tool_calling: bool,
+        carried: Vec<onde::inference::ChatMessage>,
+    ) -> Result<GgufModelConfig, String> {
+        if let Err(error) = loaded {
+            log::error!("model switch failed: {error}");
+            // Whatever is in memory now is all there is; let prompts through
+            // (they say so if nothing is loaded).
+            self.model_ready.store(true, Ordering::Release);
+            return Err(error);
+        }
 
-        self.startup_model_load_started
-            .store(true, Ordering::Release);
-        self.model_ready.store(true, Ordering::Release);
         if let Ok(mut guard) = self.model_load_error.lock() {
             *guard = None;
         }
@@ -1912,6 +1926,8 @@ impl SiGitAgent {
             let mut guard = self.current_model.lock().unwrap();
             *guard = new_config.clone();
         }
+        self.local_tool_calling
+            .store(tool_calling, Ordering::Release);
         self.record_active_model();
 
         if let Some(cwd) = self.session_cwd.lock().ok().and_then(|g| g.clone()) {
@@ -1921,13 +1937,179 @@ impl SiGitAgent {
                 ))
                 .await;
         }
-
         for message in carried {
             self.engine.push_history(message).await;
         }
 
+        // Route inference back on-device (in case we were on a cloud tier), and
+        // note that picking an on-device model puts us in local mode.
+        self.reset_to_local_backend().await;
+        let _ = settings::set_local_inference(true);
+
+        self.model_ready.store(true, Ordering::Release);
         Ok(new_config)
     }
+
+    /// Tell the user how a switch ended when nobody was waiting on it any more:
+    /// the picker, then a notice, since the request that asked has long been
+    /// answered.
+    fn announce_abandoned_switch(
+        &self,
+        notice: &SwitchNotice,
+        result: &Result<GgufModelConfig, String>,
+    ) {
+        match result {
+            Ok(config) => {
+                let options = build_config_options(config, &notice.session_id.to_string());
+                self.send_tool_call_update(
+                    &notice.cx,
+                    notice.session_id.clone(),
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                )
+                .ok();
+                self.send_assistant_message(
+                    &notice.cx,
+                    notice.session_id.clone(),
+                    format!("✓ Switched to {}", config.display_name),
+                )
+                .ok();
+            }
+            Err(error) => {
+                self.send_assistant_message(
+                    &notice.cx,
+                    notice.session_id.clone(),
+                    format!("error loading model: {error}"),
+                )
+                .ok();
+            }
+        }
+    }
+
+    /// Switch to `model_id` and wait for it. `cancelled` is whatever should
+    /// stop the waiting, not the load. `None` means it fired first, and the
+    /// switch finishes by itself in the background.
+    async fn switch_model_and_wait(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        model_id: &str,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> agent_client_protocol::Result<Option<GgufModelConfig>> {
+        let mut progress = self.model_load_progress(cx, session_id, model_id);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let notice = SwitchNotice {
+            cx: cx.clone(),
+            session_id: session_id.clone(),
+            card: progress.card(),
+            abandoned: Arc::clone(&abandoned),
+        };
+        // Dropping the request mid-wait (`/models N` cancelled by the turn)
+        // counts as giving up just as much as the explicit branch below.
+        let waiter = AbandonOnDrop(abandoned);
+        let done = match self.begin_model_switch(model_id, Some(notice)).await {
+            Ok(done) => done,
+            Err(error) => {
+                progress.finish(LoadOutcome::Failed(error.message.clone()));
+                waiter.disarm();
+                return Err(error);
+            }
+        };
+        // The card now belongs to the completion task, which finishes it.
+        progress.hand_off();
+        tokio::select! {
+            result = done => {
+                waiter.disarm();
+                match result {
+                    Ok(Ok(config)) => Ok(Some(config)),
+                    Ok(Err(error)) => Err(agent_client_protocol::Error::new(
+                        ErrorCode::InternalError.into(),
+                        format!("model switch failed: {error}"),
+                    )),
+                    Err(_) => Err(agent_client_protocol::Error::new(
+                        ErrorCode::InternalError.into(),
+                        "model loader thread crashed",
+                    )),
+                }
+            }
+            () = cancelled => Ok(None),
+        }
+    }
+}
+
+/// Everything the completion of a model switch needs to talk to the user,
+/// kept apart from the request that started it, which may be gone by then.
+struct SwitchNotice {
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+    card: LoadCard,
+    /// Set when the request stopped waiting.
+    abandoned: Arc<AtomicBool>,
+}
+
+impl SwitchNotice {
+    fn finish_card(&self, result: &Result<GgufModelConfig, String>) {
+        let outcome = match result {
+            Ok(_) => LoadOutcome::Loaded,
+            Err(error) => LoadOutcome::Failed(error.clone()),
+        };
+        finish_load_card(&self.cx, &self.session_id, &self.card, outcome);
+    }
+}
+
+/// Flags a switch as abandoned when the request waiting on it is dropped
+/// before it saw the result.
+struct AbandonOnDrop(Arc<AtomicBool>);
+
+impl AbandonOnDrop {
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Weights into an engine. The real loader gives the load a thread and a
+/// runtime of its own: `block_in_place` inside a spawned-local task panics.
+type ModelLoader = Arc<
+    dyn Fn(
+            Arc<ChatEngine>,
+            GgufModelConfig,
+            String,
+            SamplingConfig,
+        ) -> tokio::sync::oneshot::Receiver<Result<(), String>>
+        + Send
+        + Sync,
+>;
+
+fn thread_model_loader() -> ModelLoader {
+    Arc::new(|engine, config, system_prompt, sampling| {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|error| error.to_string())
+                .and_then(|rt| {
+                    rt.block_on(engine.load_gguf_model(config, Some(system_prompt), Some(sampling)))
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            let _ = tx.send(result);
+        });
+        rx
+    })
+}
+
+/// What an on-device turn is offered. A local model that cannot call tools gets
+/// none: that keeps it usable, and with no tools to watch for the engine can
+/// stream even the first round. A remote endpoint always gets the full set.
+fn tools_for_turn(is_remote: bool, local_tool_calling: bool) -> Vec<ToolSpec> {
+    if !is_remote && !local_tool_calling {
+        return Vec::new();
+    }
+    agent_tools_as_specs()
 }
 
 /// Session and model pairs already told that earlier images are hidden, so
@@ -2465,6 +2647,34 @@ impl SiGitAgent {
         }
     }
 
+    /// Say so in `session_id` once the model that is loading is in memory, for
+    /// a load whose requester stopped waiting.
+    fn announce_when_loaded(&self, cx: &ConnectionTo<Client>, session_id: SessionId) {
+        let ready = Arc::clone(&self.model_ready);
+        let error = Arc::clone(&self.model_load_error);
+        let name = self.current_model.lock().unwrap().display_name.clone();
+        let notice_cx = cx.clone();
+        cx.spawn(async move {
+            while !ready.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let text = match error.lock().unwrap().clone() {
+                Some(error) => format!("error loading model: {error}"),
+                None => format!("✓ {name} loaded"),
+            };
+            notice_cx
+                .send_notification(SessionNotification::new(
+                    session_id,
+                    SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(ContentBlock::from(text)).message_id(new_message_id()),
+                    ),
+                ))
+                .ok();
+            Ok(())
+        })
+        .ok();
+    }
+
     /// Keep the active session's parked metadata in step with a successful
     /// model/backend switch. Its conversation remains stale while active.
     fn record_active_model(&self) {
@@ -2684,10 +2894,7 @@ impl SiGitAgent {
         }
 
         match self.switch_model_by_id(&target).await {
-            Ok(_) => {
-                self.reset_to_local_backend().await;
-                let _ = settings::set_local_inference(true);
-            }
+            Ok(_) => {}
             Err(error) => {
                 log::warn!("session({key}): could not restore model {target}: {error}");
             }
@@ -3462,6 +3669,25 @@ impl SiGitAgent {
         // conversation, so an on-device turn keeps the workspace throughout.
         let release_while_waiting = backend.is_remote();
 
+        // A model switch is still bringing weights in. Say so, rather than let
+        // the turn run into an engine that is half way through a reload.
+        if !backend.is_remote()
+            && self.startup_model_load_started.load(Ordering::Acquire)
+            && !self.model_ready.load(Ordering::Acquire)
+        {
+            let name = self.current_model.lock().unwrap().display_name.clone();
+            self.send_assistant_message(
+                cx,
+                session_id,
+                format!(
+                    "The on-device model is still loading ({name}). Try again when it \
+                     finishes; the progress card above shows where it is."
+                ),
+            )
+            .ok();
+            return Ok(PromptResponse::new(StopReason::EndTurn));
+        }
+
         // Only on-device inference needs a local model in memory. Cloud tiers run
         // over the network, so they never need a local model. Xcode's explicit
         // `--acp` mode loads lazily on the first prompt because its custom-agent
@@ -3497,7 +3723,10 @@ impl SiGitAgent {
         // send message → execute any tool calls → feed results back
         // repeat up to the tool-round cap, then force a text reply
 
-        let tools = agent_tools_as_specs();
+        let tools = tools_for_turn(
+            backend.is_remote(),
+            self.local_tool_calling.load(Ordering::Acquire),
+        );
         let max_tool_rounds = headless::max_tool_rounds_from_env();
 
         let model_name = self.current_model.lock().unwrap().display_name.clone();
@@ -4274,7 +4503,7 @@ impl SiGitAgent {
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
         tokio::select! {
-            response = exec_slash_acp(self, cx, session_id, command) => response,
+            response = exec_slash_acp(self, cx, session_id, command, cancellation) => response,
             () = cancellation.cancelled() => Ok(PromptResponse::new(StopReason::Cancelled)),
         }
     }
@@ -4561,6 +4790,7 @@ impl SiGitAgent {
         &self,
         cx: &ConnectionTo<Client>,
         args: SetSessionConfigOptionRequest,
+        cancellation: Option<agent_client_protocol::RequestCancellation>,
     ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
         log::info!(
             "set_session_config_option: config_id={}, value={:?}",
@@ -4635,14 +4865,33 @@ impl SiGitAgent {
             ));
         };
 
-        // can't switch while the startup model is still loading — the old
-        // weights are in GPU memory and the new load gets "does not fit"
+        // `$/cancel_request` for this request stops the waiting, never the
+        // load. Dropping out releases the session and workspace locks, so the
+        // user can go on chatting on whatever backend was live before.
+        let cancel_signal = async {
+            match &cancellation {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(cancel_signal);
+
+        // can't switch while another model is still loading — the old weights
+        // are in GPU memory and the new load gets "does not fit"
         if self.startup_model_load_started.load(Ordering::Acquire)
             && !self.model_ready.load(Ordering::Acquire)
         {
-            log::info!("set_session_config_option: waiting for startup model to finish loading");
-            while !self.model_ready.load(Ordering::Acquire) {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            log::info!("set_session_config_option: waiting for the model that is loading");
+            let loaded = async {
+                while !self.model_ready.load(Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            };
+            tokio::select! {
+                () = loaded => {}
+                () = cancel_signal.as_mut() => {
+                    return Err(agent_client_protocol::Error::request_cancelled());
+                }
             }
         }
 
@@ -4698,260 +4947,18 @@ impl SiGitAgent {
             return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
-        let needs_download = models::local_picker_items()
-            .into_iter()
-            .find(|item| item.config.model_id == model_id)
-            .map(|item| item.cache_health == setup::ModelCacheHealth::NotDownloaded)
-            .unwrap_or(false);
-
-        // tells the progress poller to stop
-        let stop_flag = Arc::new(AtomicBool::new(false));
-
-        let tool_call_id = format!("model-switch-{}", uuid::Uuid::new_v4());
-
-        if needs_download {
-            let model_id_owned = model_id.to_string();
-            let expected_bytes = onde::inference::models::SUPPORTED_MODEL_INFO
-                .iter()
-                .find(|m| m.id == model_id_owned)
-                .map(|m| m.expected_size_bytes)
-                .unwrap_or(0);
-
-            let display_name = models::local_picker_items()
-                .into_iter()
-                .find(|item| item.config.model_id == model_id_owned)
-                .map(|item| item.display_name.clone())
-                .unwrap_or_else(|| model_id_owned.clone());
-
-            let size_hint = if expected_bytes > 0 {
-                format!(" (~{})", format_size_human(expected_bytes))
-            } else {
-                String::new()
-            };
-
-            self.send_tool_call_update(
-                cx,
-                args.session_id.clone(),
-                SessionUpdate::ToolCall(
-                    ToolCall::new(
-                        tool_call_id.clone(),
-                        format!("⏬ Downloading {display_name}{size_hint}"),
-                    )
-                    .kind(ToolKind::Think)
-                    .status(ToolCallStatus::InProgress)
-                    .content(vec![
-                        format!(
-                            "Preparing download for {display_name}. This may take a few minutes."
-                        )
-                        .into(),
-                    ]),
-                ),
-            )
-            .ok();
-
-            // poll download progress and update the spinner in Zed
-            let cx_for_poller = cx.clone();
-            let poller_session = args.session_id.clone();
-            let poller_model_id = model_id_owned.clone();
-            let poller_stop = Arc::clone(&stop_flag);
-            let poller_tool_call_id = tool_call_id.clone();
-
-            cx.spawn(async move {
-                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-                let cache_path = onde::hf_cache::model_cache_path(&poller_model_id);
-                let mut tick: usize = 0;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-                interval.tick().await; // consume the immediate first tick
-
-                while !poller_stop.load(Ordering::Relaxed) {
-                    interval.tick().await;
-
-                    if poller_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let downloaded = cache_path
-                        .as_ref()
-                        .filter(|p| p.exists())
-                        .map(|p| dir_size_recursive(p))
-                        .unwrap_or(0);
-
-                    let frame = SPINNER[tick % SPINNER.len()];
-                    tick += 1;
-
-                    let title = if expected_bytes > 0 {
-                        let pct =
-                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
-                        format!("{frame} Downloading {display_name}{size_hint} ({pct}%)")
-                    } else {
-                        format!("{frame} Downloading {display_name}{size_hint}")
-                    };
-
-                    let msg = if expected_bytes > 0 {
-                        let pct =
-                            ((downloaded as f64 / expected_bytes as f64) * 100.0).min(99.0) as u8;
-                        let bar = progress_bar(pct, 20);
-                        format!(
-                            "{display_name} — {bar} {pct}%  ({} / {})",
-                            format_size_human(downloaded),
-                            format_size_human(expected_bytes),
-                        )
-                    } else {
-                        format!(
-                            "{display_name} — {} downloaded…",
-                            format_size_human(downloaded)
-                        )
-                    };
-
-                    let notification = SessionNotification::new(
-                        poller_session.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            poller_tool_call_id.clone(),
-                            ToolCallUpdateFields::new()
-                                .title(title)
-                                .status(ToolCallStatus::InProgress)
-                                .content(vec![msg.into()]),
-                        )),
-                    );
-                    if cx_for_poller.send_notification(notification).is_err() {
-                        break;
-                    }
-                }
-                Ok(())
-            })
-            .ok();
-        }
-
-        // cached models still take 10-30s to load weights; show a spinner
-        if !needs_download {
-            let cached_display_name = models::local_picker_items()
-                .into_iter()
-                .find(|item| item.config.model_id == model_id)
-                .map(|item| item.display_name.clone())
-                .unwrap_or_else(|| model_id.to_string());
-
-            self.send_tool_call_update(
-                cx,
-                args.session_id.clone(),
-                SessionUpdate::ToolCall(
-                    ToolCall::new(
-                        tool_call_id.clone(),
-                        format!("Loading {cached_display_name}"),
-                    )
-                    .kind(ToolKind::Think)
-                    .status(ToolCallStatus::InProgress)
-                    .content(vec![format!("Loading {cached_display_name}…").into()]),
-                ),
-            )
-            .ok();
-
-            // tick every 5s so the user knows we haven't frozen
-            let cx_for_spinner = cx.clone();
-            let spinner_session = args.session_id.clone();
-            let spinner_name = cached_display_name.clone();
-            let spinner_stop = Arc::clone(&stop_flag);
-            let spinner_tool_call_id = tool_call_id.clone();
-            let load_start = std::time::Instant::now();
-
-            cx.spawn(async move {
-                const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-                let mut tick: usize = 0;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                interval.tick().await; // consume the immediate first tick
-
-                while !spinner_stop.load(Ordering::Relaxed) {
-                    interval.tick().await;
-
-                    if spinner_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let elapsed = load_start.elapsed();
-                    let elapsed_str = if elapsed.as_secs() >= 60 {
-                        format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
-                    } else {
-                        format!("{}s", elapsed.as_secs())
-                    };
-                    let frame = SPINNER[tick % SPINNER.len()];
-                    tick += 1;
-
-                    let msg = format!("{frame} Loading {spinner_name}… ({elapsed_str})");
-                    let notification = SessionNotification::new(
-                        spinner_session.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            spinner_tool_call_id.clone(),
-                            ToolCallUpdateFields::new()
-                                .status(ToolCallStatus::InProgress)
-                                .content(vec![msg.into()]),
-                        )),
-                    );
-                    if cx_for_spinner.send_notification(notification).is_err() {
-                        break;
-                    }
-                }
-                Ok(())
-            })
-            .ok();
-        }
-
-        let switch_result = self.switch_model_by_id(model_id).await;
-
-        stop_flag.store(true, Ordering::Relaxed);
-
-        match switch_result {
-            Ok(new_config) => {
-                // Route inference back on-device (in case we were on a cloud tier).
-                self.reset_to_local_backend().await;
-                // Selecting an on-device model puts us in local mode.
-                let _ = settings::set_local_inference(true);
-
-                let completion_title = if needs_download {
-                    format!("✓ {} downloaded and loaded", new_config.display_name)
-                } else {
-                    format!("✓ Switched to {}", new_config.display_name)
-                };
-                let completion_body = if needs_download {
-                    format!("✓ {} downloaded and loaded.", new_config.display_name)
-                } else {
-                    format!("✓ Switched to {}.", new_config.display_name)
-                };
-
-                self.send_tool_call_update(
-                    cx,
-                    args.session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                        tool_call_id,
-                        ToolCallUpdateFields::new()
-                            .title(completion_title)
-                            .status(ToolCallStatus::Completed)
-                            .content(vec![completion_body.into()]),
-                    )),
-                )
-                .ok();
-
-                let config_options = {
-                    let guard = self.current_model.lock().unwrap();
-                    build_config_options(&guard, &args.session_id.to_string())
-                };
-
+        match self
+            .switch_model_and_wait(cx, &args.session_id, model_id, cancel_signal.as_mut())
+            .await?
+        {
+            // Gave up waiting; the load finishes on its own and says so.
+            None => Err(agent_client_protocol::Error::request_cancelled()),
+            Some(new_config) => {
                 log::info!("model switch complete");
-                Ok(SetSessionConfigOptionResponse::new(config_options))
-            }
-            Err(err) => {
-                self.send_tool_call_update(
-                    cx,
-                    args.session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                        tool_call_id,
-                        ToolCallUpdateFields::new()
-                            .title("Model switch failed".to_string())
-                            .status(ToolCallStatus::Failed)
-                            .content(vec![format!("error loading model: {}", err.message).into()]),
-                    )),
-                )
-                .ok();
-
-                Err(err)
+                Ok(SetSessionConfigOptionResponse::new(build_config_options(
+                    &new_config,
+                    &args.session_id.to_string(),
+                )))
             }
         }
     }
@@ -5433,6 +5440,7 @@ async fn exec_slash_acp(
     cx: &ConnectionTo<Client>,
     session_id: SessionId,
     command: SlashCommand,
+    cancellation: &PromptCancellation,
 ) -> agent_client_protocol::Result<PromptResponse> {
     match command {
         SlashCommand::Help => {
@@ -5645,63 +5653,52 @@ async fn exec_slash_acp(
                                 ),
                             )
                             .ok();
-                    } else if model.cache_health == setup::ModelCacheHealth::NotDownloaded {
-                        agent
-                            .send_assistant_message(
+                    } else {
+                        // The progress card (download bar or loading spinner)
+                        // is the reply; a failure is reported on it too.
+                        let switched = agent
+                            .switch_model_and_wait(
                                 cx,
-                                session_id.clone(),
-                                format!(
-                                    "Downloading and loading {} ({})… this may take a few minutes.",
-                                    model.display_name, model.description
-                                ),
+                                &session_id,
+                                &model.config.model_id,
+                                cancellation.cancelled(),
                             )
-                            .ok();
-
-                        match agent.switch_model_by_id(&model.config.model_id).await {
-                            Ok(new_config) => {
-                                agent.reset_to_local_backend().await;
-                                let _ = settings::set_local_inference(true);
+                            .await;
+                        match switched {
+                            Ok(Some(new_config)) => {
                                 agent
                                     .send_assistant_message(
                                         cx,
-                                        session_id,
-                                        format!(
-                                            "✓ Downloaded and switched to {}",
-                                            new_config.display_name
-                                        ),
+                                        session_id.clone(),
+                                        format!("✓ Switched to {}", new_config.display_name),
                                     )
                                     .ok();
+                                let options =
+                                    build_config_options(&new_config, &session_id.to_string());
+                                agent
+                                    .send_tool_call_update(
+                                        cx,
+                                        session_id,
+                                        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                                            options,
+                                        )),
+                                    )
+                                    .ok();
+                            }
+                            // Stopped waiting; the load tells the user when it lands.
+                            Ok(None) => {
+                                return Ok(PromptResponse::new(StopReason::Cancelled));
                             }
                             Err(err) => {
                                 agent
                                     .send_assistant_message(
                                         cx,
                                         session_id,
-                                        format!("error downloading model: {}", err.message),
+                                        format!("error loading model: {}", err.message),
                                     )
                                     .ok();
                             }
                         }
-                    } else {
-                        agent
-                            .send_assistant_message(
-                                cx,
-                                session_id.clone(),
-                                format!("Loading {}...", model.display_name),
-                            )
-                            .ok();
-
-                        let switched = agent.switch_model_by_id(&model.config.model_id).await?;
-                        agent.reset_to_local_backend().await;
-                        let _ = settings::set_local_inference(true);
-
-                        agent
-                            .send_assistant_message(
-                                cx,
-                                session_id,
-                                format!("Switched to {}.", switched.display_name),
-                            )
-                            .ok();
                     }
                 }
             }
@@ -5750,9 +5747,17 @@ async fn exec_slash_acp(
             // Loading an on-device model puts us in local inference mode.
             let _ = settings::set_local_inference(true);
             // `await_model_ready` drives the download/load progress UI and reports
-            // success or failure to the editor.
+            // success or failure to the editor. Cancelling stops the waiting
+            // only: the loader thread cannot be aborted, so a watcher tells the
+            // user when the model lands.
             agent.start_startup_model_load_if_needed();
-            agent.await_model_ready(cx, &session_id).await?;
+            tokio::select! {
+                ready = agent.await_model_ready(cx, &session_id) => ready?,
+                () = cancellation.cancelled() => {
+                    agent.announce_when_loaded(cx, session_id);
+                    return Ok(PromptResponse::new(StopReason::Cancelled));
+                }
+            }
         }
         SlashCommand::Login(argument) => {
             let message = match argument.as_deref().and_then(account::parse_login_args) {
@@ -5764,7 +5769,24 @@ async fn exec_slash_acp(
                 },
                 // A bare `/login` takes the browser route, same as the editor's
                 // sign-in button.
-                None => browser_login_message().await,
+                None => {
+                    // Shown before the wait, so someone on a box with no
+                    // browser (ssh) can see where to go while the page is open.
+                    let notice_session = session_id.clone();
+                    browser_login_message(|url| {
+                        agent
+                            .send_assistant_message(
+                                cx,
+                                notice_session,
+                                format!(
+                                    "Opening your browser to sign in. If it does not open, \
+                                     go to:\n{url}"
+                                ),
+                            )
+                            .ok();
+                    })
+                    .await
+                }
             };
             agent.send_assistant_message(cx, session_id, message).ok();
         }
@@ -5843,6 +5865,186 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
     total
 }
 
+// ── Model-load progress ───────────────────────────────────────────────────────
+
+/// The model a load card is about, resolved once from the picker so the card's
+/// title, percentage and size come from the model actually being loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadTarget {
+    model_id: String,
+    display_name: String,
+    needs_download: bool,
+    expected_bytes: u64,
+}
+
+impl LoadTarget {
+    fn resolve(model_id: &str) -> Self {
+        let item = models::local_picker_items()
+            .into_iter()
+            .find(|item| item.config.model_id == model_id);
+        let needs_download = item
+            .as_ref()
+            .is_some_and(|item| item.cache_health != setup::ModelCacheHealth::Complete);
+        let expected_bytes = if needs_download {
+            onde::inference::models::SUPPORTED_MODEL_INFO
+                .iter()
+                .find(|info| info.id == model_id)
+                .map(|info| info.expected_size_bytes)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Self {
+            model_id: model_id.to_string(),
+            display_name: item
+                .map(|item| item.display_name)
+                .unwrap_or_else(|| model_id.to_string()),
+            needs_download,
+            expected_bytes,
+        }
+    }
+}
+
+/// Title and body of one progress tick. `downloaded` only matters for a model
+/// that is still being fetched.
+fn load_progress_text(
+    target: &LoadTarget,
+    downloaded: u64,
+    frame: char,
+    elapsed_secs: u64,
+) -> (String, String) {
+    let name = &target.display_name;
+    let elapsed = if elapsed_secs >= 60 {
+        format!("{}m {:02}s", elapsed_secs / 60, elapsed_secs % 60)
+    } else {
+        format!("{elapsed_secs}s")
+    };
+    if target.needs_download && target.expected_bytes > 0 {
+        let pct = ((downloaded as f64 / target.expected_bytes as f64) * 100.0).min(99.0) as u8;
+        let size_hint = format!(" (~{})", format_size_human(target.expected_bytes));
+        (
+            format!("{frame} Downloading {name}{size_hint} ({pct}%)"),
+            format!(
+                "{name} — {} {pct}%  ({} / {})",
+                progress_bar(pct, 20),
+                format_size_human(downloaded),
+                format_size_human(target.expected_bytes),
+            ),
+        )
+    } else if target.needs_download {
+        (
+            format!("{frame} Downloading {name}"),
+            format!(
+                "{name} — {} downloaded… ({elapsed})",
+                format_size_human(downloaded)
+            ),
+        )
+    } else {
+        (
+            format!("{frame} Loading {name}"),
+            format!("{frame} Loading {name}… ({elapsed})"),
+        )
+    }
+}
+
+/// A load card on the wire: its tool call id, the model, and the flag that
+/// silences its poller. Whoever finishes the card sets the flag first.
+#[derive(Clone)]
+struct LoadCard {
+    tool_call_id: String,
+    target: LoadTarget,
+    stop: Arc<AtomicBool>,
+}
+
+enum LoadOutcome {
+    Loaded,
+    Failed(String),
+    /// The requester stopped waiting; the load itself carries on.
+    Cancelled,
+}
+
+/// Close a load card. Synchronous (a notification is just queued), so it also
+/// works from `Drop`.
+fn finish_load_card(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    card: &LoadCard,
+    outcome: LoadOutcome,
+) {
+    card.stop.store(true, Ordering::Relaxed);
+    let name = &card.target.display_name;
+    let fields = match outcome {
+        LoadOutcome::Loaded => {
+            let title = if card.target.needs_download {
+                format!("✓ {name} downloaded and loaded")
+            } else {
+                format!("✓ {name} loaded")
+            };
+            ToolCallUpdateFields::new()
+                .title(title.clone())
+                .status(ToolCallStatus::Completed)
+                .content(vec![format!("{title}.").into()])
+        }
+        LoadOutcome::Failed(error) => ToolCallUpdateFields::new()
+            .title("Model load failed".to_string())
+            .status(ToolCallStatus::Failed)
+            .content(vec![format!("error loading model: {error}").into()]),
+        LoadOutcome::Cancelled => ToolCallUpdateFields::new()
+            .title(format!("Stopped waiting for {name}"))
+            .status(ToolCallStatus::Failed)
+            .content(vec![
+                format!(
+                    "{name} keeps loading in the background; you will be told when it is ready."
+                )
+                .into(),
+            ]),
+    };
+    cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(card.tool_call_id.clone(), fields)),
+    ))
+    .ok();
+}
+
+/// A load card whose request is still waiting. Dropped unfinished (the request
+/// was cancelled), it closes the card as cancelled so it never spins forever.
+struct LoadProgress {
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+    card: LoadCard,
+    finished: bool,
+}
+
+impl LoadProgress {
+    fn card(&self) -> LoadCard {
+        self.card.clone()
+    }
+
+    fn finish(&mut self, outcome: LoadOutcome) {
+        self.finished = true;
+        finish_load_card(&self.cx, &self.session_id, &self.card, outcome);
+    }
+
+    /// Someone else closes the card from here on; the poller keeps going until
+    /// they do.
+    fn hand_off(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for LoadProgress {
+    fn drop(&mut self) {
+        if !self.finished {
+            finish_load_card(
+                &self.cx,
+                &self.session_id,
+                &self.card,
+                LoadOutcome::Cancelled,
+            );
+        }
+    }
+}
+
 fn format_size_human(bytes: u64) -> String {
     const GB: u64 = 1_073_741_824;
     const MB: u64 = 1_048_576;
@@ -5904,8 +6106,8 @@ fn redirect_output_to_log() -> anyhow::Result<(std::fs::File, std::fs::File)> {
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-/// in TUI mode stderr is the log file (redirected earlier);
-/// in ACP mode it's real stderr. either way, write there.
+/// in ACP mode stderr is the client's pipe; in other modes it's the terminal.
+/// either way, write there.
 fn init_logging(is_tty: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_fmt::Subscriber::builder()
@@ -5915,122 +6117,66 @@ fn init_logging(is_tty: bool) {
         .try_init();
 }
 
+/// The terminal UI owns the screen, so everything it logs goes to
+/// `$TMPDIR/sigit.log` through a file writer, on every platform. The agent it
+/// starts writes to its own stderr, which the client pipes into the same file
+/// (see `acp_client`). On Unix the fd redirect stays as well, as a safety net
+/// for anything that prints without going through `log`.
+fn init_tui_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let path = std::env::temp_dir().join("sigit.log");
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        // Nowhere to write: say nothing rather than draw over the screen.
+        return;
+    };
+    let _ = tracing_fmt::Subscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .try_init();
+}
+
 // ── Interactive TUI mode ──────────────────────────────────────────────────────
 
-/// boot the TUI and load the model on a background thread.
-/// `tty` goes to ratatui; `cleanup_tty` is a separate fd for
-/// LeaveAlternateScreen (ratatui 0.29 hides `writer_mut()`).
-#[cfg(unix)]
-async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
-    let engine = Arc::new(ChatEngine::new());
-
-    let startup_selection = setup::startup_model_selection();
-    let startup_model_name = startup_selection
-        .as_ref()
-        .map(|selection| selection.display_name.clone())
-        .unwrap_or_else(|| GgufModelConfig::qwen25_3b().display_name);
-
-    // Signals the loading phase to finish. On-device models are no longer loaded
-    // at startup, so this resolves immediately for both backends; it stays a
-    // channel so the loading-phase plumbing in `chat::run_with` is unchanged.
-    let (load_tx, load_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-    // The launch directory and its project instruction files, injected into the
-    // system prompt so the TUI shares the same always-on project context the
-    // ACP sessions get.
-    let with_instructions = |base: String| with_launch_context(&base);
-
-    // Pick the inference backend: a configured provider if present, else on-device.
-    let (inference_backend, startup_model_name): (Arc<dyn InferenceBackend>, String) =
-        match provider::active_provider() {
-            Some(provider) => {
-                log::info!(
-                    "inference: using {} (model {}) at {}",
-                    provider.display_name,
-                    provider.model,
-                    provider.base_url
-                );
-                // No local model to load; the endpoint is ready immediately.
-                let _ = load_tx.send(Ok(()));
-                let label = provider.display_name.clone();
-                register_subagent_factory_for(&provider);
-                let backend = Arc::new(OpenAiBackend::new(
-                    provider.base_url,
-                    provider.api_key,
-                    provider.model,
-                    Some(with_instructions(system_prompt_for_model(true))),
-                )) as Arc<dyn InferenceBackend>;
-                (backend, label)
-            }
-            None => {
-                // Honor the Local Inference toggle: when off and signed in, start
-                // on a cloud tier. Otherwise bring up on-device WITHOUT loading a
-                // model — the user loads it explicitly with /load (or /models), so
-                // the UI comes up immediately. Project instructions are injected at
-                // load time in `chat.rs`.
-                let cloud_when_off = if settings::local_inference_enabled() {
-                    None
-                } else {
-                    provider::cloud_tier_provider(provider::DEFAULT_CLOUD_TIER)
-                };
-
-                match cloud_when_off {
-                    Some(provider) => {
-                        log::info!(
-                            "inference: local inference off; using {} (model {})",
-                            provider.display_name,
-                            provider.model
-                        );
-                        let _ = load_tx.send(Ok(()));
-                        let label = provider.display_name.clone();
-                        register_subagent_factory_for(&provider);
-                        let backend = Arc::new(OpenAiBackend::new(
-                            provider.base_url,
-                            provider.api_key,
-                            provider.model,
-                            Some(with_instructions(system_prompt_for_model(true))),
-                        )) as Arc<dyn InferenceBackend>;
-                        (backend, label)
-                    }
-                    None => {
-                        if !settings::local_inference_enabled() {
-                            log::warn!(
-                                "local inference is off but no account is signed in; \
-                                 bringing up on-device. Run /login or /local on."
-                            );
-                        }
-                        let _ = load_tx.send(Ok(()));
-                        // On-device inference has a single shared history; no
-                        // subagent context is possible yet.
-                        tools::set_subagent_factory(Box::new(|_system_prompt: &str| None));
-                        let backend = Arc::new(LocalBackend::new(Arc::clone(&engine)))
-                            as Arc<dyn InferenceBackend>;
-                        (backend, startup_model_name)
-                    }
-                }
-            }
-        };
-
+/// Open the terminal UI: set the terminal up, run [`chat::run_with`], and put
+/// the terminal back. The UI is an ACP client of this binary (see
+/// `acp_client`), so nothing that loads a model or runs a tool lives here.
+/// `tty` goes to ratatui; `cleanup` is a separate handle for
+/// `LeaveAlternateScreen` (ratatui hides its writer).
+async fn run_interactive(tty: impl Write, cleanup: &mut impl Write) -> anyhow::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let mut tty = BufWriter::new(tty);
     crossterm::execute!(tty, crossterm::terminal::EnterAlternateScreen)?;
     let term_backend = ratatui::backend::CrosstermBackend::new(tty);
     let mut terminal = ratatui::Terminal::new(term_backend)?;
 
-    // polls load_rx with try_recv() each tick, no blocking
-    let chat_result = chat::run_with(
-        &mut terminal,
-        engine,
-        inference_backend,
-        load_rx,
-        startup_model_name,
-    )
-    .await;
+    let chat_result = chat::run_with(&mut terminal).await;
 
-    // cleanup fd because backend's writer is private
-    crossterm::execute!(cleanup_tty, crossterm::terminal::LeaveAlternateScreen)?;
-    cleanup_tty.flush()?;
+    crossterm::execute!(cleanup, crossterm::terminal::LeaveAlternateScreen)?;
+    cleanup.flush()?;
     crossterm::terminal::disable_raw_mode()?;
+    chat_result
+}
+
+/// `sigit code`, or a bare `sigit` in a terminal on Unix.
+async fn launch_tui() -> anyhow::Result<()> {
+    // must redirect before any library code touches stdout
+    #[cfg(unix)]
+    let (tty, mut cleanup_tty) = redirect_output_to_log()?;
+    // Windows has no fd redirect to lean on, and needs none: this process
+    // renders and speaks JSON-RPC to a pipe, and runs no library that prints.
+    #[cfg(not(unix))]
+    let (tty, mut cleanup_tty) = (std::io::stdout(), std::io::stdout());
+
+    init_tui_logging();
+    // Only the official server, for the Repo tab's lookups; the agent process
+    // connects the rest.
+    mcp::init_official_only().await;
+    let result = run_interactive(tty, &mut cleanup_tty).await;
 
     // restore real stdout/stderr for post-TUI error output
     #[cfg(unix)]
@@ -6041,8 +6187,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
             libc::dup2(cleanup_fd, libc::STDERR_FILENO);
         }
     }
-
-    chat_result
+    result
 }
 
 // ── ACP server mode ───────────────────────────────────────────────────────────
@@ -6069,6 +6214,15 @@ fn default_local_model_config() -> GgufModelConfig {
             })
         })
         .unwrap_or_else(GgufModelConfig::qwen25_3b)
+}
+
+/// The surface an ACP-mode process serves: `tui` when the terminal UI launched
+/// it as its agent, an editor otherwise.
+fn surface_from_env(value: Option<&str>) -> tools::Surface {
+    match value {
+        Some("tui") => tools::Surface::Tui,
+        _ => tools::Surface::Acp,
+    }
 }
 
 fn parse_explicit_acp(args: &[String]) -> Result<bool, String> {
@@ -6112,15 +6266,15 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
     let model_load_error: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    let state = Arc::new(SiGitAgent::new(
+    let state = SiGitAgent::new(
         engine,
         config,
         model_ready,
         startup_model_load_started,
         model_load_error,
-        needs_download,
         auto_load_local_model,
-    ));
+    )
+    .share();
 
     // Honor the explicit provider override (OPENAI_BASE_URL/OPENAI_API_KEY or
     // an active providers.toml profile) in ACP mode too — the interactive
@@ -6355,6 +6509,10 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                             cx: ConnectionTo<Client>| {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
+                    // `$/cancel_request` stops a model load being waited on
+                    // (the load itself runs to the end, see
+                    // `begin_model_switch`).
+                    let cancellation = Some(responder.cancellation());
                     cx.spawn(async move {
                         // A Permissions change can arrive while a turn is
                         // running, so it takes neither lock. Model and
@@ -6362,14 +6520,14 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                         if req.config_id.0.as_ref() == PERMISSION_MODE_CONFIG_ID {
                             return handle_response(
                                 responder,
-                                state.handle_set_session_config_option(&task_cx, req).await,
+                                state.handle_set_session_config_option(&task_cx, req, cancellation).await,
                             );
                         }
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
-                            state.handle_set_session_config_option(&task_cx, req).await,
+                            state.handle_set_session_config_option(&task_cx, req, cancellation).await,
                         )
                     })
                 }
@@ -6475,10 +6633,11 @@ async fn sign_in_via_client(
 
 /// Run the browser sign-in from a chat surface and describe how it went.
 ///
-/// Both the TUI and an ACP session reach this from a bare `/login`. Neither can
-/// prompt for a pasted code mid-command, so a box with no bindable port is told
-/// to use `sigit login`, which can.
-pub(crate) async fn browser_login_message() -> String {
+/// An ACP session reaches this from a bare `/login` (the terminal UI is one).
+/// It cannot prompt for a pasted code mid-command, so a box with no bindable
+/// port is told to use `sigit login`, which can. `announce` gets the authorize
+/// URL before the wait starts, so the user can see where the sign-in is.
+pub(crate) async fn browser_login_message(announce: impl FnOnce(&str)) -> String {
     let flow = browser_auth::begin();
     if !flow.is_loopback() {
         return "Could not open a local port to receive the sign-in. \
@@ -6488,6 +6647,7 @@ pub(crate) async fn browser_login_message() -> String {
 
     browser_auth::open_browser(flow.authorize_url());
     let url = flow.authorize_url().to_string();
+    announce(&url);
 
     match browser_auth::complete_loopback(flow).await {
         Ok(email) => format!("Signed in as {email}. Pick a siGit Code Cloud tier in /models."),
@@ -6583,6 +6743,18 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", account::status_line().await);
                 return Ok(());
             }
+            // The terminal UI, on every platform. A bare `sigit` opens it only
+            // on Unix (see the usage text below for why not on Windows).
+            "code" => {
+                if !std::io::stdin().is_terminal() {
+                    eprintln!(
+                        "sigit code needs a terminal. To use siGit Code from an editor, point \
+                         its ACP client at this binary; for scripts, use `sigit run \"<prompt>\"`."
+                    );
+                    std::process::exit(2);
+                }
+                return launch_tui().await;
+            }
             _ => {}
         }
     }
@@ -6661,46 +6833,41 @@ async fn main() -> anyhow::Result<()> {
     let is_tty = std::io::stdin().is_terminal();
 
     if is_tty {
-        // must redirect before any library code touches stdout
         #[cfg(unix)]
         {
-            tools::set_surface(tools::Surface::Tui);
-            let (tty, cleanup_tty) = redirect_output_to_log()?;
-            init_logging(true);
-            setup::setup_shared_model_cache();
-            // Best-effort: discover MCP servers (incl. the official one) before
-            // the first turn so their tools are offered to the model.
-            mcp::init().await;
-            run_interactive(tty, cleanup_tty).await
+            launch_tui().await
         }
         #[cfg(not(unix))]
         {
-            // No TUI on non-Unix: the interactive full-screen client relies on
-            // fd redirection that only exists on Unix. A bare launch in a
-            // terminal (the common case, and exactly what the winget installer
-            // validator does — run `sigit.exe` with no arguments) therefore has
-            // nothing to do, so print how to use the binary and exit cleanly.
-            // Bailing here instead would return a non-zero exit code, which the
-            // validator reads as a failure (Validation-Executable-Error).
+            // A bare launch in a terminal is exactly what the winget installer
+            // validator does (run `sigit.exe` with no arguments), so it must
+            // print how to use the binary and exit cleanly: bailing here would
+            // return a non-zero exit code, which the validator reads as a
+            // failure (Validation-Executable-Error). The terminal UI is one
+            // word away.
             println!(
                 "siGit Code v{}\n\n\
-                 Interactive terminal mode is Unix-only (macOS / Linux). On this \
-                 platform sigit runs as an ACP agent for editor integration, or \
-                 non-interactively from a script:\n\n\
+                 \x20 sigit code             open the terminal UI\n\
                  \x20 sigit run \"<prompt>\"   run one prompt and exit\n\
                  \x20 sigit --version        print the version\n\
                  \x20 sigit login            sign in to siGit Code Cloud\n\n\
-                 Point your editor's ACP client at this binary to use it \
-                 interactively.",
+                 Point your editor's ACP client at this binary to use it from \
+                 an editor.",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
         }
     } else {
         // ACP mode: keep stdout untouched for protocol JSON only.
-        // Logs already go to stderr via `init_logging(false)`.
-        tools::set_surface(tools::Surface::Acp);
-        init_logging(false);
+        // Logs already go to stderr via `init_logging`.
+        //
+        // The terminal UI is an ACP client of this very binary and says so in
+        // `SIGIT_SURFACE`, so commit trailers read `-tui` instead of `-acp`.
+        let surface = surface_from_env(std::env::var("SIGIT_SURFACE").ok().as_deref());
+        tools::set_surface(surface);
+        // The terminal UI copies these lines into its log file, where colour
+        // codes are noise.
+        init_logging(surface == tools::Surface::Tui);
         setup::setup_shared_model_cache();
         // Best-effort MCP discovery (incl. the official server) before serving.
         mcp::init().await;
@@ -6901,7 +7068,6 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
             false,
-            false,
         );
 
         let error = agent
@@ -6921,7 +7087,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
-            false,
             false,
         );
         let session_id = SessionId::new("early");
@@ -6961,7 +7126,6 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
             false,
-            false,
         );
         let old = Arc::new(PromptCancellation::default());
         let new = Arc::new(PromptCancellation::default());
@@ -6986,7 +7150,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
-            false,
             false,
         );
         let first = Arc::new(PromptCancellation::default());
@@ -7041,7 +7204,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
-            false,
             false,
         );
         let cloud = || provider::ProviderConfig {
@@ -7135,7 +7297,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
-            false,
             false,
         );
         // A remote backend keeps its own history, which is where threads used
@@ -7292,7 +7453,6 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
             false,
-            false,
         );
         // No request is ever sent.
         *agent.backend.lock().await = Arc::new(OpenAiBackend::new(
@@ -7382,7 +7542,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
-            false,
             false,
         );
         *agent.backend.lock().await = Arc::new(OpenAiBackend::new(
@@ -7482,7 +7641,6 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
             false,
-            false,
         ));
         let held = |key: &str| agent.session_locks.lock().unwrap().contains_key(key);
         let thread = SessionId::new("lock-thread");
@@ -7530,7 +7688,6 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
             false,
-            false,
         );
         let gone = SessionId::new("resume-thread-gone");
         let cancellation = PromptCancellation::default();
@@ -7568,18 +7725,6 @@ mod tests {
         // Relative paths only resolve against the primary root, so the model is
         // told to address the others absolutely.
         assert!(multi.contains("absolute paths"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn launch_context_tells_the_tui_model_where_the_project_is() {
-        // The TUI has no ACP session carrying a cwd; without this the model
-        // guesses paths like `/path/to/repo/AGENTS.md`. Only assert on the
-        // guidance, not the path: the cwd is process-global and other tests
-        // move it briefly.
-        let prompt = with_launch_context("BASE PROMPT");
-        assert!(prompt.starts_with("BASE PROMPT\n\n"));
-        assert!(prompt.contains("absolute paths"));
     }
 
     #[test]
@@ -8406,5 +8551,243 @@ mod tests {
         let locations = tool_call_locations("multi_edit", r#"{"path":"src/main.rs"}"#);
         assert_eq!(locations.len(), 1);
         assert!(locations[0].path.ends_with("src/main.rs"));
+    }
+
+    // ── On-device inference through the ACP path ──────────────────────────────
+
+    /// Point every place a model switch writes its choice (settings, the saved
+    /// selection, the model cache) at `root`, so a test never touches the real
+    /// ones. Callers hold `ENV_TEST_LOCK`.
+    fn isolate_user_state(
+        root: &std::path::Path,
+    ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        const NAMES: [&str; 5] = [
+            "SIGIT_CONFIG_DIR",
+            "HF_HOME",
+            "HF_HUB_CACHE",
+            "HOME",
+            "SIGIT_LOCAL_INFERENCE",
+        ];
+        let saved = NAMES
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        std::fs::create_dir_all(root).unwrap();
+        // SAFETY: callers hold ENV_TEST_LOCK and restore with `restore_user_state`.
+        unsafe {
+            std::env::set_var("SIGIT_CONFIG_DIR", root.join("config"));
+            std::env::set_var("HF_HOME", root);
+            std::env::set_var("HF_HUB_CACHE", root.join("hub"));
+            std::env::set_var("HOME", root);
+            std::env::remove_var("SIGIT_LOCAL_INFERENCE");
+        }
+        saved
+    }
+
+    fn restore_user_state(saved: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        // SAFETY: callers hold ENV_TEST_LOCK.
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_model_without_tool_calling_is_offered_no_tools() {
+        assert!(tools_for_turn(false, false).is_empty());
+    }
+
+    /// Whether `tools` offers a tool by name. The exact set shifts with
+    /// process-global state other tests set (subagent factory, MCP), so a test
+    /// asks for the tools every build has.
+    fn offers(tools: &[ToolSpec], name: &str) -> bool {
+        tools.iter().any(|tool| tool.name == name)
+    }
+
+    #[test]
+    fn a_local_model_with_tool_calling_is_offered_the_full_set() {
+        let tools = tools_for_turn(false, true);
+        assert!(offers(&tools, "run_command") && offers(&tools, "edit_file"));
+    }
+
+    #[test]
+    fn a_remote_endpoint_is_always_offered_the_full_set() {
+        // The flag describes the on-device model only; a cloud tier ignores it.
+        let tools = tools_for_turn(true, false);
+        assert!(offers(&tools, "run_command") && offers(&tools, "edit_file"));
+    }
+
+    #[test]
+    fn the_surface_follows_sigit_surface() {
+        assert_eq!(surface_from_env(Some("tui")), tools::Surface::Tui);
+        assert_eq!(surface_from_env(Some("anything")), tools::Surface::Acp);
+        assert_eq!(surface_from_env(None), tools::Surface::Acp);
+    }
+
+    fn load_target(name: &str, needs_download: bool, expected_bytes: u64) -> LoadTarget {
+        LoadTarget {
+            model_id: format!("test/{name}"),
+            display_name: name.to_string(),
+            needs_download,
+            expected_bytes,
+        }
+    }
+
+    #[test]
+    fn load_progress_is_titled_after_the_model_being_loaded() {
+        let gib = 1_073_741_824;
+        let small = load_target("Small 1B", true, gib);
+        let big = load_target("Big 7B", true, 4 * gib);
+
+        // Half of each model's own size, not of the startup model's.
+        let (title, body) = load_progress_text(&small, gib / 2, '⠋', 3);
+        assert!(title.contains("Downloading Small 1B"), "{title}");
+        assert!(title.contains("(50%)"), "{title}");
+        assert!(body.contains("[██████████░░░░░░░░░░] 50%"), "{body}");
+        assert!(body.contains("512.0 MB / 1.00 GB"), "{body}");
+
+        let (title, body) = load_progress_text(&big, gib / 2, '⠙', 3);
+        assert!(title.contains("Downloading Big 7B"), "{title}");
+        assert!(title.contains("(12%)"), "{title}");
+        assert!(body.contains("512.0 MB / 4.00 GB"), "{body}");
+    }
+
+    #[test]
+    fn load_progress_caps_at_99_until_the_load_finishes() {
+        let target = load_target("Model", true, 1000);
+        let (title, _) = load_progress_text(&target, 5000, '⠋', 0);
+        assert!(title.contains("(99%)"), "{title}");
+    }
+
+    #[test]
+    fn a_cached_model_shows_a_spinner_and_elapsed_time() {
+        let target = load_target("Cached 3B", false, 0);
+        let (title, body) = load_progress_text(&target, 0, '⠹', 75);
+        assert_eq!(title, "⠹ Loading Cached 3B");
+        assert_eq!(body, "⠹ Loading Cached 3B… (1m 15s)");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global env for the whole test
+    async fn a_load_nobody_waits_for_still_applies_its_state() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = std::env::temp_dir().join(format!("sigit-load-{}", uuid::Uuid::new_v4()));
+        let saved_env = isolate_user_state(&config);
+
+        let current = default_local_model_config();
+        let target = models::local_picker_items()
+            .into_iter()
+            .find(|item| {
+                item.config.model_id != current.model_id
+                    && item.cache_health != setup::ModelCacheHealth::Incomplete
+            })
+            .expect("the picker lists a second on-device model");
+
+        // The fake loader hands out a receiver the test completes by hand.
+        let (finish, loaded) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let loaded = std::sync::Mutex::new(Some(loaded));
+        let mut agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            current,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+        );
+        agent
+            .local_tool_calling
+            .store(!target.tool_calling, Ordering::Release);
+        agent.model_loader = Arc::new(move |_, _, _, _| loaded.lock().unwrap().take().unwrap());
+        let agent = agent.share();
+
+        let done = agent
+            .begin_model_switch(&target.config.model_id, None)
+            .await
+            .unwrap();
+        // In flight: a prompt now is told the model is still loading.
+        assert!(agent.startup_model_load_started.load(Ordering::Acquire));
+        assert!(!agent.model_ready.load(Ordering::Acquire));
+
+        // The requester gives up (cancelled prompt); the load carries on.
+        drop(done);
+        finish.send(Ok(())).unwrap();
+        for _ in 0..200 {
+            if agent.model_ready.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(agent.model_ready.load(Ordering::Acquire));
+        assert_eq!(
+            agent.current_model.lock().unwrap().model_id,
+            target.config.model_id
+        );
+        assert_eq!(
+            agent.local_tool_calling.load(Ordering::Acquire),
+            target.tool_calling
+        );
+        assert_eq!(
+            setup::load_selected_model().map(|selected| selected.model_id),
+            Some(target.config.model_id.clone())
+        );
+        assert!(settings::local_inference_enabled());
+
+        restore_user_state(saved_env);
+        std::fs::remove_dir_all(&config).ok();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global env for the whole test
+    async fn a_failed_load_lets_prompts_through_again() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = std::env::temp_dir().join(format!("sigit-load-{}", uuid::Uuid::new_v4()));
+        let saved_env = isolate_user_state(&config);
+        let current = default_local_model_config();
+        let target = models::local_picker_items()
+            .into_iter()
+            .find(|item| {
+                item.config.model_id != current.model_id
+                    && item.cache_health != setup::ModelCacheHealth::Incomplete
+            })
+            .expect("the picker lists a second on-device model");
+
+        let mut agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            current.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+        );
+        agent.model_loader = Arc::new(|_, _, _, _| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(Err("does not fit".to_string())).unwrap();
+            rx
+        });
+        let agent = agent.share();
+
+        let error = agent
+            .switch_model_by_id(&target.config.model_id)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("does not fit"), "{}", error.message);
+        assert!(agent.model_ready.load(Ordering::Acquire));
+        // Nothing was applied.
+        assert_eq!(
+            agent.current_model.lock().unwrap().model_id,
+            current.model_id
+        );
+
+        restore_user_state(saved_env);
+        std::fs::remove_dir_all(&config).ok();
     }
 }
