@@ -335,7 +335,7 @@ fn decode_k3_attribute(value: &str) -> String {
     value.replace("&quot;", "\"").replace("&amp;", "&")
 }
 
-/// Parse a DeepSeek DSML `<｜DSML｜tool_calls>` envelope's inner text: zero or
+/// Parse a DSML `<｜DSML｜tool_calls>` envelope's inner text: zero or
 /// more `<｜DSML｜invoke name="$TOOL">...</｜DSML｜invoke>` blocks, each
 /// holding `<｜DSML｜parameter name="$KEY" string="true|false">...` entries.
 fn parse_dsml_block(inner: &str, tools: &[ToolSpec]) -> Option<Vec<Recovered>> {
@@ -792,7 +792,7 @@ fn looks_like_k3_call(after_marker: &str) -> bool {
     rest.is_empty() || rest.starts_with(K3_CALL_OPEN)
 }
 
-/// Whether the text after a DeepSeek `<｜DSML｜tool_calls>` marker reads as
+/// Whether the text after a DSML `<｜DSML｜tool_calls>` marker reads as
 /// the start of a call: a `<｜DSML｜invoke` marker after any whitespace, or
 /// nothing at all. A quoted marker, like the constant in this file, fails.
 fn looks_like_dsml_call(after_marker: &str) -> bool {
