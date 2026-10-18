@@ -745,11 +745,12 @@ fn todos_arguments_to_plan(arguments: &str) -> Option<Plan> {
     Some(Plan::new(entries))
 }
 
-/// Rebuilds an ACP [`Plan`] from the persisted todo list in `tools::get_todos()`.
-/// Used to re-emit the plan on error turns so the client panel stays populated
-/// when the model never got to (or forgot to) call `write_todos` this turn.
-fn persisted_todos_to_plan() -> Option<Plan> {
-    let todos = tools::get_todos()?;
+/// Rebuilds an ACP [`Plan`] from the session's persisted todo list in
+/// `tools::get_todos()`. Used to re-emit the plan on error turns so the client
+/// panel stays populated when the model never got to (or forgot to) call
+/// `write_todos` this turn.
+fn persisted_todos_to_plan(session: &SessionId) -> Option<Plan> {
+    let todos = tools::get_todos(&session.to_string())?;
     let entries = todos
         .into_iter()
         .map(|todo| {
@@ -3013,10 +3014,11 @@ impl SiGitAgent {
     ///
     /// Drops everything this process holds for it: the parked state (and with
     /// it the MCP servers the client named), its permission grants and plan
-    /// mode, and the background commands it started. The saved history stays,
-    /// so the thread still lists and reopens. The caller has already signalled
-    /// the session's running turn (see `begin_close`) and holds the session's
-    /// lock and `workspace_lock`, so that turn has ended by the time this runs.
+    /// mode, its todo list, and the background commands it started. The saved
+    /// history stays, so the thread still lists and reopens. The caller has
+    /// already signalled the session's running turn (see `begin_close`) and
+    /// holds the session's lock and `workspace_lock`, so that turn has ended by
+    /// the time this runs.
     ///
     /// An id this process does not hold is answered with success. The spec
     /// allows an error there, but the client wants the session gone and it is.
@@ -3052,6 +3054,10 @@ impl SiGitAgent {
         self.announced_titles.lock().unwrap().remove(&key);
         let killed = tools::kill_session_tasks(&key);
         tools::forget_abort(&key);
+        // The plan is the conversation's, so it goes with the conversation:
+        // an id that comes back later starts with an empty panel rather than
+        // the previous life's list.
+        tools::clear_todos(&key);
         self.closing_sessions.lock().unwrap().remove(&key);
 
         log::info!(
@@ -3601,7 +3607,7 @@ impl SiGitAgent {
                 // Re-emit the persisted plan so the client panel doesn't go
                 // empty when the initial inference call fails before the model
                 // can call `write_todos`.
-                if let Some(plan) = persisted_todos_to_plan() {
+                if let Some(plan) = persisted_todos_to_plan(&session_id) {
                     let _ = self.send_plan_update(cx, session_id.clone(), plan);
                 }
                 // Verbatim, no prefix: the backend has already turned this into
@@ -3998,7 +4004,7 @@ impl SiGitAgent {
                     log::error!("send_tool_results failed: {error}");
                     // Re-emit the persisted plan so the client panel doesn't go
                     // empty when a tool round fails mid-turn.
-                    if let Some(plan) = persisted_todos_to_plan() {
+                    if let Some(plan) = persisted_todos_to_plan(&session_id) {
                         let _ = self.send_plan_update(cx, session_id.clone(), plan);
                     }
                     self.finish_prompt(&session_id, &cancellation);
@@ -5494,6 +5500,13 @@ async fn exec_slash_acp(
             permissions::reset_session(&session_key);
             // The saved session must not resurrect what the user just wiped.
             session_store::delete(&session_key);
+            // The plan belongs to the conversation, so the wipe drops it too.
+            // The empty plan is what clears the client's panel: without it the
+            // editor keeps showing the list of the thread that no longer exists.
+            tools::clear_todos(&session_key);
+            agent
+                .send_plan_update(cx, session_id.clone(), Plan::new(Vec::new()))
+                .ok();
             // The wipe drops the session's Permissions override too; push the
             // refreshed chip so it doesn't keep showing a stale pick.
             let config_options = {
@@ -5926,6 +5939,12 @@ fn init_logging(is_tty: bool) {
 /// LeaveAlternateScreen (ratatui 0.29 hides `writer_mut()`).
 #[cfg(unix)]
 async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> anyhow::Result<()> {
+    // The TUI is one long-lived conversation and shares the key the permission
+    // and session stores already use, so its tool calls are scoped to it —
+    // background task ownership and the todo list — instead of the session-less
+    // `""` key, which no teardown path can name.
+    tools::set_active_session(Some(permissions::TUI_SESSION));
+
     let engine = Arc::new(ChatEngine::new());
 
     let startup_selection = setup::startup_model_selection();
@@ -6052,6 +6071,18 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
             libc::dup2(cleanup_fd, libc::STDERR_FILENO);
         }
     }
+
+    // The conversation is over, however it ended (`/exit`, Ctrl+C, a panic in
+    // the event loop). Drop what it owned — background tasks, the plan, the
+    // permission grants and the abort slot — and detach the active session, so
+    // nothing outlives the conversation. The saved history deliberately stays:
+    // it is what `/resume` brings back on the next launch.
+    let killed = tools::kill_session_tasks(permissions::TUI_SESSION);
+    tools::clear_todos(permissions::TUI_SESSION);
+    tools::forget_abort(permissions::TUI_SESSION);
+    permissions::reset_session(permissions::TUI_SESSION);
+    tools::set_active_session(None);
+    log::info!("tui exit: {killed} background task(s) stopped");
 
     chat_result
 }
@@ -6911,7 +6942,7 @@ mod tests {
     async fn unknown_session_is_rejected_instead_of_borrowing_live_cwd() {
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -6932,7 +6963,7 @@ mod tests {
     async fn a_turn_leaves_no_cancellation_behind_however_it_returns() {
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -6971,7 +7002,7 @@ mod tests {
     async fn a_finished_turn_does_not_remove_its_successors_cancellation() {
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -6997,7 +7028,7 @@ mod tests {
     async fn cancel_signals_only_the_matching_active_prompt() {
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -7049,7 +7080,7 @@ mod tests {
             std::env::set_var("SIGIT_LOCAL_INFERENCE", "on");
         }
 
-        let local = default_local_model_config();
+        let local = GgufModelConfig::qwen25_3b();
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
             local.clone(),
@@ -7146,7 +7177,7 @@ mod tests {
 
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -7302,7 +7333,7 @@ mod tests {
 
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -7393,7 +7424,7 @@ mod tests {
 
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -7492,7 +7523,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let agent = Arc::new(SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -7540,7 +7571,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let agent = SiGitAgent::new(
             Arc::new(ChatEngine::new()),
-            default_local_model_config(),
+            GgufModelConfig::qwen25_3b(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),

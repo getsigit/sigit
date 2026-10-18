@@ -1673,6 +1673,10 @@ mod tui {
                     };
                     if app.history_pending_delete.as_deref() == Some(id.as_str()) {
                         crate::session_store::delete(&id);
+                        // A plan must not outlive its conversation. The id is
+                        // the live session's key when the user deletes the
+                        // thread the TUI is currently running.
+                        crate::tools::clear_todos(&id);
                         app.refresh_history();
                         app.history_notice = Some(format!("Deleted session '{id}'."));
                     } else {
@@ -2876,6 +2880,8 @@ mod tui {
                 crate::permissions::reset_session(crate::permissions::TUI_SESSION);
                 // The saved session must not resurrect what the user just wiped.
                 crate::session_store::delete(TUI_STORE_SESSION);
+                // The plan belongs to the conversation, so the wipe drops it too.
+                crate::tools::clear_todos(crate::permissions::TUI_SESSION);
                 app.context_tokens_used = None;
                 app.messages.push(ChatMessage::system(format!(
                     "Cleared {cleared} turn(s). History is empty.",
