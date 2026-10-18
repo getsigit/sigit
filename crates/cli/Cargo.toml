@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
-keywords = ["cli", "ai", "coding-agent", "llm", "acp", "local", "on-device", "sigit"]
+keywords = ["cli", "ai", "coding-agent", "llm", "acp"]
 categories = ["command-line-utilities"]
 authors.workspace = true
 # `src/bin/` holds test-only helper binaries (the MCP stdio stub used by the

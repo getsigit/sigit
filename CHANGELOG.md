@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.7.1
+
+Two process-global stores in the CLI leaked between the sessions one process
+serves. A patch release, so nothing here changes the protocol surface 1.7.0
+introduced.
+
+### Fixed
+
+- **A todo list cannot leak into another thread.** `tools.rs` kept the list in
+  a single process-global slot, shared by every session the process serves, so
+  a plan written in one conversation showed up in the next. It is keyed by
+  session now, like the permission grants, and cleared when the session ends.
+  The TUI carries a session key of its own (`permissions::TUI_SESSION`) rather
+  than the session-less `""` key, so its background commands, plan and
+  permission grants are torn down on exit; the unused `TODOS_TEST_LOCK` and
+  `reset_todos` are gone.
+- **The model picker's roots are resolved per caller instead of through the
+  environment.** `setup.rs` built its model store by mutating `HF_HUB_CACHE`,
+  `HF_HOME` and `HOME` under `ENV_TEST_LOCK`, which never isolated the values
+  because the picker reads those variables on other threads — `setup::tests`
+  failed intermittently. Production callers resolve the roots once with
+  `ModelRoots::from_env()` and pass them into the internals, so a test points
+  the readers at a scratch directory instead of aiming process-global
+  variables at it.
+- **`sigit` publishes again.** The crate listed eight keywords and crates.io
+  accepts five, so the v1.7.0 publish failed with a 400. The list is trimmed to
+  `cli`, `ai`, `coding-agent`, `llm`, `acp`.
+
 ## 1.7.0
 
 Finishes the Agent Client Protocol v1 surface. An editor can now delete a
