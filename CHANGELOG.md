@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A thread whose directory is gone no longer runs tools elsewhere.** The
+  process stayed in whichever directory the previous thread left it in, so
+  `read_file`, `edit_file` and `run_command` acted on the wrong project. A
+  prompt on such a thread now fails with resource not found, and a turn that
+  loses its directory mid-wait is cancelled. `session/load`, `session/resume`
+  and `session/fork` still succeed, so the saved history stays readable (#179).
+
 ## 1.7.2
 
 The interactive terminal tells the program that launched it what it is doing,

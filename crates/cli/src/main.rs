@@ -2587,7 +2587,7 @@ impl SiGitAgent {
         cancellation: &PromptCancellation,
     ) {
         if workspace.reacquire().await
-            && let Err(error) = self.activate_session(session_id).await
+            && let Err(error) = self.reinstall_for_tools(session_id).await
         {
             log::warn!(
                 "session({session_id}): could not reinstall mid-turn, cancelling the turn: {}",
@@ -2595,6 +2595,30 @@ impl SiGitAgent {
             );
             cancellation.cancelled.store(true, Ordering::Release);
             cancellation.notify.notify_one();
+        }
+    }
+
+    /// Make `session_id` the live session and check that its directory is still
+    /// there. Tools resolve relative paths against the process directory, and
+    /// `install_session` leaves that alone when the session's `cwd` is gone, so
+    /// a prompt or a tool run on such a session would act in the previous
+    /// session's directory. Load, resume and fork do not call this: they
+    /// succeed for a deleted project so a client can still show its history.
+    async fn reinstall_for_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> agent_client_protocol::Result<()> {
+        self.activate_session(session_id).await?;
+        let cwd = self.session_cwd.lock().unwrap().clone();
+        match cwd {
+            Some(cwd) if !cwd.is_dir() => Err(agent_client_protocol::Error::new(
+                ErrorCode::ResourceNotFound.into(),
+                format!(
+                    "the working directory of session {session_id} no longer exists: {}",
+                    cwd.display()
+                ),
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -2619,9 +2643,12 @@ impl SiGitAgent {
         }
         workspace::replace_additional_roots(additional_roots.clone());
         mcp::set_session_servers(mcp_servers);
-        if cwd.is_dir()
-            && let Err(err) = std::env::set_current_dir(&cwd)
-        {
+        if !cwd.is_dir() {
+            log::warn!(
+                "session({key}): cwd {} no longer exists, prompts and tools on it will fail",
+                cwd.display()
+            );
+        } else if let Err(err) = std::env::set_current_dir(&cwd) {
             log::warn!("could not set cwd to {}: {err}", cwd.display());
         }
         *self.active_session.lock().unwrap() = Some(key.to_string());
@@ -3270,7 +3297,7 @@ impl SiGitAgent {
         if cancellation.cancelled.load(Ordering::Acquire) {
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
-        self.activate_session(&session_id).await?;
+        self.reinstall_for_tools(&session_id).await?;
         if cancellation.cancelled.load(Ordering::Acquire) {
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
@@ -7607,6 +7634,50 @@ mod tests {
         // The signal is there for whatever waits on it next.
         cancellation.cancelled().await;
         assert!(agent.active_session.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global env for the whole test
+    async fn a_session_whose_directory_is_gone_loads_but_refuses_tools() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            GgufModelConfig::qwen25_3b(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        let dir = std::env::temp_dir().join(format!("sigit_gone_cwd_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let thread = SessionId::new("gone-cwd-thread");
+        agent
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("gone-cwd-thread".into(), agent.session_state(&dir, &[]));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Load, resume and fork only activate, so they still succeed.
+        agent.activate_session(&thread).await.unwrap();
+
+        // A prompt or a tool run does not.
+        *agent.active_session.lock().unwrap() = None;
+        let error = agent.reinstall_for_tools(&thread).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceNotFound);
+        assert!(error.message.contains("no longer exists"));
+
+        let cancellation = PromptCancellation::default();
+        let mut workspace = WorkspaceHold::acquire(&agent.workspace_lock).await;
+        workspace.release();
+        *agent.active_session.lock().unwrap() = None;
+        agent
+            .resume_workspace(&mut workspace, &thread, &cancellation)
+            .await;
+        assert!(cancellation.cancelled.load(Ordering::Acquire));
     }
 
     #[test]
