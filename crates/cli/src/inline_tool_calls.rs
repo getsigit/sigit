@@ -36,7 +36,14 @@
 //!
 //! One spelling difference is folded away before matching: DSML markers are
 //! built from fullwidth bars, and some stacks hand them back with each bar
-//! doubled (`<｜｜DSML｜｜invoke …>`). See [`fold_dsml_bars`].
+//! doubled (`<｜｜DSML｜｜invoke …>`). See [`fold_dsml_bars`]. DSML envelopes
+//! come as `tool_calls`, `function_calls` or bare `calls`, and a closer may put
+//! its slash before the bar (`</｜DSML｜invoke>`); see [`fold_dsml_closers`].
+//!
+//! Some models wrap the call in `<tool_call>` or `<minimax:tool_call>` and
+//! write `<invoke name="…">` with parameters as `<parameter name="k">v</parameter>`
+//! or `<k>v</k>`. The tokenizer's `]<]minimax[>[` special token also leaks
+//! into content, between tags and in prose; it is stripped before matching.
 
 use std::collections::HashMap;
 
@@ -44,6 +51,16 @@ use crate::backend::ToolSpec;
 
 const XML_OPEN_TAG: &str = "<tool_call>";
 const XML_CLOSE_TAG: &str = "</tool_call>";
+
+const NAMESPACED_OPEN_TAG: &str = "<minimax:tool_call>";
+const NAMESPACED_CLOSE_TAG: &str = "</minimax:tool_call>";
+/// A tokenizer special token that leaks into content. Never meant to
+/// be visible, so it is removed wherever it appears.
+const LEAKED_SENTINEL: &str = "]<]minimax[>[";
+const INVOKE_OPEN: &str = "<invoke";
+const INVOKE_CLOSE: &str = "</invoke>";
+const PARAMETER_OPEN: &str = "<parameter";
+const PARAMETER_CLOSE: &str = "</parameter>";
 
 const K3_TOOLS_OPEN: &str = "<|open|>tools<|sep|>";
 const K3_TOOLS_CLOSE: &str = "<|close|>tools<|sep|>";
@@ -66,6 +83,22 @@ const DSML_TAG_NAME: &str = "DSML";
 
 const DSML_TOOL_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
 const DSML_TOOL_CALLS_CLOSE: &str = "<｜DSML｜/tool_calls>";
+// The published DSML template names the envelope `function_calls`; one stack
+// was seen writing bare `calls`.
+const DSML_FUNCTION_CALLS_OPEN: &str = "<｜DSML｜function_calls>";
+const DSML_FUNCTION_CALLS_CLOSE: &str = "<｜DSML｜/function_calls>";
+const DSML_CALLS_OPEN: &str = "<｜DSML｜calls>";
+const DSML_CALLS_CLOSE: &str = "<｜DSML｜/calls>";
+/// Every DSML envelope spelling as `(open, close)`.
+const DSML_ENVELOPES: &[(&str, &str)] = &[
+    (DSML_TOOL_CALLS_OPEN, DSML_TOOL_CALLS_CLOSE),
+    (DSML_FUNCTION_CALLS_OPEN, DSML_FUNCTION_CALLS_CLOSE),
+    (DSML_CALLS_OPEN, DSML_CALLS_CLOSE),
+];
+/// A closer with the slash before the bar, and the canonical spelling the
+/// scanner matches instead.
+const DSML_SLASH_FIRST_CLOSER: &str = "</｜DSML｜";
+const DSML_CANONICAL_CLOSER: &str = "<｜DSML｜/";
 const DSML_INVOKE_OPEN: &str = "<｜DSML｜invoke";
 const DSML_INVOKE_CLOSE: &str = "<｜DSML｜/invoke>";
 const DSML_PARAMETER_OPEN: &str = "<｜DSML｜parameter";
@@ -73,10 +106,13 @@ const DSML_PARAMETER_CLOSE: &str = "<｜DSML｜/parameter>";
 
 const START_MARKERS: &[&str] = &[
     XML_OPEN_TAG,
+    NAMESPACED_OPEN_TAG,
     K3_TOOLS_OPEN,
     K3_RESPONSE_OPEN,
     K3_THINK_OPEN,
     DSML_TOOL_CALLS_OPEN,
+    DSML_FUNCTION_CALLS_OPEN,
+    DSML_CALLS_OPEN,
 ];
 
 /// One tool call recovered from inline text.
@@ -299,7 +335,7 @@ fn decode_k3_attribute(value: &str) -> String {
     value.replace("&quot;", "\"").replace("&amp;", "&")
 }
 
-/// Parse a DeepSeek DSML `<｜DSML｜tool_calls>` envelope's inner text: zero or
+/// Parse a DSML `<｜DSML｜tool_calls>` envelope's inner text: zero or
 /// more `<｜DSML｜invoke name="$TOOL">...</｜DSML｜invoke>` blocks, each
 /// holding `<｜DSML｜parameter name="$KEY" string="true|false">...` entries.
 fn parse_dsml_block(inner: &str, tools: &[ToolSpec]) -> Option<Vec<Recovered>> {
@@ -366,6 +402,78 @@ fn parse_dsml_parameters(
         };
         args.insert(key.to_string(), value);
         rest = after_param;
+    }
+
+    Some(args)
+}
+
+/// Parse an `<invoke>`-shaped `<tool_call>` body of one or more
+/// `<invoke name="$TOOL">…</invoke>` blocks. A parameter is either
+/// `<parameter name="k">v</parameter>` or `<k>v</k>`.
+fn parse_invoke_block(inner: &str, tools: &[ToolSpec]) -> Option<Vec<Recovered>> {
+    let mut calls = Vec::new();
+    let mut rest = inner;
+
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let header = rest.strip_prefix(INVOKE_OPEN)?;
+        let (attr_text, after_header) = split_once(header, ">")?;
+        let attrs = parse_k3_attributes(attr_text)?;
+        let name = attrs.get("name")?;
+        if name.is_empty() || !offered_tool(tools, name) {
+            return None;
+        }
+
+        let (call_inner, after_call) = split_once(after_header, INVOKE_CLOSE)?;
+        let arguments = parse_invoke_parameters(call_inner, tools, name)?;
+        calls.push(Recovered {
+            name: name.to_string(),
+            arguments: serde_json::Value::Object(arguments).to_string(),
+        });
+        rest = after_call;
+    }
+
+    if calls.is_empty() { None } else { Some(calls) }
+}
+
+fn parse_invoke_parameters(
+    mut rest: &str,
+    tools: &[ToolSpec],
+    tool_name: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut args = serde_json::Map::new();
+
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let (key, raw_value, after) = if let Some(header) = rest.strip_prefix(PARAMETER_OPEN) {
+            let (attr_text, after_header) = split_once(header, ">")?;
+            let attrs = parse_k3_attributes(attr_text)?;
+            let key = attrs.get("name")?.trim().to_string();
+            let (raw_value, after) = split_once(after_header, PARAMETER_CLOSE)?;
+            (key, raw_value, after)
+        } else {
+            let header = rest.strip_prefix('<')?;
+            let (key, after_header) = split_once(header, ">")?;
+            if !key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                return None;
+            }
+            let (raw_value, after) = split_once(after_header, &format!("</{key}>"))?;
+            (key.to_string(), raw_value, after)
+        };
+        if key.is_empty() {
+            return None;
+        }
+
+        let declared = declared_type(tools, tool_name, &key);
+        let value = match declared.as_deref() {
+            Some("array" | "object") => serde_json::from_str(raw_value).ok()?,
+            other => coerce(raw_value, other),
+        };
+        args.insert(key, value);
+        rest = after;
     }
 
     Some(args)
@@ -458,6 +566,11 @@ impl<'a> StreamScanner<'a> {
     /// be empty if the chunk was absorbed into a tag that hasn't closed yet.
     pub fn push(&mut self, chunk: &str) -> Vec<ScanEvent> {
         self.pending.push_str(chunk);
+        // Like the bar fold, this runs on the whole buffer so a sentinel split
+        // across deltas is seen joined; `drain` holds back a half sentinel.
+        if self.pending.contains(LEAKED_SENTINEL) {
+            self.pending = self.pending.replace(LEAKED_SENTINEL, "");
+        }
         // The fold runs on the whole buffer, not the chunk: a doubled bar split
         // across two deltas is only visible once they are joined, and a marker
         // is never emitted before then because a partial prefix is held back.
@@ -466,6 +579,9 @@ impl<'a> StreamScanner<'a> {
         // text on this push; the fold then rewrites the buffer and the next
         // push re-runs `drain` against canonical markers.
         if let Some(folded) = fold_dsml_bars(&self.pending) {
+            self.pending = folded;
+        }
+        if let Some(folded) = fold_dsml_closers(&self.pending) {
             self.pending = folded;
         }
         self.drain()
@@ -485,12 +601,12 @@ impl<'a> StreamScanner<'a> {
             if rest
                 .strip_prefix(K3_TOOLS_OPEN)
                 .is_some_and(looks_like_k3_call)
-                || rest
-                    .strip_prefix(XML_OPEN_TAG)
-                    .is_some_and(looks_like_xml_call)
-                || rest
-                    .strip_prefix(DSML_TOOL_CALLS_OPEN)
-                    .is_some_and(looks_like_dsml_call)
+                || [XML_OPEN_TAG, NAMESPACED_OPEN_TAG]
+                    .iter()
+                    .any(|open| rest.strip_prefix(open).is_some_and(looks_like_xml_call))
+                || DSML_ENVELOPES
+                    .iter()
+                    .any(|(open, _)| rest.strip_prefix(open).is_some_and(looks_like_dsml_call))
             {
                 ScanEvent::Malformed(rest)
             } else {
@@ -503,7 +619,8 @@ impl<'a> StreamScanner<'a> {
         let mut events = Vec::new();
         loop {
             let Some((open_idx, marker)) = find_next_marker(&self.pending) else {
-                let keep = max_partial_prefix_len(&self.pending, START_MARKERS);
+                let keep = max_partial_prefix_len(&self.pending, START_MARKERS)
+                    .max(partial_prefix_len(&self.pending, LEAKED_SENTINEL));
                 let flush_len = self.pending.len() - keep;
                 if flush_len > 0 {
                     events.push(ScanEvent::Text(
@@ -520,20 +637,31 @@ impl<'a> StreamScanner<'a> {
             }
 
             match marker {
-                XML_OPEN_TAG => {
-                    let Some(event) = self.drain_xml() else {
-                        break;
+                XML_OPEN_TAG | NAMESPACED_OPEN_TAG => {
+                    let close = if marker == XML_OPEN_TAG {
+                        XML_CLOSE_TAG
+                    } else {
+                        NAMESPACED_CLOSE_TAG
                     };
-                    events.push(event);
+                    match self.drain_xml(marker, close) {
+                        Some(mut recovered) => events.append(&mut recovered),
+                        None => break,
+                    }
                 }
                 K3_TOOLS_OPEN => match self.drain_k3_tools() {
                     Some(mut recovered) => events.append(&mut recovered),
                     None => break,
                 },
-                DSML_TOOL_CALLS_OPEN => match self.drain_dsml() {
-                    Some(mut recovered) => events.append(&mut recovered),
-                    None => break,
-                },
+                DSML_TOOL_CALLS_OPEN | DSML_FUNCTION_CALLS_OPEN | DSML_CALLS_OPEN => {
+                    let close = DSML_ENVELOPES
+                        .iter()
+                        .find_map(|(open, close)| (*open == marker).then_some(*close))
+                        .expect("every DSML open marker has a close");
+                    match self.drain_dsml(marker, close) {
+                        Some(mut recovered) => events.append(&mut recovered),
+                        None => break,
+                    }
+                }
                 K3_RESPONSE_OPEN => {
                     let Some(mut unwrapped) =
                         self.drain_wrapped_text(K3_RESPONSE_OPEN, K3_RESPONSE_CLOSE, true)
@@ -556,19 +684,22 @@ impl<'a> StreamScanner<'a> {
         events
     }
 
-    fn drain_xml(&mut self) -> Option<ScanEvent> {
-        let close_rel = self.pending[XML_OPEN_TAG.len()..].find(XML_CLOSE_TAG)?;
-        let close_idx = XML_OPEN_TAG.len() + close_rel;
-        let block: String = self
-            .pending
-            .drain(..close_idx + XML_CLOSE_TAG.len())
-            .collect();
-        let inner = &block[XML_OPEN_TAG.len()..block.len() - XML_CLOSE_TAG.len()];
-        Some(match parse_xml_block(inner, self.tools) {
+    fn drain_xml(&mut self, open: &str, close: &str) -> Option<Vec<ScanEvent>> {
+        let close_rel = self.pending[open.len()..].find(close)?;
+        let close_idx = open.len() + close_rel;
+        let block: String = self.pending.drain(..close_idx + close.len()).collect();
+        let inner = &block[open.len()..block.len() - close.len()];
+        if inner.trim_start().starts_with(INVOKE_OPEN) {
+            return Some(match parse_invoke_block(inner, self.tools) {
+                Some(calls) => calls.into_iter().map(ScanEvent::ToolCall).collect(),
+                None => vec![ScanEvent::Malformed(block)],
+            });
+        }
+        Some(vec![match parse_xml_block(inner, self.tools) {
             Some(call) => ScanEvent::ToolCall(call),
             None if looks_like_xml_call(inner) => ScanEvent::Malformed(block),
             None => ScanEvent::Text(block),
-        })
+        }])
     }
 
     fn drain_k3_tools(&mut self) -> Option<Vec<ScanEvent>> {
@@ -587,14 +718,11 @@ impl<'a> StreamScanner<'a> {
         })
     }
 
-    fn drain_dsml(&mut self) -> Option<Vec<ScanEvent>> {
-        let close_rel = self.pending[DSML_TOOL_CALLS_OPEN.len()..].find(DSML_TOOL_CALLS_CLOSE)?;
-        let close_idx = DSML_TOOL_CALLS_OPEN.len() + close_rel;
-        let block: String = self
-            .pending
-            .drain(..close_idx + DSML_TOOL_CALLS_CLOSE.len())
-            .collect();
-        let inner = &block[DSML_TOOL_CALLS_OPEN.len()..block.len() - DSML_TOOL_CALLS_CLOSE.len()];
+    fn drain_dsml(&mut self, open: &str, close: &str) -> Option<Vec<ScanEvent>> {
+        let close_rel = self.pending[open.len()..].find(close)?;
+        let close_idx = open.len() + close_rel;
+        let block: String = self.pending.drain(..close_idx + close.len()).collect();
+        let inner = &block[open.len()..block.len() - close.len()];
 
         Some(match parse_dsml_block(inner, self.tools) {
             Some(calls) => calls.into_iter().map(ScanEvent::ToolCall).collect(),
@@ -664,7 +792,7 @@ fn looks_like_k3_call(after_marker: &str) -> bool {
     rest.is_empty() || rest.starts_with(K3_CALL_OPEN)
 }
 
-/// Whether the text after a DeepSeek `<｜DSML｜tool_calls>` marker reads as
+/// Whether the text after a DSML `<｜DSML｜tool_calls>` marker reads as
 /// the start of a call: a `<｜DSML｜invoke` marker after any whitespace, or
 /// nothing at all. A quoted marker, like the constant in this file, fails.
 fn looks_like_dsml_call(after_marker: &str) -> bool {
@@ -735,6 +863,15 @@ fn bar_run_len(text: &str, leading: bool) -> usize {
         text.len() - text.trim_end_matches(FULLWIDTH_BAR).len()
     };
     bytes / FULLWIDTH_BAR.len_utf8()
+}
+
+/// Some stacks write a DSML closer with the slash before the bar
+/// (`</｜DSML｜invoke>`), as the published template does, instead of after it.
+/// Rewritten to the canonical `<｜DSML｜/invoke>` once bars are folded. Returns
+/// `None` when nothing needs rewriting.
+fn fold_dsml_closers(text: &str) -> Option<String> {
+    text.contains(DSML_SLASH_FIRST_CLOSER)
+        .then(|| text.replace(DSML_SLASH_FIRST_CLOSER, DSML_CANONICAL_CLOSER))
 }
 
 fn scan_complete_text(text: &str, tools: &[ToolSpec]) -> Vec<ScanEvent> {
@@ -1668,5 +1805,139 @@ mod tests {
         assert_eq!(text, "the tag <｜DSML｜done> is not a call");
         assert!(calls.is_empty());
         assert_eq!(malformed, 0);
+    }
+
+    const ISSUE_246: &str = "Now let me run the lint/typecheck:]<]minimax[>[<tool_call>\n\
+        ]<]minimax[>[<invoke name=\"run_command\">]<]minimax[>[<command>cd app && npm run lint | tail -60]<]minimax[>[</command>\
+        ]<]minimax[>[<timeout>120000]<]minimax[>[</timeout>]<]minimax[>[</invoke>\n]<]minimax[>[";
+
+    fn args_of(call: &Recovered) -> serde_json::Value {
+        serde_json::from_str(&call.arguments).unwrap()
+    }
+
+    fn feed(tools: &[ToolSpec], chunks: &[&str]) -> (String, Vec<Recovered>, usize) {
+        let mut scanner = StreamScanner::new(tools);
+        let (mut text, mut calls, mut malformed) = (String::new(), Vec::new(), 0);
+        let mut handle = |event| match event {
+            ScanEvent::Text(t) => text.push_str(&t),
+            ScanEvent::ToolCall(c) => calls.push(c),
+            ScanEvent::Malformed(_) => malformed += 1,
+        };
+        for chunk in chunks {
+            scanner.push(chunk).into_iter().for_each(&mut handle);
+        }
+        scanner.finish().into_iter().for_each(&mut handle);
+        (text, calls, malformed)
+    }
+
+    #[test]
+    fn an_unclosed_invoke_call_with_sentinels_is_dropped() {
+        let tools = vec![run_command_spec()];
+        let extracted = extract(ISSUE_246, &tools);
+        assert_eq!(extracted.text, "Now let me run the lint/typecheck:");
+        assert_eq!(extracted.malformed, 1);
+        assert!(extracted.calls.is_empty());
+        assert!(!extracted.text.contains("minimax"));
+    }
+
+    #[test]
+    fn a_closed_invoke_call_with_sentinels_is_recovered() {
+        let tools = vec![run_command_spec()];
+        let text = format!("{ISSUE_246}</tool_call>");
+        let extracted = extract(&text, &tools);
+        assert_eq!(extracted.malformed, 0);
+        assert_eq!(extracted.calls.len(), 1);
+        assert_eq!(extracted.calls[0].name, "run_command");
+        assert_eq!(
+            args_of(&extracted.calls[0])["command"],
+            "cd app && npm run lint | tail -60"
+        );
+    }
+
+    #[test]
+    fn a_namespaced_envelope_is_recovered_with_typed_parameters() {
+        let tools = vec![run_command_spec(), command_output_spec()];
+        let extracted = extract(
+            "<minimax:tool_call><invoke name=\"run_command\"><parameter name=\"command\">echo hi</parameter></invoke>\
+             <invoke name=\"command_output\"><parameter name=\"task_id\">3</parameter></invoke></minimax:tool_call>",
+            &tools,
+        );
+        assert_eq!(extracted.malformed, 0);
+        assert_eq!(extracted.calls.len(), 2);
+        assert_eq!(args_of(&extracted.calls[0])["command"], "echo hi");
+        assert_eq!(args_of(&extracted.calls[1])["task_id"], 3);
+    }
+
+    #[test]
+    fn a_sentinel_split_across_pushes_is_removed() {
+        let tools = vec![run_command_spec()];
+        let (text, calls, malformed) = feed(&tools, &["a]<]mini", "max[>[b"]);
+        assert_eq!(text, "ab");
+        assert!(calls.is_empty());
+        assert_eq!(malformed, 0);
+    }
+
+    #[test]
+    fn an_unknown_tool_in_an_invoke_block_is_malformed() {
+        let tools = vec![run_command_spec()];
+        let extracted = extract(
+            "<tool_call><invoke name=\"delete_everything\"><x>1</x></invoke></tool_call>",
+            &tools,
+        );
+        assert_eq!(extracted.malformed, 1);
+        assert!(extracted.calls.is_empty());
+        assert_eq!(extracted.text, "");
+    }
+
+    const ISSUE_236_BODY: &str = "<｜｜DSML｜｜invoke name=\"run_command\">\
+        <｜｜DSML｜｜parameter name=\"command\" string=\"true\">echo hi</｜｜DSML｜｜parameter>\
+        </｜｜DSML｜｜invoke>";
+
+    #[test]
+    fn doubled_bar_dsml_with_slash_first_closers_is_recovered_for_every_envelope() {
+        let tools = vec![run_command_spec()];
+        for name in ["function_calls", "calls", "tool_calls"] {
+            let text =
+                format!("before <｜｜DSML｜｜{name}>{ISSUE_236_BODY}</｜｜DSML｜｜{name}> after");
+            let extracted = extract(&text, &tools);
+            assert_eq!(extracted.text, "before  after", "{name}");
+            assert_eq!(extracted.malformed, 0, "{name}");
+            assert_eq!(extracted.calls.len(), 1, "{name}");
+            assert_eq!(args_of(&extracted.calls[0])["command"], "echo hi");
+        }
+    }
+
+    #[test]
+    fn a_dsml_function_calls_open_marker_split_mid_name_is_recovered() {
+        let tools = vec![run_command_spec()];
+        let (text, calls, malformed) = feed(
+            &tools,
+            &[
+                "pre <｜DSML｜func",
+                "tion_calls><｜DSML｜invoke name=\"run_command\"><｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>",
+                " post",
+            ],
+        );
+        assert_eq!(text, "pre  post");
+        assert_eq!(malformed, 0);
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn a_dsml_function_calls_marker_mentioned_in_prose_stays_text() {
+        let tools = vec![run_command_spec()];
+        for text in [
+            "The marker is `<｜DSML｜function_calls>` and it never closes here.",
+            "Quote `<｜DSML｜function_calls>` then `<｜DSML｜/function_calls>` in docs.",
+        ] {
+            assert_eq!(
+                extract(text, &tools),
+                Extracted {
+                    text: text.to_string(),
+                    ..Extracted::default()
+                },
+                "{text}"
+            );
+        }
     }
 }

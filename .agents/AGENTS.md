@@ -198,7 +198,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   with `round_cap_stop_message`. Without both, the thread stops on the model announcing a
   step that never runs (issue #120).
   Some models write tool calls into content as text; `crates/cli/src/inline_tool_calls.rs` recovers the
-  well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
+  well-formed ones. That covers the `<invoke>` shape (and its leaking `]<]minimax[>[` token, which is stripped) and
+  DSML in every envelope/closer spelling. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
   didn't run. Leaving the raw block in history makes the model invent `<function_results>` later.
   What that scanner lets through then goes through `crates/cli/src/harness_markup.rs`, which removes
