@@ -526,6 +526,14 @@ async fn run_prompt(
 
         let allow_tool_calls = round < config.max_tool_rounds;
 
+        // The round that reaches the cap is forced to answer in text. Say so,
+        // or the model spends its last reply narrating the step it can no
+        // longer take.
+        if !allow_tool_calls && let Some(last) = tool_results.last_mut() {
+            last.content
+                .push_str(&crate::headless_round_cap_note(config.max_tool_rounds));
+        }
+
         // Whatever this round says starts a new paragraph rather than
         // continuing the sentence the tool calls interrupted.
         reply.interrupt();

@@ -183,6 +183,17 @@ fn round_cap_note(max_tool_rounds: usize) -> String {
     )
 }
 
+/// The headless counterpart of [`round_cap_note`]. Nobody replies to a headless
+/// run, so it says what the final message is for instead of promising a
+/// follow-up, and it names commits because that is all the run leaves behind.
+fn headless_round_cap_note(max_tool_rounds: usize) -> String {
+    format!(
+        "\n\n[siGit Code] That was tool round {max_tool_rounds} of {max_tool_rounds} for \
+         this run, so no more tools can run. Do not announce a next action. Say what is \
+         done, what is committed, and what is left."
+    )
+}
+
 /// What the user sees when a turn that ran tools ends with no closing text.
 fn silent_stop_message(repeated_tool: Option<&str>, rounds: usize) -> String {
     match repeated_tool {
