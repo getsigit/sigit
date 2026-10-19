@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.7.2
+
+The interactive terminal tells the program that launched it what it is doing,
+and a model that writes its tool calls as prose gets them run more often. No
+protocol change, so an editor sees a 1.7.1-shaped agent.
+
+### Added
+
+- **Program status in the interactive terminal.** siGit Code now writes an
+  `OSC 7501` record (`app=sigit`) as its state changes, so a terminal that
+  tracks program status can show it: `idle`, `working`, `done`, `error`, and
+  `blocked` with `kind=permission`, `question` or `auth` while it waits on the
+  user. Repeated states are collapsed, a write failure is ignored rather than
+  ending the turn, and the root record is deliberately left alone on exit, so
+  a bare clear cannot wipe another program's records (#235).
+
+### Fixed
+
+- **More inline tool calls are recovered.** Models that write a call into the
+  content as text instead of the tool channel are now understood in more
+  spellings: a DSML envelope named `function_calls` or bare `calls` as well as
+  `tool_calls`, a closer that puts its slash before the bar
+  (`</｜DSML｜invoke>`), and the `<minimax:tool_call>` wrapper around
+  `<invoke name="…">` with parameters written either as
+  `<parameter name="k">v</parameter>` or `<k>v</k>`. The tokenizer's
+  `]<]minimax[>[` special token, which leaks into content between tags and in
+  prose, is stripped instead of being left in the reply and in history (#249).
+- **Headless mode says when a tool round is the last one.** The round that
+  reaches the cap is answered in text with no tools, which the model could not
+  see, so it spent its final reply announcing a step that would never run. That
+  round's last tool result now carries a note giving the round count, saying no
+  tools remain and that nobody is there to reply. The interactive client has
+  said this for a while; headless was left without it (#250).
+
+### Docs
+
+- **A README for `sigit-agent`.** The crate a host embeds had no front page.
+  It now has a short one: what the profile offers, and a `serve` example that
+  notes the host must call it from inside a tokio runtime.
+
 ## 1.7.1
 
 Two process-global stores in the CLI leaked between the sessions one process

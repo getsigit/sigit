@@ -43,6 +43,8 @@ mod instructions;
 mod mcp;
 mod models;
 mod permissions;
+#[cfg(unix)]
+mod program_status;
 mod provider;
 mod repetition;
 mod session_store;
@@ -178,6 +180,17 @@ fn round_cap_note(max_tool_rounds: usize) -> String {
         "\n\n[siGit Code] That was tool round {max_tool_rounds} of {max_tool_rounds} for \
          this turn, so no more tools can run until the user replies. Do not announce a next \
          action. Say briefly what is done and what is left."
+    )
+}
+
+/// The headless counterpart of [`round_cap_note`]. Nobody replies to a headless
+/// run, so it says what the final message is for instead of promising a
+/// follow-up, and it names commits because that is all the run leaves behind.
+fn headless_round_cap_note(max_tool_rounds: usize) -> String {
+    format!(
+        "\n\n[siGit Code] That was tool round {max_tool_rounds} of {max_tool_rounds} for \
+         this run, so no more tools can run. Do not announce a next action. Say what is \
+         done, what is committed, and what is left."
     )
 }
 
@@ -5777,7 +5790,9 @@ async fn exec_slash_acp(
                 },
                 // A bare `/login` takes the browser route, same as the editor's
                 // sign-in button.
-                None => browser_login_message().await,
+                None => browser_login_message()
+                    .await
+                    .unwrap_or_else(|message| message),
             };
             agent.send_assistant_message(cx, session_id, message).ok();
         }
@@ -6030,6 +6045,12 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
             }
         };
 
+    // The saved output fd may be redirected even when stdin is a TTY.
+    let program_status = if std::io::IsTerminal::is_terminal(&tty) {
+        program_status::Reporter::new(tty.try_clone()?)
+    } else {
+        program_status::Reporter::new(std::io::sink())
+    };
     crossterm::terminal::enable_raw_mode()?;
     let mut tty = BufWriter::new(tty);
     crossterm::execute!(tty, crossterm::terminal::EnterAlternateScreen)?;
@@ -6043,6 +6064,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
         inference_backend,
         load_rx,
         startup_model_name,
+        program_status,
     )
     .await;
 
@@ -6509,20 +6531,24 @@ async fn sign_in_via_client(
 /// Both the TUI and an ACP session reach this from a bare `/login`. Neither can
 /// prompt for a pasted code mid-command, so a box with no bindable port is told
 /// to use `sigit login`, which can.
-pub(crate) async fn browser_login_message() -> String {
+pub(crate) async fn browser_login_message() -> Result<String, String> {
     let flow = browser_auth::begin();
     if !flow.is_loopback() {
-        return "Could not open a local port to receive the sign-in. \
+        return Err("Could not open a local port to receive the sign-in. \
                 Run `sigit login` in a terminal instead."
-            .to_string();
+            .to_string());
     }
 
     browser_auth::open_browser(flow.authorize_url());
     let url = flow.authorize_url().to_string();
 
     match browser_auth::complete_loopback(flow).await {
-        Ok(email) => format!("Signed in as {email}. Pick a siGit Code Cloud tier in /models."),
-        Err(error) => format!("Login failed: {error}\nYou can also open {url} by hand."),
+        Ok(email) => Ok(format!(
+            "Signed in as {email}. Pick a siGit Code Cloud tier in /models."
+        )),
+        Err(error) => Err(format!(
+            "Login failed: {error}\nYou can also open {url} by hand."
+        )),
     }
 }
 

@@ -593,6 +593,78 @@ fn run_cut_off_at_the_round_cap_still_ends_with_a_final_message() {
     assert!(asked.contains("final message"), "got: {asked}");
 }
 
+/// The round that reaches the cap is forced to answer in text, and the model
+/// cannot tell the tools are gone unless the last tool result says so. Without
+/// the note it narrates its next step and that becomes the final message.
+#[test]
+fn round_cap_note_reaches_the_model_only_on_the_capped_round() {
+    let endpoint = start_fake_endpoint(vec![
+        json_tool_call("call_1", "run_command", r#"{"command":"echo one"}"#),
+        json_tool_call("call_2", "run_command", r#"{"command":"echo two"}"#),
+        json_text("Ran two commands; nothing is committed and the tests are left."),
+    ]);
+    let scratch = scratch("round_cap_note");
+    let cwd = scratch.cwd.to_str().unwrap().to_string();
+
+    let output = run_headless(
+        endpoint.port,
+        &scratch,
+        &[
+            "-p",
+            "look into it",
+            "--quiet",
+            "--max-tool-rounds",
+            "2",
+            "--allow-tool",
+            "run_command",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_of(&output),
+        "Ran two commands; nothing is committed and the tests are left.\n"
+    );
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "prompt and two tool rounds; a real final reply needs no wrap-up"
+    );
+    let last_tool_message = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rfind(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .expect("a tool result")
+    };
+    let before_cap = last_tool_message(&requests[1]);
+    assert!(
+        !before_cap.contains("[siGit Code]"),
+        "no note before the cap: {before_cap}"
+    );
+    assert!(requests[1].get("tools").is_some());
+    let at_cap = last_tool_message(&requests[2]);
+    assert!(
+        at_cap.contains("tool round 2 of 2 for this run"),
+        "got: {at_cap}"
+    );
+    assert!(
+        at_cap.contains("Do not announce a next action"),
+        "got: {at_cap}"
+    );
+    assert!(
+        !at_cap.contains("until the user replies"),
+        "headless has nobody to reply: {at_cap}"
+    );
+    assert!(requests[2].get("tools").is_none());
+}
+
 /// A run that ends with a real final message is left alone: no extra request.
 #[test]
 fn run_with_a_final_message_makes_no_wrap_up_request() {
