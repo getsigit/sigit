@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.7.3
+
+One fix, and no protocol change, so an editor sees a 1.7.2-shaped agent.
 
 ### Fixed
 
