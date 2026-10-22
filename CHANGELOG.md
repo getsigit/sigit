@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.7.4
+
+The browser sign-in page looks like the product and stops reporting success
+before there is any. No protocol change, so an editor sees a 1.7.3-shaped agent.
+
+### Fixed
+
+- **The sign-in page only says "Signed in" once the sign-in actually
+  happened.** The loopback success page was sent the moment the callback
+  arrived, before the authorization code was redeemed. If the exchange then
+  failed, the browser read "Signed in to siGit Code" while the app reported an
+  error. `wait_for_code` now hands back the open connection unanswered and
+  `complete_loopback` responds only after the exchange has settled, with a
+  separate page for a failure (#254).
+- **The sign-in page is restyled.** It is now a centered logo, title and hint
+  on a dark canvas, with inline CSS and an inlined logo, so the page served
+  from the loopback address makes no second request. Title and hint are
+  distinct, so a decline, a stray request and a mismatched callback each read
+  as themselves (#254).
+
 ## 1.7.3
 
 One fix, and no protocol change, so an editor sees a 1.7.2-shaped agent.
