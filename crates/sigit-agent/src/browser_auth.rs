@@ -180,11 +180,27 @@ pub async fn complete_loopback(flow: Flow) -> Result<String, String> {
     let listener = listener.ok_or_else(|| "this sign-in has no local listener".to_string())?;
 
     let expected_state = state.clone();
-    let code = tokio::task::spawn_blocking(move || wait_for_code(listener, &expected_state))
-        .await
-        .map_err(|error| format!("sign-in was interrupted: {error}"))??;
+    let (code, mut stream) =
+        tokio::task::spawn_blocking(move || wait_for_code(listener, &expected_state))
+            .await
+            .map_err(|error| format!("sign-in was interrupted: {error}"))??;
 
-    exchange(&code, &verifier, &redirect_uri).await
+    // The browser is still waiting on its request. Answer it only once the
+    // exchange has settled, so the page never reports a sign-in that failed.
+    let result = exchange(&code, &verifier, &redirect_uri).await;
+    match &result {
+        Ok(_) => respond(
+            &mut stream,
+            "Signed in to siGit Code",
+            "You can close this tab.",
+        ),
+        Err(_) => respond(
+            &mut stream,
+            "Sign-in did not complete",
+            "Return to siGit Code and try again.",
+        ),
+    }
+    result
 }
 
 /// Redeem a code the person pasted in. Returns the signed-in email.
@@ -198,8 +214,12 @@ pub async fn complete_paste(flow: &Flow, code: &str) -> Result<String, String> {
 
 /// Accept connections until one carries our callback. Anything else on the
 /// port (a browser probe, a stray scan) is answered and ignored rather than
-/// ending the wait.
-fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, String> {
+/// ending the wait. On success the matching connection is returned unanswered,
+/// for the caller to respond to once the code has been redeemed.
+fn wait_for_code(
+    listener: TcpListener,
+    expected_state: &str,
+) -> Result<(String, std::net::TcpStream), String> {
     let deadline = std::time::Instant::now() + CALLBACK_TIMEOUT;
     listener
         .set_nonblocking(true)
@@ -243,7 +263,7 @@ fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, 
                     }
                 }
                 Err(error) => {
-                    respond(&mut stream, "Could not read the sign-in callback.");
+                    respond(&mut stream, "Nothing to do here", "");
                     log::debug!("could not read browser callback: {error}");
                     continue 'connections;
                 }
@@ -255,7 +275,7 @@ fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, 
             .next()
             .and_then(|line| line.split_whitespace().nth(1))
         else {
-            respond(&mut stream, "Bad request.");
+            respond(&mut stream, "Nothing to do here", "");
             continue;
         };
 
@@ -273,39 +293,68 @@ fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String, 
         }
 
         if let Some(error) = error {
-            respond(
-                &mut stream,
-                "Sign-in was cancelled. You can close this tab.",
-            );
+            respond(&mut stream, "Sign-in cancelled", "You can close this tab.");
             return Err(format!("sign-in was declined ({error})"));
         }
 
         let Some(code) = code else {
-            respond(&mut stream, "Nothing to do here.");
+            respond(&mut stream, "Nothing to do here", "");
             continue;
         };
 
         // The state proves this callback belongs to the flow we started, not
         // to a link someone else sent to this browser.
         if state.as_deref() != Some(expected_state) {
-            respond(&mut stream, "That sign-in did not come from siGit Code.");
+            respond(
+                &mut stream,
+                "Sign-in didn't match",
+                "That sign-in did not come from siGit Code.",
+            );
             return Err("the sign-in response did not match this request".to_string());
         }
 
-        respond(
-            &mut stream,
-            "Signed in to siGit Code. You can close this tab.",
-        );
-        return Ok(code);
+        return Ok((code, stream));
     }
 }
 
-fn respond(stream: &mut std::net::TcpStream, message: &str) {
-    let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>siGit Code</title>\
-         <body style=\"font:16px system-ui;display:grid;place-items:center;height:90vh\">\
-         <p>{message}</p></body>"
-    );
+/// The 64x64 app icon, inlined into the page so it needs no second request.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/sign-in-logo.png");
+
+/// Renders the page the browser lands on. Self-contained: inline CSS and an
+/// inline logo, because the page is served from the loopback address and must
+/// not fetch anything. Title and hint are constants, so nothing is escaped.
+fn page(title: &str, hint: &str) -> String {
+    let logo = base64::engine::general_purpose::STANDARD.encode(LOGO_PNG);
+    let hint = if hint.is_empty() {
+        String::new()
+    } else {
+        format!("<p>{hint}</p>")
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <meta name=\"color-scheme\" content=\"dark\"><title>{title}</title><style>\
+         :root{{color-scheme:dark}}\
+         html,body{{margin:0;height:100%}}\
+         body{{display:flex;align-items:center;justify-content:center;background:#15171a;\
+         font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial,sans-serif}}\
+         main{{display:flex;flex-direction:column;align-items:center;text-align:center;\
+         padding:0 24px;transform:translateY(-6%);animation:fade-in 240ms ease-out}}\
+         img{{width:40px;height:40px;border-radius:9px;opacity:.8;\
+         box-shadow:0 0 0 1px rgb(255 255 255/.06)}}\
+         h1{{margin:16px 0 0;font-size:15px;line-height:20px;font-weight:500;\
+         letter-spacing:-.01em;color:#f3f4f6}}\
+         p{{margin:4px 0 0;font-size:13px;line-height:18px;color:#6b7280}}\
+         @keyframes fade-in{{from{{opacity:0}}to{{opacity:1}}}}\
+         @media(prefers-reduced-motion:reduce){{main{{animation:none}}}}\
+         </style></head><body><main>\
+         <img src=\"data:image/png;base64,{logo}\" alt=\"\" width=\"40\" height=\"40\">\
+         <h1>{title}</h1>{hint}</main></body></html>"
+    )
+}
+
+fn respond(stream: &mut std::net::TcpStream, title: &str, hint: &str) {
+    let body = page(title, hint);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -463,6 +512,19 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_carries_the_title_hint_and_an_inline_logo() {
+        let body = page("Signed in to siGit Code", "You can close this tab.");
+        assert!(body.contains("<h1>Signed in to siGit Code</h1>"));
+        assert!(body.contains("<p>You can close this tab.</p>"));
+        assert!(body.contains("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn page_omits_the_hint_when_empty() {
+        assert!(!page("Nothing to do here", "").contains("<p>"));
+    }
 
     #[test]
     fn code_challenge_matches_rfc_7636_example() {
