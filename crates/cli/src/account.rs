@@ -27,7 +27,7 @@ fn api_base() -> String {
 // `serde_json::Value` rather than a struct because of the bare-string variant.
 
 #[derive(Debug, Deserialize)]
-struct MeResponse {
+struct UserResponse {
     #[serde(default)]
     email: Option<String>,
 }
@@ -90,40 +90,6 @@ pub async fn authenticate(email: &str, password: &str) -> Result<String, String>
     Err(format!("sign-in failed: {message}"))
 }
 
-/// Verify that a usable session exists, confirming the stored token against the
-/// account API. Returns the signed-in email on success, or a human-readable
-/// reason it is not usable. Used by the ACP `authenticate` handler to answer the
-/// editor's auth gate.
-pub async fn verify_session() -> Result<String, String> {
-    let Some(creds) = credentials::load() else {
-        return Err("not signed in".to_string());
-    };
-
-    let url = format!("{}/api/v1/me", api_base().trim_end_matches('/'));
-    let response = reqwest::Client::new()
-        .get(&url)
-        .bearer_auth(&creds.access_token)
-        .send()
-        .await
-        .map_err(|error| format!("could not reach siGit Code Cloud: {error}"))?;
-
-    if response.status().is_success() {
-        let email = response
-            .json::<MeResponse>()
-            .await
-            .ok()
-            .and_then(|me| me.email)
-            .or(creds.email)
-            .unwrap_or_else(|| "(unknown)".to_string());
-        Ok(email)
-    } else {
-        Err(format!(
-            "session expired (HTTP {})",
-            response.status().as_u16()
-        ))
-    }
-}
-
 /// Run an interactive sign-in against the terminal, prompting for email and a
 /// hidden password. Used by `sigit login`, which the editor launches in an
 /// embedded terminal for ACP terminal-based authentication. Returns the signed-in
@@ -166,11 +132,10 @@ pub async fn end_session() -> String {
 /// One-line description of the current session, verifying the token if reachable.
 pub async fn status_line() -> String {
     let Some(creds) = credentials::load() else {
-        return "Not signed in. Use `/login <email> <password>` to use siGit Code Cloud."
-            .to_string();
+        return "Not signed in. Use `/login` to use siGit Code Cloud.".to_string();
     };
 
-    let url = format!("{}/api/v1/me", api_base().trim_end_matches('/'));
+    let url = format!("{}/api/v1/user", api_base().trim_end_matches('/'));
     match reqwest::Client::new()
         .get(&url)
         .bearer_auth(&creds.access_token)
@@ -179,7 +144,7 @@ pub async fn status_line() -> String {
     {
         Ok(response) if response.status().is_success() => {
             let email = response
-                .json::<MeResponse>()
+                .json::<UserResponse>()
                 .await
                 .ok()
                 .and_then(|me| me.email)

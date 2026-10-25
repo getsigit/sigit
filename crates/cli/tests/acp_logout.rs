@@ -123,6 +123,32 @@ impl AgentUnderTest {
             }
         }
     }
+
+    /// Send `text` as a prompt and return the agent message text it streamed
+    /// before the turn ended.
+    fn prompt_text(&mut self, session_id: &str, text: &str) -> String {
+        let id = self.request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        let mut reply = String::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the response to prompt {id}");
+            };
+            if message["method"] == "session/update"
+                && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                && let Some(chunk) = message["params"]["update"]["content"]["text"].as_str()
+            {
+                reply.push_str(chunk);
+            }
+            if message["id"] == id && message.get("method").is_none() {
+                return reply;
+            }
+        }
+    }
 }
 
 impl Drop for AgentUnderTest {
@@ -174,6 +200,51 @@ fn logout_is_advertised_and_ends_the_account_session() {
     // Signing out twice is not an error: the editor's state may be stale.
     let id = agent.request("logout", json!({}));
     agent.wait_for_response(id);
+
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+/// `/whoami` asks `/api/v1/user`, the endpoint that accepts the OAuth tokens
+/// browser sign-in stores. The deprecated `/api/v1/me` answers them with a 403.
+#[test]
+fn whoami_checks_the_session_against_the_user_endpoint() {
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_whoami_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("credentials.toml"),
+        "access_token = \"token-under-test\"\nemail = \"dev@example.com\"\n",
+    )
+    .unwrap();
+
+    let (api_port, api_requests) = start_fake_account_api();
+    let mut agent = spawn_agent(api_port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": scratch, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let reply = agent.prompt_text(&session_id, "/whoami");
+    assert!(
+        reply.contains("Signed in to siGit Code Cloud as dev@example.com"),
+        "{reply}"
+    );
+
+    let head = api_requests
+        .recv_timeout(TIMEOUT)
+        .expect("/whoami should ask the account API");
+    assert!(head.starts_with("get /api/v1/user "), "{head}");
+    assert!(
+        head.contains("authorization: bearer token-under-test"),
+        "{head}"
+    );
 
     std::fs::remove_dir_all(&scratch).ok();
 }
