@@ -40,7 +40,7 @@ const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 /// to be updated together when a tier is added.
 pub const CLOUD_TIERS: &[&str] = &[
     "fast", "balanced", "large", "mini", "air", "pro", "oke", "flux", "apex", "aura", "orbit",
-    "nova", "flare", "zenith", "prism",
+    "nova", "flare", "zenith", "prism", "lumen",
 ];
 
 pub const DEFAULT_CLOUD_TIER: &str = "nova";
@@ -57,6 +57,7 @@ pub const DEFAULT_CLOUD_TIER: &str = "nova";
 /// client does not know is not offered at all (see [`CLOUD_TIERS`]).
 const IMAGE_TIERS: &[&str] = &[
     "fast", "balanced", "large", "mini", "air", "pro", "oke", "aura", "flare", "zenith", "prism",
+    "lumen",
 ];
 
 /// Whether the cloud tier `tier` reads images.
@@ -132,6 +133,7 @@ fn tier_to_model(tier: &str) -> String {
         "flare" => "onde-flare",
         "zenith" => "onde-zenith",
         "prism" => "onde-prism",
+        "lumen" => "onde-lumen",
         other => other,
     }
     .to_string()
