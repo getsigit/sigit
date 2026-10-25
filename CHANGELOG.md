@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.7.5
+
+A new siGit Code Cloud tier, and two fixes for signing in and switching
+accounts. No protocol change, so an editor sees a 1.7.4-shaped agent.
+
+### Added
+
+- A new siGit Code Cloud tier, `lumen`, for long-context work over text and images. It shows in `/models` and the editor picker (#261).
+
+### Fixed
+
+- **`/whoami` no longer reports a working sign-in as expired.** It called
+  `/api/v1/me`, which rejects the OAuth tokens the browser sign-in stores, so a
+  good session read "Session may be expired (HTTP 403)". It now calls
+  `/api/v1/user`, the endpoint the browser flow uses to read the profile
+  (#258).
+- **Reauthenticate can switch accounts again.** `authenticate` returned early
+  when the stored session verified, which stopped Reauthenticate from opening
+  the browser. It now always runs the browser flow (#258).
+- **After Reauthenticate, the next message uses the new account.** Every cloud
+  backend kept the token it was built with, so the live backend, parked
+  threads and subagents kept sending the old account's bearer until Reload
+  Agent. Cloud backends now read the stored token on each request (#259).
+
 ## 1.7.4
 
 The browser sign-in page looks like the product and stops reporting success

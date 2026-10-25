@@ -349,12 +349,15 @@ pub async fn run(config: HeadlessConfig) -> i32 {
         &crate::workspace::additional_roots(),
     ));
 
-    let backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
-        cfg.base_url,
-        cfg.api_key,
-        cfg.model.clone(),
-        Some(system_prompt),
-    ));
+    let backend: Arc<dyn InferenceBackend> = Arc::new(
+        OpenAiBackend::new(
+            cfg.base_url,
+            cfg.api_key,
+            cfg.model.clone(),
+            Some(system_prompt),
+        )
+        .with_session_token(cfg.session_token),
+    );
 
     if config.resume {
         let Some(history) = session_store::load(&config.session_id) else {

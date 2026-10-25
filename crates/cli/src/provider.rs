@@ -40,7 +40,7 @@ const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 /// to be updated together when a tier is added.
 pub const CLOUD_TIERS: &[&str] = &[
     "fast", "balanced", "large", "mini", "air", "pro", "oke", "flux", "apex", "aura", "orbit",
-    "nova", "flare", "zenith", "prism",
+    "nova", "flare", "zenith", "prism", "lumen",
 ];
 
 pub const DEFAULT_CLOUD_TIER: &str = "nova";
@@ -57,6 +57,7 @@ pub const DEFAULT_CLOUD_TIER: &str = "nova";
 /// client does not know is not offered at all (see [`CLOUD_TIERS`]).
 const IMAGE_TIERS: &[&str] = &[
     "fast", "balanced", "large", "mini", "air", "pro", "oke", "aura", "flare", "zenith", "prism",
+    "lumen",
 ];
 
 /// Whether the cloud tier `tier` reads images.
@@ -110,6 +111,7 @@ pub fn cloud_tier_provider(tier: &str) -> Option<ProviderConfig> {
         base_url: cloud_base_url(),
         api_key: token,
         model: tier_to_model(tier),
+        session_token: true,
     })
 }
 
@@ -132,6 +134,7 @@ fn tier_to_model(tier: &str) -> String {
         "flare" => "onde-flare",
         "zenith" => "onde-zenith",
         "prism" => "onde-prism",
+        "lumen" => "onde-lumen",
         other => other,
     }
     .to_string()
@@ -148,6 +151,11 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// Model id sent to the endpoint, e.g. `onde-balanced` or `gpt-4o-mini`.
     pub model: String,
+    /// Whether `api_key` is the stored siGit Code Cloud session token. A
+    /// backend built from such a config reads the token again on every
+    /// request, so signing in as another account takes effect without a
+    /// restart.
+    pub session_token: bool,
 }
 
 /// Title-case a tier name for display (`balanced` → `Balanced`).
@@ -201,6 +209,7 @@ fn from_env() -> Option<ProviderConfig> {
         base_url,
         api_key,
         model,
+        session_token: false,
     })
 }
 
@@ -260,6 +269,7 @@ fn from_config_file() -> Result<Option<ProviderConfig>, String> {
         base_url: entry.base_url,
         api_key: entry.api_key,
         model: entry.model,
+        session_token: false,
     }))
 }
 

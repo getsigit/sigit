@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/cli", "crates/sigit-*"]
 
 [workspace.package]
-version = "1.7.4"
+version = "1.7.5"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/getsigit/sigit"
@@ -16,7 +16,7 @@ authors = ["Seto Elkahfi <seto@sigit.si>", "paydii <193906237+paydii@users.norep
 # crates.io, so this resolves from the registry rather than the onde-ed checkout next door.
 ed-acp = { version = "1.3.0", default-features = false }
 ed-acp-testkit = "1.3.0"
-sigit-agent = { version = "1.7.4", default-features = false, path = "crates/sigit-agent" }
+sigit-agent = { version = "1.7.5", default-features = false, path = "crates/sigit-agent" }
 
 # ACP protocol SDK
 agent-client-protocol = { version = "2.2", features = ["unstable_session_fork"] }

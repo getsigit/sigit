@@ -3013,12 +3013,15 @@ mod tui {
                                         let system_prompt = crate::with_launch_context(
                                             &crate::system_prompt_for_model(true),
                                         );
-                                        app.backend = Arc::new(OpenAiBackend::new(
-                                            provider.base_url,
-                                            provider.api_key,
-                                            provider.model,
-                                            Some(system_prompt),
-                                        ));
+                                        app.backend = Arc::new(
+                                            OpenAiBackend::new(
+                                                provider.base_url,
+                                                provider.api_key,
+                                                provider.model,
+                                                Some(system_prompt),
+                                            )
+                                            .with_session_token(provider.session_token),
+                                        );
                                         app.current_model_name = provider.display_name.clone();
                                         app.tool_calling = true;
                                         // Selecting a cloud tier puts us in cloud mode.
