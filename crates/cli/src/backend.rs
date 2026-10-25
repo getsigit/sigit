@@ -951,6 +951,9 @@ fn onde_result_to_turn(result: onde::inference::ToolAwareResult) -> TurnResult {
 pub struct OpenAiBackend {
     base_url: String,
     api_key: String,
+    /// Read the bearer from the stored session on each request instead of
+    /// using `api_key`; see `bearer`.
+    session_token: bool,
     model: String,
     http: reqwest::Client,
     /// The full message list sent on each request (system + turns + tool results).
@@ -985,6 +988,7 @@ impl OpenAiBackend {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
+            session_token: false,
             accepts_images: crate::provider::model_accepts_images(&model),
             accepts_audio: crate::provider::model_accepts_audio(&model),
             model,
@@ -992,6 +996,25 @@ impl OpenAiBackend {
             history: Mutex::new(history),
             stream_usage_refused: Arc::default(),
         }
+    }
+
+    /// Have the backend send the stored siGit Code Cloud session token as its
+    /// bearer, read on every request. A token captured at build time goes
+    /// stale when the user signs in as someone else; `api_key` is then only
+    /// the fallback for a signed-out request.
+    pub fn with_session_token(mut self, on: bool) -> Self {
+        self.session_token = on;
+        self
+    }
+
+    /// The bearer for the next request.
+    fn bearer(&self) -> String {
+        if self.session_token
+            && let Some(token) = crate::credentials::load_token()
+        {
+            return token;
+        }
+        self.api_key.clone()
     }
 
     fn tools_json(tools: &[ToolSpec]) -> Vec<serde_json::Value> {
@@ -1122,7 +1145,7 @@ impl OpenAiBackend {
         let mut response = self
             .http
             .post(&url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.bearer())
             .json(&body)
             .send()
             .await
@@ -1144,7 +1167,7 @@ impl OpenAiBackend {
             response = self
                 .http
                 .post(&url)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(self.bearer())
                 .json(&body)
                 .send()
                 .await
@@ -1193,7 +1216,7 @@ impl OpenAiBackend {
         let response = self
             .http
             .post(&url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.bearer())
             .json(&body)
             .send()
             .await
@@ -1826,6 +1849,7 @@ impl InferenceBackend for OpenAiBackend {
         Some(Arc::new(Self {
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
+            session_token: self.session_token,
             model: self.model.clone(),
             // The client is a handle on one connection pool; sharing it keeps
             // connections to the endpoint warm across sessions.

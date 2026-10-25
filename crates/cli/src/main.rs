@@ -907,12 +907,15 @@ fn agent_tools_as_specs() -> Vec<ToolSpec> {
 fn register_subagent_factory_for(cfg: &provider::ProviderConfig) {
     let cfg = cfg.clone();
     tools::set_subagent_factory(Box::new(move |system_prompt: &str| {
-        Some(Arc::new(OpenAiBackend::new(
-            cfg.base_url.clone(),
-            cfg.api_key.clone(),
-            cfg.model.clone(),
-            Some(system_prompt.to_string()),
-        )) as Arc<dyn InferenceBackend>)
+        Some(Arc::new(
+            OpenAiBackend::new(
+                cfg.base_url.clone(),
+                cfg.api_key.clone(),
+                cfg.model.clone(),
+                Some(system_prompt.to_string()),
+            )
+            .with_session_token(cfg.session_token),
+        ) as Arc<dyn InferenceBackend>)
     }));
 }
 
@@ -4390,12 +4393,10 @@ impl SiGitAgent {
             )),
             None => system_prompt_for_model(true),
         };
-        let cloud_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
-            cfg.base_url,
-            cfg.api_key,
-            cfg.model,
-            Some(system_prompt),
-        ));
+        let cloud_backend: Arc<dyn InferenceBackend> = Arc::new(
+            OpenAiBackend::new(cfg.base_url, cfg.api_key, cfg.model, Some(system_prompt))
+                .with_session_token(cfg.session_token),
+        );
         // Continue the thread on the new backend instead of starting over.
         let carried =
             backend::carryover_history(self.backend.lock().await.history_snapshot().await);
@@ -6015,12 +6016,15 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                 let _ = load_tx.send(Ok(()));
                 let label = provider.display_name.clone();
                 register_subagent_factory_for(&provider);
-                let backend = Arc::new(OpenAiBackend::new(
-                    provider.base_url,
-                    provider.api_key,
-                    provider.model,
-                    Some(with_instructions(system_prompt_for_model(true))),
-                )) as Arc<dyn InferenceBackend>;
+                let backend = Arc::new(
+                    OpenAiBackend::new(
+                        provider.base_url,
+                        provider.api_key,
+                        provider.model,
+                        Some(with_instructions(system_prompt_for_model(true))),
+                    )
+                    .with_session_token(provider.session_token),
+                ) as Arc<dyn InferenceBackend>;
                 (backend, label)
             }
             None => {
@@ -6045,12 +6049,15 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                         let _ = load_tx.send(Ok(()));
                         let label = provider.display_name.clone();
                         register_subagent_factory_for(&provider);
-                        let backend = Arc::new(OpenAiBackend::new(
-                            provider.base_url,
-                            provider.api_key,
-                            provider.model,
-                            Some(with_instructions(system_prompt_for_model(true))),
-                        )) as Arc<dyn InferenceBackend>;
+                        let backend = Arc::new(
+                            OpenAiBackend::new(
+                                provider.base_url,
+                                provider.api_key,
+                                provider.model,
+                                Some(with_instructions(system_prompt_for_model(true))),
+                            )
+                            .with_session_token(provider.session_token),
+                        ) as Arc<dyn InferenceBackend>;
                         (backend, label)
                     }
                     None => {
@@ -6217,12 +6224,15 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
             cfg.base_url
         );
         register_subagent_factory_for(&cfg);
-        let override_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
-            cfg.base_url,
-            cfg.api_key,
-            cfg.model,
-            Some(system_prompt_for_model(true)),
-        ));
+        let override_backend: Arc<dyn InferenceBackend> = Arc::new(
+            OpenAiBackend::new(
+                cfg.base_url,
+                cfg.api_key,
+                cfg.model,
+                Some(system_prompt_for_model(true)),
+            )
+            .with_session_token(cfg.session_token),
+        );
         *state.backend.lock().await = override_backend;
     } else {
         // On-device inference has a single shared conversation history, so a
@@ -7133,6 +7143,7 @@ mod tests {
             base_url: "http://127.0.0.1:9".into(),
             api_key: String::new(),
             model: "test".into(),
+            session_token: false,
         };
 
         // Thread A is parked on a cloud tier, thread B stays on-device, and
@@ -7249,6 +7260,7 @@ mod tests {
                     base_url: "http://127.0.0.1:9".into(),
                     api_key: String::new(),
                     model: "test".into(),
+                    session_token: false,
                 },
                 "sigit-cloud:test".into(),
             )
@@ -7311,6 +7323,7 @@ mod tests {
                     base_url: "http://127.0.0.1:9".into(),
                     api_key: String::new(),
                     model: "test-b".into(),
+                    session_token: false,
                 },
                 "sigit-cloud:test-b".into(),
             )
