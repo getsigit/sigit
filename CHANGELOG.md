@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- A new siGit Code Cloud tier, `lumen`, for long-context work over text and images. It shows in `/models` and the editor picker.
+
 ## 1.7.4
 
 The browser sign-in page looks like the product and stops reporting success
