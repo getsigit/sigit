@@ -2332,17 +2332,12 @@ impl SiGitAgent {
             ));
         }
 
-        // An existing session clears the gate without sending anyone to a
-        // browser they didn't ask for.
-        if let Ok(email) = account::verify_session().await {
-            log::info!("authenticate: verified existing session for {email}");
-            return Ok(AuthenticateResponse::default());
-        }
-
-        // Otherwise run the browser flow. There is no way to collect a password
-        // here (the spec forbids asking for credentials in a form) and no way
-        // to take a pasted code back, so this is the loopback variant or
-        // nothing: the editor gets an error naming the terminal command that
+        // `authenticate` is the user asking to sign in, so it always runs the
+        // browser flow, even with a valid session stored: that is how they
+        // switch accounts. There is no way to collect a password here (the
+        // spec forbids asking for credentials in a form) and no way to take a
+        // pasted code back, so this is the loopback variant or nothing: the
+        // editor gets an error naming the terminal command that
         // does work without a listener.
         let flow = browser_auth::begin();
         if !flow.is_loopback() {
