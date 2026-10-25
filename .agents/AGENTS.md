@@ -236,8 +236,12 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
 - **`crates/cli/src/tools.rs`** — agent tool schemas + execution: `read_file`, `create_directory`,
   `list_directory`, `search_files`, `glob`, `read_website`, `create_file`, `edit_file`,
-  `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
-  spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
+  `multi_edit`, `delete_file`, `run_command`, `command_output`, `kill_command`, `monitor_command`,
+  `write_todos`, `remember`. Add a tool in both the
+  spec list (`all_tools`) and the execute `match` (`execute_tool`). `monitor_command` waits on a background task in one call and reports what it has so far
+  through the `ToolProgress` seam (`register_tool_progress`; `main.rs` registers `AcpToolProgress`,
+  which sends a `tool_call_update` replacing the card's content; a no-op in the TUI and headless).
+  `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
   `Co-Authored-By: siGit Code` trailer (`commit_co_author_trailer()`, which reads
   `siGit Code v<version>-<acp|tui|headless>` from the surface `main` sets via `set_surface`), it amends the trailer in —

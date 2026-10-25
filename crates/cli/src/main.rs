@@ -377,7 +377,7 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
             ToolKind::Edit
         }
         "delete_file" => ToolKind::Delete,
-        "run_command" | "kill_command" => ToolKind::Execute,
+        "run_command" | "kill_command" | "monitor_command" => ToolKind::Execute,
         "read_file" | "list_directory" | "command_output" => ToolKind::Read,
         "search_files" | "glob" | "web_search" => ToolKind::Search,
         "read_website" => ToolKind::Fetch,
@@ -1004,6 +1004,26 @@ impl client_fs::ClientFileSystem for AcpClientFs {
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Live tool-card updates over the ACP connection (see `tools::ToolProgress`).
+struct AcpToolProgress {
+    cx: ConnectionTo<Client>,
+}
+
+impl tools::ToolProgress for AcpToolProgress {
+    fn update(&self, session_id: &str, tool_call_id: &str, text: &str) {
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            ToolCallUpdateFields::new().content(vec![tool_output_content(text)]),
+        ));
+        if let Err(error) = self
+            .cx
+            .send_notification(SessionNotification::new(session_id.to_string(), update))
+        {
+            log::warn!("could not update tool call {tool_call_id}: {error}");
+        }
     }
 }
 
@@ -2215,6 +2235,8 @@ impl SiGitAgent {
             log::info!("client terminal: {terminal}");
             client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
         }
+
+        tools::register_tool_progress(Arc::new(AcpToolProgress { cx: cx.clone() }));
 
         // URL-mode elicitation is where `authenticate` sends the user to sign
         // in. Form mode is never used: the spec forbids collecting
@@ -3737,10 +3759,12 @@ impl SiGitAgent {
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
                 // Repeated status checks are expected for a live background
-                // command. command_output long-polls and the overall round cap
+                // command. command_output and monitor_command wait, and the overall round cap
                 // still bounds a confused model without cutting off a real
                 // build or release while it is in progress.
-                let repeated = *repeat_count >= 3 && tc.name != "command_output";
+                let repeated = *repeat_count >= 3
+                    && tc.name != "command_output"
+                    && tc.name != "monitor_command";
                 if repeated {
                     force_text = true;
                     stopped_repeating = Some(tc.name.clone());

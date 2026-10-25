@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`monitor_command` follows a background task in one tool call.** It waits
+  until the task exits, a line of new output matches an optional `until`
+  pattern, or a timeout passes (300 s by default, 600 s at most). In an
+  editor it is a single card that updates with the task's output as it
+  arrives, instead of a column of `command_output` cards that also used up
+  the turn's tool rounds (#253).
+
+### Changed
+
+- Cards for `command_output`, `monitor_command` and `kill_command` name the
+  task and its command.
+
 ## 1.7.5
 
 A new siGit Code Cloud tier, and two fixes for signing in and switching
