@@ -111,6 +111,7 @@ pub fn cloud_tier_provider(tier: &str) -> Option<ProviderConfig> {
         base_url: cloud_base_url(),
         api_key: token,
         model: tier_to_model(tier),
+        session_token: true,
     })
 }
 
@@ -150,6 +151,11 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// Model id sent to the endpoint, e.g. `onde-balanced` or `gpt-4o-mini`.
     pub model: String,
+    /// Whether `api_key` is the stored siGit Code Cloud session token. A
+    /// backend built from such a config reads the token again on every
+    /// request, so signing in as another account takes effect without a
+    /// restart.
+    pub session_token: bool,
 }
 
 /// Title-case a tier name for display (`balanced` → `Balanced`).
@@ -203,6 +209,7 @@ fn from_env() -> Option<ProviderConfig> {
         base_url,
         api_key,
         model,
+        session_token: false,
     })
 }
 
@@ -262,6 +269,7 @@ fn from_config_file() -> Result<Option<ProviderConfig>, String> {
         base_url: entry.base_url,
         api_key: entry.api_key,
         model: entry.model,
+        session_token: false,
     }))
 }
 
