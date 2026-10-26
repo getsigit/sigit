@@ -48,7 +48,7 @@ The command-line agent and the desktop and mobile app are separate products. Eac
 | [Google Play](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) | | | | | [✓](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) |
 | [Microsoft Store](https://apps.microsoft.com/detail/9p69ph1k7nxx) | | [✓](https://apps.microsoft.com/detail/9p69ph1k7nxx) | | | |
 | [Snap Store](https://snapcraft.io/sigit) | | | [✓](https://snapcraft.io/sigit) | | |
-| [Direct download](https://getsigit.5mb.app/#download) | [✓](https://getsigit.5mb.app/#download) | [✓](https://getsigit.5mb.app/#download) | [✓](https://getsigit.5mb.app/#download) | | |
+| [Direct download](https://getsigit.5mb.app/download) | [✓](https://getsigit.5mb.app/download) | [✓](https://getsigit.5mb.app/download) | [✓](https://getsigit.5mb.app/download) | | |
 
 | Command line | macOS | Windows | Linux |
 |---|:-:|:-:|:-:|

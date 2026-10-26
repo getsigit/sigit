@@ -32,7 +32,7 @@ Each release is cut from this repository.
 | Google Play | Android | [siGit Code & Deploy](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) |
 | Microsoft Store | Windows | [siGit Code & Deploy](https://apps.microsoft.com/detail/9p69ph1k7nxx) |
 | Snap Store | Linux (amd64) | [`sudo snap install sigit`](https://snapcraft.io/sigit) |
-| Direct download | macOS, Windows, Linux | [siGit Code download page](https://getsigit.5mb.app/#download) |
+| Direct download | macOS, Windows, Linux | [siGit Code download page](https://getsigit.5mb.app/download) |
 
 App versions are numbered separately from the CLI.
 

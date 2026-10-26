@@ -1,6 +1,6 @@
 # Editor setup
 
-siGit Code runs inside any [ACP](acp.md) editor. Every client must pass `--acp`. Guides for Zed, Xcode, VS Code and the JetBrains IDEs follow, and any other client is covered at the end.
+siGit Code runs inside any [ACP](acp.md) editor. Every client must pass `--acp`. Guides for Zed, Xcode, VS Code, the JetBrains IDEs and Android Studio follow, and any other client is covered at the end.
 
 ## Zed setup
 
@@ -79,8 +79,8 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
 
 ## JetBrains IDEs
 
-RustRover, RubyMine, IntelliJ IDEA, Android Studio and the other JetBrains IDEs run ACP agents
-through AI Assistant. In the **AI Chat** window, choose **Add Custom Agent**. That opens
+The JetBrains IDEs run ACP agents through AI Assistant. We tested siGit Code in RustRover and
+RubyMine. In the **AI Chat** window, choose **Add Custom Agent**. That opens
 `~/.jetbrains/acp.json`. Add:
 
 ```json
@@ -97,8 +97,20 @@ through AI Assistant. In the **AI Chat** window, choose **Add Custom Agent**. Th
 
 Use the full path to `sigit` as `command`. See JetBrains' [ACP documentation](https://www.jetbrains.com/help/ai-assistant/acp.html).
 
+## Android Studio
+
+Android Studio can connect ACP agents through Bring Your Own Agent (BYOA). It is a preview in the
+Canary channel, starting with Android Studio Rabbit 2, so you need the latest Canary build. See the
+Android Developers Blog post
+[Build your way: Use any AI agent of your choice in Android Studio](https://android-developers.googleblog.com/2026/09/build-your-way-use-any-ai-agent-in-android-studio.html).
+
+siGit Code is in the agent registry, which you find under **Settings > Tools > AI > Agents**
+(**Android Studio > Settings** on macOS). Install **siGit Code** there and sign in. The registry
+entry launches siGit through `npx`. We tested siGit Code in Android Studio this way. The
+`~/.jetbrains/acp.json` file from the JetBrains section is not part of this setup.
+
 ## Other editors
 
 Any other client that speaks ACP works the same way: run `sigit` with `--acp`. The protocol site
 keeps a list of [ACP clients](https://agentclientprotocol.com/get-started/clients), including
-Emacs, Neovim, Sublime Text and VS Code compatible IDEs such as Cursor and Windsurf.
+Emacs, Neovim, Sublime Text, [marimo](https://github.com/marimo-team/marimo) and VS Code compatible IDEs such as Cursor and Windsurf.
