@@ -5400,74 +5400,135 @@ fn parse_on_off(arg: Option<&str>) -> Option<bool> {
     }
 }
 
-fn format_models_list(current_model: &GgufModelConfig) -> String {
+/// One inference mode of the `/models` list: a card title, the mode shown as
+/// its raw input, and its rows.
+struct ModelGroup {
+    title: String,
+    description: &'static str,
+    rows: String,
+}
+
+/// Send `/models` as one collapsible tool-call card per inference mode
+/// (clients fold those behind a chevron), then a usage hint as system status.
+fn send_models_list(
+    agent: &SiGitAgent,
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    current_model: &GgufModelConfig,
+) {
     let items = models::build_model_picker_items();
     if items.is_empty() {
-        return "No local models found. siGit will use the platform default model.".to_string();
+        agent
+            .send_assistant_message(
+                cx,
+                session_id.clone(),
+                "No local models found. siGit will use the platform default model.",
+            )
+            .ok();
+        return;
     }
+    for group in render_models_list(
+        &items,
+        models::active_inference_kind(),
+        &current_model.model_id,
+    ) {
+        agent
+            .send_tool_call_update(
+                cx,
+                session_id.clone(),
+                SessionUpdate::ToolCall(
+                    ToolCall::new(format!("models-{}", uuid::Uuid::new_v4()), group.title)
+                        .kind(ToolKind::Other)
+                        .status(ToolCallStatus::Completed)
+                        .raw_input(serde_json::Value::String(group.description.to_string()))
+                        .content(vec![group.rows.into()]),
+                ),
+            )
+            .ok();
+    }
+    agent
+        .send_system_status(cx, session_id.clone(), "Use /models N to switch models.")
+        .ok();
+}
 
-    let mut lines = vec!["Available models:".to_string()];
-    let mut last_source: Option<&str> = None;
+/// Group the picker items by inference mode. Numbers are the global picker
+/// index, since `/models N` indexes the same (kind-sorted) list.
+fn render_models_list(
+    items: &[models::ModelPickerItem],
+    active: models::InferenceKind,
+    current_id: &str,
+) -> Vec<ModelGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < items.len() {
+        let kind = items[start].source.kind();
+        let end = items[start..]
+            .iter()
+            .position(|item| item.source.kind() != kind)
+            .map_or(items.len(), |offset| start + offset);
+        let group = &items[start..end];
 
-    for (index, item) in items.iter().enumerate() {
-        let source_key = match item.source_label.as_str() {
-            "Onde" => "Onde",
-            "HuggingFace" => "HuggingFace",
-            "siGit Code Cloud" => "Cloud",
-            _ => "Fallback",
+        let mut title = match kind {
+            models::InferenceKind::Cloud => "siGit Code Cloud".to_string(),
+            models::InferenceKind::Local => "siGit Code on-device".to_string(),
         };
-
-        if last_source != Some(source_key) {
-            if last_source.is_some() {
-                lines.push(String::new());
-            }
-            let section = match source_key {
-                "Onde" => "Onde Inference",
-                "HuggingFace" => "Hugging Face cache",
-                "Cloud" => "siGit Code Cloud",
-                _ => "Fallback",
+        if kind == active {
+            title.push_str(" (active)");
+        }
+        if let Some(selected) = group.iter().find(|item| item.config.model_id == current_id) {
+            let selected_name = match &selected.cloud_tier {
+                Some(tier) => provider::tier_title(tier),
+                None => selected.display_name.clone(),
             };
-            lines.push(section.to_string());
-            // Blank line so the following "N." items render as an ordered list.
-            // CommonMark only lets an ordered list interrupt a paragraph when it
-            // starts at 1, so without this the cloud section (items 9+) would be
-            // absorbed into the header paragraph.
-            lines.push(String::new());
-            last_source = Some(source_key);
+            title.push_str(&format!(" · {selected_name}"));
         }
 
-        let number = index + 1;
-        let current_badge = if item.config.model_id == current_model.model_id {
-            "  <- current"
-        } else {
-            ""
-        };
-        let tool_badge = if item.tool_calling {
-            "  tool calling"
-        } else {
-            ""
-        };
-        let health_badge = match item.cache_health {
-            setup::ModelCacheHealth::Complete => "",
-            setup::ModelCacheHealth::Incomplete => "  ! incomplete cache",
-            setup::ModelCacheHealth::NotDownloaded => "  ↓ download on select",
-        };
-        let source = match source_key {
-            "Onde" => "  [Onde]",
-            "HuggingFace" => "  [HuggingFace]",
-            "Cloud" => "  [☁ Cloud]",
-            _ => "  [default]",
-        };
-
-        lines.push(format!(
-            "{number}. {}  {}{}{}{}{}",
-            item.display_name, item.description, tool_badge, health_badge, current_badge, source,
-        ));
+        let mut rows = Vec::new();
+        for (offset, item) in group.iter().enumerate() {
+            let number = start + offset + 1;
+            let current_badge = if item.config.model_id == current_id {
+                "  ← current"
+            } else {
+                ""
+            };
+            let tool_badge = if item.tool_calling {
+                "  tool calling"
+            } else {
+                ""
+            };
+            if let Some(tier) = &item.cloud_tier {
+                rows.push(format!(
+                    "{number}. {}{tool_badge}{current_badge}",
+                    provider::tier_title(tier)
+                ));
+                continue;
+            }
+            let health_badge = match item.cache_health {
+                setup::ModelCacheHealth::Complete => "",
+                setup::ModelCacheHealth::Incomplete => "  ! incomplete cache",
+                setup::ModelCacheHealth::NotDownloaded => "  ↓ download on select",
+            };
+            let source = match item.source_label.as_str() {
+                "Onde" => "  [Onde]",
+                "HuggingFace" => "  [HuggingFace]",
+                _ => "  [default]",
+            };
+            rows.push(format!(
+                "{number}. {}  {}{tool_badge}{health_badge}{current_badge}{source}",
+                item.display_name, item.description,
+            ));
+        }
+        groups.push(ModelGroup {
+            title,
+            description: match kind {
+                models::InferenceKind::Cloud => "Onde Cloud inference",
+                models::InferenceKind::Local => "On-device inference",
+            },
+            rows: rows.join("\n"),
+        });
+        start = end;
     }
-
-    lines.push(String::new());
-    lines.push("Use /models N to switch models.".to_string());
-    lines.join("\n")
+    groups
 }
 
 async fn exec_slash_acp(
@@ -5636,9 +5697,7 @@ async fn exec_slash_acp(
         }
         SlashCommand::Models(None) => {
             let current_model = agent.current_model.lock().unwrap().clone();
-            agent
-                .send_assistant_message(cx, session_id, format_models_list(&current_model))
-                .ok();
+            send_models_list(agent, cx, &session_id, &current_model);
         }
         SlashCommand::Skills => {
             agent
@@ -6809,6 +6868,100 @@ mod tests {
         let expected: Vec<_> = std::path::Path::new(expected).components().collect();
         let actual: Vec<_> = actual.components().collect();
         assert_eq!(actual, expected);
+    }
+
+    fn picker_item(
+        config: GgufModelConfig,
+        source: models::ModelSource,
+        cloud_tier: Option<&str>,
+    ) -> models::ModelPickerItem {
+        let cloud = cloud_tier.is_some();
+        models::ModelPickerItem {
+            display_name: match cloud_tier {
+                Some(tier) => format!("siGit Code Cloud · {}", provider::tier_title(tier)),
+                None => config.display_name.clone(),
+            },
+            description: if cloud { "siGit Code Cloud" } else { "~2 GB" }.to_string(),
+            tool_calling: true,
+            max_tokens: 4096,
+            context_window_tokens: 32_768,
+            config,
+            source_label: match source {
+                models::ModelSource::Onde => "Onde",
+                models::ModelSource::Cloud => "siGit Code Cloud",
+                _ => "Available",
+            }
+            .to_string(),
+            source,
+            cache_health: setup::ModelCacheHealth::Complete,
+            cloud_tier: cloud_tier.map(str::to_string),
+        }
+    }
+
+    fn sample_picker(active_first: models::InferenceKind) -> Vec<models::ModelPickerItem> {
+        let cloud = [
+            picker_item(
+                GgufModelConfig::qwen3_14b(),
+                models::ModelSource::Cloud,
+                Some("air"),
+            ),
+            picker_item(
+                GgufModelConfig::qwen3_8b(),
+                models::ModelSource::Cloud,
+                Some("prism"),
+            ),
+        ];
+        let local = [
+            picker_item(GgufModelConfig::qwen3_4b(), models::ModelSource::Onde, None),
+            picker_item(
+                GgufModelConfig::qwen25_3b(),
+                models::ModelSource::Available,
+                None,
+            ),
+        ];
+        match active_first {
+            models::InferenceKind::Cloud => cloud.into_iter().chain(local).collect(),
+            models::InferenceKind::Local => local.into_iter().chain(cloud).collect(),
+        }
+    }
+
+    #[test]
+    fn models_list_groups_by_mode_with_cloud_active() {
+        let items = sample_picker(models::InferenceKind::Cloud);
+        let groups = render_models_list(
+            &items,
+            models::InferenceKind::Cloud,
+            &GgufModelConfig::qwen3_8b().model_id,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].title, "siGit Code Cloud (active) · Prism");
+        assert_eq!(groups[1].title, "siGit Code on-device");
+        let rows = format!("{}\n{}", groups[0].rows, groups[1].rows);
+        for n in 1..=4 {
+            assert!(rows.contains(&format!("{n}. ")), "missing row {n}");
+        }
+        assert!(groups[0].rows.contains("2. Prism  tool calling  ← current"));
+        assert!(!rows.contains("siGit Code Cloud ·"));
+        assert!(!rows.contains("[☁ Cloud]"));
+        assert!(groups[1].rows.starts_with("3. "));
+    }
+
+    #[test]
+    fn models_list_marks_local_active() {
+        let items = sample_picker(models::InferenceKind::Local);
+        let groups = render_models_list(
+            &items,
+            models::InferenceKind::Local,
+            &GgufModelConfig::qwen3_4b().model_id,
+        );
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups[0]
+                .title
+                .starts_with("siGit Code on-device (active) · ")
+        );
+        assert_eq!(groups[1].title, "siGit Code Cloud");
+        assert!(groups[0].rows.contains("[Onde]"));
     }
 
     /// On Windows `to_file_path` requires a drive letter, so the test URIs use
