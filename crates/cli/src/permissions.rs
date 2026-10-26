@@ -117,7 +117,8 @@ pub enum Decision {
 pub fn classify(tool_name: &str) -> ToolRisk {
     match tool_name {
         "read_file" | "list_directory" | "search_files" | "glob" | "read_website"
-        | "write_todos" | "skill" | "task" | "command_output" | "web_search" => ToolRisk::ReadOnly,
+        | "write_todos" | "skill" | "task" | "command_output" | "monitor_command"
+        | "web_search" => ToolRisk::ReadOnly,
         _ => {
             if let Some(bare) = crate::mcp::official_tool_suffix(tool_name)
                 && (bare.starts_with("list_")
@@ -544,6 +545,7 @@ mod tests {
             "skill",
             "task",
             "command_output",
+            "monitor_command",
             "web_search",
         ] {
             assert_eq!(classify(tool), ToolRisk::ReadOnly, "{tool}");
