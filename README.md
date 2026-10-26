@@ -16,6 +16,16 @@
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
+<p align="center">
+  <a href="https://www.nuget.org/packages/SiGit.Code"><img src="https://img.shields.io/nuget/v/SiGit.Code?style=flat-square&labelColor=17211D&color=235843&label=nuget" alt="NuGet"></a>
+  <a href="https://github.com/microsoft/winget-pkgs/tree/master/manifests/g/getSigit/siGitCode"><img src="https://img.shields.io/winget/v/getSigit.siGitCode?style=flat-square&labelColor=17211D&color=235843" alt="winget"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=getsigit.sigit-code"><img src="https://img.shields.io/badge/VS%20Code-Marketplace-235843?style=flat-square&labelColor=17211D" alt="VS Code Marketplace"></a>
+  <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/dm/sigit-code?style=flat-square&labelColor=17211D&color=235843&label=pypi%20downloads" alt="PyPI downloads"></a>
+  <a href="https://github.com/getsigit/sigit/releases"><img src="https://img.shields.io/github/v/release/getsigit/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Release"></a>
+  <a href="https://github.com/getsigit/sigit/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/getsigit/sigit/ci.yml?style=flat-square&labelColor=17211D&label=ci" alt="CI"></a>
+  <a href="https://github.com/getsigit/sigit/releases"><img src="https://img.shields.io/github/downloads/getsigit/sigit/total?style=flat-square&labelColor=17211D&color=235843" alt="GitHub downloads"></a>
+</p>
+
 siGit Code runs on your machine and works in any codebase. Inference runs on-device by default through [Onde Inference](https://ondeinference.com), or on siGit Code Cloud when you choose it. You need no API key to start, and it works with any editor that speaks the [Agent Client Protocol](https://agentclientprotocol.com). The agent is Apache-2.0. siGit Code Cloud and [siGit Factory](https://factory.sigit.si/) are the hosted, paid side.
 
 ## Install
@@ -77,4 +87,4 @@ Issues and pull requests are welcome. Open one against `development`.
 
 ## Copyright
 
-© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](https://github.com/getsigit/sigit/blob/main/NOTICE) for the rights holder and distributor.
+© 2026 [siGit Code & Deploy](https://sigit.si).
