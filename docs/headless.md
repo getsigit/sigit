@@ -27,6 +27,23 @@ for interactive permission are denied in headless mode unless granted with
 `--allow-tool <name>`. A repeatable `--deny-tool <name>` takes precedence over grants and
 settings.
 
+## Choosing the model
+
+With no flag, a run uses the provider override (`OPENAI_BASE_URL` and `OPENAI_API_KEY`, or the
+active profile in `providers.toml`) when there is one, and otherwise the default siGit Code Cloud
+tier when you are signed in and local inference is off. `--model <tier>` picks a siGit Code
+Cloud tier for the run instead:
+
+```sh
+sigit run "Run the focused tests" --model prism --allow-tool run_command
+```
+
+The value is a tier name from `/models` (`prism`) or the model id sent on the wire
+(`onde-prism`). An unknown name is a usage error, exit code 2. The flag wins over the provider
+override and the local-inference setting, and it needs a signed-in session.
+
+## Tool rounds
+
 A run makes at most 24 rounds of tool calls. `--max-tool-rounds <n>`, or the
 `SIGIT_MAX_TOOL_ROUNDS` environment variable, sets a different cap from 1 to 500; the flag wins.
 When the cap is reached, or the model otherwise ends without saying anything, siGit Code asks it

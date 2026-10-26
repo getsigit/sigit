@@ -30,7 +30,7 @@ use crate::{permissions, provider, session_store, settings, tools};
 pub const USAGE: &str = "Usage: sigit run \"<prompt>\" [--cwd <dir>] [--add-dir <dir>]... \
                          [--output text|jsonl] [--quiet] [--resume <session-id>] \
                          [--allow-tool <name>]... [--deny-tool <name>]... \
-                         [--max-tool-rounds <n>]\n       \
+                         [--max-tool-rounds <n>] [--model <tier>]\n       \
                          sigit -p \"<prompt>\" [same options]";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,6 +67,9 @@ pub struct HeadlessConfig {
     /// asked for its final message. `--max-tool-rounds`, else
     /// `SIGIT_MAX_TOOL_ROUNDS`, else the built-in cap.
     pub max_tool_rounds: usize,
+    /// siGit Code Cloud tier named by `--model`. When set it wins over the
+    /// provider override and the local-inference setting.
+    pub cloud_tier: Option<&'static str>,
 }
 
 /// Upper bound for `--max-tool-rounds` / `SIGIT_MAX_TOOL_ROUNDS`.
@@ -147,6 +150,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
     let mut allow_tools: Vec<String> = Vec::new();
     let mut deny_tools: Vec<String> = Vec::new();
     let mut max_tool_rounds: Option<usize> = None;
+    let mut cloud_tier: Option<&'static str> = None;
 
     let mut iter = args.iter().skip(usize::from(run_command));
     while let Some(arg) = iter.next() {
@@ -211,6 +215,21 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
                     .ok_or_else(|| "--max-tool-rounds requires a number".to_string())?;
                 max_tool_rounds = Some(parse_tool_rounds(value, "--max-tool-rounds")?);
             }
+            "--model" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--model requires a cloud tier".to_string())?;
+                if cloud_tier.is_some() {
+                    return Err("--model was given more than once".to_string());
+                }
+                let tier = provider::cloud_tier_named(value).ok_or_else(|| {
+                    format!(
+                        "unknown cloud tier: {value} (expected one of: {})",
+                        provider::CLOUD_TIERS.join(", ")
+                    )
+                })?;
+                cloud_tier = Some(tier);
+            }
             // A mistyped flag must not become the prompt. A prompt that
             // really starts with '-' can still go through -p.
             other if other.starts_with('-') => return Err(format!("unknown argument: {other}")),
@@ -258,6 +277,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
         allow_tools,
         deny_tools,
         max_tool_rounds,
+        cloud_tier,
     }))
 }
 
@@ -312,22 +332,32 @@ pub async fn run(config: HeadlessConfig) -> i32 {
     // first, else the signed-in cloud tier when local inference is off (what
     // `apply_startup_inference_mode` does at every ACP session entry). There is
     // never an implicit on-device load — a fresh process has no model in memory
-    // and headless mode must not silently download gigabytes.
-    let provider_cfg = provider::active_provider().or_else(|| {
-        if settings::local_inference_enabled() {
-            None
-        } else {
-            provider::cloud_tier_provider(provider::DEFAULT_CLOUD_TIER)
-        }
-    });
+    // and headless mode must not silently download gigabytes. `--model` is the
+    // exception to that order: a tier named on the command line wins over the
+    // override and the setting, the way a flag wins over the environment.
+    let provider_cfg = match config.cloud_tier {
+        Some(tier) => provider::cloud_tier_provider(tier),
+        None => provider::active_provider().or_else(|| {
+            if settings::local_inference_enabled() {
+                None
+            } else {
+                provider::cloud_tier_provider(provider::DEFAULT_CLOUD_TIER)
+            }
+        }),
+    };
     let Some(cfg) = provider_cfg else {
-        emit_error(
-            &config,
-            "headless mode needs a remote inference provider — running on-device would require \
-             loading (and possibly downloading) a local model, which headless mode never does \
-             implicitly. Set OPENAI_BASE_URL and OPENAI_API_KEY (or configure providers.toml), \
-             or sign in with `sigit login` and turn local inference off.",
-        );
+        let message = match config.cloud_tier {
+            Some(tier) => format!(
+                "--model {tier} needs a siGit Code Cloud session. Sign in with `sigit login`."
+            ),
+            None => "headless mode needs a remote inference provider — running on-device would \
+                     require loading (and possibly downloading) a local model, which headless \
+                     mode never does implicitly. Set OPENAI_BASE_URL and OPENAI_API_KEY (or \
+                     configure providers.toml), or sign in with `sigit login` and turn local \
+                     inference off."
+                .to_string(),
+        };
+        emit_error(&config, &message);
         return 1;
     };
 
@@ -815,6 +845,32 @@ mod tests {
     }
 
     #[test]
+    fn model_flag_names_a_cloud_tier() {
+        let config = parse_args(&args(&["run", "go"])).unwrap().unwrap();
+        assert_eq!(config.cloud_tier, None);
+        let config = parse_args(&args(&["run", "go", "--model", "prism"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.cloud_tier, Some("prism"));
+        // The wire id works too, so a model id copied from logs is accepted.
+        let config = parse_args(&args(&["-p", "go", "--model", "onde-zenith"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.cloud_tier, Some("zenith"));
+    }
+
+    #[test]
+    fn model_flag_rejects_unknown_and_repeated_tiers() {
+        let error = parse_args(&args(&["run", "go", "--model", "gpt-4o"])).unwrap_err();
+        assert!(error.starts_with("unknown cloud tier: gpt-4o"), "{error}");
+        assert!(error.contains("prism"), "{error}");
+        assert_eq!(
+            parse_args(&args(&["run", "go", "--model", "apex", "--model", "flare"])),
+            Err("--model was given more than once".to_string())
+        );
+    }
+
+    #[test]
     fn wrap_up_prompt_names_the_cap_only_when_it_was_reached() {
         let capped = wrap_up_prompt(true, 24);
         assert!(capped.contains("all 24 tool rounds"), "{capped}");
@@ -877,6 +933,7 @@ mod tests {
         assert!(parse_args(&args(&["-p", "x", "--deny-tool"])).is_err());
         assert!(parse_args(&args(&["run", "x", "--output"])).is_err());
         assert!(parse_args(&args(&["run", "x", "--resume"])).is_err());
+        assert!(parse_args(&args(&["run", "x", "--model"])).is_err());
     }
 
     #[test]
