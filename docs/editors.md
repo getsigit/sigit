@@ -1,6 +1,6 @@
 # Editor setup
 
-siGit Code runs inside any [ACP](acp.md) editor. Every client must pass `--acp`.
+siGit Code runs inside any [ACP](acp.md) editor. Every client must pass `--acp`. Guides for Zed, Xcode, VS Code and the JetBrains IDEs follow, and any other client is covered at the end.
 
 ## Zed setup
 
@@ -76,3 +76,29 @@ Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formula
   }
 }
 ```
+
+## JetBrains IDEs
+
+RustRover, RubyMine, IntelliJ IDEA, Android Studio and the other JetBrains IDEs run ACP agents
+through AI Assistant. In the **AI Chat** window, choose **Add Custom Agent**. That opens
+`~/.jetbrains/acp.json`. Add:
+
+```json
+{
+  "agent_servers": {
+    "siGit Code": {
+      "command": "/absolute/path/to/sigit",
+      "args": ["--acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+Use the full path to `sigit` as `command`. See JetBrains' [ACP documentation](https://www.jetbrains.com/help/ai-assistant/acp.html).
+
+## Other editors
+
+Any other client that speaks ACP works the same way: run `sigit` with `--acp`. The protocol site
+keeps a list of [ACP clients](https://agentclientprotocol.com/get-started/clients), including
+Emacs, Neovim, Sublime Text and VS Code compatible IDEs such as Cursor and Windsurf.

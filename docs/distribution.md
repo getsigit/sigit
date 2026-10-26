@@ -4,9 +4,8 @@ There are two products under the siGit Code name, and they ship through differen
 
 - **siGit Code** is the command-line agent in this repository. It runs in a terminal, in CI, or
   inside any ACP editor.
-- **siGit Code & Deploy** is the desktop and mobile app, built from
-  [getsigit/sigit-app](https://github.com/getsigit/sigit-app). It adds a Git client, a code
-  editor and deploy to smbCloud around the same agent.
+- **siGit Code & Deploy** is the desktop and mobile app. It embeds this same siGit Code as an
+  in-process agent and adds a Git client, a code editor and deploy to smbCloud around it.
 
 Every channel is listed, and kept current, at <https://getsigit.5mb.app/>.
 
@@ -33,7 +32,7 @@ Each release is cut from this repository.
 | Google Play | Android | [siGit Code & Deploy](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) |
 | Microsoft Store | Windows | [siGit Code & Deploy](https://apps.microsoft.com/detail/9p69ph1k7nxx) |
 | Snap Store | Linux (amd64) | [`sudo snap install sigit`](https://snapcraft.io/sigit) |
-| Direct download | macOS, Windows, Linux | [sigit-app releases](https://github.com/getsigit/sigit-app/releases) |
+| Direct download | macOS, Windows, Linux | [siGit Code download page](https://getsigit.5mb.app/#download) |
 
 App versions are numbered separately from the CLI.
 
@@ -47,6 +46,6 @@ files in the folder you open and answers through siGit Code Cloud.
 
 ## Inference
 
-The CLI runs models on-device through [Onde Inference](https://ondeinference.com) by default, and
+The CLI runs models on-device through the [Onde Inference on-device inference SDK](https://ondeinference.com/sdk) by default, and
 can use siGit Code Cloud when you choose it. The desktop and mobile apps currently use siGit Code
 Cloud.

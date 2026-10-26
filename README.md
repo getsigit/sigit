@@ -26,7 +26,7 @@
   <a href="https://github.com/getsigit/sigit/releases"><img src="https://img.shields.io/github/downloads/getsigit/sigit/total?style=flat-square&labelColor=17211D&color=235843" alt="GitHub downloads"></a>
 </p>
 
-siGit Code runs on your machine and works in any codebase. Inference runs on-device by default through [Onde Inference](https://ondeinference.com), or on siGit Code Cloud when you choose it. You need no API key to start, and it works with any editor that speaks the [Agent Client Protocol](https://agentclientprotocol.com). The agent is Apache-2.0. siGit Code Cloud and [siGit Factory](https://factory.sigit.si/) are the hosted, paid side.
+siGit Code runs on your machine and works in any codebase. Inference runs on-device by default through the [Onde Inference on-device inference SDK](https://ondeinference.com/sdk), or on siGit Code Cloud when you choose it. You need no API key to start, and it works with any editor that speaks the [Agent Client Protocol](https://agentclientprotocol.com). The agent is Apache-2.0. siGit Code Cloud and [siGit Factory](https://factory.sigit.si/) are the hosted, paid side.
 
 ## Install
 
@@ -48,7 +48,7 @@ The command-line agent and the desktop and mobile app are separate products. Eac
 | [Google Play](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) | | | | | [✓](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) |
 | [Microsoft Store](https://apps.microsoft.com/detail/9p69ph1k7nxx) | | [✓](https://apps.microsoft.com/detail/9p69ph1k7nxx) | | | |
 | [Snap Store](https://snapcraft.io/sigit) | | | [✓](https://snapcraft.io/sigit) | | |
-| [Direct download](https://github.com/getsigit/sigit-app/releases) | [✓](https://github.com/getsigit/sigit-app/releases) | [✓](https://github.com/getsigit/sigit-app/releases) | [✓](https://github.com/getsigit/sigit-app/releases) | | |
+| [Direct download](https://getsigit.5mb.app/#download) | [✓](https://getsigit.5mb.app/#download) | [✓](https://getsigit.5mb.app/#download) | [✓](https://getsigit.5mb.app/#download) | | |
 
 | Command line | macOS | Windows | Linux |
 |---|:-:|:-:|:-:|
@@ -71,7 +71,7 @@ Every channel, kept current: https://getsigit.5mb.app/
 - **In the terminal.** Run `sigit` for a full-screen chat UI. See [terminal mode](docs/terminal.md).
 - **In scripts and CI.** `sigit run "<prompt>"` gives you JSONL events and exit codes. See [headless mode](docs/headless.md).
 
-Setup guides for Zed, Xcode and VS Code are in [docs/editors.md](docs/editors.md).
+Setup guides for Zed, Xcode, VS Code and the JetBrains IDEs are in [docs/editors.md](docs/editors.md).
 
 ## Docs
 
