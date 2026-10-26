@@ -850,7 +850,7 @@ fn successful_config_option_changes_are_rendered_as_system_status_cards() {
         .expect("Local Inference change should render as a system-style status card");
     assert_eq!(
         status["title"],
-        "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
+        "Local inference is off. siGit Code Cloud tiers are selectable in Model."
     );
 
     let id = agent.request(
