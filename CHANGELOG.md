@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.7.6
+
+A background-task tool for long commands, model pickers grouped by where the
+model runs, and a shorter README. No protocol change, so an editor sees a
+1.7.5-shaped agent.
 
 ### Added
 
@@ -15,6 +19,19 @@
 
 - Cards for `command_output`, `monitor_command` and `kill_command` name the
   task and its command.
+- `/models` and the editor's model picker group models by where they run,
+  on-device or cloud, instead of one flat list (#264, #265).
+
+### Fixed
+
+- The winget pull request description gives the version of the release it was
+  filed for (#267).
+
+### Docs
+
+- The README is shorter and the details moved into docs. Android Studio is
+  documented, and the JetBrains and download links point to the right places
+  (#266).
 
 ## 1.7.5
 
