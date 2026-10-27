@@ -290,7 +290,7 @@ jobs:
           PR_URL="${{ steps.submit_new.outputs.pr_url || steps.submit_update.outputs.pr_url }}"
           ISSUE_NUMBER="${{ steps.issue.outputs.issue_number }}"
           VERSION="${{ steps.release.outputs.version }}"
-          TAG="${{ steps.release.outputs.tag }}"
+          RELEASE_URL="https://github.com/${REPO}/releases/tag/${{ steps.release.outputs.tag }}"
 
           if [ -n "$ISSUE_NUMBER" ]; then
             CHECKBOX="- [x] Linked to an issue (if applicable)"
@@ -301,9 +301,9 @@ jobs:
           fi
 
           if [ "${{ steps.exists.outputs.found }}" = "false" ]; then
-            DESC="Adds ${PACKAGE_IDENTIFIER} version ${VERSION} from ${TAG}."
+            DESC="Adds ${PACKAGE_IDENTIFIER} version ${VERSION}. Release notes: ${RELEASE_URL}"
           else
-            DESC="Updates ${PACKAGE_IDENTIFIER} to version ${VERSION} from ${TAG}."
+            DESC="Updates ${PACKAGE_IDENTIFIER} to version ${VERSION}. Release notes: ${RELEASE_URL}"
           fi
 
           # Mirrors the current .github/PULL_REQUEST_TEMPLATE.md; keep the
