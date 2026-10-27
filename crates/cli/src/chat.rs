@@ -167,6 +167,13 @@ pub(crate) fn tool_title(name: &str, arguments_json: &str) -> String {
                 str_arg("path")
             }
             "search_files" | "glob" => str_arg("pattern"),
+            "command_output" | "monitor_command" | "kill_command" => {
+                let id = args.as_ref().and_then(|a| a.get("task_id")?.as_u64());
+                id.map(|id| match crate::tools::background_task_command(id) {
+                    Some(command) => format!("task {id} (`{command}`)"),
+                    None => format!("task {id}"),
+                })
+            }
             _ => None,
         };
         (name.to_string(), summary)
@@ -4143,6 +4150,17 @@ mod tests {
             tool_title("run_command", r#"{"command":"cargo test"}"#),
             "run_command · cargo test"
         );
+    }
+
+    #[test]
+    fn tool_title_task_tools_name_the_task() {
+        for name in ["command_output", "monitor_command", "kill_command"] {
+            assert_eq!(
+                tool_title(name, r#"{"task_id":999999}"#),
+                format!("{name} · task 999999")
+            );
+        }
+        assert_eq!(tool_title("monitor_command", "{}"), "monitor_command");
     }
 
     #[test]

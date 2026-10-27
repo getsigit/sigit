@@ -1,229 +1,85 @@
-# siGit Code
+<p align="center">
+  <img src="docs/assets/logo.png" alt="siGit Code" width="96">
+</p>
+
+<h1 align="center">siGit Code</h1>
+
+<p align="center"><strong>The coding agent that runs where your code lives.</strong></p>
+<p align="center">A modular on-device inference LLM coding agent. Core component of siGit Factory.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/sigit"><img src="https://img.shields.io/crates/v/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Crates.io"></a>
   <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/v/sigit-code?style=flat-square&labelColor=17211D&color=235843" alt="PyPI"></a>
   <a href="https://www.npmjs.com/package/@getsigit/sigit"><img src="https://img.shields.io/npm/v/@getsigit/sigit?style=flat-square&labelColor=17211D&color=235843" alt="npm"></a>
+  <a href="https://snapcraft.io/sigit"><img src="https://snapcraft.io/sigit/badge.svg" alt="sigit"></a>
   <a href="https://sigit.si/code"><img src="https://img.shields.io/badge/sigit.si%2Fcode-235843?style=flat-square&labelColor=17211D" alt="Website"></a>
   <a href="https://github.com/getsigit/sigit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-235843?style=flat-square&labelColor=17211D" alt="License"></a>
 </p>
 
-siGit Code is a local-first AI coding agent. It runs on your machine by default, with optional
-cloud inference and remote automation when you choose them. No API key is required to start; the
-on-device path needs none at all.
+<p align="center">
+  <a href="https://www.nuget.org/packages/SiGit.Code"><img src="https://img.shields.io/nuget/v/SiGit.Code?style=flat-square&labelColor=17211D&color=235843&label=nuget" alt="NuGet"></a>
+  <a href="https://github.com/microsoft/winget-pkgs/tree/master/manifests/g/getSigit/siGitCode"><img src="https://img.shields.io/winget/v/getSigit.siGitCode?style=flat-square&labelColor=17211D&color=235843" alt="winget"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=getsigit.sigit-code"><img src="https://img.shields.io/badge/VS%20Code-Marketplace-235843?style=flat-square&labelColor=17211D" alt="VS Code Marketplace"></a>
+  <a href="https://pypi.org/project/sigit-code/"><img src="https://img.shields.io/pypi/dm/sigit-code?style=flat-square&labelColor=17211D&color=235843&label=pypi%20downloads" alt="PyPI downloads"></a>
+  <a href="https://github.com/getsigit/sigit/releases"><img src="https://img.shields.io/github/v/release/getsigit/sigit?style=flat-square&labelColor=17211D&color=235843" alt="Release"></a>
+  <a href="https://github.com/getsigit/sigit/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/getsigit/sigit/ci.yml?style=flat-square&labelColor=17211D&label=ci" alt="CI"></a>
+  <a href="https://github.com/getsigit/sigit/releases"><img src="https://img.shields.io/github/downloads/getsigit/sigit/total?style=flat-square&labelColor=17211D&color=235843" alt="GitHub downloads"></a>
+</p>
 
-It is the agent runtime for [siGit Factory](https://factory.sigit.si/), the hosted version of the
-same product. Run it yourself, as below, or use siGit Code Cloud there if you would rather not
-host a model locally. [sigit.si](https://sigit.si) is Git hosting built for AI workflows.
-
-It works in any codebase. In smbCloud repos it is more useful out of the box because it already understands the Rust workspace layout, deploy flows, auth boundaries, and GresIQ.
-
-You can use it in two ways:
-
-- **ACP mode:** Zed or another ACP-compatible editor starts it over stdio with the `--acp` argument
-- **Terminal mode:** run `sigit` for the interactive chat UI
-
-Every ACP client must pass `--acp`. It takes no other arguments, and it is what
-tells the binary to speak the Agent Client Protocol instead of opening the
-terminal UI.
-
-| Platform | ACP mode | Terminal mode |
-|----------|----------|---------------|
-| macOS | ✓ | ✓ |
-| Linux | ✓ | ✓ |
-| Windows | ✓ | not yet |
+siGit Code runs on your machine and works in any codebase. Inference runs on-device by default through the [Onde Inference on-device inference SDK](https://ondeinference.com/sdk), or on siGit Code Cloud when you choose it. You need no API key to start, and it works with any editor that speaks the [Agent Client Protocol](https://agentclientprotocol.com). The agent is Apache-2.0. siGit Code Cloud and [siGit Factory](https://factory.sigit.si/) are the hosted, paid side.
 
 ## Install
 
 ```sh
 cargo install sigit
+brew tap getsigit/tap && brew trust --tap getsigit/tap && brew install sigit
+npm install -g @getsigit/sigit
 ```
 
-| Method | Command |
-|--------|---------|
-| Homebrew | `brew tap getsigit/tap && brew trust --tap getsigit/tap && brew install sigit` |
-| pip | `pip install sigit-code` |
-| uv | `uvx --from sigit-code sigit` |
-| npm | `npm install -g @getsigit/sigit` |
-| NuGet | `dotnet tool install --global SiGit.Code` |
-| winget | `winget install smbCloud.siGitCode` |
-| Scoop | `scoop bucket add getsigit https://github.com/getsigit/scoop-bucket && scoop install sigit` |
-| AUR | `yay -S sigit-bin` |
-| Debian/Ubuntu | download the `.deb` from [releases](https://github.com/getsigit/sigit/releases), then `sudo dpkg -i sigit_*.deb` |
-| Fedora/RHEL | download the `.rpm` from [releases](https://github.com/getsigit/sigit/releases), then `sudo rpm -i sigit-*.rpm` |
+More ways, including pip, NuGet, winget, Scoop and Linux packages, are in [docs/install.md](docs/install.md).
 
-## First run
+## Get siGit anywhere
 
-The first launch downloads a GGUF model from Hugging Face. Expect roughly 1 to 2 GB, depending on the model. After that, loads come from disk and are much faster.
+The command-line agent and the desktop and mobile app are separate products. Each cell links to where it ships.
 
-On macOS, siGit Code shares its model cache with the desktop app through an App Group container. If the desktop app already downloaded the model, the CLI reuses it.
+| Desktop and mobile apps | macOS | Windows | Linux | iOS | Android |
+|---|:-:|:-:|:-:|:-:|:-:|
+| [App Store](https://apps.apple.com/app/id6753018849) | [✓](https://apps.apple.com/app/id6753018849) | | | [✓](https://apps.apple.com/app/id6753018849) | |
+| [Google Play](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) | | | | | [✓](https://play.google.com/store/apps/details?id=xyz.smbcloud.SiGit) |
+| [Microsoft Store](https://apps.microsoft.com/detail/9p69ph1k7nxx) | | [✓](https://apps.microsoft.com/detail/9p69ph1k7nxx) | | | |
+| [Snap Store](https://snapcraft.io/sigit) | | | [✓](https://snapcraft.io/sigit) | | |
+| [Direct download](https://getsigit.5mb.app/download) | [✓](https://getsigit.5mb.app/download) | [✓](https://getsigit.5mb.app/download) | [✓](https://getsigit.5mb.app/download) | | |
 
-## Zed setup
+| Command line | macOS | Windows | Linux |
+|---|:-:|:-:|:-:|
+| [crates.io](https://crates.io/crates/sigit) | ✓ | ✓ | ✓ |
+| [Homebrew](docs/install.md) | ✓ | | |
+| [npm](https://www.npmjs.com/package/@getsigit/sigit) | ✓ | ✓ | ✓ |
+| [PyPI and uv](https://pypi.org/project/sigit-code/) | ✓ | ✓ | ✓ |
+| [NuGet](https://www.nuget.org/packages/SiGit.Code) | ✓ | ✓ | ✓ |
+| [winget](docs/install.md) | | ✓ | |
+| [Scoop](https://github.com/getsigit/scoop-bucket) | | ✓ | |
+| [deb and rpm](https://github.com/getsigit/sigit/releases) | | | ✓ |
 
-Add this to `~/.config/zed/settings.json`:
+`sudo snap install sigit` installs the desktop app, not the terminal agent. The app currently uses siGit Code Cloud for inference, while the command line runs models on-device. Details are in [docs/distribution.md](docs/distribution.md).
 
-```json
-{
-  "agent_servers": {
-    "siGit Code": {
-      "type": "custom",
-      "command": "/absolute/path/to/sigit",
-      "args": ["--acp"]
-    }
-  }
-}
-```
+Every channel, kept current: https://getsigit.5mb.app/
 
-Use the full absolute path. `~` does not expand here.
+## Use it your way
 
-## Xcode custom agent
+- **In your editor.** Any ACP client starts `sigit --acp`. See [ACP support](docs/acp.md).
+- **In the terminal.** Run `sigit` for a full-screen chat UI. See [terminal mode](docs/terminal.md).
+- **In scripts and CI.** `sigit run "<prompt>"` gives you JSONL events and exit codes. See [headless mode](docs/headless.md).
 
-In Xcode, open **Settings > Intelligence > Agents**, add a custom agent, and set:
+Setup guides for Zed, Xcode, VS Code and the JetBrains IDEs are in [docs/editors.md](docs/editors.md).
 
-- **Executable:** the absolute path to `sigit`
-- **Arguments:** `--acp`
+## Docs
 
-In Xcode the `--acp` mode also loads the selected on-device model on the first
-prompt, so you do not need to send `/load` from the Xcode chat.
+[Install](docs/install.md), [editors](docs/editors.md), [ACP](docs/acp.md), [terminal](docs/terminal.md), [headless](docs/headless.md), [hooks](docs/hooks.md), [MCP](docs/mcp.md), [telemetry](docs/telemetry.md), [distribution](docs/distribution.md). The index is [docs/README.md](docs/README.md).
 
-To let siGit use Xcode's build, test, and project tools, enable **Allow external
-agents to use Xcode tools** in Xcode's Intelligence settings, keep the project
-open, and add this to `~/.config/sigit/mcp.toml`:
+## Contributing
 
-```toml
-[[server]]
-name = "xcode"
-command = "xcrun"
-args = ["mcpbridge"]
-```
-
-## VS Code
-
-### With siGit Code Extension
-
-Install from the [Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=getsigit.sigit-code).
-
-```jsonc
-{
-  "sigit.agents": {
-    "sigit": {
-      "name": "siGit (on-device)",
-      "command": "sigit",
-      "args": ["--acp"],
-      "env": {}
-    },
-  },
-  "sigit.agent.default": "sigit"
-}
-```
-
-### With ACP Client
-
-Install [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client), then add:
-
-```json
-{
-  "acp.agents": {
-    "siGit Code": {
-      "command": "sigit",
-      "args": ["--acp"],
-      "env": {}
-    }
-  }
-}
-```
-
-## ACP support
-
-siGit Code speaks [Agent Client Protocol](https://agentclientprotocol.com) v1 over stdio.
-As of 1.7.0 it implements the whole stable v1 surface an agent can offer:
-
-| Area | What is supported |
-|------|-------------------|
-| Sessions | `session/new`, `load`, `resume`, `fork`, `list` (paged, with a `cwd` filter), `close`, `delete`, and multi-root projects through `additionalDirectories` |
-| Prompts | Text, images, audio, embedded resources and resource links. Stop reasons `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` and `cancelled` |
-| Updates | Message and thought chunks with a `messageId`, tool calls with diffs, locations and embedded terminals, plans, `usage_update`, `session_info_update`, slash commands |
-| Cancellation | `session/cancel`, and `$/cancel_request` for a prompt or a sign-in |
-| Permissions | `session/request_permission` with allow or deny, once or for the session. Manual, Auto and Plan as config options and as session modes |
-| Client features | `fs/read_text_file` and `fs/write_text_file`, `terminal/*`, URL-mode elicitation and boolean config options, each used only when the client advertises it |
-| MCP | stdio and Streamable HTTP servers passed in `mcpServers` |
-| Auth | `authenticate` (browser sign-in) and `logout` |
-
-`session/fork` is still marked unstable in the protocol. Draft v2 is not enabled.
-
-## Terminal mode
-
-Run `sigit` in a terminal and you get the same model and system prompt as the editor integration, just in a full-screen chat UI.
-
-Terminal mode currently needs Unix terminal behavior, so it works on macOS and Linux only.
-
-The interactive UI emits [OSC 7501 program status](https://www.superlogical.com/rex/docs/build/program-status) reports so supporting terminals can show working, waiting for permission or input, browser sign-in, completion, and errors across tabs. User-driven quit reports idle; terminals expire active work on process exit and retain completion or error reports. Status sequences are never written to headless/JSON or ACP output.
-
-## Headless and CI mode
-
-Use `sigit run` to execute the same agent from scripts, CI, or another siGit Factory client:
-
-```sh
-sigit run "Review this repository and run the focused tests" --cwd .
-```
-
-Every run receives a durable session ID. The ID is printed to stderr in text mode and included
-in every event in JSONL mode. Resume the same conversation from a later command—or import it in
-an ACP client—by passing that ID:
-
-```sh
-sigit run "Continue with the next issue" --resume <session-id>
-```
-
-For automation, JSONL output provides session, assistant-delta, tool-call, tool-result, result,
-and error events on stdout. Logs remain on stderr.
-
-```sh
-sigit run "Run the checks" --output jsonl --allow-tool run_command
-```
-
-Mutating tools still follow siGit's permission policy. Because a headless run cannot answer an
-interactive permission prompt, approve only the tools the run needs with repeatable
-`--allow-tool` flags. The legacy `sigit -p "<prompt>"` form remains supported. See the
-[headless execution reference](docs/headless.md) for the event contract and exit codes.
-
-## Telemetry
-
-siGit Code itself collects no usage analytics. On-device models run on
-[Onde Inference](https://ondeinference.com), and Onde can report model timing to its own
-dashboard. That reporting only switches on in builds where Onde's credentials were embedded at
-compile time. When it is on, siGit Code sends:
-
-- one event when an on-device model finishes loading: the model's Hugging Face repo ID, its
-  display name, and how long the load took;
-- one event per on-device response: the model ID, a per-process request ID, the response time,
-  the time to first token when it was measured, and whether it succeeded, errored, or was
-  cancelled.
-
-Nothing from your conversation goes with them: no prompts, responses, file paths, or code.
-siGit Code doesn't set a machine identifier, so every install reports as the same
-`onde-unknown` edge, and it sends no location. Models you run through siGit Code Cloud or your
-own endpoint send no Onde events.
-
-To see whether your build reports, load an on-device model and check the log for
-`ChatEngine: pulse telemetry enabled` or `ChatEngine: pulse telemetry disabled`. siGit Code logs
-to stderr, which an editor shows in its agent log. Terminal mode writes it to
-`$TMPDIR/sigit.log`.
-
-To turn it off, set `ONDE_DISABLE_PULSE=1` in the environment siGit Code runs in. For an
-editor, put it in the agent's `env` block:
-
-```json
-"env": { "ONDE_DISABLE_PULSE": "1" }
-```
-
-## Platform support
-
-| Platform | Architecture |
-|----------|-------------|
-| macOS | arm64, x64 |
-| Linux (glibc) | arm64, x64 |
-| Windows | arm64, x64 |
+Issues and pull requests are welcome. Open one against `development`.
 
 ## License
 
@@ -231,4 +87,4 @@ editor, put it in the agent's `env` block:
 
 ## Copyright
 
-© 2026 [siGit Code & Deploy](https://sigit.si). See [NOTICE](https://github.com/getsigit/sigit/blob/main/NOTICE) for the rights holder and distributor.
+© 2026 [siGit Code & Deploy](https://sigit.si).

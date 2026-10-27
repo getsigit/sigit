@@ -93,14 +93,14 @@ use agent_client_protocol::schema::v1::{
     ReadTextFileRequest, ReleaseTerminalRequest, RequestId, RequestPermissionOutcome,
     RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
     SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
-    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeState,
-    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    Terminal, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
-    WaitForTerminalExitRequest, WriteTextFileRequest,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionConfigValueId, SessionDeleteCapabilities,
+    SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
+    SessionMode, SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput, UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -377,7 +377,7 @@ fn tool_kind_for(tool_name: &str) -> ToolKind {
             ToolKind::Edit
         }
         "delete_file" => ToolKind::Delete,
-        "run_command" | "kill_command" => ToolKind::Execute,
+        "run_command" | "kill_command" | "monitor_command" => ToolKind::Execute,
         "read_file" | "list_directory" | "command_output" => ToolKind::Read,
         "search_files" | "glob" | "web_search" => ToolKind::Search,
         "read_website" => ToolKind::Fetch,
@@ -1004,6 +1004,26 @@ impl client_fs::ClientFileSystem for AcpClientFs {
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Live tool-card updates over the ACP connection (see `tools::ToolProgress`).
+struct AcpToolProgress {
+    cx: ConnectionTo<Client>,
+}
+
+impl tools::ToolProgress for AcpToolProgress {
+    fn update(&self, session_id: &str, tool_call_id: &str, text: &str) {
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            ToolCallUpdateFields::new().content(vec![tool_output_content(text)]),
+        ));
+        if let Err(error) = self
+            .cx
+            .send_notification(SessionNotification::new(session_id.to_string(), update))
+        {
+            log::warn!("could not update tool call {tool_call_id}: {error}");
+        }
     }
 }
 
@@ -2215,6 +2235,8 @@ impl SiGitAgent {
             log::info!("client terminal: {terminal}");
             client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
         }
+
+        tools::register_tool_progress(Arc::new(AcpToolProgress { cx: cx.clone() }));
 
         // URL-mode elicitation is where `authenticate` sends the user to sign
         // in. Form mode is never used: the spec forbids collecting
@@ -3737,10 +3759,12 @@ impl SiGitAgent {
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
                 // Repeated status checks are expected for a live background
-                // command. command_output long-polls and the overall round cap
+                // command. command_output and monitor_command wait, and the overall round cap
                 // still bounds a confused model without cutting off a real
                 // build or release while it is in progress.
-                let repeated = *repeat_count >= 3 && tc.name != "command_output";
+                let repeated = *repeat_count >= 3
+                    && tc.name != "command_output"
+                    && tc.name != "monitor_command";
                 if repeated {
                     force_text = true;
                     stopped_repeating = Some(tc.name.clone());
@@ -4648,9 +4672,9 @@ impl SiGitAgent {
                 ));
             }
             let message = if enabled {
-                "Local inference is on. On-device models are highlighted; pick one from Model."
+                "Local inference is on. On-device models are selectable in Model."
             } else {
-                "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
+                "Local inference is off. siGit Code Cloud tiers are selectable in Model."
             };
             self.send_system_status(cx, args.session_id.clone(), message)
                 .ok();
@@ -4709,6 +4733,31 @@ impl SiGitAgent {
                 let config_options = build_config_options(&current, &args.session_id.to_string());
                 return Ok(SetSessionConfigOptionResponse::new(config_options));
             }
+        }
+
+        // Both groups are listed, but only the one matching Local inference can
+        // be picked. ACP has no disabled option, so refuse and answer with the
+        // unchanged options so the picker snaps back.
+        if model_kind_of(model_id) != models::active_inference_kind() {
+            let message = match model_id.strip_prefix("sigit-cloud:") {
+                Some(tier) => format!(
+                    "{} runs on siGit Code Cloud. Turn off Local inference to use it.",
+                    provider::tier_title(tier)
+                ),
+                None => {
+                    let name = models::local_picker_items()
+                        .into_iter()
+                        .find(|item| item.config.model_id == model_id)
+                        .map(|item| item.display_name)
+                        .unwrap_or_else(|| model_id.to_string());
+                    format!("{name} runs on-device. Turn on Local inference to use it.")
+                }
+            };
+            self.send_system_status(cx, args.session_id.clone(), message)
+                .ok();
+            let current = self.current_model.lock().unwrap().clone();
+            let config_options = build_config_options(&current, &args.session_id.to_string());
+            return Ok(SetSessionConfigOptionResponse::new(config_options));
         }
 
         // ── siGit Code Cloud tier: no local load; sign-in gated ─────────────
@@ -5131,15 +5180,21 @@ fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<Se
     let items = models::build_model_picker_items();
     let active_kind = models::active_inference_kind();
 
-    let options: Vec<SessionConfigSelectOption> = items
+    let tagged: Vec<(models::InferenceKind, SessionConfigSelectOption)> = items
         .iter()
         .filter(|item| item.cache_health != setup::ModelCacheHealth::Incomplete)
         .map(|item| {
             let mut desc_parts = Vec::new();
-            // Mark options in the inactive mode so the active group reads as the
-            // recommended set (the list is already ordered active-group-first).
+            // Options in the inactive group stay visible but cannot be picked;
+            // `handle_set_session_config_option` refuses them.
             if item.source.kind() != active_kind {
-                desc_parts.push("inactive mode".to_string());
+                desc_parts.push(
+                    match active_kind {
+                        models::InferenceKind::Local => "Unavailable while Local inference is on",
+                        models::InferenceKind::Cloud => "Unavailable while Local inference is off",
+                    }
+                    .to_string(),
+                );
             }
             if item.tool_calling {
                 desc_parts.push("tool calling".to_string());
@@ -5189,13 +5244,46 @@ fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<Se
                 "{base_name} - {}{source_badge}",
                 models::format_context_window(item.context_window_tokens)
             ));
-            SessionConfigSelectOption::new(
+            let option = SessionConfigSelectOption::new(
                 SessionConfigValueId::new(item.config.model_id.as_str()),
                 name,
             )
-            .description(description)
+            .description(description);
+            (item.source.kind(), option)
         })
         .collect();
+
+    // Two groups, the active one first. ACP has no disabled flag on an option,
+    // so the inactive group is labelled and the agent refuses a pick from it.
+    let mut groups: Vec<SessionConfigSelectGroup> = Vec::new();
+    for kind in [active_kind, other_inference_kind(active_kind)] {
+        let options: Vec<SessionConfigSelectOption> = tagged
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, option)| option.clone())
+            .collect();
+        if options.is_empty() {
+            continue;
+        }
+        let (id, base, hint) = match kind {
+            models::InferenceKind::Local => (
+                "sigit-on-device",
+                "siGit Code on-device",
+                "turn on Local inference to use",
+            ),
+            models::InferenceKind::Cloud => (
+                "sigit-cloud",
+                "siGit Code Cloud",
+                "turn off Local inference to use",
+            ),
+        };
+        let name = if kind == active_kind {
+            format!("{base} (active)")
+        } else {
+            ascii_safe(&format!("{base} - {hint}"))
+        };
+        groups.push(SessionConfigSelectGroup::new(id, name, options));
+    }
 
     // Local Inference on/off toggle, modeled as a two-option select so panel-only
     // ACP clients (no slash commands) can flip the mode.
@@ -5210,12 +5298,12 @@ fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<Se
             SessionConfigValueId::new(LOCAL_INFERENCE_ON),
             "Local".to_string(),
         )
-        .description("Run inference on-device; on-device models are highlighted".to_string()),
+        .description("Run inference on-device; on-device models are selectable".to_string()),
         SessionConfigSelectOption::new(
             SessionConfigValueId::new(LOCAL_INFERENCE_OFF),
             "Cloud".to_string(),
         )
-        .description("Use siGit Code Cloud; cloud tiers are highlighted".to_string()),
+        .description("Use siGit Code Cloud; cloud tiers are selectable".to_string()),
     ];
     let local_option = if CLIENT_BOOLEAN_CONFIG_OPTIONS.load(Ordering::Relaxed) {
         SessionConfigOption::boolean(LOCAL_INFERENCE_CONFIG_ID, "Local inference", local_on)
@@ -5227,7 +5315,7 @@ fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<Se
             local_options,
         )
     }
-    .description("Toggle on-device inference; changes which models are highlighted");
+    .description("Toggle on-device inference; changes which models are selectable");
 
     // Permissions dropdown (issue #76): Manual (ask), Auto (run unattended),
     // Plan (research only).
@@ -5248,19 +5336,37 @@ fn build_config_options_for(current_model_id: &str, session_key: &str) -> Vec<Se
     .category(SessionConfigOptionCategory::Mode)
     .description("How tool calls are approved for this session");
 
-    if options.is_empty() {
+    if groups.is_empty() {
         return vec![local_option, permission_option];
     }
 
     let current_value = SessionConfigValueId::new(current_model_id);
 
     vec![
-        SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, options)
+        SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current_value, groups)
             .category(SessionConfigOptionCategory::Model)
-            .description("Select an on-device model or a siGit Code Cloud tier"),
+            .description(
+                "On-device models or siGit Code Cloud tiers, depending on Local inference",
+            ),
         local_option,
         permission_option,
     ]
+}
+
+fn other_inference_kind(kind: models::InferenceKind) -> models::InferenceKind {
+    match kind {
+        models::InferenceKind::Local => models::InferenceKind::Cloud,
+        models::InferenceKind::Cloud => models::InferenceKind::Local,
+    }
+}
+
+/// Which inference group a picker model id belongs to.
+fn model_kind_of(model_id: &str) -> models::InferenceKind {
+    if model_id.starts_with("sigit-cloud:") {
+        models::InferenceKind::Cloud
+    } else {
+        models::InferenceKind::Local
+    }
 }
 
 /// returns `(config, max_tokens, tool_calling)` for a picker model_id, or None
@@ -5400,74 +5506,135 @@ fn parse_on_off(arg: Option<&str>) -> Option<bool> {
     }
 }
 
-fn format_models_list(current_model: &GgufModelConfig) -> String {
+/// One inference mode of the `/models` list: a card title, the mode shown as
+/// its raw input, and its rows.
+struct ModelGroup {
+    title: String,
+    description: &'static str,
+    rows: String,
+}
+
+/// Send `/models` as one collapsible tool-call card per inference mode
+/// (clients fold those behind a chevron), then a usage hint as system status.
+fn send_models_list(
+    agent: &SiGitAgent,
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    current_model: &GgufModelConfig,
+) {
     let items = models::build_model_picker_items();
     if items.is_empty() {
-        return "No local models found. siGit will use the platform default model.".to_string();
+        agent
+            .send_assistant_message(
+                cx,
+                session_id.clone(),
+                "No local models found. siGit will use the platform default model.",
+            )
+            .ok();
+        return;
     }
+    for group in render_models_list(
+        &items,
+        models::active_inference_kind(),
+        &current_model.model_id,
+    ) {
+        agent
+            .send_tool_call_update(
+                cx,
+                session_id.clone(),
+                SessionUpdate::ToolCall(
+                    ToolCall::new(format!("models-{}", uuid::Uuid::new_v4()), group.title)
+                        .kind(ToolKind::Other)
+                        .status(ToolCallStatus::Completed)
+                        .raw_input(serde_json::Value::String(group.description.to_string()))
+                        .content(vec![group.rows.into()]),
+                ),
+            )
+            .ok();
+    }
+    agent
+        .send_system_status(cx, session_id.clone(), "Use /models N to switch models.")
+        .ok();
+}
 
-    let mut lines = vec!["Available models:".to_string()];
-    let mut last_source: Option<&str> = None;
+/// Group the picker items by inference mode. Numbers are the global picker
+/// index, since `/models N` indexes the same (kind-sorted) list.
+fn render_models_list(
+    items: &[models::ModelPickerItem],
+    active: models::InferenceKind,
+    current_id: &str,
+) -> Vec<ModelGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < items.len() {
+        let kind = items[start].source.kind();
+        let end = items[start..]
+            .iter()
+            .position(|item| item.source.kind() != kind)
+            .map_or(items.len(), |offset| start + offset);
+        let group = &items[start..end];
 
-    for (index, item) in items.iter().enumerate() {
-        let source_key = match item.source_label.as_str() {
-            "Onde" => "Onde",
-            "HuggingFace" => "HuggingFace",
-            "siGit Code Cloud" => "Cloud",
-            _ => "Fallback",
+        let mut title = match kind {
+            models::InferenceKind::Cloud => "siGit Code Cloud".to_string(),
+            models::InferenceKind::Local => "siGit Code on-device".to_string(),
         };
-
-        if last_source != Some(source_key) {
-            if last_source.is_some() {
-                lines.push(String::new());
-            }
-            let section = match source_key {
-                "Onde" => "Onde Inference",
-                "HuggingFace" => "Hugging Face cache",
-                "Cloud" => "siGit Code Cloud",
-                _ => "Fallback",
+        if kind == active {
+            title.push_str(" (active)");
+        }
+        if let Some(selected) = group.iter().find(|item| item.config.model_id == current_id) {
+            let selected_name = match &selected.cloud_tier {
+                Some(tier) => provider::tier_title(tier),
+                None => selected.display_name.clone(),
             };
-            lines.push(section.to_string());
-            // Blank line so the following "N." items render as an ordered list.
-            // CommonMark only lets an ordered list interrupt a paragraph when it
-            // starts at 1, so without this the cloud section (items 9+) would be
-            // absorbed into the header paragraph.
-            lines.push(String::new());
-            last_source = Some(source_key);
+            title.push_str(&format!(" · {selected_name}"));
         }
 
-        let number = index + 1;
-        let current_badge = if item.config.model_id == current_model.model_id {
-            "  <- current"
-        } else {
-            ""
-        };
-        let tool_badge = if item.tool_calling {
-            "  tool calling"
-        } else {
-            ""
-        };
-        let health_badge = match item.cache_health {
-            setup::ModelCacheHealth::Complete => "",
-            setup::ModelCacheHealth::Incomplete => "  ! incomplete cache",
-            setup::ModelCacheHealth::NotDownloaded => "  ↓ download on select",
-        };
-        let source = match source_key {
-            "Onde" => "  [Onde]",
-            "HuggingFace" => "  [HuggingFace]",
-            "Cloud" => "  [☁ Cloud]",
-            _ => "  [default]",
-        };
-
-        lines.push(format!(
-            "{number}. {}  {}{}{}{}{}",
-            item.display_name, item.description, tool_badge, health_badge, current_badge, source,
-        ));
+        let mut rows = Vec::new();
+        for (offset, item) in group.iter().enumerate() {
+            let number = start + offset + 1;
+            let current_badge = if item.config.model_id == current_id {
+                "  ← current"
+            } else {
+                ""
+            };
+            let tool_badge = if item.tool_calling {
+                "  tool calling"
+            } else {
+                ""
+            };
+            if let Some(tier) = &item.cloud_tier {
+                rows.push(format!(
+                    "{number}. {}{tool_badge}{current_badge}",
+                    provider::tier_title(tier)
+                ));
+                continue;
+            }
+            let health_badge = match item.cache_health {
+                setup::ModelCacheHealth::Complete => "",
+                setup::ModelCacheHealth::Incomplete => "  ! incomplete cache",
+                setup::ModelCacheHealth::NotDownloaded => "  ↓ download on select",
+            };
+            let source = match item.source_label.as_str() {
+                "Onde" => "  [Onde]",
+                "HuggingFace" => "  [HuggingFace]",
+                _ => "  [default]",
+            };
+            rows.push(format!(
+                "{number}. {}  {}{tool_badge}{health_badge}{current_badge}{source}",
+                item.display_name, item.description,
+            ));
+        }
+        groups.push(ModelGroup {
+            title,
+            description: match kind {
+                models::InferenceKind::Cloud => "Onde Cloud inference",
+                models::InferenceKind::Local => "On-device inference",
+            },
+            rows: rows.join("\n"),
+        });
+        start = end;
     }
-
-    lines.push(String::new());
-    lines.push("Use /models N to switch models.".to_string());
-    lines.join("\n")
+    groups
 }
 
 async fn exec_slash_acp(
@@ -5636,9 +5803,7 @@ async fn exec_slash_acp(
         }
         SlashCommand::Models(None) => {
             let current_model = agent.current_model.lock().unwrap().clone();
-            agent
-                .send_assistant_message(cx, session_id, format_models_list(&current_model))
-                .ok();
+            send_models_list(agent, cx, &session_id, &current_model);
         }
         SlashCommand::Skills => {
             agent
@@ -5758,10 +5923,10 @@ async fn exec_slash_acp(
         SlashCommand::Local(value) => {
             let enabled = value.unwrap_or(!settings::local_inference_enabled());
             let message = match settings::set_local_inference(enabled) {
-                Ok(()) if enabled => "Local inference is on. On-device models are highlighted; \
+                Ok(()) if enabled => "Local inference is on. On-device models are selectable; \
                      pick one with /models."
                     .to_string(),
-                Ok(()) => "Local inference is off. siGit Code Cloud tiers are highlighted; \
+                Ok(()) => "Local inference is off. siGit Code Cloud tiers are selectable; \
                      pick one with /models."
                     .to_string(),
                 Err(error) => format!("error: could not save local inference setting: {error}"),
@@ -6809,6 +6974,100 @@ mod tests {
         let expected: Vec<_> = std::path::Path::new(expected).components().collect();
         let actual: Vec<_> = actual.components().collect();
         assert_eq!(actual, expected);
+    }
+
+    fn picker_item(
+        config: GgufModelConfig,
+        source: models::ModelSource,
+        cloud_tier: Option<&str>,
+    ) -> models::ModelPickerItem {
+        let cloud = cloud_tier.is_some();
+        models::ModelPickerItem {
+            display_name: match cloud_tier {
+                Some(tier) => format!("siGit Code Cloud · {}", provider::tier_title(tier)),
+                None => config.display_name.clone(),
+            },
+            description: if cloud { "siGit Code Cloud" } else { "~2 GB" }.to_string(),
+            tool_calling: true,
+            max_tokens: 4096,
+            context_window_tokens: 32_768,
+            config,
+            source_label: match source {
+                models::ModelSource::Onde => "Onde",
+                models::ModelSource::Cloud => "siGit Code Cloud",
+                _ => "Available",
+            }
+            .to_string(),
+            source,
+            cache_health: setup::ModelCacheHealth::Complete,
+            cloud_tier: cloud_tier.map(str::to_string),
+        }
+    }
+
+    fn sample_picker(active_first: models::InferenceKind) -> Vec<models::ModelPickerItem> {
+        let cloud = [
+            picker_item(
+                GgufModelConfig::qwen3_14b(),
+                models::ModelSource::Cloud,
+                Some("air"),
+            ),
+            picker_item(
+                GgufModelConfig::qwen3_8b(),
+                models::ModelSource::Cloud,
+                Some("prism"),
+            ),
+        ];
+        let local = [
+            picker_item(GgufModelConfig::qwen3_4b(), models::ModelSource::Onde, None),
+            picker_item(
+                GgufModelConfig::qwen25_3b(),
+                models::ModelSource::Available,
+                None,
+            ),
+        ];
+        match active_first {
+            models::InferenceKind::Cloud => cloud.into_iter().chain(local).collect(),
+            models::InferenceKind::Local => local.into_iter().chain(cloud).collect(),
+        }
+    }
+
+    #[test]
+    fn models_list_groups_by_mode_with_cloud_active() {
+        let items = sample_picker(models::InferenceKind::Cloud);
+        let groups = render_models_list(
+            &items,
+            models::InferenceKind::Cloud,
+            &GgufModelConfig::qwen3_8b().model_id,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].title, "siGit Code Cloud (active) · Prism");
+        assert_eq!(groups[1].title, "siGit Code on-device");
+        let rows = format!("{}\n{}", groups[0].rows, groups[1].rows);
+        for n in 1..=4 {
+            assert!(rows.contains(&format!("{n}. ")), "missing row {n}");
+        }
+        assert!(groups[0].rows.contains("2. Prism  tool calling  ← current"));
+        assert!(!rows.contains("siGit Code Cloud ·"));
+        assert!(!rows.contains("[☁ Cloud]"));
+        assert!(groups[1].rows.starts_with("3. "));
+    }
+
+    #[test]
+    fn models_list_marks_local_active() {
+        let items = sample_picker(models::InferenceKind::Local);
+        let groups = render_models_list(
+            &items,
+            models::InferenceKind::Local,
+            &GgufModelConfig::qwen3_4b().model_id,
+        );
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups[0]
+                .title
+                .starts_with("siGit Code on-device (active) · ")
+        );
+        assert_eq!(groups[1].title, "siGit Code Cloud");
+        assert!(groups[0].rows.contains("[Onde]"));
     }
 
     /// On Windows `to_file_path` requires a drive letter, so the test URIs use
@@ -8283,6 +8542,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_kind_of_follows_the_cloud_prefix() {
+        assert!(model_kind_of("sigit-cloud:oke") == models::InferenceKind::Cloud);
+        assert!(model_kind_of("Qwen/Qwen3-4B-GGUF") == models::InferenceKind::Local);
+    }
+
+    #[test]
+    fn acp_model_picker_groups_by_inference_kind() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config = std::env::temp_dir().join(format!("sigit-groups-{}", uuid::Uuid::new_v4()));
+        let saved: Vec<_> = ["SIGIT_CONFIG_DIR", "SIGIT_LOCAL_INFERENCE"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored below.
+        unsafe { std::env::set_var("SIGIT_CONFIG_DIR", &config) };
+        let outcome = std::panic::catch_unwind(acp_model_picker_groups_once);
+        // SAFETY: serialized by ENV_TEST_LOCK.
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&config);
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn acp_model_picker_groups_once() {
+        fn model_option(current: &str) -> serde_json::Value {
+            let options =
+                serde_json::to_value(build_config_options_for(current, "t-groups")).unwrap();
+            options
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|option| option["id"] == MODEL_CONFIG_ID)
+                .expect("model config option")
+                .clone()
+        }
+        fn ids(group: &serde_json::Value) -> Vec<&str> {
+            group["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|option| option["value"].as_str())
+                .collect()
+        }
+
+        // SAFETY: the caller holds ENV_TEST_LOCK.
+        unsafe { std::env::set_var("SIGIT_LOCAL_INFERENCE", "off") };
+        let model = model_option("sigit-cloud:oke");
+        let groups = model["options"].as_array().expect("groups");
+        assert_eq!(groups[0]["group"], "sigit-cloud");
+        assert!(
+            ids(&groups[0])
+                .iter()
+                .all(|id| id.starts_with("sigit-cloud:"))
+        );
+        if let Some(local) = groups.get(1) {
+            assert_eq!(local["group"], "sigit-on-device");
+            assert!(
+                local["name"]
+                    .as_str()
+                    .unwrap()
+                    .contains("turn on Local inference")
+            );
+            for option in local["options"].as_array().unwrap() {
+                assert!(
+                    option["description"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("Unavailable while Local inference is on")
+                        || option["description"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("Unavailable while Local inference is off")
+                );
+            }
+        }
+
+        // SAFETY: the caller holds ENV_TEST_LOCK.
+        unsafe { std::env::set_var("SIGIT_LOCAL_INFERENCE", "on") };
+        let model = model_option("sigit-cloud:oke");
+        let groups = model["options"].as_array().expect("groups");
+        assert_eq!(groups[0]["group"], "sigit-on-device");
+        assert!(
+            !ids(&groups[0])
+                .iter()
+                .any(|id| id.starts_with("sigit-cloud:"))
+        );
+        let cloud = groups.get(1).expect("cloud group second");
+        assert_eq!(cloud["group"], "sigit-cloud");
+        // The current model stays selected even though it sits in the inactive group.
+        assert_eq!(model["currentValue"], "sigit-cloud:oke");
+        assert!(ids(cloud).contains(&"sigit-cloud:oke"));
+    }
+
     fn acp_config_option_labels_once() {
         let current = GgufModelConfig {
             model_id: "sigit-cloud:oke".to_string(),
@@ -8301,8 +8664,9 @@ mod tests {
             .expect("model config option");
         let model_names: Vec<&str> = model["options"]
             .as_array()
-            .expect("model select options")
+            .expect("model select groups")
             .iter()
+            .flat_map(|group| group["options"].as_array().expect("group options"))
             .filter_map(|option| option["name"].as_str())
             .collect();
         assert!(model_names.contains(&"Oke - 200K ctx"));

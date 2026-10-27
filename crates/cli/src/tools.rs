@@ -254,7 +254,7 @@ pub fn all_tools() -> Vec<AgentTool> {
                     },
                     "run_in_background": {
                         "type": "boolean",
-                        "description": "Start the command as a background task and return a task id immediately instead of waiting for it to finish. Set this to true for servers, watchers, builds, test suites, and anything that may run longer than two minutes (foreground commands are killed after 120 seconds). Poll the task's output and status with command_output, and stop it with kill_command. Background tasks are killed when sigit exits. Defaults to false."
+                        "description": "Start the command as a background task and return a task id immediately instead of waiting for it to finish. Set this to true for servers, watchers, builds, test suites, and anything that may run longer than two minutes (foreground commands are killed after 120 seconds). Wait for it with monitor_command (or take a quick look with command_output), and stop it with kill_command. Background tasks are killed when sigit exits. Defaults to false."
                     }
                 },
                 "required": ["command"],
@@ -432,6 +432,39 @@ pub fn all_tools() -> Vec<AgentTool> {
                 "additionalProperties": false
             }),
         },
+        AgentTool {
+            name: "monitor_command",
+            description: "Follow a background task (started with run_command's \
+                           run_in_background) until it stops: it exits, a line of new output \
+                           matches `until`, or `timeout_seconds` pass. One call covers the whole \
+                           wait and shows up as a single live-updating card, so use this to wait \
+                           for a build, test run or release instead of calling command_output \
+                           over and over. Reports the exit code (or that the task is still \
+                           running) and the output gathered while watching. The task keeps \
+                           running if the watch ends first. Use command_output only for a quick \
+                           look at a server or watcher.",
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Id of the background task, as returned by run_command with run_in_background."
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "Optional regular expression. The watch ends as soon as a line of new output matches it, e.g. \"Finished|error\\\\[\"."
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600,
+                        "description": "Longest the watch may last. Defaults to 300."
+                    }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -523,6 +556,9 @@ async fn execute_tool_impl(name: &str, arguments: &str, tool_call_id: Option<&st
         TASK_TOOL_NAME => exec_task(arguments).await.into(),
         WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await.into(),
         "command_output" => exec_command_output_wait(arguments, active_session())
+            .await
+            .into(),
+        "monitor_command" => exec_monitor_command(arguments, active_session(), tool_call_id)
             .await
             .into(),
         // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
@@ -3045,9 +3081,9 @@ fn start_background_task(command_str: &str, cwd_path: &Path, owner: Option<Strin
     );
 
     format!(
-        "Started background task {task_id}: `{command_str}`. Poll its output and status \
-         with command_output (task_id: {task_id}); stop it with kill_command. The task is \
-         killed when sigit exits."
+        "Started background task {task_id}: `{command_str}`. Wait for it with \
+         monitor_command (task_id: {task_id}), or take a quick look with command_output; \
+         stop it with kill_command. The task is killed when sigit exits."
     )
 }
 
@@ -3106,6 +3142,25 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
     poll_command_output(arguments, owner, false).text
 }
 
+/// The sentence both `command_output` and `monitor_command` open with.
+fn task_status_line(task_id: u64, task: &BackgroundTask, exit_code: Option<i32>) -> String {
+    let command = &task.command;
+    match exit_code {
+        None => format!("Task {task_id} (`{command}`) is still running."),
+        Some(_) if task.killed => format!("Task {task_id} (`{command}`) was killed."),
+        Some(code) => format!("Task {task_id} (`{command}`) exited with code {code}."),
+    }
+}
+
+/// The command of `owner`'s background task `task_id`, for a card title.
+pub fn background_task_command(task_id: u64) -> Option<String> {
+    let owner = active_session();
+    lock_tasks()
+        .get(&task_id)
+        .filter(|task| task.owner == owner)
+        .map(|task| task.command.clone())
+}
+
 /// One `command_output` check, with the tool text and whether the task is
 /// still running, so the long-poll loop knows when to keep waiting.
 struct CommandPoll {
@@ -3161,12 +3216,7 @@ fn poll_command_output(
 
     let (new_output, dropped) = drain_task_output(task);
 
-    let command = &task.command;
-    let status = match exit_code {
-        None => format!("Task {task_id} (`{command}`) is still running."),
-        Some(_) if task.killed => format!("Task {task_id} (`{command}`) was killed."),
-        Some(code) => format!("Task {task_id} (`{command}`) exited with code {code}."),
-    };
+    let status = task_status_line(task_id, task, exit_code);
 
     let running = exit_code.is_none();
     let text = if new_output.is_empty() {
@@ -3217,6 +3267,209 @@ async fn exec_command_output_wait(arguments: &str, owner: Option<String>) -> Str
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+// ── monitor_command ──────────────────────────────────────────────────────────
+
+/// Where a long-running tool reports what it has so far, so the client's card
+/// for the call can update before the call returns. The seam has `client_fs`'s
+/// shape: `main.rs` registers an ACP implementation at `initialize`, and with
+/// nothing registered (TUI, headless) updates go nowhere.
+pub trait ToolProgress: Send + Sync {
+    /// Replace the content of tool call `tool_call_id` with `text`.
+    fn update(&self, session_id: &str, tool_call_id: &str, text: &str);
+}
+
+static TOOL_PROGRESS: RwLock<Option<Arc<dyn ToolProgress>>> = RwLock::new(None);
+
+pub fn register_tool_progress(progress: Arc<dyn ToolProgress>) {
+    if let Ok(mut guard) = TOOL_PROGRESS.write() {
+        *guard = Some(progress);
+    }
+}
+
+fn report_progress(session: Option<&str>, tool_call_id: Option<&str>, text: &str) {
+    let (Some(session), Some(tool_call_id)) = (session, tool_call_id) else {
+        return;
+    };
+    let progress = TOOL_PROGRESS.read().ok().and_then(|guard| guard.clone());
+    if let Some(progress) = progress {
+        progress.update(session, tool_call_id, text);
+    }
+}
+
+/// One look at a task for `monitor_command`.
+struct MonitorStep {
+    status: String,
+    exit_code: Option<i32>,
+    output: String,
+    dropped: bool,
+}
+
+fn monitor_step(task_id: u64, owner: Option<&str>) -> Option<MonitorStep> {
+    let mut map = lock_tasks();
+    let task = map
+        .get_mut(&task_id)
+        .filter(|task| task.owner.as_deref() == owner)?;
+    let was_running = task.exit_code.is_none();
+    let exit_code = poll_exit_code(task);
+    if was_running && exit_code.is_some() {
+        // Let the reader threads flush the final output (see poll_command_output).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let (output, dropped) = drain_task_output(task);
+    Some(MonitorStep {
+        status: task_status_line(task_id, task, exit_code),
+        exit_code,
+        output,
+        dropped,
+    })
+}
+
+/// Keep the tail of `buf` within COMMAND_OUTPUT_LIMIT, like the reader threads.
+fn cap_tail(buf: &mut String) -> bool {
+    if buf.len() <= COMMAND_OUTPUT_LIMIT {
+        return false;
+    }
+    let mut cut = buf.len() - COMMAND_OUTPUT_LIMIT;
+    while !buf.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buf.drain(..cut);
+    true
+}
+
+/// `monitor_command` tool: follow a background task to a stopping point.
+async fn exec_monitor_command(
+    arguments: &str,
+    owner: Option<String>,
+    tool_call_id: Option<&str>,
+) -> String {
+    const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
+    const MAX_TIMEOUT_SECONDS: u64 = 600;
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let task_id = match parse_task_id(arguments) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let until_source = args
+        .get("until")
+        .and_then(Value::as_str)
+        .filter(|pattern| !pattern.is_empty());
+    let until = match until_source.map(regex::Regex::new).transpose() {
+        Ok(re) => re,
+        Err(err) => return format!("Error: invalid \"until\" pattern: {err}"),
+    };
+    let timeout_seconds = args
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+        .clamp(1, MAX_TIMEOUT_SECONDS);
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(timeout_seconds);
+    let signal = owner.as_deref().map(abort_signal);
+
+    let mut gathered = String::new();
+    let mut dropped = false;
+    // The unterminated last line so far, so a match is not missed when the
+    // line arrives in two chunks.
+    let mut partial = String::new();
+    let mut last_report = started;
+    let mut reported_len = 0;
+
+    enum Stop {
+        Exited(String),
+        Matched,
+        Timeout,
+        Aborted,
+    }
+
+    let (status, stop) = loop {
+        let step_owner = owner.clone();
+        let step =
+            tokio::task::spawn_blocking(move || monitor_step(task_id, step_owner.as_deref())).await;
+        let step = match step {
+            Ok(Some(step)) => step,
+            Ok(None) => return unknown_task(task_id),
+            Err(err) => return format!("Error: monitor_command task failed: {err}"),
+        };
+
+        dropped |= step.dropped;
+        let mut matched = false;
+        if !step.output.is_empty() {
+            gathered.push_str(&step.output);
+            dropped |= cap_tail(&mut gathered);
+            if let Some(re) = &until {
+                let scan = format!("{partial}{}", step.output);
+                matched = scan.split('\n').any(|line| re.is_match(line));
+                partial = if scan.ends_with('\n') {
+                    String::new()
+                } else {
+                    scan.rsplit('\n').next().unwrap_or_default().to_string()
+                };
+            }
+        }
+
+        if step.exit_code.is_some() {
+            break (step.status.clone(), Stop::Exited(step.status));
+        }
+        if matched {
+            break (step.status, Stop::Matched);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break (step.status, Stop::Timeout);
+        }
+        if signal.as_ref().is_some_and(|signal| signal.is_aborted()) {
+            break (step.status, Stop::Aborted);
+        }
+
+        if now.duration_since(last_report) >= PROGRESS_INTERVAL && gathered.len() != reported_len {
+            last_report = now;
+            reported_len = gathered.len();
+            let text = format!(
+                "{} Watching for {}s.\n{gathered}",
+                step.status,
+                now.duration_since(started).as_secs()
+            );
+            report_progress(owner.as_deref(), tool_call_id, &text);
+        }
+
+        match &signal {
+            Some(signal) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                    _ = signal.aborted() => {}
+                }
+            }
+            None => tokio::time::sleep(POLL_INTERVAL).await,
+        }
+    };
+
+    let headline = match stop {
+        Stop::Exited(status) => status,
+        Stop::Matched => format!(
+            "{} Stopped watching: a line matched \"{}\".",
+            status,
+            until_source.unwrap_or_default()
+        ),
+        Stop::Timeout => {
+            format!("{status} Stopped watching after {timeout_seconds}s; the task keeps running.")
+        }
+        Stop::Aborted => format!(
+            "{status} Stopped watching because the turn was cancelled; the task keeps running."
+        ),
+    };
+    let note = dropped_note(dropped);
+    if gathered.is_empty() {
+        format!("{headline} No output while watching.{note}")
+    } else {
+        format!("{headline} Output while watching:{note}\n{gathered}")
     }
 }
 
@@ -3418,7 +3671,7 @@ mod tests {
     #[test]
     fn test_all_tools_count() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
         assert_eq!(tools[0].name, "read_file");
         assert_eq!(tools[1].name, "create_directory");
         assert_eq!(tools[2].name, "list_directory");
@@ -3434,6 +3687,7 @@ mod tests {
         assert_eq!(tools[12].name, "remember");
         assert_eq!(tools[13].name, "command_output");
         assert_eq!(tools[14].name, "kill_command");
+        assert_eq!(tools[15].name, "monitor_command");
     }
 
     #[test]
@@ -4772,6 +5026,91 @@ mod tests {
             started.elapsed()
         );
         exec_kill_command(&serde_json::json!({ "task_id": task_id }).to_string(), None);
+    }
+
+    fn start_test_task(command: &str, owner: Option<&str>) -> u64 {
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        background_task_id(&exec_run_command(&args, owner))
+    }
+
+    #[cfg(unix)]
+    const SLOW_TAIL: &str = "sleep 30";
+    #[cfg(windows)]
+    const SLOW_TAIL: &str = "ping -n 31 127.0.0.1 > nul";
+
+    fn kill_test_task(task_id: u64, owner: Option<&str>) {
+        exec_kill_command(
+            &serde_json::json!({ "task_id": task_id }).to_string(),
+            owner,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_monitor_command_returns_on_exit_with_output() {
+        let task_id = start_test_task("echo monitored", None);
+        let args = serde_json::json!({ "task_id": task_id }).to_string();
+        let result = exec_monitor_command(&args, None, None).await;
+        assert!(result.contains("exited with code 0"), "got: {result}");
+        assert!(result.contains("monitored"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_monitor_command_stops_when_until_matches() {
+        let task_id = start_test_task(&format!("echo build-ready && {SLOW_TAIL}"), None);
+        let args =
+            serde_json::json!({ "task_id": task_id, "until": "build-(ready|failed)" }).to_string();
+        let started = std::time::Instant::now();
+        let result = exec_monitor_command(&args, None, None).await;
+        assert!(started.elapsed().as_secs() < 20, "waited for the task");
+        assert!(result.contains("still running"), "got: {result}");
+        assert!(result.contains("a line matched"), "got: {result}");
+        assert!(result.contains("build-ready"), "got: {result}");
+        kill_test_task(task_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_command_times_out_on_a_quiet_task() {
+        let task_id = start_test_task(SLOW_TAIL, None);
+        let args = serde_json::json!({ "task_id": task_id, "timeout_seconds": 1 }).to_string();
+        let result = exec_monitor_command(&args, None, None).await;
+        assert!(result.contains("still running"), "got: {result}");
+        assert!(result.contains("after 1s"), "got: {result}");
+        kill_test_task(task_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_command_ends_when_the_turn_is_aborted() {
+        let owner = "monitor-abort-test";
+        reset_abort(owner);
+        let task_id = start_test_task(SLOW_TAIL, Some(owner));
+        let args = serde_json::json!({ "task_id": task_id }).to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            abort_session_tools(owner);
+        });
+        let started = std::time::Instant::now();
+        let result = exec_monitor_command(&args, Some(owner.to_string()), None).await;
+        assert!(started.elapsed().as_secs() < 20, "ignored the abort");
+        assert!(result.contains("turn was cancelled"), "got: {result}");
+        kill_test_task(task_id, Some(owner));
+        forget_abort(owner);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_command_rejects_other_owners_and_bad_input() {
+        let task_id = start_test_task(SLOW_TAIL, Some("monitor-owner-a"));
+        let args = serde_json::json!({ "task_id": task_id }).to_string();
+        let result = exec_monitor_command(&args, Some("monitor-owner-b".into()), None).await;
+        assert!(result.contains("no background task"), "got: {result}");
+        let bad = serde_json::json!({ "task_id": task_id, "until": "(" }).to_string();
+        let result = exec_monitor_command(&bad, Some("monitor-owner-a".into()), None).await;
+        assert!(result.contains("invalid \"until\""), "got: {result}");
+        kill_test_task(task_id, Some("monitor-owner-a"));
     }
 
     #[test]

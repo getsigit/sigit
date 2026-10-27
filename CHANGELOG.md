@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.7.6
+
+A background-task tool for long commands, model pickers grouped by where the
+model runs, and a shorter README. No protocol change, so an editor sees a
+1.7.5-shaped agent.
+
+### Added
+
+- **`monitor_command` follows a background task in one tool call.** It waits
+  until the task exits, a line of new output matches an optional `until`
+  pattern, or a timeout passes (300 s by default, 600 s at most). In an
+  editor it is a single card that updates with the task's output as it
+  arrives, instead of a column of `command_output` cards that also used up
+  the turn's tool rounds (#253).
+
+### Changed
+
+- Cards for `command_output`, `monitor_command` and `kill_command` name the
+  task and its command.
+- `/models` and the editor's model picker group models by where they run,
+  on-device or cloud, instead of one flat list (#264, #265).
+
+### Fixed
+
+- The winget pull request description gives the version of the release it was
+  filed for (#267).
+
+### Docs
+
+- The README is shorter and the details moved into docs. Android Studio is
+  documented, and the JetBrains and download links point to the right places
+  (#266).
+
 ## 1.7.5
 
 A new siGit Code Cloud tier, and two fixes for signing in and switching

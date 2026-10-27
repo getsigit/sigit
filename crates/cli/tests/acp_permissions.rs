@@ -850,7 +850,7 @@ fn successful_config_option_changes_are_rendered_as_system_status_cards() {
         .expect("Local Inference change should render as a system-style status card");
     assert_eq!(
         status["title"],
-        "Local inference is off. siGit Code Cloud tiers are highlighted; pick one from Model."
+        "Local inference is off. siGit Code Cloud tiers are selectable in Model."
     );
 
     let id = agent.request(
@@ -1882,6 +1882,78 @@ fn repeated_command_output_calls_remain_available() {
         requests[3].get("tools").is_some(),
         "command_output repetition must not force tools off: {:?}",
         requests[3]
+    );
+    drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn monitor_command_is_one_execute_card_and_exempt_from_the_repeat_guard() {
+    let monitor_arguments = json!({"task_id": 1}).to_string();
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_start",
+            "run_command",
+            &json!({"command": "echo built", "run_in_background": true}).to_string(),
+        ),
+        sse_tool_call("call_1", "monitor_command", &monitor_arguments),
+        sse_tool_call("call_2", "monitor_command", &monitor_arguments),
+        sse_tool_call("call_3", "monitor_command", &monitor_arguments),
+        sse_text("The build finished."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_monitor_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent_with_permissions(endpoint.port, &config_dir, Some("allow"));
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "build and wait"}],
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let card = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "tool_call" && update["toolCallId"] == "call_3")
+        .unwrap_or_else(|| panic!("call_3 is announced: {updates:#?}"));
+    assert_eq!(card["kind"], "execute");
+    let final_status = updates
+        .iter()
+        .rev()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update"
+                && update["toolCallId"] == "call_3"
+                && !update["status"].is_null()
+        })
+        .unwrap_or_else(|| panic!("call_3 is closed out: {updates:#?}"))["status"]
+        .clone();
+    assert_eq!(final_status, "completed");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert!(
+        requests[4].get("tools").is_some(),
+        "monitor_command repetition must not force tools off: {:?}",
+        requests[4]
     );
     drop(requests);
 
