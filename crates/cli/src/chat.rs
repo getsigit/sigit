@@ -520,6 +520,7 @@ mod tui {
     use onde::inference::{ChatEngine, SamplingConfig};
 
     use super::{RepoItem, Tab};
+    use crate::account::SessionState;
     use crate::backend::{
         InferenceBackend, LocalBackend, OpenAiBackend, TokenChunk, ToolResult, ToolSpec,
     };
@@ -528,6 +529,11 @@ mod tui {
     };
     use crate::program_status::{Reporter, Status};
     use crate::session_store::SessionEntry;
+    use crate::splash::{self, BANNER_ART, Phase, Splash, Wordmark};
+    use crate::startup::{
+        self, CHECK_ROWS, Check, Checks, Report, account_check, models_check, tools_check,
+        workspace_check,
+    };
     use ratatui::{
         Frame,
         layout::{Constraint, Layout, Position},
@@ -771,6 +777,13 @@ mod tui {
         load_error: Option<String>,
         load_start: Instant,
         load_model_name: String,
+        /// The backend is up. The splash still decides when the loading view ends.
+        load_ready: bool,
+        /// The launch splash and the checks it waits on.
+        splash: Splash,
+        checks: Checks,
+        /// What the account check found, for the welcome message.
+        session: Option<SessionState>,
 
         // ── Model picker state ────────────────────────────────────────────────
         show_model_picker: bool,
@@ -832,21 +845,6 @@ mod tui {
         repo_rx: Option<mpsc::UnboundedReceiver<RepoUpdate>>,
     }
 
-    const BANNER_ART: &str = "\
-77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777
-77777777322222222222222222222222222222223777389969902208431358831999699051111177777777777777
-1111111125555555555555555555555511113222311159    5002         088    3081771691111111111111
-1111111111111111111111111111131136841   1482853332007    05    9043332891    400811111111111
-1111111111111111111111111111111201        109    304    40     00    79      100041111111111
-333333255555555555555555555552392   102   503    90    7000000005    903    0000023333333333
-333333245454545454545454545433381    7600000    302    61    780    109    20009533333333333
-3333333333333333333333333333333402      7001    08    761    202    902    90003333333333333
-2222255555555555555555555555250899901    49    304    403    08    108    300042222222222222
-2222222222222222222222222222269   106    03    901    06    505    402    000052222222222222
-2222255555555555555555555555299        708    1002          80     00      90852222222222222
-55555555555555555555555555555560953258000866660000051140866908666600008966900065555555555555
-88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888";
-
     const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
     fn rich_text_spans(text: &str, base_style: Style, bold_style: Style) -> Vec<Span<'static>> {
@@ -870,21 +868,10 @@ mod tui {
             backend: Arc<dyn InferenceBackend>,
             program_status: Reporter,
         ) -> Self {
-            let is_remote = backend.is_remote();
-            let items = build_model_picker_items();
-            let tool_calling = items
-                .iter()
-                .find(|m| m.display_name == load_model_name)
-                .map(|m| m.tool_calling)
-                .unwrap_or(true);
-            // For a remote provider the passed-in name is authoritative; the
-            // persisted local selection must not override it (or the title would
-            // show an on-device model while requests go to the cloud).
-            let current_model_name = if is_remote {
-                load_model_name.clone()
-            } else {
-                crate::setup::load_selected_model_name().unwrap_or_else(|| load_model_name.clone())
-            };
+            // The model scan, the saved selection and the repo lookup used to run
+            // here, before the first frame. They run behind the splash now and
+            // land in `apply_startup`; until then the picker is empty and the
+            // passed-in name stands.
             Self {
                 messages: Vec::new(),
                 input: String::new(),
@@ -911,11 +898,15 @@ mod tui {
                 load_error: None,
                 load_start: Instant::now(),
                 load_model_name: load_model_name.clone(),
+                load_ready: false,
+                splash: Splash::new(std::time::Instant::now()),
+                checks: Checks::new(),
+                session: None,
                 show_model_picker: false,
                 model_picker_index: 0,
-                model_picker_items: items,
-                current_model_name,
-                tool_calling,
+                model_picker_items: Vec::new(),
+                current_model_name: load_model_name.clone(),
+                tool_calling: true,
                 context_tokens_used: None,
                 show_thinking: false,
                 tools_expanded: false,
@@ -927,7 +918,7 @@ mod tui {
                 history_notice: None,
                 cloud_lines: None,
                 cloud_rx: None,
-                repo: detect_sigit_repo(),
+                repo: None,
                 repo_section: RepoSection::Issues,
                 repo_issues: RepoData::NotFetched,
                 repo_prs: RepoData::NotFetched,
@@ -1108,6 +1099,40 @@ mod tui {
             self.download_progress = Some((downloaded, expected));
         }
 
+        /// Take one startup check's answer.
+        fn apply_startup(&mut self, report: Report) {
+            match report {
+                Report::Account(state) => {
+                    self.checks.account = account_check(&state);
+                    self.session = Some(state);
+                }
+                Report::Models { items, selected } => {
+                    self.tool_calling = items
+                        .iter()
+                        .find(|m| m.display_name == self.load_model_name)
+                        .map(|m| m.tool_calling)
+                        .unwrap_or(true);
+                    // For a remote provider the passed-in name is authoritative; the
+                    // persisted local selection must not override it (or the title
+                    // would show an on-device model while requests go to the cloud).
+                    if !self.backend.is_remote()
+                        && let Some(name) = selected
+                    {
+                        self.current_model_name = name;
+                    }
+                    self.checks.models = models_check(&items);
+                    self.model_picker_items = items;
+                }
+                Report::Tools(overview) => {
+                    self.checks.tools = tools_check(overview.as_ref());
+                }
+                Report::Workspace(repo) => {
+                    self.checks.workspace = workspace_check(repo.as_deref());
+                    self.repo = repo;
+                }
+            }
+        }
+
         /// switch to chat phase and show the welcome banner
         fn finish_loading(&mut self) {
             self.is_loading = false;
@@ -1130,6 +1155,11 @@ mod tui {
                     "No on-device model loaded. Run /load to load {}, or /models to choose one.",
                     self.current_model_name
                 )));
+            }
+            if matches!(self.session, Some(SessionState::Expired { .. })) {
+                self.messages.push(ChatMessage::system(
+                    "Your siGit Code Cloud session has expired. Use /login to sign in again.",
+                ));
             }
             self.messages
                 .push(ChatMessage::system("Type /help for commands."));
@@ -1554,21 +1584,6 @@ mod tui {
     }
 
     // ── Repo tab (issues / pull requests via the official MCP server) ─────────
-
-    /// `owner/name` when the current directory's `origin` remote lives on the
-    /// sigit.si host (per `SIGIT_API_URL`). Runs `git remote get-url origin`
-    /// once at startup; any failure (no git, no repo, no origin) → `None`.
-    fn detect_sigit_repo() -> Option<String> {
-        let output = std::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let url = String::from_utf8_lossy(&output.stdout);
-        super::parse_repo_remote(url.trim(), &super::sigit_host())
-    }
 
     /// Fetch both Repo-tab lists on spawned tasks feeding `repo_rx` — the same
     /// spawned-fetch pattern as the Cloud tab, so the render loop never blocks
@@ -2125,6 +2140,11 @@ mod tui {
     fn render(frame: &mut Frame, app: &mut App) {
         let area = frame.area();
 
+        if app.is_loading && app.load_error.is_none() {
+            render_splash(frame, app, area);
+            return;
+        }
+
         if app.is_loading {
             let zones = Layout::vertical([
                 Constraint::Length(1),
@@ -2247,9 +2267,109 @@ mod tui {
         }
     }
 
+    /// The launch splash: the wordmark with the startup checks under it. Too
+    /// small a terminal gets the caption and the checks without the art.
+    fn render_splash(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+        const SPINNER: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+        const CHECKS: u16 = CHECK_ROWS as u16;
+        let now = std::time::Instant::now();
+        let reduced = app.splash.reduced();
+        let tc = app.splash.truecolor;
+        let t = if reduced {
+            Duration::from_secs(2)
+        } else {
+            app.splash.elapsed(now)
+        };
+        let ms = t.as_millis() as f32;
+        let exit = app.splash.exit_progress(now);
+        let vis = 1.0 - exit;
+
+        // caption, a gap, the checklist
+        let art = app
+            .splash
+            .banner
+            .size(area.width)
+            .filter(|(_, h)| area.height >= h + 2 + 1 + CHECKS);
+        let art_h = art.map_or(0, |(_, h)| h + 1);
+        let total = art_h + 1 + 1 + CHECKS;
+        let top = area.y + area.height.saturating_sub(total) / 2;
+        let rect = |y: u16, h: u16| ratatui::layout::Rect::new(area.x, y, area.width, h);
+
+        if let Some((_, h)) = art {
+            frame.render_widget(
+                Wordmark {
+                    banner: &app.splash.banner,
+                    t,
+                    exit,
+                    still: reduced,
+                    truecolor: tc,
+                },
+                rect(top, h),
+            );
+        }
+
+        let caption_y = top + art_h;
+        let caption = Paragraph::new(Line::from(Span::styled(
+            "siGit Code & Deploy",
+            Style::default().fg(splash::fade(splash::MUTED, vis * (ms / 300.0).min(1.0), tc)),
+        )))
+        .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(caption, rect(caption_y, 1));
+
+        // The checklist fades in once the flame has caught.
+        let shown = vis * ((ms - 700.0) / 300.0).clamp(0.0, 1.0);
+        if shown <= 0.0 {
+            return;
+        }
+        let spin = SPINNER[(ms as usize / 100) % SPINNER.len()];
+        let rows: Vec<(String, Line)> = app
+            .checks
+            .rows()
+            .into_iter()
+            .map(|(label, check)| {
+                let (glyph, detail, glyph_rgb, detail_rgb) = match check {
+                    Check::Pending => (spin, "…".to_string(), splash::EMBER, splash::MUTED),
+                    Check::Ok(d) => ("✓", d.clone(), splash::INK, splash::INK),
+                    Check::Note(d) => ("·", d.clone(), splash::MUTED, splash::MUTED),
+                    Check::Warn(d) => ("!", d.clone(), splash::EMBER, splash::EMBER),
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("{glyph} "),
+                        Style::default().fg(splash::fade(glyph_rgb, shown, tc)),
+                    ),
+                    Span::styled(
+                        format!("{label:<9}  "),
+                        Style::default().fg(splash::fade(splash::MUTED, shown, tc)),
+                    ),
+                    Span::styled(
+                        detail.clone(),
+                        Style::default().fg(splash::fade(detail_rgb, shown, tc)),
+                    ),
+                ]);
+                (format!("{glyph} {label:<9}  {detail}"), line)
+            })
+            .collect();
+        // One left edge for every line, centred as a block.
+        let width = rows
+            .iter()
+            .map(|(plain, _)| plain.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        for (i, (_, line)) in rows.into_iter().enumerate() {
+            let y = caption_y + 2 + i as u16;
+            if y >= area.y + area.height {
+                break;
+            }
+            let r = ratatui::layout::Rect::new(x, y, area.width.saturating_sub(x - area.x), 1);
+            frame.render_widget(Paragraph::new(line), r);
+        }
+    }
+
     fn render_loading_title(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         const SPINNER: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-        let spin = SPINNER[(app.load_tick as usize) % SPINNER.len()];
+        let spin = SPINNER[(app.load_tick as usize / 3) % SPINNER.len()];
         let label = format!(" siGit {} loading {}… ", spin, app.load_model_name);
         let line = Line::from(Span::styled(
             label,
@@ -3528,21 +3648,40 @@ mod tui {
     {
         let mut app = App::new(load_model_name, backend, program_status);
         let mut event_stream = EventStream::new();
+        let mut startup_rx = startup::spawn();
 
-        // 10 fps is plenty for spinners
-        let mut ticker = interval(Duration::from_millis(100));
+        // ~30 fps while the splash plays; the loading phase is the only user
+        let mut ticker = interval(Duration::from_millis(33));
 
         loop {
             // ── Poll the loader channel (non-blocking) ────────────────────────
             if app.is_loading {
                 match load_rx.try_recv() {
-                    Ok(Ok(())) => app.finish_loading(),
+                    Ok(Ok(())) => app.load_ready = true,
                     Ok(Err(e)) => app.set_load_error(e),
                     Err(std_mpsc::TryRecvError::Empty) => {}
                     Err(std_mpsc::TryRecvError::Disconnected) => {
                         app.set_load_error("Model loader thread crashed.".to_string());
                     }
                 }
+            }
+
+            // Startup checks report as they finish, and keep reporting after a
+            // skip: the picker and the Repo tab fill in behind the chat.
+            while let Ok(report) = startup_rx.try_recv() {
+                app.apply_startup(report);
+            }
+            // The splash leaves once the backend is up and every check has
+            // reported (and never before its minimum), or on a key press.
+            if app.is_loading
+                && app.load_ready
+                && app.load_error.is_none()
+                && app
+                    .splash
+                    .update(std::time::Instant::now(), app.checks.all_done())
+                    == Phase::Done
+            {
+                app.finish_loading();
             }
 
             // redraw every iteration
@@ -3637,7 +3776,7 @@ mod tui {
             tokio::select! {
                 biased;
 
-                // ── Spinner tick (loading phase only) ─────────────────────────
+                // ── Splash / spinner tick (loading phase only) ────────────────
                 _ = ticker.tick(), if app.is_loading => {
                     app.tick();
                 }
@@ -3800,6 +3939,9 @@ mod tui {
                                         || key.code == KeyCode::Char('d'))
                                 {
                                     app.quit = true;
+                                } else {
+                                    // any other key skips the splash
+                                    app.splash.skip();
                                 }
                             }
                             continue;

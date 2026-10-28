@@ -129,14 +129,32 @@ pub async fn end_session() -> String {
     }
 }
 
-/// One-line description of the current session, verifying the token if reachable.
-pub async fn status_line() -> String {
+/// What the stored session amounts to right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// No credentials are stored.
+    SignedOut,
+    /// The server accepted the token.
+    Valid { email: String },
+    /// The server rejected the token (HTTP status).
+    Expired { status: u16 },
+    /// Credentials are stored but the server could not be reached in time.
+    Offline { email: String },
+}
+
+/// Look up the stored session and verify its token, giving up on the network
+/// after `timeout`.
+pub async fn check_session(timeout: std::time::Duration) -> SessionState {
     let Some(creds) = credentials::load() else {
-        return "Not signed in. Use `/login` to use siGit Code Cloud.".to_string();
+        return SessionState::SignedOut;
     };
 
     let url = format!("{}/api/v1/user", api_base().trim_end_matches('/'));
-    match reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default();
+    match client
         .get(&url)
         .bearer_auth(&creds.access_token)
         .send()
@@ -150,14 +168,28 @@ pub async fn status_line() -> String {
                 .and_then(|me| me.email)
                 .or(creds.email)
                 .unwrap_or_else(|| "(unknown)".to_string());
-            format!("Signed in to siGit Code Cloud as {email}.")
+            SessionState::Valid { email }
         }
-        Ok(response) => format!(
-            "Session may be expired (HTTP {}). Use `/login` again.",
-            response.status().as_u16()
-        ),
-        Err(_) => {
-            let email = creds.email.unwrap_or_else(|| "(unknown)".to_string());
+        Ok(response) => SessionState::Expired {
+            status: response.status().as_u16(),
+        },
+        Err(_) => SessionState::Offline {
+            email: creds.email.unwrap_or_else(|| "(unknown)".to_string()),
+        },
+    }
+}
+
+/// One-line description of the current session, verifying the token if reachable.
+pub async fn status_line() -> String {
+    match check_session(std::time::Duration::from_secs(10)).await {
+        SessionState::SignedOut => {
+            "Not signed in. Use `/login` to use siGit Code Cloud.".to_string()
+        }
+        SessionState::Valid { email } => format!("Signed in to siGit Code Cloud as {email}."),
+        SessionState::Expired { status } => {
+            format!("Session may be expired (HTTP {status}). Use `/login` again.")
+        }
+        SessionState::Offline { email } => {
             format!("Signed in as {email} (could not reach siGit Code Cloud to verify).")
         }
     }
