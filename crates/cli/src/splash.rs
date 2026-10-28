@@ -54,7 +54,6 @@ const RAMP: [Rgb; 4] = [
 ];
 pub(crate) const INK: Rgb = [0xf3, 0xf4, 0xf6];
 pub(crate) const MUTED: Rgb = [0x6b, 0x72, 0x80];
-pub(crate) const EMBER: Rgb = RAMP[2];
 
 /// Heat per digit. 0 and 9 are the densest in the art, 7 and 1 the thinnest.
 const HEAT: [f32; 10] = [1.0, 0.2, 0.45, 0.55, 0.5, 0.4, 0.65, 0.15, 0.8, 1.0];

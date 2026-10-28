@@ -529,9 +529,9 @@ mod tui {
     };
     use crate::program_status::{Reporter, Status};
     use crate::session_store::SessionEntry;
-    use crate::splash::{self, BANNER_ART, Phase, Splash, Wordmark};
+    use crate::splash::{self, Phase, Splash, Wordmark};
     use crate::startup::{
-        self, CHECK_ROWS, Check, Checks, Report, account_check, models_check, tools_check,
+        self, Check, Checks, Report, account_check, models_check, tools_check,
         workspace_check,
     };
     use ratatui::{
@@ -551,8 +551,6 @@ mod tui {
         User,
         Assistant,
         System,
-        /// rainbow-colored banner art
-        Banner,
         /// a collapsible tool-call entry (`text` holds the title line)
         Tool,
     }
@@ -595,16 +593,6 @@ mod tui {
         fn system(text: impl Into<String>) -> Self {
             Self {
                 role: Role::System,
-                text: text.into(),
-                think_block: None,
-                tool_detail: None,
-                tool_result: None,
-            }
-        }
-
-        fn banner(text: impl Into<String>) -> Self {
-            Self {
-                role: Role::Banner,
                 text: text.into(),
                 think_block: None,
                 tool_detail: None,
@@ -1133,16 +1121,20 @@ mod tui {
             }
         }
 
-        /// switch to chat phase and show the welcome banner
+        /// switch to chat phase and show the welcome notes
         fn finish_loading(&mut self) {
             self.is_loading = false;
-            for line in BANNER_ART.lines() {
-                self.messages.push(ChatMessage::banner(line));
-            }
-            self.messages.push(ChatMessage::system(""));
             self.messages.push(ChatMessage::system(
                 "In this world, nothing can be said to be certain, except death and taxes. ~ Pak Sigit",
             ));
+            for (label, check) in self.checks.rows() {
+                match check {
+                    Check::Ok(d) | Check::Note(d) | Check::Warn(d) => self
+                        .messages
+                        .push(ChatMessage::system(format!("{label}: {d}"))),
+                    Check::Pending => {}
+                }
+            }
             if self.backend.is_remote() {
                 self.messages.push(ChatMessage::system(format!(
                     "Current model: {}",
@@ -2267,11 +2259,10 @@ mod tui {
         }
     }
 
-    /// The launch splash: the wordmark with the startup checks under it. Too
-    /// small a terminal gets the caption and the checks without the art.
+    /// The launch splash: the wordmark with a caption under it. The startup
+    /// checks still gate it, and their results land in the chat's info lines.
+    /// Too small a terminal gets the caption without the art.
     fn render_splash(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-        const SPINNER: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-        const CHECKS: u16 = CHECK_ROWS as u16;
         let now = std::time::Instant::now();
         let reduced = app.splash.reduced();
         let tc = app.splash.truecolor;
@@ -2284,14 +2275,14 @@ mod tui {
         let exit = app.splash.exit_progress(now);
         let vis = 1.0 - exit;
 
-        // caption, a gap, the checklist
+        // the wordmark, a gap, the caption
         let art = app
             .splash
             .banner
             .size(area.width)
-            .filter(|(_, h)| area.height >= h + 2 + 1 + CHECKS);
+            .filter(|(_, h)| area.height >= h + 2);
         let art_h = art.map_or(0, |(_, h)| h + 1);
-        let total = art_h + 1 + 1 + CHECKS;
+        let total = art_h + 1;
         let top = area.y + area.height.saturating_sub(total) / 2;
         let rect = |y: u16, h: u16| ratatui::layout::Rect::new(area.x, y, area.width, h);
 
@@ -2315,56 +2306,6 @@ mod tui {
         )))
         .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(caption, rect(caption_y, 1));
-
-        // The checklist fades in once the flame has caught.
-        let shown = vis * ((ms - 700.0) / 300.0).clamp(0.0, 1.0);
-        if shown <= 0.0 {
-            return;
-        }
-        let spin = SPINNER[(ms as usize / 100) % SPINNER.len()];
-        let rows: Vec<(String, Line)> = app
-            .checks
-            .rows()
-            .into_iter()
-            .map(|(label, check)| {
-                let (glyph, detail, glyph_rgb, detail_rgb) = match check {
-                    Check::Pending => (spin, "…".to_string(), splash::EMBER, splash::MUTED),
-                    Check::Ok(d) => ("✓", d.clone(), splash::INK, splash::INK),
-                    Check::Note(d) => ("·", d.clone(), splash::MUTED, splash::MUTED),
-                    Check::Warn(d) => ("!", d.clone(), splash::EMBER, splash::EMBER),
-                };
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!("{glyph} "),
-                        Style::default().fg(splash::fade(glyph_rgb, shown, tc)),
-                    ),
-                    Span::styled(
-                        format!("{label:<9}  "),
-                        Style::default().fg(splash::fade(splash::MUTED, shown, tc)),
-                    ),
-                    Span::styled(
-                        detail.clone(),
-                        Style::default().fg(splash::fade(detail_rgb, shown, tc)),
-                    ),
-                ]);
-                (format!("{glyph} {label:<9}  {detail}"), line)
-            })
-            .collect();
-        // One left edge for every line, centred as a block.
-        let width = rows
-            .iter()
-            .map(|(plain, _)| plain.chars().count())
-            .max()
-            .unwrap_or(0) as u16;
-        let x = area.x + area.width.saturating_sub(width) / 2;
-        for (i, (_, line)) in rows.into_iter().enumerate() {
-            let y = caption_y + 2 + i as u16;
-            if y >= area.y + area.height {
-                break;
-            }
-            let r = ratatui::layout::Rect::new(x, y, area.width.saturating_sub(x - area.x), 1);
-            frame.render_widget(Paragraph::new(line), r);
-        }
     }
 
     fn render_loading_title(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -2562,22 +2503,6 @@ mod tui {
                 ) {
                     lines.push(Line::from(Span::styled(format!("  {entry_line}"), dim)));
                 }
-            }
-            Role::Banner => {
-                let palette = [
-                    Color::Red,
-                    Color::Yellow,
-                    Color::Green,
-                    Color::Cyan,
-                    Color::Blue,
-                    Color::Magenta,
-                ];
-                let mut spans = Vec::new();
-                for (i, ch) in msg.text.chars().enumerate() {
-                    let color = palette[i % palette.len()];
-                    spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-                }
-                lines.push(Line::from(spans));
             }
             Role::System => {
                 for text_line in msg.text.split('\n') {
