@@ -3228,7 +3228,8 @@ impl SiGitAgent {
             build_config_options(&guard, &new_id.to_string())
         };
 
-        self.advertise_commands(cx, new_id.clone());
+        // The command list is advertised by the dispatcher, after this
+        // response is written. See the `ForkSessionRequest` handler.
 
         // Run SessionStart hooks
         let hook_settings = settings::load().hooks;
@@ -3244,7 +3245,6 @@ impl SiGitAgent {
 
     async fn handle_new_session(
         &self,
-        cx: &ConnectionTo<Client>,
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         validate_session_roots(&args.cwd, &args.additional_directories)?;
@@ -3269,7 +3269,8 @@ impl SiGitAgent {
             build_config_options(&guard, &session_id.to_string())
         };
 
-        self.advertise_commands(cx, session_id.clone());
+        // The command list is advertised by the dispatcher, after this
+        // response is written. See the `NewSessionRequest` handler.
 
         // Run SessionStart hooks
         let hook_settings = settings::load().hooks;
@@ -6552,7 +6553,18 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                         // which has to be between turns.
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
-                        handle_response(responder, state.handle_fork_session(&task_cx, req).await)
+                        let result = state.handle_fork_session(&task_cx, req).await;
+                        let new_id = result.as_ref().ok().map(|r| r.session_id.clone());
+                        handle_response(responder, result)?;
+                        // Zed creates the thread only once it has this
+                        // response and drops updates for a session it does
+                        // not know yet, so the command list has to follow the
+                        // response, not precede it. Notifications and
+                        // responses share one ordered writer.
+                        if let Some(id) = new_id {
+                            state.advertise_commands(&task_cx, id);
+                        }
+                        Ok(())
                     })
                 }
             },
@@ -6566,7 +6578,18 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let task_cx = cx.clone();
                     cx.spawn(async move {
                         let _workspace = state.workspace_lock.lock().await;
-                        handle_response(responder, state.handle_new_session(&task_cx, req).await)
+                        let result = state.handle_new_session(req).await;
+                        let session_id = result.as_ref().ok().map(|r| r.session_id.clone());
+                        handle_response(responder, result)?;
+                        // Zed creates the thread only once it has this
+                        // response and drops updates for a session it does
+                        // not know yet, so the command list has to follow the
+                        // response, not precede it. Notifications and
+                        // responses share one ordered writer.
+                        if let Some(id) = session_id {
+                            state.advertise_commands(&task_cx, id);
+                        }
+                        Ok(())
                     })
                 }
             },
