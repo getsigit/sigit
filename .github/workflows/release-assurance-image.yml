@@ -1,0 +1,80 @@
+name: Assurance runner image
+
+# Builds ghcr.io/getsigit/sigit-code-assurance-runner, the guest image of the
+# siGit Code Assurance Fireactions pool, with the released `sigit` baked in.
+# release-github dispatches this once the release assets exist. A pull request
+# that touches the image builds it without pushing, so a broken Dockerfile
+# shows up before merge.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1)"
+        required: true
+  pull_request:
+    paths:
+      - packaging/assurance-runner/**
+      - .github/workflows/release-assurance-image.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/getsigit/sigit-code-assurance-runner
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        # A release builds from the tagged tree, so the Dockerfile matches the binary it bakes in.
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tags
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ github.event.inputs.tag }}"
+            echo "sigit_version=${tag}" >> "$GITHUB_OUTPUT"
+            {
+              echo "tags<<EOF"
+              echo "${IMAGE}:latest"
+              echo "${IMAGE}:${tag}"
+              echo "${IMAGE}:$(git rev-parse HEAD)"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            # Not `latest`: v1.7.6's linux-amd64 binary needs GLIBC_2.43 and the base has
+            # 2.39. Move to `latest` once a release is built on ubuntu-24.04.
+            echo "sigit_version=v1.7.5" >> "$GITHUB_OUTPUT"
+            echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: packaging/assurance-runner
+          build-args: SIGIT_VERSION=${{ steps.meta.outputs.sigit_version }}
+          push: ${{ github.event_name == 'workflow_dispatch' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

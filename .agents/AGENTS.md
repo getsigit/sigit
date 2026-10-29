@@ -560,6 +560,17 @@ GitHub release, so `release-github` builds the binaries, attaches the assets, an
 is logged as a warning rather than failing the others, so an unconfigured channel does not block a
 release. Their inputs live in `packaging/`.
 
+The same fan-out dispatches `release-assurance-image`, which builds
+`ghcr.io/getsigit/sigit-code-assurance-runner` from `packaging/assurance-runner/Dockerfile`. That
+is the guest image of the Fireactions pool `sigit-code-assurance`, where siGit Code Assurance runs
+a release candidate's tests and its QA agent in a fresh microVM. Each sigit release rebuilds it
+with that release's `sigit` at `/usr/local/bin/sigit`, so the agent uses it instead of downloading
+one, and pushes `:latest`, `:<tag>` and `:<sha>`. The image carries no app dependencies and no
+secrets. Its `PLAYWRIGHT_VERSION` must match the consuming repo's `@playwright/test`. A pull
+request touching the image builds it without pushing. One-time setup on the package: it is
+public (the Fireactions hosts pull it without credentials), and under "Manage Actions access"
+getsigit/sigit has write access.
+
 The Windows binaries link the MSVC C runtime statically (`+crt-static` in `.cargo/config.toml`).
 winget, Scoop, npm, PyPI and NuGet all ship the bare exe with no installer, so a dynamic build
 that imports `VCRUNTIME140.dll` fails to load on a machine without the VC++ Redistributable
