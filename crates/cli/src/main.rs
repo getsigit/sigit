@@ -51,6 +51,10 @@ mod session_store;
 mod settings;
 mod setup;
 mod skills;
+#[cfg(unix)]
+mod splash;
+#[cfg(unix)]
+mod startup;
 mod subagents;
 mod tools;
 mod workspace;
@@ -6922,9 +6926,9 @@ async fn main() -> anyhow::Result<()> {
             let (tty, cleanup_tty) = redirect_output_to_log()?;
             init_logging(true);
             setup::setup_shared_model_cache();
-            // Best-effort: discover MCP servers (incl. the official one) before
-            // the first turn so their tools are offered to the model.
-            mcp::init().await;
+            // MCP discovery (incl. the official server) runs behind the launch
+            // splash (`startup.rs`), so a slow server never leaves the terminal
+            // blank before the first frame.
             run_interactive(tty, cleanup_tty).await
         }
         #[cfg(not(unix))]

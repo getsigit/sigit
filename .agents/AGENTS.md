@@ -458,7 +458,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   clients. The legacy `-p` form reaches the same parser. Every new run gets a UUID session id;
   `--resume <id>` restores that session through `session_store`, and `--output jsonl` emits a
   structured session/delta/tool/result stream while logs stay on stderr. Headless permission
-  prompts collapse to denial unless the tool was pre-approved with `--allow-tool`.
+  prompts collapse to denial unless the tool was pre-approved with `--allow-tool`. The backend is
+  the provider override, else the default cloud tier when local inference is off; `--model <tier>`
+  (validated by `provider::cloud_tier_named`, a tier or its `onde-*` id) picks a cloud tier
+  instead and wins over both.
 - **`crates/cli/src/session_store.rs`** — durable conversations: one JSON-lines history file per session at
   `$SIGIT_CONFIG_DIR/sessions/<id>.jsonl`, written atomically, restorable into either backend.
   Each save also writes a `<id>.meta.json` sidecar naming the session's `cwd` and the extra roots

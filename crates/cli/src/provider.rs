@@ -115,6 +115,17 @@ pub fn cloud_tier_provider(tier: &str) -> Option<ProviderConfig> {
     })
 }
 
+/// The cloud tier a name refers to: the tier itself (`prism`) or the model id
+/// sent on the wire (`onde-prism`), case-insensitively. `None` for a name that
+/// is neither, so a caller can reject it instead of sending it to the cloud.
+pub fn cloud_tier_named(name: &str) -> Option<&'static str> {
+    let name = name.trim().to_lowercase();
+    CLOUD_TIERS
+        .iter()
+        .copied()
+        .find(|tier| *tier == name || tier_to_model(tier) == name)
+}
+
 /// Map a neutral tier name to the model id sent on the wire. Unknown values pass
 /// through unchanged so an explicit model id still works.
 fn tier_to_model(tier: &str) -> String {
@@ -323,6 +334,19 @@ mod tests {
     fn maps_default_cloud_tier_to_wire_model_id() {
         assert_eq!(DEFAULT_CLOUD_TIER, "nova");
         assert_eq!(tier_to_model(DEFAULT_CLOUD_TIER), "onde-nova");
+    }
+
+    #[test]
+    fn cloud_tier_named_accepts_tiers_and_wire_ids() {
+        assert_eq!(cloud_tier_named("prism"), Some("prism"));
+        assert_eq!(cloud_tier_named(" Zenith "), Some("zenith"));
+        assert_eq!(cloud_tier_named("onde-flare"), Some("flare"));
+        // The wire id of `oke` does not follow the `onde-<tier>` pattern.
+        assert_eq!(cloud_tier_named("onde-kkk"), Some("oke"));
+        assert_eq!(cloud_tier_named("oke"), Some("oke"));
+        assert_eq!(cloud_tier_named("gpt-4o-mini"), None);
+        assert_eq!(cloud_tier_named("onde-"), None);
+        assert_eq!(cloud_tier_named(""), None);
     }
 
     #[test]

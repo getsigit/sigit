@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.7.7
+
+A launch splash for the terminal, and a way to pick the cloud tier for a
+headless run. No protocol change, so an editor sees a 1.7.6-shaped agent.
+
+### Added
+
+- **The terminal opens on the siGit wordmark.** The banner is an animated
+  "ember wordmark" — the letters of "siGit" are the blank cells in the art and
+  the digits are a flame that ignites from the right and trails off to the
+  left. It is the same animation the siGit app plays at launch.
+- **The splash waits on the startup checks.** The account check (a bounded
+  request to sigit.si), the model scan, the git remote lookup and MCP
+  discovery each run on their own task and report as they finish; the results
+  print as Account, Models, Workspace and Tools lines under the chat's opening
+  quote. The model scan, the git lookup and MCP discovery used to run before
+  the first frame, so a slow MCP server meant a blank terminal for up to its
+  8 s handshake timeout. The splash leaves once the checks are in and 1.4 s
+  have passed, any key skips it, and 4 s is the hard cap. A skip or the cap
+  does not cancel the checks, so the model picker and the Repo tab still fill
+  in behind the chat. `SIGIT_REDUCE_MOTION=1` draws the finished frame, and
+  terminals without truecolor fall back to the nearest 256-colour cell.
+- **`sigit run --model <tier>` picks the siGit Code Cloud tier for a headless run.** Headless
+  runs always used the default tier, so when that tier was unavailable a script or sandbox
+  runner had no way to pick another without pointing the custom-endpoint override at siGit Code
+  Cloud. The flag takes a tier name (`prism`) or its model id (`onde-prism`) and wins over the
+  provider override and the local-inference setting.
+
+### Fixed
+
+- **`/whoami` has a timeout.** The account check behind it now gives up after
+  10 s instead of waiting on an unreachable server.
+
+### Known limitations
+
+- A turn sent before MCP discovery finishes has no MCP tools for that turn.
+  The splash normally covers that window, but a skip or the 4 s cap can end
+  it earlier.
+
+### Docs
+
+- The release skill now records that the public MCP Registry listing moved to
+  `getsigit/si`, that winget goes live only after a human merges the manifest
+  PR, and which name each registry publishes under.
+
 ## 1.7.6
 
 A background-task tool for long commands, model pickers grouped by where the
