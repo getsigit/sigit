@@ -89,8 +89,21 @@ jobs:
           key: nuget-${{ matrix.build.TARGET }}
 
       - name: Build binary
+        if: ${{ !contains(matrix.build.TARGET, 'linux') }}
         shell: bash
         run: cargo build --locked --release -p sigit --target ${{ matrix.build.TARGET }}
+
+      # Built in manylinux2014 so the binary runs on glibc 2.17 and later, whatever the runner
+      # has. See packaging/linux/build-manylinux.sh.
+      - name: Build Linux binary (glibc 2.17)
+        if: contains(matrix.build.TARGET, 'linux')
+        shell: bash
+        run: ./packaging/linux/build-manylinux.sh ${{ matrix.build.TARGET }}
+
+      - name: Check Linux binary against the glibc 2.17 floor
+        if: contains(matrix.build.TARGET, 'linux')
+        shell: bash
+        run: ./packaging/linux/check-glibc.sh target/${{ matrix.build.TARGET }}/release/sigit 2.17
 
       - name: Prepare artifact
         shell: bash
@@ -135,7 +148,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: nuget-native-*
-          path: nuget/sigit/native
+          path: packaging/nuget/sigit/native
           merge-multiple: true
 
       - name: Setup .NET SDK
@@ -146,9 +159,9 @@ jobs:
       - name: Pack .NET tool
         shell: bash
         run: |
-          dotnet pack nuget/sigit/SiGit.Code.csproj \
+          dotnet pack packaging/nuget/sigit/SiGit.Code.csproj \
             --configuration Release \
-            --output nuget/dist \
+            --output packaging/nuget/dist \
             -p:PackageVersion=${RELEASE_VERSION}
 
       # All six binaries ship in one package, so this sits closer to nuget.org's
@@ -158,7 +171,7 @@ jobs:
       - name: Check package size against the NuGet limit
         shell: bash
         run: |
-          package="$(ls nuget/dist/*.nupkg | head -n 1)"
+          package="$(ls packaging/nuget/dist/*.nupkg | head -n 1)"
           size_bytes="$(wc -c < "${package}")"
           limit_bytes=$((250 * 1024 * 1024))
 
@@ -174,7 +187,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nuget-package
-          path: nuget/dist/*.nupkg
+          path: packaging/nuget/dist/*.nupkg
 
   smoke-test:
     name: Smoke test (${{ matrix.os }})
@@ -208,7 +221,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: nuget-package
-          path: nuget/dist
+          path: packaging/nuget/dist
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
@@ -218,7 +231,7 @@ jobs:
       - name: Install tool from local package
         shell: pwsh
         run: |
-          $packageSource = (Resolve-Path "nuget/dist").Path
+          $packageSource = (Resolve-Path "packaging/nuget/dist").Path
           @"
           <?xml version="1.0" encoding="utf-8"?>
           <configuration>
@@ -227,11 +240,11 @@ jobs:
               <add key="local" value="$packageSource" />
             </packageSources>
           </configuration>
-          "@ | Set-Content -Path "nuget/NuGet.Config"
+          "@ | Set-Content -Path "packaging/nuget/NuGet.Config"
 
           dotnet tool install `
             --tool-path ".tool" `
-            --configfile "nuget/NuGet.Config" `
+            --configfile "packaging/nuget/NuGet.Config" `
             --version "$env:RELEASE_VERSION" `
             "$env:NUGET_PACKAGE_ID"
 
@@ -284,7 +297,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: nuget-package
-          path: nuget/dist
+          path: packaging/nuget/dist
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
@@ -340,7 +353,7 @@ jobs:
         if: steps.nuget-check.outputs.exists != 'true'
         shell: bash
         run: |
-          dotnet nuget push nuget/dist/*.nupkg \
+          dotnet nuget push packaging/nuget/dist/*.nupkg \
             --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate
