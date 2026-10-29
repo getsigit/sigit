@@ -36,7 +36,10 @@ jobs:
       matrix:
         include:
           - name: linux-amd64
-            runner: ubuntu-latest
+            # Pinned, not ubuntu-latest: the binary links against the build host's
+            # glibc, and v1.7.6 built on a newer image needed GLIBC_2.43, which
+            # Ubuntu 24.04 (2.39, the assurance runner image's base) doesn't have.
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - name: linux-arm64
             runner: ubuntu-24.04-arm
@@ -302,7 +305,7 @@ jobs:
           files: release/*
 
       # These channels all publish somewhere outside this repo (a tap, a Scoop
-      # bucket, microsoft/winget-pkgs, the AUR) and every one of them reads
+      # bucket, microsoft/winget-pkgs, the AUR, ghcr.io) and every one of them reads
       # checksums off the release created above, so they hang off this job
       # rather than firing on the tag directly.
       - name: Trigger OS package manager releases
@@ -314,6 +317,7 @@ jobs:
               'release-homebrew.yml',
               'release-scoop.yml',
               'release-winget.yml',
+              'release-assurance-image.yml',
               // New AUR account registration is temporarily closed
               //'release-aur.yml',
             ]
