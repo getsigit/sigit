@@ -979,6 +979,25 @@ pub fn status_summary() -> String {
     summarize_servers(&mcp.servers, &session.0)
 }
 
+/// Counts for the launch checklist: configured startup servers, the tools they
+/// expose, and how many could not be reached. `None` before [`init`] has run.
+#[cfg(unix)]
+pub struct Overview {
+    pub servers: usize,
+    pub tools: usize,
+    pub unavailable: usize,
+}
+
+#[cfg(unix)]
+pub fn overview() -> Option<Overview> {
+    let mcp = MCP.get()?;
+    Some(Overview {
+        servers: mcp.servers.len(),
+        tools: mcp.servers.iter().map(|s| s.tools.len()).sum(),
+        unavailable: mcp.servers.iter().filter(|s| s.error.is_some()).count(),
+    })
+}
+
 /// The `/mcp` listing for the startup servers followed by the ones the live
 /// session's client supplied, which are marked as such.
 fn summarize_servers(startup: &[ServerConn], session: &[ServerConn]) -> String {
