@@ -1,13 +1,32 @@
 name: CI
 
-# Runs on every push.
+# Runs on every push and pull request that can change what cargo builds.
 # Splits formatting, clippy, and tests into separate jobs for clearer reporting
 # across supported desktop targets.
 
 on:
   push:
     branches: [main, development]
+    paths: &rust-paths
+      - "**"
+      # Nothing below can change what cargo builds, so a change that only
+      # touches these skips the nine jobs (four of them on macOS). Later
+      # entries win, which is how packaging/windows/ and this file get back in.
+      - "!**.md"
+      - "!docs/**"
+      - "!examples/**"
+      - "!LICENSE"
+      - "!NOTICE"
+      - "!.agents/**"
+      - "!npm/**"
+      - "!pypi/**"
+      - "!nuget/**"
+      - "!packaging/**"
+      - "packaging/windows/**"
+      - "!.github/**"
+      - ".github/workflows/ci.yml"
   pull_request:
+    paths: *rust-paths
   workflow_dispatch:
 
 concurrency:
