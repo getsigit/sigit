@@ -124,28 +124,34 @@ impl AgentUnderTest {
         }
     }
 
-    /// Send `text` as a prompt and return the agent message text it streamed
-    /// before the turn ended.
-    fn prompt_text(&mut self, session_id: &str, text: &str) -> String {
+    /// Send `text` as a prompt and return the system notice it produced: the
+    /// completed `think` tool card's title, then its content text if any.
+    fn prompt_notice(&mut self, session_id: &str, text: &str) -> String {
         let id = self.request(
             "session/prompt",
             json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
         );
         let deadline = Instant::now() + TIMEOUT;
-        let mut reply = String::new();
+        let mut notice = String::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let Ok(message) = self.incoming.recv_timeout(remaining) else {
                 panic!("timed out waiting for the response to prompt {id}");
             };
-            if message["method"] == "session/update"
-                && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
-                && let Some(chunk) = message["params"]["update"]["content"]["text"].as_str()
-            {
-                reply.push_str(chunk);
+            let update = &message["params"]["update"];
+            if message["method"] == "session/update" && update["sessionUpdate"] == "tool_call" {
+                assert_eq!(update["kind"], "think", "{update}");
+                assert_eq!(update["status"], "completed", "{update}");
+                notice.push_str(update["title"].as_str().unwrap_or_default());
+                for item in update["content"].as_array().into_iter().flatten() {
+                    if let Some(body) = item["content"]["text"].as_str() {
+                        notice.push('\n');
+                        notice.push_str(body);
+                    }
+                }
             }
             if message["id"] == id && message.get("method").is_none() {
-                return reply;
+                return notice;
             }
         }
     }
@@ -231,7 +237,7 @@ fn whoami_checks_the_session_against_the_user_endpoint() {
         .expect("session id")
         .to_string();
 
-    let reply = agent.prompt_text(&session_id, "/whoami");
+    let reply = agent.prompt_notice(&session_id, "/whoami");
     assert!(
         reply.contains("Signed in to siGit Code Cloud as dev@example.com"),
         "{reply}"

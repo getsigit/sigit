@@ -433,6 +433,19 @@ fn tool_arguments_content(arguments_json: &str) -> ToolCallContent {
     fenced_code_block(language, &chat::pretty_tool_arguments(arguments_json)).into()
 }
 
+/// Splits a notice into its title (the first non-empty line) and the body
+/// (everything after it), if there is any.
+fn split_notice(text: &str) -> (String, Option<String>) {
+    let text = text.trim();
+    match text.split_once('\n') {
+        Some((title, rest)) if !rest.trim().is_empty() => {
+            (title.trim().to_string(), Some(rest.trim().to_string()))
+        }
+        Some((title, _)) => (title.trim().to_string(), None),
+        None => (text.to_string(), None),
+    }
+}
+
 /// Wraps a tool's output as the display content of its ACP tool-call card
 /// (issue #78). Capped via [`chat::cap_output_preview`] — display only, the
 /// model still gets the full output — and fenced so plain-text output (or a
@@ -1658,6 +1671,28 @@ impl SiGitAgent {
                 .kind(ToolKind::Think)
                 .status(ToolCallStatus::Completed),
             ),
+        ))
+    }
+
+    /// A system notice that may run to several lines: the first line is the
+    /// card's title and the rest is its body, so a sign-in URL stays visible
+    /// and clickable. A single line is the same as `send_system_status`.
+    fn send_system_notice(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        text: impl AsRef<str>,
+    ) -> agent_client_protocol::Result<()> {
+        let (title, body) = split_notice(text.as_ref());
+        let mut call = ToolCall::new(format!("system-status-{}", uuid::Uuid::new_v4()), title)
+            .kind(ToolKind::Think)
+            .status(ToolCallStatus::Completed);
+        if let Some(body) = body {
+            call = call.content(vec![body.into()]);
+        }
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::ToolCall(call),
         ))
     }
 
@@ -5987,15 +6022,15 @@ async fn exec_slash_acp(
                     .await
                     .unwrap_or_else(|message| message),
             };
-            agent.send_assistant_message(cx, session_id, message).ok();
+            agent.send_system_notice(cx, session_id, message).ok();
         }
         SlashCommand::Logout => {
             let message = agent.sign_out(cx).await;
-            agent.send_assistant_message(cx, session_id, message).ok();
+            agent.send_system_notice(cx, session_id, message).ok();
         }
         SlashCommand::Whoami => {
             let message = account::status_line().await;
-            agent.send_assistant_message(cx, session_id, message).ok();
+            agent.send_system_notice(cx, session_id, message).ok();
         }
         SlashCommand::Reload => {
             agent.handle_reload(cx, session_id).await;
@@ -6992,6 +7027,22 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notices_split_into_title_and_body() {
+        assert_eq!(super::split_notice("Signed in"), ("Signed in".into(), None));
+        assert_eq!(
+            super::split_notice("Signed in\n"),
+            ("Signed in".into(), None)
+        );
+        assert_eq!(
+            super::split_notice("Open this page:\nhttps://x.test/a\nthen return"),
+            (
+                "Open this page:".into(),
+                Some("https://x.test/a\nthen return".into())
+            )
+        );
+    }
+
     use super::*;
 
     /// Compares path components so the tests pass on both Unix (forward slashes)
