@@ -1,4 +1,4 @@
-name: Linux glibc floor
+name: CI Linux glibc floor
 
 # The release workflows build the Linux binaries with packaging/linux/build-manylinux.sh so they
 # run on glibc 2.17 and later. A pull request that touches that script, or this file, builds
