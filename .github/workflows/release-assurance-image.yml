@@ -1,4 +1,4 @@
-name: Assurance runner image
+name: Release Assurance runner image
 
 # Builds ghcr.io/getsigit/sigit-code-assurance-runner, the guest image of the
 # siGit Code Assurance Fireactions pool, with the released `sigit` baked in.
