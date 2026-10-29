@@ -2907,6 +2907,7 @@ mod tui {
                      /skills        — list available Agent Skills\n\
                      /agents        — list configured subagent types (.sigit/agents/*.md)\n\
                      /commands      — list user-defined commands (.sigit/commands/*.md)\n\
+                     /<skill-name> [task] — run an Agent Skill, optionally on a task\n\
                      /mcp           — list MCP servers and their tools\n\
                      /load          — load the selected on-device model\n\
                      /login         — sign in via your browser\n\
@@ -4013,16 +4014,23 @@ mod tui {
                                                 argument.as_deref(),
                                             );
                                         }
-                                        None => {
-                                            exec_slash(
-                                                &mut app,
-                                                SlashCommand::Unknown(command, argument),
-                                                Arc::clone(&engine),
-                                                terminal,
-                                            )
-                                            .await;
-                                            continue;
-                                        }
+                                        // Then a skill: `/<skill-name> [task]`.
+                                        None => match crate::skills::slash_prompt(
+                                            &command,
+                                            argument.as_deref(),
+                                        ) {
+                                            Some(prompt) => inference_text = prompt,
+                                            None => {
+                                                exec_slash(
+                                                    &mut app,
+                                                    SlashCommand::Unknown(command, argument),
+                                                    Arc::clone(&engine),
+                                                    terminal,
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                        },
                                     }
                                 }
                                 Some(cmd) => {
