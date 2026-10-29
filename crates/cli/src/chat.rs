@@ -737,6 +737,13 @@ mod tui {
         messages: Vec<ChatMessage>,
         input: String,
         cursor: usize,
+        /// Slash-command completion source (name, description), refreshed
+        /// whenever the input becomes `/`.
+        slash_candidates: Vec<(String, String)>,
+        /// Selected row of the completion popup.
+        slash_index: usize,
+        /// Esc closed the popup; it stays closed until the input changes.
+        slash_dismissed: bool,
         /// true while assistant tokens are streaming into `stream_buf`
         streaming: bool,
         stream_buf: String,
@@ -863,6 +870,9 @@ mod tui {
                 messages: Vec::new(),
                 input: String::new(),
                 cursor: 0,
+                slash_candidates: Vec::new(),
+                slash_index: 0,
+                slash_dismissed: false,
                 streaming: false,
                 stream_buf: String::new(),
                 inference_rx: None,
@@ -915,6 +925,63 @@ mod tui {
                 repo_tx: None,
                 repo_rx: None,
             }
+        }
+
+        /// Candidates the popup shows for the current input: names starting
+        /// with what follows the `/`, then names merely containing it. Empty
+        /// once the input has whitespace (the argument is being typed) or the
+        /// popup was dismissed.
+        fn slash_matches(&self) -> Vec<(String, String)> {
+            if self.slash_dismissed
+                || !self.input.starts_with('/')
+                || self.input.contains(char::is_whitespace)
+            {
+                return Vec::new();
+            }
+            let query = self.input[1..].to_lowercase();
+            let lower = |name: &str| name.to_lowercase();
+            let (prefix, rest): (Vec<_>, Vec<_>) = self
+                .slash_candidates
+                .iter()
+                .filter(|(name, _)| lower(name).contains(&query))
+                .partition(|(name, _)| lower(name).starts_with(&query));
+            prefix.into_iter().chain(rest).cloned().collect()
+        }
+
+        fn slash_popup_open(&self) -> bool {
+            !self.slash_matches().is_empty()
+        }
+
+        /// Every edit of the input resets the selection and reopens a
+        /// dismissed popup; typing `/` rereads commands and skills from disk.
+        fn on_input_edited(&mut self) {
+            self.slash_index = 0;
+            self.slash_dismissed = false;
+            if self.input == "/" {
+                self.slash_candidates = slash_candidates();
+            }
+        }
+
+        fn move_slash_selection(&mut self, down: bool) {
+            let count = self.slash_matches().len();
+            if count == 0 {
+                return;
+            }
+            self.slash_index = if down {
+                (self.slash_index + 1) % count
+            } else {
+                (self.slash_index + count - 1) % count
+            };
+        }
+
+        /// Put `/<selected> ` in the input. Returns the selected name.
+        fn complete_slash(&mut self) -> Option<String> {
+            let matches = self.slash_matches();
+            let (name, _) = matches.get(self.slash_index.min(matches.len().checked_sub(1)?))?;
+            self.input = format!("/{name} ");
+            self.cursor = self.input.len();
+            self.slash_index = 0;
+            Some(name.clone())
         }
 
         /// Whether the Repo tab exists for this session.
@@ -2082,6 +2149,61 @@ mod tui {
         Unknown(String, Option<String>),
     }
 
+    /// Every name `/` can complete to, with a description: the built-ins
+    /// `parse_slash` knows (plus the TUI-only ones), then user-defined
+    /// commands, then skills. A name already taken by an earlier source is
+    /// dropped, since the earlier one is what runs.
+    fn slash_candidates() -> Vec<(String, String)> {
+        const BUILT_INS: &[(&str, &str)] = &[
+            ("help", "Show available commands"),
+            ("models", "Open the model picker, or switch with a number"),
+            ("local", "Toggle on-device inference mode"),
+            ("skills", "List available Agent Skills"),
+            ("agents", "List configured subagent types"),
+            ("commands", "List user-defined commands"),
+            ("mcp", "List MCP servers and their tools"),
+            ("load", "Load the selected on-device model"),
+            ("login", "Sign in via your browser"),
+            ("logout", "Sign out of siGit Code Cloud"),
+            ("whoami", "Show the signed-in account"),
+            ("plan", "Plan mode: research only, no edits or commands"),
+            ("permissions", "Show the tool permission policy"),
+            ("thinking", "Expand or collapse model reasoning"),
+            ("tools", "Expand or collapse tool-call details"),
+            ("compact", "Summarize and shrink the conversation history"),
+            ("resume", "Restore the saved session from disk"),
+            ("init", "Generate or improve the repo's AGENTS.md"),
+            ("clear", "Wipe the conversation history"),
+            ("status", "Show engine status"),
+            ("exit", "Quit chat"),
+        ];
+        let mut candidates: Vec<(String, String)> = BUILT_INS
+            .iter()
+            .map(|(name, description)| (name.to_string(), description.to_string()))
+            .collect();
+        let extra = crate::commands::discover_commands()
+            .into_iter()
+            .map(|command| {
+                let description = command
+                    .description
+                    .unwrap_or_else(|| "User-defined command".to_string());
+                (command.name, description)
+            })
+            .chain(
+                crate::skills::discover_skills()
+                    .into_iter()
+                    .map(|skill| (skill.name, skill.description)),
+            );
+        for (name, description) in extra {
+            if candidates.iter().any(|(taken, _)| *taken == name) {
+                continue;
+            }
+            let line = description.split_whitespace().collect::<Vec<_>>().join(" ");
+            candidates.push((name, line));
+        }
+        candidates
+    }
+
     fn parse_slash(input: &str) -> Option<SlashCommand> {
         let trimmed = input.trim();
         if !trimmed.starts_with('/') {
@@ -2619,12 +2741,89 @@ mod tui {
             inner,
         );
 
+        render_slash_popup(frame, app, area);
+
         let col = (app.cursor as u16) % inner.width;
         let row = (app.cursor as u16) / inner.width;
         frame.set_cursor_position(Position {
             x: inner.x + col,
             y: inner.y + row,
         });
+    }
+
+    /// Most rows the slash-command popup shows at once.
+    const SLASH_POPUP_ROWS: usize = 8;
+
+    /// The completion popup, drawn just above the input box: a name column
+    /// and a dimmed description, with the selected row highlighted.
+    fn render_slash_popup(frame: &mut Frame, app: &App, input_area: ratatui::layout::Rect) {
+        let matches = app.slash_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let selected = app.slash_index.min(matches.len() - 1);
+        let first = (selected + 1).saturating_sub(SLASH_POPUP_ROWS);
+        let shown = &matches[first..matches.len().min(first + SLASH_POPUP_ROWS)];
+
+        let height = (shown.len() as u16 + 2).min(input_area.y);
+        if height < 3 {
+            return;
+        }
+        let popup = ratatui::layout::Rect {
+            x: input_area.x,
+            y: input_area.y - height,
+            width: input_area.width,
+            height,
+        };
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .title(" commands and skills ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().bg(Color::Black));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let name_width = shown
+            .iter()
+            .map(|(name, _)| name.chars().count() + 1)
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let lines: Vec<Line> = shown
+            .iter()
+            .enumerate()
+            .take(inner.height as usize)
+            .map(|(row, (name, description))| {
+                let is_selected = first + row == selected;
+                let name_style = if is_selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).bg(Color::Black)
+                };
+                let description_style = if is_selected {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray).bg(Color::Black)
+                };
+                let room = (inner.width as usize).saturating_sub(name_width + 1);
+                let mut description: String = description.chars().take(room).collect();
+                if description.chars().count() < room {
+                    description.push_str(&" ".repeat(room - description.chars().count()));
+                }
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:<w$}", format!("/{name}"), w = name_width),
+                        name_style,
+                    ),
+                    Span::styled(description, description_style),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -2726,6 +2925,39 @@ mod tui {
             }
         }
 
+        // The slash-command popup takes these keys while it is open.
+        if app.slash_popup_open() {
+            match key.code {
+                KeyCode::Up => {
+                    app.move_slash_selection(false);
+                    return None;
+                }
+                KeyCode::Down => {
+                    app.move_slash_selection(true);
+                    return None;
+                }
+                KeyCode::Esc => {
+                    app.slash_dismissed = true;
+                    return None;
+                }
+                KeyCode::Tab => {
+                    app.complete_slash();
+                    return None;
+                }
+                KeyCode::Enter => {
+                    // Complete first. Once the input is exactly the selected
+                    // name, Enter submits it like any other line.
+                    let matches = app.slash_matches();
+                    let selected = matches.get(app.slash_index).map(|(name, _)| name.as_str());
+                    if selected.is_none_or(|name| app.input.trim() != format!("/{name}")) {
+                        app.complete_slash();
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.quit = true;
@@ -2747,12 +2979,14 @@ mod tui {
                 if app.cursor > 0 {
                     app.cursor -= 1;
                     app.input.remove(app.cursor);
+                    app.on_input_edited();
                 }
                 None
             }
             KeyCode::Delete => {
                 if app.cursor < app.input.len() {
                     app.input.remove(app.cursor);
+                    app.on_input_edited();
                 }
                 None
             }
@@ -2777,6 +3011,7 @@ mod tui {
             KeyCode::Char(ch) => {
                 app.input.insert(app.cursor, ch);
                 app.cursor += 1;
+                app.on_input_edited();
                 None
             }
             _ => None,
@@ -4115,9 +4350,188 @@ mod tui {
     mod tui_tests {
         use super::{
             App, OpenAiBackend, Status, compact_tokens, context_gauge_color, context_gauge_label,
+            handle_key, slash_candidates,
         };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use ratatui::style::Color;
         use std::sync::Arc;
+
+        fn slash_app(candidates: &[(&str, &str)]) -> App {
+            let backend = Arc::new(OpenAiBackend::new("http://localhost/v1", "", "test", None));
+            let mut app = App::new(
+                "test".into(),
+                backend,
+                super::Reporter::new(std::io::sink()),
+            );
+            app.finish_loading();
+            app.slash_candidates = candidates
+                .iter()
+                .map(|(name, description)| (name.to_string(), description.to_string()))
+                .collect();
+            app
+        }
+
+        fn press(app: &mut App, code: KeyCode) -> Option<String> {
+            handle_key(app, KeyEvent::new(code, KeyModifiers::NONE))
+        }
+
+        /// Seed the input without going through `handle_key`, which would
+        /// reload the candidates from disk when the text is `/`.
+        fn set_input(app: &mut App, text: &str) {
+            app.input = text.into();
+            app.cursor = text.len();
+        }
+
+        fn type_text(app: &mut App, text: &str) {
+            for ch in text.chars() {
+                press(app, KeyCode::Char(ch));
+            }
+        }
+
+        fn names(app: &App) -> Vec<String> {
+            app.slash_matches()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        }
+
+        #[test]
+        fn slash_candidates_list_built_ins_first_without_duplicates() {
+            let candidates = slash_candidates();
+            let names: Vec<&str> = candidates.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names[0], "help");
+            for built_in in ["whoami", "login", "logout", "thinking", "tools", "resume"] {
+                assert!(names.contains(&built_in), "{built_in} missing");
+            }
+            let mut unique = names.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), names.len(), "duplicate candidates: {names:?}");
+        }
+
+        #[test]
+        fn slash_matches_prefix_first_then_substring() {
+            let mut app = slash_app(&[
+                ("rewhoami", ""),
+                ("whoami", ""),
+                ("help", ""),
+                ("whatever", ""),
+            ]);
+            app.input = "/wh".into();
+            assert_eq!(names(&app), vec!["whoami", "whatever", "rewhoami"]);
+            app.input = "/".into();
+            assert_eq!(names(&app).len(), 4);
+            app.input = "/WHO".into();
+            assert_eq!(names(&app), vec!["whoami", "rewhoami"]);
+            app.input = "/nothing".into();
+            assert!(names(&app).is_empty());
+            app.input = "/whoami now".into();
+            assert!(names(&app).is_empty(), "closed once an argument starts");
+            app.input = "whoami".into();
+            assert!(names(&app).is_empty(), "only a leading slash opens it");
+        }
+
+        #[test]
+        fn tab_completes_the_selected_name() {
+            let mut app = slash_app(&[("help", ""), ("whoami", ""), ("web", "")]);
+            set_input(&mut app, "/w");
+            assert_eq!(names(&app), vec!["whoami", "web"]);
+            press(&mut app, KeyCode::Down);
+            assert_eq!(press(&mut app, KeyCode::Tab), None);
+            assert_eq!(app.input, "/web ");
+            assert_eq!(app.cursor, app.input.len());
+            assert!(!app.slash_popup_open(), "the argument is next");
+        }
+
+        #[test]
+        fn selection_wraps_in_both_directions() {
+            let mut app = slash_app(&[("aa", ""), ("ab", ""), ("ac", "")]);
+            set_input(&mut app, "/a");
+            press(&mut app, KeyCode::Up);
+            assert_eq!(app.slash_index, 2);
+            press(&mut app, KeyCode::Down);
+            assert_eq!(app.slash_index, 0);
+        }
+
+        #[test]
+        fn enter_completes_then_submits_on_an_exact_match() {
+            let mut app = slash_app(&[("whoami", ""), ("who", "")]);
+            set_input(&mut app, "/wh");
+            assert_eq!(press(&mut app, KeyCode::Enter), None);
+            assert_eq!(app.input, "/whoami ");
+
+            // The input is exactly the selected name: Enter sends it.
+            let mut app = slash_app(&[("whoami", ""), ("who", "")]);
+            set_input(&mut app, "/whoami");
+            assert_eq!(press(&mut app, KeyCode::Enter), Some("/whoami".into()));
+            assert!(app.input.is_empty());
+        }
+
+        #[test]
+        fn esc_closes_the_popup_until_the_input_changes() {
+            let mut app = slash_app(&[("whoami", "")]);
+            set_input(&mut app, "/wh");
+            assert!(app.slash_popup_open());
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.slash_popup_open());
+            assert_eq!(app.input, "/wh", "Esc leaves the text alone");
+            type_text(&mut app, "o");
+            assert!(app.slash_popup_open());
+        }
+
+        #[test]
+        fn typing_a_slash_refreshes_the_candidates() {
+            let mut app = slash_app(&[]);
+            type_text(&mut app, "/");
+            assert!(names(&app).contains(&"whoami".to_string()));
+        }
+
+        #[test]
+        fn the_popup_draws_above_the_input_with_the_selection_visible() {
+            use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+            let candidates: Vec<(String, String)> = (0..12)
+                .map(|n| (format!("cmd{n:02}"), format!("does thing {n}")))
+                .collect();
+            let refs: Vec<(&str, &str)> = candidates
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let mut app = slash_app(&refs);
+            app.input = "/cmd".into();
+            app.slash_index = 10;
+
+            let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            terminal
+                .draw(|frame| super::render_input(frame, &app, Rect::new(0, 17, 60, 3)))
+                .unwrap();
+            let text: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(60)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            let all = text.join("\n");
+            assert!(
+                all.contains("/cmd10"),
+                "the selected row scrolls into view:\n{all}"
+            );
+            assert!(all.contains("does thing 10"), "{all}");
+            assert!(!all.contains("/cmd00"), "only 8 rows show:\n{all}");
+            assert!(
+                text[17].contains("message"),
+                "the input box stays put: {all}"
+            );
+        }
+
+        #[test]
+        fn keys_are_untouched_when_the_popup_is_closed() {
+            let mut app = slash_app(&[("whoami", "")]);
+            type_text(&mut app, "hello");
+            assert_eq!(press(&mut app, KeyCode::Tab), None);
+            assert_eq!(app.input, "hello");
+            assert_eq!(press(&mut app, KeyCode::Enter), Some("hello".into()));
+        }
 
         #[test]
         fn login_status_uses_the_result_instead_of_message_wording() {
