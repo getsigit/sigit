@@ -1,4 +1,4 @@
-name: Crates.io Release
+name: Release crates.io
 
 on:
   push:

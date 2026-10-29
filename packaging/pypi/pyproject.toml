@@ -37,6 +37,6 @@ Repository = "https://github.com/getsigit/sigit"
 Issues = "https://github.com/getsigit/sigit/issues"
 
 [tool.maturin]
-manifest-path = "../crates/cli/Cargo.toml"
+manifest-path = "../../crates/cli/Cargo.toml"
 bindings = "bin"
 strip = true

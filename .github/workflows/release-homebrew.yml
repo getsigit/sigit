@@ -1,4 +1,4 @@
-name: Homebrew CLI Release
+name: Release Homebrew
 
 on:
   workflow_dispatch:

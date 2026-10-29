@@ -1,4 +1,4 @@
-name: NPM Release
+name: Release npm
 
 on:
   push:
@@ -100,8 +100,21 @@ jobs:
           key: npm-${{ matrix.build.TARGET }}
 
       - name: Build binary
+        if: ${{ !contains(matrix.build.TARGET, 'linux') }}
         shell: bash
         run: cargo build --locked --release -p sigit --target ${{ matrix.build.TARGET }}
+
+      # Built in manylinux2014 so the binary runs on glibc 2.17 and later, whatever the runner
+      # has. See packaging/linux/build-manylinux.sh.
+      - name: Build Linux binary (glibc 2.17)
+        if: contains(matrix.build.TARGET, 'linux')
+        shell: bash
+        run: ./packaging/linux/build-manylinux.sh ${{ matrix.build.TARGET }}
+
+      - name: Check Linux binary against the glibc 2.17 floor
+        if: contains(matrix.build.TARGET, 'linux')
+        shell: bash
+        run: ./packaging/linux/check-glibc.sh target/${{ matrix.build.TARGET }}/release/sigit 2.17
 
       - name: Install Node
         uses: actions/setup-node@v6
@@ -123,7 +136,7 @@ jobs:
       - name: Publish platform package to NPM
         shell: bash
         run: |
-          cd npm
+          cd packaging/npm
 
           # Binary name from Cargo.toml
           cargo_bin="sigit"
@@ -156,7 +169,7 @@ jobs:
             cargo_bin="${cargo_bin}.exe"
           fi
 
-          cp "../target/${{ matrix.build.TARGET }}/release/${cargo_bin}" "${node_pkg}/bin"
+          cp "../../target/${{ matrix.build.TARGET }}/release/${cargo_bin}" "${node_pkg}/bin"
 
           # One binary, published under both scopes: re-render package.json and
           # README for each, from the same directory.
@@ -224,7 +237,7 @@ jobs:
       - name: Publish base packages to NPM
         shell: bash
         run: |
-          cd npm/sigit
+          cd packaging/npm/sigit
 
           npm_package_version="${{ env.RELEASE_VERSION }}"
 

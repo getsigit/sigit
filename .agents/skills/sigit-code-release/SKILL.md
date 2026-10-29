@@ -27,13 +27,13 @@ Use this skill when preparing a release for this repository.
 - Bump `[workspace.package].version` in the root `Cargo.toml`; every workspace crate inherits it.
 - Update the root `sigit` package entry in `Cargo.lock` when the crate version changes.
 - Add or update the top changelog entry in `CHANGELOG.md` for the release being cut.
-- Do not treat `npm/sigit/package.json` `0.0.0-dev` as a bug by default. The npm release workflow rewrites it at publish time using `npm/scripts/render-main-package.cjs` and the release tag.
+- Do not treat `packaging/npm/sigit/package.json` `0.0.0-dev` as a bug by default. The npm release workflow rewrites it at publish time using `packaging/npm/scripts/render-main-package.cjs` and the release tag.
 - Every npm package publishes twice, under `@getsigit` and under `@smbcloud`. `@smbcloud` is the pre-1.5.5 name, mirrored so an install predating the rename keeps updating; `@getsigit` is canonical and is what the README, the Homebrew tap, and the ACP registry entry point at. All fourteen names (two base packages, twelve platform packages) publish over OIDC and each needs its own Trusted Publisher on npm pointing at `release-npm.yml`.
-- The scope is a render-time argument, not a second copy of the packaging: `render-platform-package.cjs` takes it as a fifth argument, and the base package picks it up from `package-main.json.tmpl` versus `package-compat.json.tmpl`. `npm/sigit/src/index.ts` is built once and shipped under both names — it reads its own `package.json` at runtime to decide which scope to resolve the platform binary from, and prints the migration notice only when it finds itself running as `@smbcloud/sigit`.
-- Do not add a hardcoded version to `pypi/pyproject.toml` for normal releases. PyPI uses `maturin` with `dynamic = ["version"]` and derives the published package version from `crates/cli/Cargo.toml`, which inherits the workspace version.
+- The scope is a render-time argument, not a second copy of the packaging: `render-platform-package.cjs` takes it as a fifth argument, and the base package picks it up from `package-main.json.tmpl` versus `package-compat.json.tmpl`. `packaging/npm/sigit/src/index.ts` is built once and shipped under both names — it reads its own `package.json` at runtime to decide which scope to resolve the platform binary from, and prints the migration notice only when it finds itself running as `@smbcloud/sigit`.
+- Do not add a hardcoded version to `packaging/pypi/pyproject.toml` for normal releases. PyPI uses `maturin` with `dynamic = ["version"]` and derives the published package version from `crates/cli/Cargo.toml`, which inherits the workspace version.
 - Release workflows are tag-driven. `release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, `release-homebrew.yml`, and `release-nuget.yml` all derive `RELEASE_VERSION` from a `v*.*.*` tag or a manually supplied tag input.
 - The crate is published to crates.io (`release-crates.yml`) and the Homebrew tap is updated (`release-homebrew.yml`) as part of the tag-driven flow. Per the siGit release flow, Homebrew is auto-triggered — do not dispatch it manually.
-- `release-github.yml` builds the binaries, attaches them (plus a `.deb`/`.rpm` per Linux target built with nfpm from `packaging/nfpm.yaml`) to the GitHub release, then dispatches `release-homebrew`, `release-scoop`, `release-winget`, and `release-aur`. A dispatch failure in any one of those four is logged as a warning, not a hard failure — an unconfigured channel doesn't block the rest of the release. `release-nuget.yml`, by contrast, is tag-triggered directly like the other language-registry workflows, not dispatched from `release-github.yml`. `release-aur.yml` exists but its dispatch line in `release-github.yml` is commented out (`// New AUR account registration is temporarily closed`), so AUR does not update on a normal release — an absent AUR bump is expected, not a failure.
+- `release-github.yml` builds the binaries, attaches them (plus a `.deb`/`.rpm` per Linux target built with nfpm from `packaging/linux/nfpm.yaml`) to the GitHub release, then dispatches `release-homebrew`, `release-scoop`, `release-winget`, and `release-aur`. A dispatch failure in any one of those four is logged as a warning, not a hard failure — an unconfigured channel doesn't block the rest of the release. `release-nuget.yml`, by contrast, is tag-triggered directly like the other language-registry workflows, not dispatched from `release-github.yml`. `release-aur.yml` exists but its dispatch line in `release-github.yml` is commented out (`// New AUR account registration is temporarily closed`), so AUR does not update on a normal release — an absent AUR bump is expected, not a failure.
 - Every release asset carries a `.sha256` sidecar (not just the macOS Homebrew tarball). Scoop, winget, and the AUR PKGBUILD each consume the raw binaries plus their sidecar checksum, rather than the tarball.
 - The GitHub release body is generated, not hand-written: `release-github.yml`'s release job checks out the tag, awk-extracts the `## <version>` section from `CHANGELOG.md` (a missing section is a hard failure), appends a full-changelog link and a `sigit.si/code` footnote, and publishes it via `body_path: release_notes.md`. The only file a release-prep change needs to touch is `CHANGELOG.md` — never edit release notes in the GitHub UI, because the next tag push would overwrite them.
 - npm and NuGet publish via OIDC trusted publishing — neither has a stored token in the repo. On npm this is configured per package (each `@getsigit/*` name has a trusted publisher pointing at `release-npm.yml`), so a new package needs the same setup before its first publish will work. OIDC requires npm >= 11.5.1 and Node >= 22.14.0.
@@ -95,13 +95,13 @@ flows start from different base commits and are not interchangeable.
 - `Cargo.lock`
 - `CHANGELOG.md`
 - `README.md`
-- `npm/sigit/package.json`
-- `npm/package-main.json.tmpl`, `npm/package-compat.json.tmpl`, `npm/package.json.tmpl` (publish-time package metadata for both scopes)
-- `npm/scripts/render-main-package.cjs`
-- `npm/`
-- `pypi/`
-- `nuget/sigit/` (bundled-binary `.NET` tool packaging)
-- `packaging/` (`nfpm.yaml` for `.deb`/`.rpm`, plus `aur/` and `winget/` templates)
+- `packaging/npm/sigit/package.json`
+- `packaging/npm/package-main.json.tmpl`, `packaging/npm/package-compat.json.tmpl`, `packaging/npm/package.json.tmpl` (publish-time package metadata for both scopes)
+- `packaging/npm/scripts/render-main-package.cjs`
+- `packaging/npm/`
+- `packaging/pypi/`
+- `packaging/nuget/sigit/` (bundled-binary `.NET` tool packaging)
+- `packaging/linux/nfpm.yaml` (`.deb`/`.rpm`), plus the `packaging/aur/` and `packaging/winget/` templates
 - `.github/workflows/` (`release-github.yml`, `release-npm.yml`, `release-pypi.yml`, `release-crates.yml`, `release-homebrew.yml`, `release-scoop.yml`, `release-winget.yml`, `release-aur.yml`, `release-nuget.yml`) — there is deliberately no `release-mcp-registry.yml`; the MCP Registry listing lives in `getsigit/si`
 
 ## Release checklist
@@ -109,8 +109,8 @@ flows start from different base commits and are not interchangeable.
 - Version bump is applied everywhere it needs to be.
 - `Cargo.toml` and the root crate entry in `Cargo.lock` match.
 - `CHANGELOG.md` has a correct top entry for the new release.
-- `npm/sigit/package.json` is left at `0.0.0-dev` unless the packaging flow itself changed.
-- `pypi/pyproject.toml` still uses dynamic versioning unless there is a deliberate packaging change.
+- `packaging/npm/sigit/package.json` is left at `0.0.0-dev` unless the packaging flow itself changed.
+- `packaging/pypi/pyproject.toml` still uses dynamic versioning unless there is a deliberate packaging change.
 - Release workflows still derive their version from the tag as expected.
 - Correct git flow for the release type followed, with `v<version>` tagged on the `main` merge commit either way:
   - **Full release:** bump committed on `release/v<version>` (off `development`), merged back to `development`, then `development` merged into `main`.

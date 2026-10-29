@@ -1,4 +1,4 @@
-name: PyPI Release
+name: Release PyPI
 
 on:
   push:
@@ -100,7 +100,7 @@ jobs:
         with:
           target: ${{ matrix.build.TARGET }}
           manylinux: ${{ matrix.build.MANYLINUX || 'off' }}
-          working-directory: pypi
+          working-directory: packaging/pypi
           args: --release --locked --compatibility pypi --out dist
           before-script-linux: yum install -y perl-core
 
@@ -108,7 +108,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.build.NAME }}
-          path: pypi/dist/*
+          path: packaging/pypi/dist/*
 
   build-sdist:
     name: Build source distribution
@@ -138,14 +138,14 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          working-directory: pypi
+          working-directory: packaging/pypi
           args: --out dist
 
       - name: Upload sdist artifact
         uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: pypi/dist/*
+          path: packaging/pypi/dist/*
 
   publish-pypi:
     name: Publish to PyPI
