@@ -302,7 +302,7 @@ jobs:
           files: release/*
 
       # These channels all publish somewhere outside this repo (a tap, a Scoop
-      # bucket, microsoft/winget-pkgs, the AUR) and every one of them reads
+      # bucket, microsoft/winget-pkgs, the AUR, ghcr.io) and every one of them reads
       # checksums off the release created above, so they hang off this job
       # rather than firing on the tag directly.
       - name: Trigger OS package manager releases
@@ -314,6 +314,7 @@ jobs:
               'release-homebrew.yml',
               'release-scoop.yml',
               'release-winget.yml',
+              'release-assurance-image.yml',
               // New AUR account registration is temporarily closed
               //'release-aur.yml',
             ]
