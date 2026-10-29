@@ -55,7 +55,9 @@ jobs:
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
-            echo "sigit_version=latest" >> "$GITHUB_OUTPUT"
+            # Not `latest`: v1.7.6's linux-amd64 binary needs GLIBC_2.43 and the base has
+            # 2.39. Move to `latest` once a release is built on ubuntu-24.04.
+            echo "sigit_version=v1.7.5" >> "$GITHUB_OUTPUT"
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           fi
 

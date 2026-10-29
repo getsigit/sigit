@@ -30,7 +30,8 @@ ARG PNPM_VERSION=10
 # does and a browser download when it doesn't, and the visual baselines are only stable against
 # the browsers they were recorded with.
 ARG PLAYWRIGHT_VERSION=1.64.1
-# A sigit release tag (v1.7.6), or `latest` for a pull-request build.
+# A sigit release tag (v1.7.6), or `latest`. Its linux-amd64 binary has to run on this base's
+# glibc (2.39), which is why release-github builds it on ubuntu-24.04.
 ARG SIGIT_VERSION=latest
 
 # Build-time only inside the microVM: Fireactions boots this as a rootfs, so jobs must set
