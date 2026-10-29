@@ -1,4 +1,4 @@
-name: Scoop Release
+name: Release Scoop
 
 # Dispatched by release-github.yml once the release and its checksums exist.
 on:

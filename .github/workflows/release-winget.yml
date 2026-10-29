@@ -1,4 +1,4 @@
-name: winget Release
+name: Release winget
 
 # Dispatched by release-github.yml once the release and its checksums exist.
 #
