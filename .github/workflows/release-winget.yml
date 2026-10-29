@@ -73,13 +73,33 @@ jobs:
           FIRST=$(echo "${PUBLISHER:0:1}" | tr '[:upper:]' '[:lower:]')
           PATH_IN_REPO="manifests/${FIRST}/${PUBLISHER}/${NAME}"
 
-          if gh api "repos/microsoft/winget-pkgs/contents/${PATH_IN_REPO}" >/dev/null 2>&1; then
-            echo "Found ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting an update."
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "No ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting it as a new package."
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
+          # Branch on the status code, not on whether the request worked.
+          # This used to treat any failure as "not there", so a GitHub outage
+          # during the v1.7.7 run sent an existing package down the
+          # new-package path and filed a bogus Package Request
+          # (microsoft/winget-pkgs#465415). Only a 404 means "not there";
+          # anything else fails the job before an issue or PR is opened, so a
+          # rerun is safe.
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --retry 5 --retry-delay 10 --retry-all-errors \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/microsoft/winget-pkgs/contents/${PATH_IN_REPO}") || true
+
+          case "$STATUS" in
+            200)
+              echo "Found ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting an update."
+              echo "found=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "No ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting it as a new package."
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected ${STATUS:-no response} from GitHub checking ${PATH_IN_REPO}; refusing to guess" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Render manifests for a first submission
         if: steps.exists.outputs.found == 'false'
