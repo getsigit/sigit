@@ -35,10 +35,9 @@ jobs:
 
     steps:
       - name: Checkout
-        # A release builds from the tagged tree, so the Dockerfile matches the binary it bakes in.
+        # The dispatched ref, not the tag: the tag only picks the sigit to bake in, and a tag
+        # older than packaging/assurance-runner/ has no Dockerfile to build.
         uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Resolve tags
         id: meta
