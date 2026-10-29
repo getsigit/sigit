@@ -545,8 +545,13 @@ mutating tools; the escape hatch for clients without permission-request support)
 Version lives in `[workspace.package]` in the root `Cargo.toml`. Update `CHANGELOG.md` for releases.
 
 Publishing splits into two groups. **Language registries** each get their own tag-triggered
-workflow: `release-crates`, `release-npm`, `release-nuget`, `release-pypi`. The `npm/`, `nuget/`,
-and `pypi/` dirs hold their wrapper-package templates.
+workflow: `release-crates`, `release-npm`, `release-nuget`, `release-pypi`. Everything that isn't
+the Rust crates themselves lives under `packaging/`, one directory per channel: `npm/`, `nuget/`
+and `pypi/` hold the wrapper packages, `aur/` and `winget/` the manifest templates, `linux/` the
+manylinux build, glibc check and nfpm config, `windows/` the static-CRT check, and
+`assurance-runner/` the Code Assurance image. It's `packaging/` and not `dist/` because `dist/` is
+build output almost everywhere (maturin's and `dotnet pack`'s `--out dist`, and the stock Node and
+Python `.gitignore` templates) and would read as something safe to delete.
 
 npm and NuGet authenticate with OIDC (Trusted Publishing), so neither needs a stored token. On
 npm that is configured per package, not per org: all seven `@getsigit/*` names carry a trusted
@@ -593,7 +598,7 @@ actions' Node needs glibc 2.28, which CentOS 7 lacks).
 Every release asset now carries a `.sha256` sidecar, not just the macOS Homebrew tarball. Scoop,
 winget, and the AUR PKGBUILD each need one, and they consume the raw binaries rather than the
 tarball. `release-github` also builds a `.deb` and `.rpm` per Linux target with nfpm
-(`packaging/nfpm.yaml`), packaging the already-built binary rather than re-invoking cargo.
+(`packaging/linux/nfpm.yaml`), packaging the already-built binary rather than re-invoking cargo.
 
 Re-pushing a tag fires every release workflow a second time, so each one is grouped by tag in a
 `concurrency` block with `cancel-in-progress: false` — the duplicate queues behind the original
@@ -635,7 +640,7 @@ just a nicety. See the NuGet note below.
 
 The NuGet package (`SiGit.Code`, installed with `dotnet tool install --global SiGit.Code`) is the
 odd one out among the language registries: npm and PyPI publish one artifact per platform, but a
-.NET tool is a single package, so `nuget/sigit/` bundles all six binaries under
+.NET tool is a single package, so `packaging/nuget/sigit/` bundles all six binaries under
 `native/<os>-<arch>/` and a small managed shim (`Program.cs`) execs the right one. That shim leaves
 stdin/stdout/stderr unredirected on purpose, since siGit Code chooses TUI or ACP mode by testing
 whether stdin is a TTY. It also sets `RollForward=Major`: it targets `net8.0`, and without that a

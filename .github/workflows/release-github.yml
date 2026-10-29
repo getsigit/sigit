@@ -194,7 +194,7 @@ jobs:
           fi
 
           envsubst '${PKG_ARCH} ${PKG_VERSION} ${PKG_BINARY}' \
-            < packaging/nfpm.yaml > /tmp/nfpm.rendered.yaml
+            < packaging/linux/nfpm.yaml > /tmp/nfpm.rendered.yaml
 
           /tmp/nfpm package --config /tmp/nfpm.rendered.yaml --packager deb --target ./release/
           /tmp/nfpm package --config /tmp/nfpm.rendered.yaml --packager rpm --target ./release/
