@@ -531,8 +531,7 @@ mod tui {
     use crate::session_store::SessionEntry;
     use crate::splash::{self, Phase, Splash, Wordmark};
     use crate::startup::{
-        self, Check, Checks, Report, account_check, models_check, tools_check,
-        workspace_check,
+        self, Check, Checks, Report, account_check, models_check, tools_check, workspace_check,
     };
     use ratatui::{
         Frame,
