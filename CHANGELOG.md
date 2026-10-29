@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`sigit run --model <tier>` picks the siGit Code Cloud tier for a headless run.** Headless
+  runs always used the default tier, so when that tier was unavailable a script or sandbox
+  runner had no way to pick another without pointing the custom-endpoint override at siGit Code
+  Cloud. The flag takes a tier name (`prism`) or its model id (`onde-prism`) and wins over the
+  provider override and the local-inference setting.
+
 ## 1.7.6
 
 A background-task tool for long commands, model pickers grouped by where the
