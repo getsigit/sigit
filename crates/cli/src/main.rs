@@ -433,6 +433,18 @@ fn tool_arguments_content(arguments_json: &str) -> ToolCallContent {
     fenced_code_block(language, &chat::pretty_tool_arguments(arguments_json)).into()
 }
 
+/// A skill description cut to one line of about 100 characters, so a client's
+/// command popup stays readable.
+fn one_line_description(description: &str) -> String {
+    const MAX: usize = 100;
+    let line = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= MAX {
+        return line;
+    }
+    let cut: String = line.chars().take(MAX - 3).collect();
+    format!("{}...", cut.trim_end())
+}
+
 /// Splits a notice into its title (the first non-empty line) and the body
 /// (everything after it), if there is any.
 fn split_notice(text: &str) -> (String, Option<String>) {
@@ -1883,6 +1895,26 @@ impl SiGitAgent {
                 Some(hint) => with_hint(&command.name, &description, hint),
                 None => AvailableCommand::new(&command.name, &description),
             });
+        }
+
+        // Skills come last, so `/` in the client lists them next to the
+        // commands. A skill sharing a name with a built-in or custom command
+        // is unreachable as `/name` (those win), so it is not advertised.
+        let taken: Vec<String> = commands.iter().map(|c| c.name.to_string()).collect();
+        for skill in skills::discover_skills() {
+            if taken.contains(&skill.name) {
+                log::warn!(
+                    "skill \"{}\" at {} is shadowed by a command of the same name",
+                    skill.name,
+                    skill.dir.display()
+                );
+                continue;
+            }
+            commands.push(with_hint(
+                &skill.name,
+                &one_line_description(&skill.description),
+                "task (optional)",
+            ));
         }
 
         self.send_tool_call_update(
@@ -3532,22 +3564,26 @@ impl SiGitAgent {
             // permission checks.
             Some(SlashCommand::Init) => instructions::INIT_PROMPT.to_string(),
             // A word `parse_slash` didn't recognize might be a user-defined
-            // command (`.sigit/commands/*.md`) — same substitute-and-run-a-
-            // real-turn treatment as `/init`. Only fall back to "unknown
-            // command" once that lookup also misses.
+            // command (`.sigit/commands/*.md`) or a skill — same substitute-
+            // and-run-a-real-turn treatment as `/init`. Only fall back to
+            // "unknown command" once both lookups miss.
             Some(SlashCommand::Unknown(command, argument)) => {
                 match commands::resolve_command(&command) {
                     Some(custom) => commands::render(&custom.body, argument.as_deref()),
-                    None => {
-                        return self
-                            .run_slash(
-                                cx,
-                                session_id,
-                                SlashCommand::Unknown(command, argument),
-                                &cancellation,
-                            )
-                            .await;
-                    }
+                    // Then a skill: `/<skill-name> [task]` activates it.
+                    None => match skills::slash_prompt(&command, argument.as_deref()) {
+                        Some(prompt) => prompt,
+                        None => {
+                            return self
+                                .run_slash(
+                                    cx,
+                                    session_id,
+                                    SlashCommand::Unknown(command, argument),
+                                    &cancellation,
+                                )
+                                .await;
+                        }
+                    },
                 }
             }
             Some(command) => return self.run_slash(cx, session_id, command, &cancellation).await,
@@ -5696,6 +5732,7 @@ async fn exec_slash_acp(
                      /skills        - list available Agent Skills\n\
                      /agents        - list configured subagent types (.sigit/agents/*.md)\n\
                      /commands      - list user-defined commands (.sigit/commands/*.md)\n\
+                     /<skill-name> [task] - run an Agent Skill, optionally on a task\n\
                      /mcp           - list MCP servers and their tools\n\
                      /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
