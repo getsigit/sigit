@@ -51,5 +51,5 @@ jobs:
           for image in centos:7 debian:12; do
             echo "== ${image}"
             docker run --rm -v "${PWD}/target/${TARGET}/release/sigit:/usr/local/bin/sigit:ro" \
-              "${image}" sh -c 'ldd --version | head -n 1 && sigit --version'
+              "${image}" sh -c 'ldd --version | sed -n 1p && sigit --version'
           done

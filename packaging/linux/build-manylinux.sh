@@ -57,6 +57,6 @@ docker run --rm \
     yum install -y -q perl-core
     curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain "${TOOLCHAIN}"
     export PATH=/cargo/bin:$PATH
-    ldd --version | head -n 1
+    ldd --version | sed -n 1p
     cargo build --locked --release -p sigit --target "${TARGET}"
   '
