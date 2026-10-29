@@ -1,0 +1,55 @@
+name: Linux glibc floor
+
+# The release workflows build the Linux binaries with packaging/linux/build-manylinux.sh so they
+# run on glibc 2.17 and later. A pull request that touches that script, or this file, builds
+# x86_64 the same way, checks the glibc floor, and starts the binary on the oldest and a current
+# glibc, so a broken build script shows up before a release does.
+on:
+  pull_request:
+    paths:
+      - packaging/linux/**
+      - .github/workflows/check-linux-glibc.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    name: Build and check (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: manylinux-${{ env.TARGET }}
+
+      - name: Build Linux binary (glibc 2.17)
+        shell: bash
+        run: ./packaging/linux/build-manylinux.sh "${TARGET}"
+
+      - name: Check Linux binary against the glibc 2.17 floor
+        shell: bash
+        run: ./packaging/linux/check-glibc.sh "target/${TARGET}/release/sigit" 2.17
+
+      # centos:7 is glibc 2.17, the floor itself; debian:12 is a current distro.
+      - name: Run the binary on old and current glibc
+        shell: bash
+        run: |
+          for image in centos:7 debian:12; do
+            echo "== ${image}"
+            docker run --rm -v "${PWD}/target/${TARGET}/release/sigit:/usr/local/bin/sigit:ro" \
+              "${image}" sh -c 'ldd --version | head -n 1 && sigit --version'
+          done

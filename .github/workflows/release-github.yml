@@ -36,9 +36,10 @@ jobs:
       matrix:
         include:
           - name: linux-amd64
-            # Pinned, not ubuntu-latest: the binary links against the build host's
-            # glibc, and v1.7.6 built on a newer image needed GLIBC_2.43, which
-            # Ubuntu 24.04 (2.39, the assurance runner image's base) doesn't have.
+            # Pinned since v1.7.6, which built on a newer ubuntu-latest and needed
+            # GLIBC_2.43. The Linux binaries are now built in manylinux2014 (glibc
+            # 2.17, see packaging/linux/build-manylinux.sh), so the runner's own
+            # glibc no longer reaches the binary.
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - name: linux-arm64
@@ -96,8 +97,21 @@ jobs:
           key: github-${{ matrix.target }}
 
       - name: Build binary
+        if: ${{ !contains(matrix.target, 'linux') }}
         shell: bash
         run: cargo build --locked --release -p sigit --target ${{ matrix.target }}
+
+      # Built in manylinux2014 so the binary runs on glibc 2.17 and later, whatever the runner
+      # has. See packaging/linux/build-manylinux.sh.
+      - name: Build Linux binary (glibc 2.17)
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        run: ./packaging/linux/build-manylinux.sh ${{ matrix.target }}
+
+      - name: Check Linux binary against the glibc 2.17 floor
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        run: ./packaging/linux/check-glibc.sh target/${{ matrix.target }}/release/sigit 2.17
 
       - name: Check Windows binary has no VC++ runtime dependency
         if: contains(matrix.target, 'windows')

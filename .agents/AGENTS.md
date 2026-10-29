@@ -579,6 +579,17 @@ that imports `VCRUNTIME140.dll` fails to load on a machine without the VC++ Redi
 a Windows exe imports the runtime again. Don't set a `RUSTFLAGS` env var in those workflows: it
 replaces the config rustflags instead of adding to them.
 
+The Linux binaries have a glibc 2.17 floor, the same as the PyPI wheels. A plain `cargo build`
+links against the runner's glibc, and v1.7.6 built on a newer `ubuntu-latest` needed GLIBC_2.43,
+so it would not start on Ubuntu 24.04 (#272). `release-github`, `release-npm` and `release-nuget`
+build their Linux rows with `packaging/linux/build-manylinux.sh`, which runs `cargo build` inside
+`quay.io/pypa/manylinux2014_*` (the image release-pypi's maturin already uses), then run
+`packaging/linux/check-glibc.sh` to fail the job if the binary needs anything above 2.17. The
+runner image no longer matters for Linux. `check-linux-glibc.yml` builds x86_64 the same way on
+pull requests that touch `packaging/linux/` and runs the result on `centos:7` and `debian:12`.
+Don't move the Linux builds back to a bare `cargo build` or a job-level `container:` (the
+actions' Node needs glibc 2.28, which CentOS 7 lacks).
+
 Every release asset now carries a `.sha256` sidecar, not just the macOS Homebrew tarball. Scoop,
 winget, and the AUR PKGBUILD each need one, and they consume the raw binaries rather than the
 tarball. `release-github` also builds a `.deb` and `.rpm` per Linux target with nfpm

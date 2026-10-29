@@ -89,8 +89,21 @@ jobs:
           key: nuget-${{ matrix.build.TARGET }}
 
       - name: Build binary
+        if: ${{ !contains(matrix.build.TARGET, 'linux') }}
         shell: bash
         run: cargo build --locked --release -p sigit --target ${{ matrix.build.TARGET }}
+
+      # Built in manylinux2014 so the binary runs on glibc 2.17 and later, whatever the runner
+      # has. See packaging/linux/build-manylinux.sh.
+      - name: Build Linux binary (glibc 2.17)
+        if: contains(matrix.build.TARGET, 'linux')
+        shell: bash
+        run: ./packaging/linux/build-manylinux.sh ${{ matrix.build.TARGET }}
+
+      - name: Check Linux binary against the glibc 2.17 floor
+        if: contains(matrix.build.TARGET, 'linux')
+        shell: bash
+        run: ./packaging/linux/check-glibc.sh target/${{ matrix.build.TARGET }}/release/sigit 2.17
 
       - name: Prepare artifact
         shell: bash
