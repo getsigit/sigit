@@ -70,7 +70,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
 use ed_mcp::{ClientInfo, Connection, ServerSpec};
@@ -179,11 +179,29 @@ struct ServerConn {
     /// How it was reached, kept so an HTTP server can be reconnected.
     def: ServerDef,
     /// The live connection. `None` when the server failed to connect.
-    conn: RwLock<Option<Arc<Connection>>>,
-    /// Tools discovered at startup. Empty when the server failed to connect.
-    tools: Vec<McpTool>,
-    /// Connection error, if the handshake failed. Surfaced by `/mcp`.
-    error: Option<String>,
+    conn: RwLock<Option<Live>>,
+    /// Tools discovered at the last (re)connect. Empty when the server failed
+    /// to connect. Replaced when a reconnect finds a different set.
+    tools: StdRwLock<Vec<McpTool>>,
+    /// Connection error, if the last handshake failed. Surfaced by `/mcp`.
+    error: StdRwLock<Option<String>>,
+}
+
+/// A connection and the session token it was opened with, so a changed sign-in
+/// can be told apart from a connection that is still current.
+struct Live {
+    conn: Arc<Connection>,
+    token: Option<String>,
+}
+
+impl ServerConn {
+    fn tools(&self) -> std::sync::RwLockReadGuard<'_, Vec<McpTool>> {
+        self.tools.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// The process-global MCP state: every configured server.
@@ -325,25 +343,43 @@ impl TransportDef {
 struct ServerDef {
     name: String,
     transport: TransportDef,
+    /// Whether the server authenticates as the signed-in siGit account. Only
+    /// the built-in official server does. Its bearer is read from the stored
+    /// credentials on every (re)connect instead of being fixed at startup.
+    follows_session: bool,
 }
 
 impl ServerDef {
     /// The `ed-mcp` spec for this server. An `Authorization: Bearer` header is
     /// passed as the bearer token, which is how `rmcp` wants it.
-    fn spec(&self) -> ServerSpec {
+    /// The stored session token, for a server that follows the session.
+    fn session_token(&self) -> Option<String> {
+        if self.follows_session {
+            crate::credentials::load_token()
+        } else {
+            None
+        }
+    }
+
+    fn spec_with(&self, session_token: Option<&str>) -> ServerSpec {
         match &self.transport {
             TransportDef::Http { url, headers } => {
-                headers
-                    .iter()
-                    .fold(
-                        ServerSpec::http(&self.name, url),
-                        |spec, (key, value)| match value.strip_prefix("Bearer ") {
-                            Some(token) if key.eq_ignore_ascii_case("authorization") => {
-                                spec.with_bearer(token)
-                            }
-                            _ => spec.with_header(key, value),
-                        },
-                    )
+                let spec =
+                    headers
+                        .iter()
+                        .fold(
+                            ServerSpec::http(&self.name, url),
+                            |spec, (key, value)| match value.strip_prefix("Bearer ") {
+                                Some(token) if key.eq_ignore_ascii_case("authorization") => {
+                                    spec.with_bearer(token)
+                                }
+                                _ => spec.with_header(key, value),
+                            },
+                        );
+                match session_token {
+                    Some(token) => spec.with_bearer(token),
+                    None => spec,
+                }
             }
             TransportDef::Stdio { command, args, env } => {
                 ServerSpec::stdio(&self.name, command, args.clone(), env.clone())
@@ -446,7 +482,14 @@ fn load_configs() -> Vec<ServerDef> {
                     continue;
                 }
             };
-            upsert(&mut defs, ServerDef { name, transport });
+            upsert(
+                &mut defs,
+                ServerDef {
+                    name,
+                    transport,
+                    follows_session: false,
+                },
+            );
         }
     }
 
@@ -463,16 +506,13 @@ fn load_configs() -> Vec<ServerDef> {
     // Add the baked-in official server, but never clobber a user-defined entry
     // named `sigit` — an explicit config (e.g. a custom URL or headers) wins.
     if include_official && !defs.iter().any(|d| d.name == OFFICIAL_SERVER_NAME) {
-        let mut headers = Vec::new();
-        if let Some(token) = crate::credentials::load_token() {
-            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
-        }
         defs.push(ServerDef {
             name: OFFICIAL_SERVER_NAME.to_string(),
             transport: TransportDef::Http {
                 url: official_url(),
-                headers,
+                headers: Vec::new(),
             },
+            follows_session: true,
         });
     }
 
@@ -499,6 +539,7 @@ fn load_configs() -> Vec<ServerDef> {
                     args: vec!["--mcp".to_string()],
                     env: Vec::new(),
                 },
+                follows_session: false,
             });
         } else {
             log::debug!("mcp: `{SMBCLOUD_COMMAND}` not on PATH; skipping the smbcloud server");
@@ -529,6 +570,7 @@ fn load_configs() -> Vec<ServerDef> {
                     args: vec!["--mcp".to_string()],
                     env: Vec::new(),
                 },
+                follows_session: false,
             });
         } else {
             log::debug!("mcp: `{ASCAPI_COMMAND}` not on PATH; skipping the Ascapi server");
@@ -588,12 +630,12 @@ pub async fn init() {
     let servers = futures::future::join_all(load_configs().into_iter().map(connect)).await;
 
     for server in &servers {
-        match &server.error {
+        match server.error() {
             Some(error) => log::warn!("mcp: server '{}' unavailable: {error}", server.name),
             None => log::info!(
                 "mcp: server '{}' ready, {} tool(s)",
                 server.name,
-                server.tools.len()
+                server.tools().len()
             ),
         }
     }
@@ -610,21 +652,34 @@ fn client_info() -> ClientInfo {
 /// `ServerConn`; failures land in its `error` field rather than propagating.
 async fn connect(def: ServerDef) -> ServerConn {
     let endpoint = def.transport.endpoint();
-    let (conn, tools, error) =
-        match Connection::connect(&def.spec(), &client_info(), HANDSHAKE_TIMEOUT).await {
-            Ok(conn) => {
-                let tools = server_tools(&def.name, &conn);
-                (Some(Arc::new(conn)), tools, None)
-            }
-            Err(error) => (None, Vec::new(), Some(format!("{error:#}"))),
-        };
+    let token = def.session_token();
+    let (live, tools, error) = match Connection::connect(
+        &def.spec_with(token.as_deref()),
+        &client_info(),
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(conn) => {
+            let tools = server_tools(&def.name, &conn);
+            (
+                Some(Live {
+                    conn: Arc::new(conn),
+                    token,
+                }),
+                tools,
+                None,
+            )
+        }
+        Err(error) => (None, Vec::new(), Some(format!("{error:#}"))),
+    };
     ServerConn {
         name: def.name.clone(),
         endpoint,
         def,
-        conn: RwLock::new(conn),
-        tools,
-        error,
+        conn: RwLock::new(live),
+        tools: StdRwLock::new(tools),
+        error: StdRwLock::new(error),
     }
 }
 
@@ -744,30 +799,35 @@ pub async fn connect_session_servers(servers: Vec<ClientServer>) -> SessionServe
         if name.is_empty() || taken.contains(&name) {
             clashes.push(ServerConn {
                 endpoint: transport.endpoint(),
-                error: Some(if name.is_empty() {
+                error: StdRwLock::new(Some(if name.is_empty() {
                     "the client sent a server with no name".to_string()
                 } else {
                     format!("another MCP server is already named '{name}'")
-                }),
+                })),
                 def: ServerDef {
                     name: name.clone(),
                     transport,
+                    follows_session: false,
                 },
                 conn: RwLock::new(None),
-                tools: Vec::new(),
+                tools: StdRwLock::new(Vec::new()),
                 name,
             });
             continue;
         }
         taken.push(name.clone());
-        defs.push(ServerDef { name, transport });
+        defs.push(ServerDef {
+            name,
+            transport,
+            follows_session: false,
+        });
     }
 
     let mut connected = futures::future::join_all(defs.into_iter().map(connect)).await;
     connected.extend(clashes);
 
     for server in &connected {
-        match &server.error {
+        match server.error() {
             Some(error) => log::warn!(
                 "mcp: client-supplied server '{}' unavailable: {error}",
                 server.name
@@ -775,7 +835,7 @@ pub async fn connect_session_servers(servers: Vec<ClientServer>) -> SessionServe
             None => log::info!(
                 "mcp: client-supplied server '{}' ready, {} tool(s)",
                 server.name,
-                server.tools.len()
+                server.tools().len()
             ),
         }
     }
@@ -809,7 +869,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     let startup = MCP.get().map(|mcp| mcp.servers.as_slice()).unwrap_or(&[]);
     let mut specs = Vec::new();
     for server in startup.iter().chain(session.0.iter()) {
-        for tool in &server.tools {
+        for tool in server.tools().iter() {
             specs.push(ToolSpec {
                 name: tool.full_name.clone(),
                 description: tool.description.clone(),
@@ -830,11 +890,11 @@ pub async fn call_tool(full_name: &str, arguments: &str) -> String {
         return "Error: MCP is not initialized.".to_string();
     }
 
-    let Some((server, tool)) = startup.iter().chain(session.0.iter()).find_map(|s| {
-        s.tools
+    let Some((server, remote_name)) = startup.iter().chain(session.0.iter()).find_map(|s| {
+        s.tools()
             .iter()
             .find(|t| t.full_name == full_name)
-            .map(|t| (s, t))
+            .map(|t| (s, t.remote_name.clone()))
     }) else {
         return format!("Error: unknown MCP tool \"{full_name}\".");
     };
@@ -851,7 +911,7 @@ pub async fn call_tool(full_name: &str, arguments: &str) -> String {
         }
     };
 
-    match call_server(server, &tool.remote_name, args).await {
+    match call_server(server, &remote_name, args).await {
         Ok(text) => truncate(text),
         Err(error) => format!("Error: {error}"),
     }
@@ -875,7 +935,20 @@ async fn call_server(
     } else {
         "server"
     };
-    let Some(conn) = server.conn.read().await.clone() else {
+    // Reconnect before sending if the signed-in account changed, so a call is
+    // never made with the previous account's bearer.
+    if server.session_changed().await
+        && let Err(error) = reconnect(server).await
+    {
+        return Err(format!("{kind} '{}': {error}", server.name));
+    }
+    let Some(conn) = server
+        .conn
+        .read()
+        .await
+        .as_ref()
+        .map(|live| live.conn.clone())
+    else {
         return Err(format!("{kind} '{}' is not connected", server.name));
     };
     let result = match conn.call_tool(remote_name, args.clone(), timeout).await {
@@ -885,16 +958,12 @@ async fn call_server(
         }
         Err(error) => {
             log::info!("mcp: '{}' failed ({error:#}); reconnecting", server.name);
-            let fresh = Connection::connect(&server.def.spec(), &client_info(), HANDSHAKE_TIMEOUT)
-                .await
-                .map(Arc::new)
-                .map_err(|again| {
-                    format!(
-                        "server '{}': {error:#}; reconnecting failed: {again:#}",
-                        server.name
-                    )
-                })?;
-            *server.conn.write().await = Some(fresh.clone());
+            let fresh = reconnect(server).await.map_err(|again| {
+                format!(
+                    "server '{}': {error:#}; reconnecting failed: {again}",
+                    server.name
+                )
+            })?;
             fresh
                 .call_tool(remote_name, args, timeout)
                 .await
@@ -902,6 +971,78 @@ async fn call_server(
         }
     };
     Ok(render_tool_result(&result))
+}
+
+impl ServerConn {
+    /// Whether this server follows the signed-in account and the stored token
+    /// is no longer the one its connection was opened with (or it has none).
+    async fn session_changed(&self) -> bool {
+        if !self.def.follows_session {
+            return false;
+        }
+        let current = crate::credentials::load_token();
+        match self.conn.read().await.as_ref() {
+            Some(live) => live.token != current,
+            None => true,
+        }
+    }
+}
+
+/// Open a fresh connection with the current spec and swap it in, along with
+/// the tools it lists and the handshake outcome.
+async fn reconnect(server: &ServerConn) -> Result<Arc<Connection>, String> {
+    let token = server.def.session_token();
+    let result = Connection::connect(
+        &server.def.spec_with(token.as_deref()),
+        &client_info(),
+        HANDSHAKE_TIMEOUT,
+    )
+    .await;
+    match result {
+        Ok(conn) => {
+            let conn = Arc::new(conn);
+            *server.tools.write().unwrap_or_else(|e| e.into_inner()) =
+                server_tools(&server.name, &conn);
+            *server.error.write().unwrap_or_else(|e| e.into_inner()) = None;
+            *server.conn.write().await = Some(Live {
+                conn: conn.clone(),
+                token,
+            });
+            Ok(conn)
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            // Drop the old connection: it carries a bearer that no longer
+            // matches the stored account.
+            if server.def.follows_session {
+                *server.conn.write().await = None;
+                server
+                    .tools
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+            }
+            *server.error.write().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
+            Err(message)
+        }
+    }
+}
+
+/// Reconnect the official server if the stored sign-in changed since it
+/// connected, so its tool list and `/mcp` entry update right away. No-op when
+/// MCP isn't initialized or the token is unchanged.
+pub async fn refresh_session_auth() {
+    let Some(mcp) = MCP.get() else {
+        return;
+    };
+    for server in mcp.servers.iter().filter(|s| s.def.follows_session) {
+        if server.session_changed().await {
+            log::info!("mcp: '{}' sign-in changed; reconnecting", server.name);
+            if let Err(error) = reconnect(server).await {
+                log::warn!("mcp: server '{}' unavailable: {error}", server.name);
+            }
+        }
+    }
 }
 
 /// Flatten an MCP `tools/call` result into text. Joins text content blocks;
@@ -993,8 +1134,8 @@ pub fn overview() -> Option<Overview> {
     let mcp = MCP.get()?;
     Some(Overview {
         servers: mcp.servers.len(),
-        tools: mcp.servers.iter().map(|s| s.tools.len()).sum(),
-        unavailable: mcp.servers.iter().filter(|s| s.error.is_some()).count(),
+        tools: mcp.servers.iter().map(|s| s.tools().len()).sum(),
+        unavailable: mcp.servers.iter().filter(|s| s.error().is_some()).count(),
     })
 }
 
@@ -1002,7 +1143,7 @@ pub fn overview() -> Option<Overview> {
 /// session's client supplied, which are marked as such.
 fn summarize_servers(startup: &[ServerConn], session: &[ServerConn]) -> String {
     let all = || startup.iter().chain(session.iter());
-    let total_tools: usize = all().map(|s| s.tools.len()).sum();
+    let total_tools: usize = all().map(|s| s.tools().len()).sum();
     let mut lines = vec![format!(
         "{} MCP server(s), {total_tools} tool(s) available:",
         all().count()
@@ -1013,7 +1154,7 @@ fn summarize_servers(startup: &[ServerConn], session: &[ServerConn]) -> String {
         } else {
             ""
         };
-        match &server.error {
+        match server.error() {
             Some(error) => lines.push(format!(
                 "- {} ({}{origin}) — unavailable: {error}",
                 server.name, server.endpoint
@@ -1023,9 +1164,9 @@ fn summarize_servers(startup: &[ServerConn], session: &[ServerConn]) -> String {
                     "- {} ({}{origin}) — {} tool(s)",
                     server.name,
                     server.endpoint,
-                    server.tools.len()
+                    server.tools().len()
                 ));
-                for tool in &server.tools {
+                for tool in server.tools().iter() {
                     lines.push(format!("    • {}", tool.full_name));
                 }
             }
@@ -1256,6 +1397,7 @@ mod tests {
                 url: "u1".into(),
                 headers: vec![],
             },
+            follows_session: false,
         }];
         upsert(
             &mut defs,
@@ -1265,6 +1407,7 @@ mod tests {
                     url: "u2".into(),
                     headers: vec![],
                 },
+                follows_session: false,
             },
         );
         assert_eq!(defs.len(), 1);
@@ -1314,5 +1457,54 @@ mod tests {
     fn tool_specs_empty_before_init() {
         // Without init() the global is unset; this must not panic.
         assert!(super::tool_specs().is_empty() || MCP.get().is_some());
+    }
+
+    #[test]
+    fn the_official_server_follows_the_session_without_a_static_header() {
+        let defs = load_configs();
+        let Some(official) = defs.iter().find(|d| d.name == OFFICIAL_SERVER_NAME) else {
+            // SIGIT_MCP or SIGIT_MCP_OFFICIAL is set in this environment.
+            return;
+        };
+        assert!(official.follows_session);
+        match &official.transport {
+            TransportDef::Http { headers, .. } => assert!(
+                !headers
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case("authorization"))
+            ),
+            TransportDef::Stdio { .. } => panic!("the official server is HTTP"),
+        }
+    }
+
+    #[test]
+    fn a_user_defined_sigit_entry_keeps_its_header_and_does_not_follow() {
+        let file: McpFile = toml::from_str(
+            r#"
+            [[server]]
+            name = "sigit"
+            url = "https://example.com/mcp"
+            headers = { Authorization = "Bearer static" }
+            "#,
+        )
+        .unwrap();
+        let entry = &file.server[0];
+        let mut defs = Vec::new();
+        upsert(
+            &mut defs,
+            ServerDef {
+                name: sanitize(&entry.name),
+                transport: entry.transport_def().unwrap(),
+                follows_session: false,
+            },
+        );
+        assert!(!defs[0].follows_session);
+        assert_eq!(defs[0].session_token(), None);
+        match &defs[0].transport {
+            TransportDef::Http { headers, .. } => {
+                assert_eq!(headers[0].1, "Bearer static");
+            }
+            TransportDef::Stdio { .. } => panic!("expected HTTP"),
+        }
     }
 }
