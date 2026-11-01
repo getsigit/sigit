@@ -7,6 +7,8 @@ two targets.
 
 - The Actions runner at `/opt/actions-runner`, pinned by version and sha256. Bump
   `RUNNER_VERSION` and `RUNNER_SHA256` together; the digest is in the release notes.
+  Node is pinned the same way (`NODE_VERSION` with `NODE_SHA256` from `SHASUMS256.txt`),
+  and pnpm to an exact version.
 - git, node, pnpm, jq, gh, python3 and a C toolchain.
 - systemd as init. The microVM boots it, and the guest agent that talks to the host is installed
   as a unit when the root filesystem is baked.

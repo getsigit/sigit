@@ -29,7 +29,9 @@ ARG RUNNER_VERSION=2.338.2
 # sha256 of actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz, from the release notes.
 ARG RUNNER_SHA256=baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
 ARG NODE_VERSION=24.12.0
-ARG PNPM_VERSION=10
+# sha256 of node-v${NODE_VERSION}-linux-x64.tar.xz, from SHASUMS256.txt in the same dist directory.
+ARG NODE_SHA256=bdebee276e58d0ef5448f3d5ac12c67daa963dd5e0a9bb621a53d1cefbc852fd
+ARG PNPM_VERSION=10.34.9
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -52,10 +54,14 @@ RUN install -d -m 0755 /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Node from nodejs.org, then pnpm.
-RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
-        | tar -xJ -C /usr/local --strip-components=1 \
-    && npm install -g "pnpm@${PNPM_VERSION}"
+# Node from nodejs.org, checked against its published digest, then pnpm at an exact version.
+RUN set -eu; \
+    curl -fsSL --retry 2 -o /tmp/node.tar.xz \
+        "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"; \
+    echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c -; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1; \
+    rm /tmp/node.tar.xz; \
+    npm install -g "pnpm@${PNPM_VERSION}"
 
 # The Actions runner, checked against the published digest, with its system dependencies. The
 # runner refuses to start as root unless RUNNER_ALLOW_RUNASROOT is set; the host sets it, since
