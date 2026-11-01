@@ -5,7 +5,7 @@
 #
 # Two targets share one base:
 #
-#   actions-runner  runner, git, node, pnpm, jq, gh   (the default)
+#   actions-runner     runner, git, node, pnpm, jq, gh   (the default)
 #   actions-runner-qa  the above plus browsers, a virtual display and tauri-driver
 #
 #   docker build --target actions-runner    -t actions-runner    packaging/actions-runner
