@@ -196,17 +196,37 @@ jobs:
           EOF
           )
 
-          ISSUE_URL=$(gh issue create \
-            --repo microsoft/winget-pkgs \
-            --title "[Package Request]: ${PACKAGE_IDENTIFIER} ${VERSION}" \
-            --body "$ISSUE_BODY")
+          TITLE="[Package Request]: ${PACKAGE_IDENTIFIER} ${VERSION}"
 
-          echo "Opened issue ${ISSUE_URL}"
+          # A rerun after a later step failed would otherwise file a second
+          # request for the same version (1.7.7 ended up with three). Reuse
+          # this account's open one if there is one. The search only narrows
+          # it down, the jq match on the exact title decides. If the lookup
+          # itself fails, set -e stops here rather than filing a duplicate.
+          ISSUE_URL=$(gh issue list \
+            --repo microsoft/winget-pkgs \
+            --author @me --state open \
+            --search "\"${TITLE}\" in:title" \
+            --json title,url \
+            --jq "map(select(.title == \"${TITLE}\")) | first | .url // empty")
+
+          if [ -n "$ISSUE_URL" ]; then
+            echo "Reusing open issue ${ISSUE_URL}"
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            ISSUE_URL=$(gh issue create \
+              --repo microsoft/winget-pkgs \
+              --title "$TITLE" \
+              --body "$ISSUE_BODY")
+            echo "Opened issue ${ISSUE_URL}"
+          fi
+
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
           echo "issue_number=${ISSUE_URL##*/}" >> "$GITHUB_OUTPUT"
 
       - name: Sebat dulu ...
-        if: steps.issue.outputs.issue_number != ''
+        # Only after a freshly filed issue. A reused one is already old.
+        if: steps.issue.outputs.issue_number != '' && steps.issue.outputs.reused != 'true'
         shell: bash
         run: sleep $(( RANDOM % 61 + 150 ))
 

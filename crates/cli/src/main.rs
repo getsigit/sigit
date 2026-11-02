@@ -2391,6 +2391,7 @@ impl SiGitAgent {
         match outcome {
             Ok(email) => {
                 log::info!("authenticate: signed in as {email}");
+                mcp::refresh_session_auth().await;
                 Ok(AuthenticateResponse::default())
             }
             Err(reason) => Err(agent_client_protocol::Error::new(
@@ -2420,6 +2421,7 @@ impl SiGitAgent {
     /// message to show. Shared by ACP `logout` and the `/logout` command.
     async fn sign_out(&self, cx: &ConnectionTo<Client>) -> String {
         let message = account::end_session().await;
+        mcp::refresh_session_auth().await;
         let local = default_local_model_config();
         for key in self.leave_cloud(&local).await {
             let config_options = build_config_options(&local, &key);
@@ -4487,6 +4489,8 @@ impl SiGitAgent {
     /// picked up), retries a failed model load, and pushes refreshed commands +
     /// picker so the editor's UI reflects the current state.
     async fn handle_reload(&self, cx: &ConnectionTo<Client>, session_id: SessionId) {
+        // A `sigit login` from another terminal may have changed the account.
+        mcp::refresh_session_auth().await;
         let signed_in = account::status_line().await;
 
         let on_cloud_tier = {
@@ -5986,6 +5990,7 @@ async fn exec_slash_acp(
                     .await
                     .unwrap_or_else(|message| message),
             };
+            mcp::refresh_session_auth().await;
             agent.send_assistant_message(cx, session_id, message).ok();
         }
         SlashCommand::Logout => {

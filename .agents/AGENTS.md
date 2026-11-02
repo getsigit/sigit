@@ -576,6 +576,13 @@ request touching the image builds it without pushing. One-time setup on the pack
 public (the Fireactions hosts pull it without credentials), and under "Manage Actions access"
 getsigit/sigit has write access.
 
+`release-actions-runner-image` builds `ghcr.io/getsigit/actions-runner` and
+`ghcr.io/getsigit/actions-runner-qa` from `packaging/actions-runner/Dockerfile`, the guest images
+for GitHub Actions jobs that run in a microVM. A push to `development` that touches that directory
+publishes both as `:latest` and `:<sha>`; a pull request builds them without pushing. It is not
+part of the release fan-out, because the images hold no `sigit`. They hold no secrets either. Each
+package needs the same one-time setup: public, with write access for getsigit/sigit.
+
 The Windows binaries link the MSVC C runtime statically (`+crt-static` in `.cargo/config.toml`).
 winget, Scoop, npm, PyPI and NuGet all ship the bare exe with no installer, so a dynamic build
 that imports `VCRUNTIME140.dll` fails to load on a machine without the VC++ Redistributable

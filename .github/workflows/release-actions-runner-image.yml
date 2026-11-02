@@ -1,0 +1,83 @@
+name: Release Actions runner image
+
+# Builds the guest images for GitHub Actions jobs that run in a microVM:
+# ghcr.io/getsigit/actions-runner and ghcr.io/getsigit/actions-runner-qa. Only
+# development publishes: a push that touches the image, or a manual run on that
+# branch. A pull request or a manual run on another branch builds without
+# pushing, so a broken Dockerfile shows up before merge.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - development
+    paths:
+      - packaging/actions-runner/**
+      - .github/workflows/release-actions-runner-image.yml
+  pull_request:
+    paths:
+      - packaging/actions-runner/**
+      - .github/workflows/release-actions-runner-image.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - actions-runner
+          - actions-runner-qa
+
+    env:
+      IMAGE: ghcr.io/getsigit/${{ matrix.target }}
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/development' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve tags
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${PUBLISH}" == "true" ]]; then
+            {
+              echo "tags<<EOF"
+              echo "${IMAGE}:latest"
+              echo "${IMAGE}:$(git rev-parse HEAD)"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: packaging/actions-runner
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}

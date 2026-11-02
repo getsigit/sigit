@@ -3162,10 +3162,12 @@ mod tui {
                         crate::browser_login_message().await
                     }
                 };
+                crate::mcp::refresh_session_auth().await;
                 app.finish_login(result);
             }
             SlashCommand::Logout => {
                 let message = crate::account::end_session().await;
+                crate::mcp::refresh_session_auth().await;
                 app.messages.push(ChatMessage::system(message));
             }
             SlashCommand::Whoami => {
