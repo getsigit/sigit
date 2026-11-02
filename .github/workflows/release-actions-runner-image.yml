@@ -1,10 +1,10 @@
 name: Release Actions runner image
 
 # Builds the guest images for GitHub Actions jobs that run in a microVM:
-# ghcr.io/getsigit/actions-runner and ghcr.io/getsigit/actions-runner-qa. A push
-# to development that touches the image publishes both. A pull request that
-# touches it builds them without pushing, so a broken Dockerfile shows up before
-# merge.
+# ghcr.io/getsigit/actions-runner and ghcr.io/getsigit/actions-runner-qa. Only
+# development publishes: a push that touches the image, or a manual run on that
+# branch. A pull request or a manual run on another branch builds without
+# pushing, so a broken Dockerfile shows up before merge.
 on:
   workflow_dispatch:
   push:
@@ -41,7 +41,7 @@ jobs:
 
     env:
       IMAGE: ghcr.io/getsigit/${{ matrix.target }}
-      PUBLISH: ${{ github.event_name != 'pull_request' }}
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/development' }}
 
     steps:
       - name: Checkout
@@ -59,7 +59,7 @@ jobs:
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
-            echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "tags=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: docker/setup-buildx-action@v4
