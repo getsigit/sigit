@@ -531,7 +531,7 @@ async fn run_prompt(
 
             // The headless deny set outranks everything, including a
             // settings-level allow and a --allow-tool grant for the same name.
-            let output = if blocked_by_flags(&denied, config.mcp_tools_only, &tc.name) {
+            let output = if blocked_by_flags(denied, config.mcp_tools_only, &tc.name) {
                 log::info!("headless: {} blocked by the tool flags", tc.name);
                 deny_flag_denial(&tc.name)
             } else {
