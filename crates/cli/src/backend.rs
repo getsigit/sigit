@@ -3650,11 +3650,16 @@ mod tests {
         backend.compact_history(2).await.unwrap();
 
         let history = backend.history_snapshot().await;
-        assert_eq!(count_content(&history, &pin), 0, "pin should be dropped: {}", history.len());
+        assert_eq!(
+            count_content(&history, &pin),
+            0,
+            "pin should be dropped: {}",
+            history.len()
+        );
         assert!(
-            history
-                .iter()
-                .any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[Conversation summary]"))),
+            history.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("[Conversation summary]"))),
             "summary should be kept: {history:?}"
         );
         assert!(
