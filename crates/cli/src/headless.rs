@@ -30,7 +30,7 @@ use crate::{permissions, provider, session_store, settings, tools};
 pub const USAGE: &str = "Usage: sigit run \"<prompt>\" [--cwd <dir>] [--add-dir <dir>]... \
                          [--output text|jsonl] [--quiet] [--resume <session-id>] \
                          [--allow-tool <name>]... [--deny-tool <name>]... \
-                         [--max-tool-rounds <n>] [--model <tier>]\n       \
+                         [--mcp-tools-only] [--max-tool-rounds <n>] [--model <tier>]\n       \
                          sigit -p \"<prompt>\" [same options]";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +63,8 @@ pub struct HeadlessConfig {
     pub allow_tools: Vec<String>,
     /// Tools blocked for the run, overriding even settings-level allow.
     pub deny_tools: Vec<String>,
+    /// Block every tool that is not provided by an MCP server (`mcp__<server>__<tool>`).
+    pub mcp_tools_only: bool,
     /// How many rounds of tool calls the run may make before the model is
     /// asked for its final message. `--max-tool-rounds`, else
     /// `SIGIT_MAX_TOOL_ROUNDS`, else the built-in cap.
@@ -149,6 +151,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
     let mut resume_session: Option<String> = None;
     let mut allow_tools: Vec<String> = Vec::new();
     let mut deny_tools: Vec<String> = Vec::new();
+    let mut mcp_tools_only = false;
     let mut max_tool_rounds: Option<usize> = None;
     let mut cloud_tier: Option<&'static str> = None;
 
@@ -209,6 +212,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
                     .ok_or_else(|| "--deny-tool requires a tool name".to_string())?;
                 deny_tools.push(value.clone());
             }
+            "--mcp-tools-only" => mcp_tools_only = true,
             "--max-tool-rounds" => {
                 let value = iter
                     .next()
@@ -276,6 +280,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
         output,
         allow_tools,
         deny_tools,
+        mcp_tools_only,
         max_tool_rounds,
         cloud_tier,
     }))
@@ -305,10 +310,17 @@ fn not_preapproved_denial(tool_name: &str) -> String {
     )
 }
 
-/// Denial fed to the model when a tool was blocked with `--deny-tool`.
+/// Whether the command-line flags block a tool: it is named by `--deny-tool`, or
+/// `--mcp-tools-only` is set and it does not come from an MCP server.
+fn blocked_by_flags(denied: &HashSet<&str>, mcp_tools_only: bool, tool_name: &str) -> bool {
+    denied.contains(tool_name) || (mcp_tools_only && !tool_name.starts_with("mcp__"))
+}
+
+/// Denial fed to the model when a tool was blocked with `--deny-tool` or
+/// `--mcp-tools-only`.
 fn deny_flag_denial(tool_name: &str) -> String {
     format!(
-        "`{tool_name}` is blocked for this headless run (--deny-tool). Do not retry it; \
+        "`{tool_name}` is blocked for this headless run (--deny-tool or --mcp-tools-only). Do not retry it; \
          continue without this tool or report what remains to be done."
     )
 }
@@ -519,8 +531,8 @@ async fn run_prompt(
 
             // The headless deny set outranks everything, including a
             // settings-level allow and a --allow-tool grant for the same name.
-            let output = if denied.contains(tc.name.as_str()) {
-                log::info!("headless: {} blocked by --deny-tool", tc.name);
+            let output = if blocked_by_flags(denied, config.mcp_tools_only, &tc.name) {
+                log::info!("headless: {} blocked by the tool flags", tc.name);
                 deny_flag_denial(&tc.name)
             } else {
                 match permissions::decision_for(&config.session_id, &tc.name, &tc.arguments) {
@@ -787,6 +799,22 @@ mod tests {
         assert_eq!(config.output, OutputFormat::Text);
         assert_eq!(config.allow_tools, vec!["run_command", "edit_file"]);
         assert_eq!(config.deny_tools, vec!["delete_file"]);
+        assert!(!config.mcp_tools_only);
+    }
+
+    #[test]
+    fn mcp_tools_only_blocks_everything_but_mcp_tools() {
+        let config = parse_args(&args(&["-p", "x", "--mcp-tools-only"]))
+            .unwrap()
+            .unwrap();
+        assert!(config.mcp_tools_only);
+        let denied: HashSet<&str> = HashSet::new();
+        assert!(blocked_by_flags(&denied, true, "run_command"));
+        assert!(blocked_by_flags(&denied, true, "read_file"));
+        assert!(!blocked_by_flags(&denied, true, "mcp__xcrs__ui_tap"));
+        assert!(!blocked_by_flags(&denied, false, "run_command"));
+        let denied: HashSet<&str> = ["mcp__xcrs__ui_tap"].into_iter().collect();
+        assert!(blocked_by_flags(&denied, true, "mcp__xcrs__ui_tap"));
     }
 
     #[test]

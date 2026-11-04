@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.7.8
+
+A headless mode that exposes only MCP tools, and a fix for the official MCP
+server after an account change. No protocol change, so an editor sees a
+1.7.7-shaped agent.
+
+### Added
+
+- **`sigit run -p ... --mcp-tools-only` runs headless with MCP tools only.** The
+  built-in tools are not offered to the model, so a script or sandbox runner
+  can limit a run to the tools its MCP servers provide.
+
+### Fixed
+
+- **The official MCP server reconnects when the signed-in account changes.**
+  Before, a session kept the connection opened under the previous account until
+  siGit Code restarted.
+
+### Changed
+
+- Linux release binaries are built against glibc 2.17 on ubuntu-24.04, so they
+  run on older distributions.
+- The npm, PyPI and NuGet wrappers moved under `packaging/`.
+- The winget job reuses an open Package Request and fails on an unexpected
+  status instead of filing another.
+- The Actions, Code Assurance and QA runner images are built and published from
+  this repository.
+
 ## 1.7.7
 
 A launch splash for the terminal, and a way to pick the cloud tier for a
