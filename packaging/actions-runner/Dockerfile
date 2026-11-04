@@ -6,7 +6,7 @@
 # Two targets share one base:
 #
 #   actions-runner     runner, git, node, pnpm, jq, gh   (the default)
-#   actions-runner-qa  the above plus browsers, a virtual display and tauri-driver
+#   actions-runner-qa  the above plus browsers, a virtual display, tauri-driver and xcrs
 #
 #   docker build --target actions-runner    -t actions-runner    packaging/actions-runner
 #   docker build --target actions-runner-qa -t actions-runner-qa packaging/actions-runner
@@ -19,6 +19,13 @@ ARG BASE=ubuntu:24.04
 # tauri-driver is cargo-only; build it here and copy the binary so the guest has no Rust.
 FROM rust:1-bookworm AS tauri-driver
 RUN cargo install tauri-driver --locked --root /out
+
+# xcrs is the MCP server the QA agent drives the app through. It is built from a pinned commit of
+# smbcloud-cli, in the same way, so the guest has no Rust. The commit is the one that adds the
+# desktop target (WebDriver); move it when xcrs changes.
+FROM rust:1-bookworm AS xcrs
+ARG XCRS_REV=571acdba8702f8cb620de4a807326ae0e3e5dd24
+RUN cargo install --git https://github.com/smbcloudXYZ/smbcloud-cli --rev "${XCRS_REV}" xcrs --locked --root /out
 
 FROM ${BASE} AS actions-runner
 
@@ -102,3 +109,4 @@ RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium webki
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tauri-driver /out/bin/tauri-driver /usr/local/bin/tauri-driver
+COPY --from=xcrs /out/bin/xcrs /usr/local/bin/xcrs
