@@ -24,7 +24,7 @@ RUN cargo install tauri-driver --locked --root /out
 # smbcloud-cli, in the same way, so the guest has no Rust. The commit is the one that adds the
 # desktop target (WebDriver); move it when xcrs changes.
 FROM rust:1-bookworm AS xcrs
-ARG XCRS_REV=0315b4635af102300ee58dbf8b9ddb668c666baa
+ARG XCRS_REV=3a2b851ec6a26092d6240edd32a327fe29e81400
 RUN cargo install --git https://github.com/smbcloudXYZ/smbcloud-cli --rev "${XCRS_REV}" xcrs --locked --root /out
 
 FROM ${BASE} AS actions-runner
