@@ -27,6 +27,10 @@ for interactive permission are denied in headless mode unless granted with
 `--allow-tool <name>`. A repeatable `--deny-tool <name>` takes precedence over grants and
 settings.
 
+`--mcp-tools-only` blocks every tool that does not come from an MCP server (names that
+start with `mcp__`), so a run can be limited to the tools of the servers in `mcp.toml`. The
+model still sees the built-in tools listed, and a call to one is refused.
+
 ## Choosing the model
 
 With no flag, a run uses the provider override (`OPENAI_BASE_URL` and `OPENAI_API_KEY`, or the
