@@ -813,13 +813,27 @@ impl InferenceBackend for LocalBackend {
             Ok(result) => {
                 // Local models may reason in <think> blocks; keep only the visible part.
                 let (_think, summary) = crate::chat::strip_think_blocks(&result.text);
-                let mut rebuilt = system;
-                rebuilt.extend(pin);
-                rebuilt.push(ChatMessage::user(format!(
-                    "[Conversation summary]\n{summary}"
-                )));
-                rebuilt.extend(tail);
-                rebuilt
+                let summary_message =
+                    ChatMessage::user(format!("[Conversation summary]\n{summary}"));
+                let mut rebuilt = system.clone();
+                rebuilt.extend(pin.clone());
+                rebuilt.push(summary_message.clone());
+                rebuilt.extend(tail.clone());
+
+                // Drop the pin if it pushes the rebuild over budget, as the
+                // fallback does; otherwise re-pinning it loops compaction every
+                // round. `truncate_chat_messages_to_budget` uses the same
+                // chars-vs-(budget * 4) convention.
+                let budget_chars = DEFAULT_CONTEXT_TOKEN_BUDGET * 4;
+                let rebuilt_chars: usize = rebuilt.iter().map(|m| m.content.len()).sum();
+                if pin.is_some() && rebuilt_chars > budget_chars {
+                    let mut without_pin = system;
+                    without_pin.push(summary_message);
+                    without_pin.extend(tail);
+                    without_pin
+                } else {
+                    rebuilt
+                }
             }
             Err(error) => {
                 log::warn!(
@@ -1961,14 +1975,26 @@ impl InferenceBackend for OpenAiBackend {
             }
         };
 
-        let mut rebuilt = Vec::with_capacity(system.len() + tail.len() + 2);
-        rebuilt.extend(system);
-        rebuilt.extend(pin);
-        rebuilt.push(serde_json::json!({
+        let summary_message = serde_json::json!({
             "role": "user",
             "content": format!("[Conversation summary]\n{summary}"),
-        }));
-        rebuilt.extend(tail);
+        });
+        let mut rebuilt = Vec::with_capacity(system.len() + tail.len() + 2);
+        rebuilt.extend(system.iter().cloned());
+        rebuilt.extend(pin.clone());
+        rebuilt.push(summary_message.clone());
+        rebuilt.extend(tail.iter().cloned());
+
+        // The pin is capped, but a large system prompt or tail can still leave
+        // the rebuild over budget. Re-pinning it every round would loop
+        // compaction, so drop the pin here as the fallback does, keeping the
+        // summary.
+        if pin.is_some() && estimate_tokens(&rebuilt) > DEFAULT_CONTEXT_TOKEN_BUDGET {
+            rebuilt = Vec::with_capacity(system.len() + tail.len() + 1);
+            rebuilt.extend(system);
+            rebuilt.push(summary_message);
+            rebuilt.extend(tail);
+        }
         *self.history.lock().await = rebuilt;
         Ok(())
     }
@@ -3598,6 +3624,43 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("[Conversation summary]")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_drops_the_pin_when_the_rebuild_would_stay_over_budget() {
+        let (addr, _requests) = spawn_completion_stub("a summary");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("sys".into()),
+        );
+        // Pinnable on its own (under the cap), but system + pin + summary + tail
+        // overflows the budget while system + summary + tail fits.
+        let pin = "p".repeat(28_000);
+        {
+            let mut history = backend.history.lock().await;
+            history.push(serde_json::json!({ "role": "user", "content": pin }));
+            history.push(serde_json::json!({ "role": "assistant", "content": "ok" }));
+            history.push(serde_json::json!({ "role": "user", "content": "x".repeat(40_000) }));
+            history.push(serde_json::json!({ "role": "assistant", "content": "y".repeat(40_000) }));
+        }
+
+        backend.compact_history(2).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(count_content(&history, &pin), 0, "pin should be dropped: {}", history.len());
+        assert!(
+            history
+                .iter()
+                .any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("[Conversation summary]"))),
+            "summary should be kept: {history:?}"
+        );
+        assert!(
+            estimate_tokens(&history) <= DEFAULT_CONTEXT_TOKEN_BUDGET,
+            "rebuild should fit the budget, got {}",
+            estimate_tokens(&history)
         );
     }
 
