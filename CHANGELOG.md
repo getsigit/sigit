@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.7.9
+
+Compaction keeps the opening request. No protocol change, so an editor sees a
+1.7.8-shaped agent.
+
+### Changed
+
+- **Compaction keeps the first user message.** When the conversation outgrows
+  the context window and is summarized, the opening request is kept verbatim
+  instead of being folded into the summary, so the task a session started from
+  survives repeated compactions. A first message past a size cap is still
+  summarized like any other, and the pin is dropped when keeping it would leave
+  the rebuilt history over budget, so compaction cannot loop on an oversized
+  pin.
+
 ## 1.7.8
 
 A headless mode that exposes only MCP tools, and a fix for the official MCP

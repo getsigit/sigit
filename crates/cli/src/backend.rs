@@ -782,12 +782,10 @@ impl InferenceBackend for LocalBackend {
             .take_while(|message| message.role == ChatRole::System)
             .cloned()
             .collect();
-        let non_system: Vec<ChatMessage> = snapshot
+        let mut non_system: Vec<ChatMessage> = snapshot
             .into_iter()
             .filter(|message| message.role != ChatRole::System)
             .collect();
-        let tail_start = non_system.len().saturating_sub(keep_last);
-        let tail: Vec<ChatMessage> = non_system[tail_start..].to_vec();
 
         // One plain (tool-free) inference round produces the summary. Note the
         // cap only bounds this request's own payload: the engine still replays
@@ -798,6 +796,13 @@ impl InferenceBackend for LocalBackend {
             &chat_messages_transcript(&non_system),
             SUMMARY_TRANSCRIPT_TOKEN_CAP,
         );
+
+        // Keep the opening request verbatim; the tail is taken from what is
+        // left so the pin is neither duplicated nor counted against `keep_last`.
+        let pin = take_pinned_first_chat_message(&mut non_system);
+        let tail_start = non_system.len().saturating_sub(keep_last);
+        let tail: Vec<ChatMessage> = non_system[tail_start..].to_vec();
+
         let result = self
             .engine
             .send_message(format!("{transcript}\n\n{SUMMARIZE_PROMPT}"))
@@ -808,12 +813,27 @@ impl InferenceBackend for LocalBackend {
             Ok(result) => {
                 // Local models may reason in <think> blocks; keep only the visible part.
                 let (_think, summary) = crate::chat::strip_think_blocks(&result.text);
-                let mut rebuilt = system;
-                rebuilt.push(ChatMessage::user(format!(
-                    "[Conversation summary]\n{summary}"
-                )));
-                rebuilt.extend(tail);
-                rebuilt
+                let summary_message =
+                    ChatMessage::user(format!("[Conversation summary]\n{summary}"));
+                let mut rebuilt = system.clone();
+                rebuilt.extend(pin.clone());
+                rebuilt.push(summary_message.clone());
+                rebuilt.extend(tail.clone());
+
+                // Drop the pin if it pushes the rebuild over budget, as the
+                // fallback does; otherwise re-pinning it loops compaction every
+                // round. `truncate_chat_messages_to_budget` uses the same
+                // chars-vs-(budget * 4) convention.
+                let budget_chars = DEFAULT_CONTEXT_TOKEN_BUDGET * 4;
+                let rebuilt_chars: usize = rebuilt.iter().map(|m| m.content.len()).sum();
+                if pin.is_some() && rebuilt_chars > budget_chars {
+                    let mut without_pin = system;
+                    without_pin.push(summary_message);
+                    without_pin.extend(tail);
+                    without_pin
+                } else {
+                    rebuilt
+                }
             }
             Err(error) => {
                 log::warn!(
@@ -822,7 +842,7 @@ impl InferenceBackend for LocalBackend {
                 // Same deterministic shrink as the remote path, on the plain
                 // chat shapes the engine holds (its history has no tool-call
                 // structure, so there are no orphaned tool results to guard).
-                match truncate_chat_messages_to_budget(system, tail) {
+                match truncate_chat_messages_keeping_pin(system, pin, tail) {
                     Some(rebuilt) => rebuilt,
                     // The system messages alone overflow the window: unrecoverable.
                     None => return Err(error),
@@ -836,6 +856,29 @@ impl InferenceBackend for LocalBackend {
         }
         Ok(())
     }
+}
+
+/// The local counterpart of `take_pinned_first_message`.
+fn take_pinned_first_chat_message(non_system: &mut Vec<ChatMessage>) -> Option<ChatMessage> {
+    let first = non_system.first()?;
+    (first.role == ChatRole::User && is_pinnable_user_content(&first.content))
+        .then(|| non_system.remove(0))
+}
+
+/// The local counterpart of `truncate_history_keeping_pin`.
+fn truncate_chat_messages_keeping_pin(
+    system: Vec<ChatMessage>,
+    pin: Option<ChatMessage>,
+    tail: Vec<ChatMessage>,
+) -> Option<Vec<ChatMessage>> {
+    if let Some(pin) = pin {
+        let mut prefix = system.clone();
+        prefix.push(pin);
+        if let Some(rebuilt) = truncate_chat_messages_to_budget(prefix, tail.clone()) {
+            return Some(rebuilt);
+        }
+    }
+    truncate_chat_messages_to_budget(system, tail)
 }
 
 /// The local counterpart of `truncate_history_to_budget`: system messages, the
@@ -1883,11 +1926,14 @@ impl InferenceBackend for OpenAiBackend {
             .cloned()
             .collect();
 
-        let non_system: Vec<serde_json::Value> = snapshot
+        let mut non_system: Vec<serde_json::Value> = snapshot
             .iter()
             .filter(|message| message["role"] != "system")
             .cloned()
             .collect();
+        // The opening request stays verbatim; the tail is taken from what is
+        // left so the pin is neither duplicated nor counted against `keep_last`.
+        let pin = take_pinned_first_message(&mut non_system);
         let tail_start = non_system.len().saturating_sub(keep_last);
         let mut tail = non_system[tail_start..].to_vec();
         // Drop leading tool results whose assistant tool-call message was
@@ -1922,22 +1968,84 @@ impl InferenceBackend for OpenAiBackend {
                 // a placeholder and drop the oldest messages until the rebuild
                 // fits the budget. Needs no endpoint, so it cannot fail the way
                 // the inference round just did (issue #125).
-                let rebuilt = truncate_history_to_budget(&system, tail.clone()).ok_or(error)?;
+                let rebuilt = truncate_history_keeping_pin(&system, pin.as_ref(), tail.clone())
+                    .ok_or(error)?;
                 *self.history.lock().await = rebuilt;
                 return Ok(());
             }
         };
 
-        let mut rebuilt = Vec::with_capacity(system.len() + tail.len() + 1);
-        rebuilt.extend(system);
-        rebuilt.push(serde_json::json!({
+        let summary_message = serde_json::json!({
             "role": "user",
             "content": format!("[Conversation summary]\n{summary}"),
-        }));
-        rebuilt.extend(tail);
+        });
+        let mut rebuilt = Vec::with_capacity(system.len() + tail.len() + 2);
+        rebuilt.extend(system.iter().cloned());
+        rebuilt.extend(pin.clone());
+        rebuilt.push(summary_message.clone());
+        rebuilt.extend(tail.iter().cloned());
+
+        // The pin is capped, but a large system prompt or tail can still leave
+        // the rebuild over budget. Re-pinning it every round would loop
+        // compaction, so drop the pin here as the fallback does, keeping the
+        // summary.
+        if pin.is_some() && estimate_tokens(&rebuilt) > DEFAULT_CONTEXT_TOKEN_BUDGET {
+            rebuilt = Vec::with_capacity(system.len() + tail.len() + 1);
+            rebuilt.extend(system);
+            rebuilt.push(summary_message);
+            rebuilt.extend(tail);
+        }
         *self.history.lock().await = rebuilt;
         Ok(())
     }
+}
+
+/// The largest first user message that compaction keeps verbatim, in
+/// `estimate_tokens` units. A third of the context budget: big enough for a
+/// long task description, small enough that pinning it cannot keep the history
+/// over budget and trigger compaction on every round.
+const PINNED_MESSAGE_TOKEN_CAP: usize = 8_000;
+
+/// Whether `content`, sent as a user message, should survive compaction
+/// verbatim as the opening request of the session.
+///
+/// A restored summary or truncation placeholder is derived text, not a
+/// request, and a message over [`PINNED_MESSAGE_TOKEN_CAP`] is summarized like
+/// any other.
+fn is_pinnable_user_content(content: &str) -> bool {
+    !content.starts_with("[Conversation summary]")
+        && !content.starts_with(TRUNCATION_PLACEHOLDER)
+        && estimate_tokens(&[serde_json::json!({ "role": "user", "content": content })])
+            <= PINNED_MESSAGE_TOKEN_CAP
+}
+
+/// Remove and return the first non-system message when it qualifies as the
+/// pinned opening request (see [`is_pinnable_user_content`]).
+fn take_pinned_first_message(non_system: &mut Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    let first = non_system.first()?;
+    let pinnable = first["role"] == "user"
+        && first["content"]
+            .as_str()
+            .is_some_and(is_pinnable_user_content);
+    pinnable.then(|| non_system.remove(0))
+}
+
+/// [`truncate_history_to_budget`] with the pin placed after the system
+/// messages. If that rebuild cannot fit, retry without the pin, so the pin
+/// cannot turn a recoverable session into a failed one.
+fn truncate_history_keeping_pin(
+    system: &[serde_json::Value],
+    pin: Option<&serde_json::Value>,
+    tail: Vec<serde_json::Value>,
+) -> Option<Vec<serde_json::Value>> {
+    if let Some(pin) = pin {
+        let mut prefix = system.to_vec();
+        prefix.push(pin.clone());
+        if let Some(rebuilt) = truncate_history_to_budget(&prefix, tail.clone()) {
+            return Some(rebuilt);
+        }
+    }
+    truncate_history_to_budget(system, tail)
 }
 
 /// The placeholder message replacing dropped history when compaction falls
@@ -3393,21 +3501,297 @@ mod tests {
         backend.compact_history(2).await.unwrap();
 
         let history = backend.history_snapshot().await;
-        assert_eq!(history.len(), 4, "system + summary + last 2: {history:?}");
+        assert_eq!(
+            history.len(),
+            5,
+            "system + pinned first message + summary + last 2: {history:?}"
+        );
         assert_eq!(history[0]["role"], "system");
         assert_eq!(history[0]["content"], "be helpful");
-        assert_eq!(history[1]["role"], "user");
-        let summary_text = history[1]["content"].as_str().unwrap();
+        assert_eq!(
+            history[1],
+            serde_json::json!({ "role": "user", "content": "message 0" })
+        );
+        assert_eq!(history[2]["role"], "user");
+        let summary_text = history[2]["content"].as_str().unwrap();
         assert!(summary_text.starts_with("[Conversation summary]\n"));
         assert!(summary_text.contains("We refactored backend.rs; tests pass."));
         assert_eq!(
-            history[2],
+            history[3],
             serde_json::json!({ "role": "assistant", "content": "message 3" })
         );
         assert_eq!(
-            history[3],
+            history[4],
             serde_json::json!({ "role": "user", "content": "message 4" })
         );
+    }
+
+    /// Push `count` alternating user/assistant messages after the first one.
+    async fn push_exchange(backend: &OpenAiBackend, first: &str, count: usize) {
+        let mut history = backend.history.lock().await;
+        history.push(serde_json::json!({ "role": "user", "content": first }));
+        for i in 1..count {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            history.push(serde_json::json!({ "role": role, "content": format!("message {i}") }));
+        }
+    }
+
+    fn count_content(history: &[serde_json::Value], content: &str) -> usize {
+        history
+            .iter()
+            .filter(|message| message["content"] == content)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_the_first_user_message_through_repeat_compactions() {
+        let first = "Open the app, sign in with the credentials, then report.";
+        let (addr, _requests) = spawn_completion_stub("first summary");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("sys".into()),
+        );
+        push_exchange(&backend, first, 8).await;
+        backend.compact_history(2).await.unwrap();
+        let once = backend.history_snapshot().await;
+        assert_eq!(once[1]["content"], first, "{once:?}");
+        assert_eq!(count_content(&once, first), 1, "{once:?}");
+
+        // Second compaction on a fresh endpoint (the stub serves one request),
+        // after the session has grown again.
+        let (addr, _requests) = spawn_completion_stub("second summary");
+        let second = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("sys".into()),
+        );
+        second.restore_history(once).await;
+        for i in 0..6 {
+            second
+                .history
+                .lock()
+                .await
+                .push(serde_json::json!({ "role": "user", "content": format!("later {i}") }));
+        }
+        second.compact_history(2).await.unwrap();
+
+        let twice = second.history_snapshot().await;
+        assert_eq!(twice[0]["role"], "system");
+        assert_eq!(twice[1]["content"], first, "{twice:?}");
+        assert_eq!(count_content(&twice, first), 1, "{twice:?}");
+        assert!(
+            twice[2]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[Conversation summary]\n"),
+            "{twice:?}"
+        );
+        assert!(
+            twice[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("second summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_pin_a_first_message_over_the_cap() {
+        let (addr, _requests) = spawn_completion_stub("a summary");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("sys".into()),
+        );
+        let huge = "x".repeat(PINNED_MESSAGE_TOKEN_CAP * 4 + 400);
+        push_exchange(&backend, &huge, 6).await;
+
+        backend.compact_history(2).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(
+            count_content(&history, &huge),
+            0,
+            "{} messages",
+            history.len()
+        );
+        assert_eq!(history.len(), 4, "system + summary + tail");
+        assert!(
+            history[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[Conversation summary]")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_drops_the_pin_when_the_rebuild_would_stay_over_budget() {
+        let (addr, _requests) = spawn_completion_stub("a summary");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("sys".into()),
+        );
+        // Pinnable on its own (under the cap), but system + pin + summary + tail
+        // overflows the budget while system + summary + tail fits.
+        let pin = "p".repeat(28_000);
+        {
+            let mut history = backend.history.lock().await;
+            history.push(serde_json::json!({ "role": "user", "content": pin }));
+            history.push(serde_json::json!({ "role": "assistant", "content": "ok" }));
+            history.push(serde_json::json!({ "role": "user", "content": "x".repeat(40_000) }));
+            history.push(serde_json::json!({ "role": "assistant", "content": "y".repeat(40_000) }));
+        }
+
+        backend.compact_history(2).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(
+            count_content(&history, &pin),
+            0,
+            "pin should be dropped: {}",
+            history.len()
+        );
+        assert!(
+            history.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("[Conversation summary]"))),
+            "summary should be kept: {history:?}"
+        );
+        assert!(
+            estimate_tokens(&history) <= DEFAULT_CONTEXT_TOKEN_BUDGET,
+            "rebuild should fit the budget, got {}",
+            estimate_tokens(&history)
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_pin_a_restored_summary() {
+        let (addr, _requests) = spawn_completion_stub("a summary");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("sys".into()),
+        );
+        let old_summary = "[Conversation summary]\nearlier work";
+        push_exchange(&backend, old_summary, 6).await;
+
+        backend.compact_history(2).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(count_content(&history, old_summary), 0, "{history:?}");
+        assert_eq!(history.len(), 4, "{history:?}");
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_duplicate_a_first_message_inside_the_tail() {
+        let (addr, _requests) = spawn_completion_stub("a summary");
+        let backend = OpenAiBackend::new(
+            format!("http://{addr}/v1"),
+            "test-key",
+            "test-model",
+            Some("sys".into()),
+        );
+        push_exchange(&backend, "the only request", 3).await;
+
+        backend.compact_history(6).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(
+            count_content(&history, "the only request"),
+            1,
+            "{history:?}"
+        );
+        assert_eq!(history[1]["content"], "the only request");
+        assert_eq!(history.len(), 5, "system + pin + summary + 2: {history:?}");
+    }
+
+    #[tokio::test]
+    async fn truncation_fallback_keeps_the_pinned_first_message() {
+        // Nothing listens here, so summarization fails.
+        let backend =
+            OpenAiBackend::new("http://127.0.0.1:9", "", "test-model", Some("sys".into()));
+        {
+            let mut history = backend.history.lock().await;
+            history.push(serde_json::json!({ "role": "user", "content": "the request" }));
+            for i in 0..20 {
+                history.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("message {i}: {}", "padding ".repeat(200)),
+                }));
+            }
+        }
+
+        backend.compact_history(4).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(history[0]["role"], "system");
+        assert_eq!(history[1]["content"], "the request", "{history:?}");
+        assert_eq!(history[2]["content"], TRUNCATION_PLACEHOLDER);
+        assert!(estimate_tokens(&history) <= DEFAULT_CONTEXT_TOKEN_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn truncation_fallback_retries_without_the_pin_when_it_does_not_fit() {
+        // The system prompt fits the window on its own, but not beside the pin.
+        let backend = OpenAiBackend::new(
+            "http://127.0.0.1:9",
+            "",
+            "test-model",
+            Some("s".repeat((DEFAULT_CONTEXT_TOKEN_BUDGET - 7_000) * 4)),
+        );
+        let pin = "p".repeat((PINNED_MESSAGE_TOKEN_CAP - 500) * 4);
+        push_exchange(&backend, &pin, 4).await;
+
+        backend.compact_history(2).await.unwrap();
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(count_content(&history, &pin), 0, "pin dropped to fit");
+        assert_eq!(history[1]["content"], TRUNCATION_PLACEHOLDER);
+        assert!(estimate_tokens(&history) <= DEFAULT_CONTEXT_TOKEN_BUDGET);
+    }
+
+    #[test]
+    fn local_pin_helpers_follow_the_same_rules() {
+        let mut messages = vec![ChatMessage::user("request"), ChatMessage::user("later")];
+        let pin = take_pinned_first_chat_message(&mut messages);
+        assert_eq!(pin.map(|m| m.content), Some("request".to_string()));
+        assert_eq!(messages.len(), 1);
+
+        let mut summary = vec![ChatMessage::user("[Conversation summary]\nold")];
+        assert!(take_pinned_first_chat_message(&mut summary).is_none());
+        assert_eq!(summary.len(), 1);
+
+        let mut huge = vec![ChatMessage::user(
+            "x".repeat(PINNED_MESSAGE_TOKEN_CAP * 4 + 400),
+        )];
+        assert!(take_pinned_first_chat_message(&mut huge).is_none());
+
+        // The pin leads the rebuild; when it cannot fit beside the system
+        // messages the rebuild drops it instead of failing.
+        let rebuilt = truncate_chat_messages_keeping_pin(
+            vec![ChatMessage::system("sys")],
+            Some(ChatMessage::user("request")),
+            vec![ChatMessage::user("newest")],
+        )
+        .unwrap();
+        let texts: Vec<&str> = rebuilt.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, ["sys", "request", TRUNCATION_PLACEHOLDER, "newest"]);
+
+        let system_len = (DEFAULT_CONTEXT_TOKEN_BUDGET - 100) * 4;
+        let rebuilt = truncate_chat_messages_keeping_pin(
+            vec![ChatMessage::system("s".repeat(system_len))],
+            Some(ChatMessage::user("p".repeat(1_000))),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.len(), 2, "pin dropped: {}", rebuilt.len());
+        assert_eq!(rebuilt[1].content, TRUNCATION_PLACEHOLDER);
     }
 
     /// Compacting a tool-heavy session must not put tool shapes on the wire.
@@ -3516,7 +3900,15 @@ mod tests {
 
         let history = backend.history_snapshot().await;
         assert_eq!(history[0]["role"], "system", "{history:?}");
-        assert_eq!(history[1]["content"], TRUNCATION_PLACEHOLDER, "{history:?}");
+        // The opening message is pinned right after the system prompt.
+        assert!(
+            history[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("message 0:"),
+            "{history:?}"
+        );
+        assert_eq!(history[2]["content"], TRUNCATION_PLACEHOLDER, "{history:?}");
         // The newest messages survive; the oldest were dropped to fit.
         assert_eq!(
             history.last().unwrap()["content"]
