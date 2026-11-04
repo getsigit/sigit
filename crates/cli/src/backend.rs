@@ -782,7 +782,7 @@ impl InferenceBackend for LocalBackend {
             .take_while(|message| message.role == ChatRole::System)
             .cloned()
             .collect();
-        let non_system: Vec<ChatMessage> = snapshot
+        let mut non_system: Vec<ChatMessage> = snapshot
             .into_iter()
             .filter(|message| message.role != ChatRole::System)
             .collect();
@@ -799,7 +799,6 @@ impl InferenceBackend for LocalBackend {
 
         // Keep the opening request verbatim; the tail is taken from what is
         // left so the pin is neither duplicated nor counted against `keep_last`.
-        let mut non_system = non_system;
         let pin = take_pinned_first_chat_message(&mut non_system);
         let tail_start = non_system.len().saturating_sub(keep_last);
         let tail: Vec<ChatMessage> = non_system[tail_start..].to_vec();
