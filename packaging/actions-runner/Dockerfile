@@ -99,9 +99,11 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Tauri runtime on Linux (AppImage under tauri-driver), a virtual display, and ffmpeg, which
 # records that display during a siGit Code Assurance operate run (sigit-app ci/assurance/record.sh).
+# The build fails if this ffmpeg lacks the x11grab input the recorder uses.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         xvfb libwebkit2gtk-4.1-0 webkit2gtk-driver bubblewrap ffmpeg \
+    && ffmpeg -hide_banner -devices 2>/dev/null | grep -qw x11grab \
     && rm -rf /var/lib/apt/lists/*
 
 # Browsers and their system libraries and fonts, at the pinned Playwright version.
