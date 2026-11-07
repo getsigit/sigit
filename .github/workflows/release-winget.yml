@@ -155,7 +155,10 @@ jobs:
       # microsoft/winget-pkgs (fork + open issues/PRs). WINGET_PR_TOKEN also
       # needs read:org and read:discussion: the "Set the winget PR body" step
       # below calls `gh pr edit`, whose GraphQL query resolves org/team and
-      # discussion fields and fails with a scope error without them.
+      # discussion fields and fails with a scope error without them. It needs
+      # workflow too: wingetcreate fast-forwards the token owner's fork before
+      # it branches, and GitHub refuses that sync when an upstream commit
+      # changed a file under .github/workflows (v1.7.10, run 42367101397).
       # WINGET_PR_TOKEN replaces the old single WINGET_TOKEN.
       - name: File the winget Package Request issue
         id: issue
@@ -242,7 +245,7 @@ jobs:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo, read:org, and read:discussion scopes so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR, and gh can edit the PR body."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo, read:org, read:discussion, and workflow scopes so wingetcreate can sync its fork of microsoft/winget-pkgs and open the manifest PR, and gh can edit the PR body."
           }
 
           $version = "${{ steps.release.outputs.version }}"
@@ -276,7 +279,7 @@ jobs:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo, read:org, and read:discussion scopes so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR, and gh can edit the PR body."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a PAT with public_repo, read:org, read:discussion, and workflow scopes so wingetcreate can sync its fork of microsoft/winget-pkgs and open the manifest PR, and gh can edit the PR body."
           }
 
           $tag = "${{ steps.release.outputs.tag }}"
