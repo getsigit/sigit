@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.10
+
+No change to the agent or the protocol, so an editor sees a 1.7.9-shaped agent.
+
+### Changed
+
+- **The QA runner image includes ffmpeg.** The image behind siGit Code
+  Assurance can now record the screen during a QA run (#294).
+
 ## 1.7.9
 
 Compaction keeps the opening request. No protocol change, so an editor sees a
