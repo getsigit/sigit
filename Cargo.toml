@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/cli", "crates/sigit-*"]
 
 [workspace.package]
-version = "1.7.9"
+version = "1.7.10"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/getsigit/sigit"
