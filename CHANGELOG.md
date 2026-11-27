@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.7.11
+
+Skills become slash commands, and the terminal UI completes them as you type.
+An editor sees the extra commands in its list, with no change to the protocol.
+
+### Added
+
+- **Skills run as `/<skill-name>`.** An unrecognized slash word is tried
+  against custom commands first, then against skills, so a skill can be
+  invoked by name with an optional task after it. The ACP command list now
+  includes each skill, with its description cut to one line. A skill named like
+  a built-in or custom command is skipped with a warning.
+- **The terminal UI completes slash commands and skills as you type.** Typing
+  `/` lists the candidates and narrows them with each character.
+
+### Changed
+
+- **`/login`, `/logout` and `/whoami` show their result as a system notice**
+  instead of an assistant message.
+
+### Fixed
+
+- **Slash commands are advertised after the `session/new` and `session/fork`
+  responses.** Sent earlier, the list could reach the client before it knew
+  the session.
+
 ## 1.7.10
 
 No change to the agent or the protocol, so an editor sees a 1.7.9-shaped agent.
