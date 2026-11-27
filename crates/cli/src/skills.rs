@@ -143,6 +143,14 @@ pub fn activate_skill(arguments: &str) -> String {
         return format!("Error: no skill named \"{name}\". Available skills: {available}.");
     };
 
+    render_activation(skill)
+}
+
+/// The text handed to the model when `skill` is activated: its `SKILL.md` body
+/// under a header naming the skill's directory, or an error line when the file
+/// cannot be read.
+fn render_activation(skill: &Skill) -> String {
+    let name = &skill.name;
     let body = match read_skill_body(&skill.skill_md()) {
         Ok(body) => body,
         Err(err) => {
@@ -172,6 +180,20 @@ pub fn activate_skill(arguments: &str) -> String {
          file references (scripts/, references/, assets/) against that path. Follow \
          these instructions:\n\n{notes}{body}"
     )
+}
+
+/// The prompt for a `/<skill-name> [task]` command, or `None` when no skill has
+/// that name. The activation text comes first, then the user's task if one was
+/// given. Accepts the name with or without a leading `/`.
+pub fn slash_prompt(name: &str, argument: Option<&str>) -> Option<String> {
+    let name = name.strip_prefix('/').unwrap_or(name);
+    let skill = discover_skills().into_iter().find(|s| s.name == name)?;
+    let mut prompt = render_activation(&skill);
+    if let Some(task) = argument.map(str::trim).filter(|t| !t.is_empty()) {
+        prompt.push_str("\n\nTask: ");
+        prompt.push_str(task);
+    }
+    Some(prompt)
 }
 
 /// Discover all valid skills across the known roots. Earlier roots win when two
@@ -443,6 +465,39 @@ mod tests {
 
         let missing = activate_skill(r#"{"name": "nope"}"#);
         assert!(missing.contains("no skill named"));
+
+        std::env::set_current_dir(prev).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn slash_prompt_activates_a_skill_and_appends_the_task() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = unique_dir("slash-prompt");
+        let skill_dir = root.join(".sigit").join("skills").join("tidy-up");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: tidy-up\ndescription: Tidy things.\n---\n\nSort the shelves.\n",
+        )
+        .unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let bare = slash_prompt("tidy-up", None).expect("skill found");
+        assert!(bare.contains("Sort the shelves."));
+        assert!(!bare.contains("Task:"));
+
+        let with_task = slash_prompt("/tidy-up", Some("  the garage ")).expect("slash accepted");
+        assert!(with_task.starts_with(&bare));
+        assert!(with_task.ends_with("\n\nTask: the garage"));
+
+        let blank = slash_prompt("tidy-up", Some("   ")).unwrap();
+        assert_eq!(blank, bare);
+        assert!(slash_prompt("nope", None).is_none());
 
         std::env::set_current_dir(prev).unwrap();
         let _ = fs::remove_dir_all(&root);

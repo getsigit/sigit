@@ -433,6 +433,31 @@ fn tool_arguments_content(arguments_json: &str) -> ToolCallContent {
     fenced_code_block(language, &chat::pretty_tool_arguments(arguments_json)).into()
 }
 
+/// A skill description cut to one line of about 100 characters, so a client's
+/// command popup stays readable.
+fn one_line_description(description: &str) -> String {
+    const MAX: usize = 100;
+    let line = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= MAX {
+        return line;
+    }
+    let cut: String = line.chars().take(MAX - 3).collect();
+    format!("{}...", cut.trim_end())
+}
+
+/// Splits a notice into its title (the first non-empty line) and the body
+/// (everything after it), if there is any.
+fn split_notice(text: &str) -> (String, Option<String>) {
+    let text = text.trim();
+    match text.split_once('\n') {
+        Some((title, rest)) if !rest.trim().is_empty() => {
+            (title.trim().to_string(), Some(rest.trim().to_string()))
+        }
+        Some((title, _)) => (title.trim().to_string(), None),
+        None => (text.to_string(), None),
+    }
+}
+
 /// Wraps a tool's output as the display content of its ACP tool-call card
 /// (issue #78). Capped via [`chat::cap_output_preview`] — display only, the
 /// model still gets the full output — and fenced so plain-text output (or a
@@ -1661,6 +1686,28 @@ impl SiGitAgent {
         ))
     }
 
+    /// A system notice that may run to several lines: the first line is the
+    /// card's title and the rest is its body, so a sign-in URL stays visible
+    /// and clickable. A single line is the same as `send_system_status`.
+    fn send_system_notice(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        text: impl AsRef<str>,
+    ) -> agent_client_protocol::Result<()> {
+        let (title, body) = split_notice(text.as_ref());
+        let mut call = ToolCall::new(format!("system-status-{}", uuid::Uuid::new_v4()), title)
+            .kind(ToolKind::Think)
+            .status(ToolCallStatus::Completed);
+        if let Some(body) = body {
+            call = call.content(vec![body.into()]);
+        }
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::ToolCall(call),
+        ))
+    }
+
     /// Run one inference turn (`fut`) while concurrently forwarding any streamed
     /// tokens to the editor. The sink receiver is drained as the future runs, so
     /// chunks reach the client live rather than all at once when it resolves.
@@ -1848,6 +1895,26 @@ impl SiGitAgent {
                 Some(hint) => with_hint(&command.name, &description, hint),
                 None => AvailableCommand::new(&command.name, &description),
             });
+        }
+
+        // Skills come last, so `/` in the client lists them next to the
+        // commands. A skill sharing a name with a built-in or custom command
+        // is unreachable as `/name` (those win), so it is not advertised.
+        let taken: Vec<String> = commands.iter().map(|c| c.name.to_string()).collect();
+        for skill in skills::discover_skills() {
+            if taken.contains(&skill.name) {
+                log::warn!(
+                    "skill \"{}\" at {} is shadowed by a command of the same name",
+                    skill.name,
+                    skill.dir.display()
+                );
+                continue;
+            }
+            commands.push(with_hint(
+                &skill.name,
+                &one_line_description(&skill.description),
+                "task (optional)",
+            ));
         }
 
         self.send_tool_call_update(
@@ -3228,7 +3295,8 @@ impl SiGitAgent {
             build_config_options(&guard, &new_id.to_string())
         };
 
-        self.advertise_commands(cx, new_id.clone());
+        // The command list is advertised by the dispatcher, after this
+        // response is written. See the `ForkSessionRequest` handler.
 
         // Run SessionStart hooks
         let hook_settings = settings::load().hooks;
@@ -3244,7 +3312,6 @@ impl SiGitAgent {
 
     async fn handle_new_session(
         &self,
-        cx: &ConnectionTo<Client>,
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         validate_session_roots(&args.cwd, &args.additional_directories)?;
@@ -3269,7 +3336,8 @@ impl SiGitAgent {
             build_config_options(&guard, &session_id.to_string())
         };
 
-        self.advertise_commands(cx, session_id.clone());
+        // The command list is advertised by the dispatcher, after this
+        // response is written. See the `NewSessionRequest` handler.
 
         // Run SessionStart hooks
         let hook_settings = settings::load().hooks;
@@ -3498,22 +3566,26 @@ impl SiGitAgent {
             // permission checks.
             Some(SlashCommand::Init) => instructions::INIT_PROMPT.to_string(),
             // A word `parse_slash` didn't recognize might be a user-defined
-            // command (`.sigit/commands/*.md`) — same substitute-and-run-a-
-            // real-turn treatment as `/init`. Only fall back to "unknown
-            // command" once that lookup also misses.
+            // command (`.sigit/commands/*.md`) or a skill — same substitute-
+            // and-run-a-real-turn treatment as `/init`. Only fall back to
+            // "unknown command" once both lookups miss.
             Some(SlashCommand::Unknown(command, argument)) => {
                 match commands::resolve_command(&command) {
                     Some(custom) => commands::render(&custom.body, argument.as_deref()),
-                    None => {
-                        return self
-                            .run_slash(
-                                cx,
-                                session_id,
-                                SlashCommand::Unknown(command, argument),
-                                &cancellation,
-                            )
-                            .await;
-                    }
+                    // Then a skill: `/<skill-name> [task]` activates it.
+                    None => match skills::slash_prompt(&command, argument.as_deref()) {
+                        Some(prompt) => prompt,
+                        None => {
+                            return self
+                                .run_slash(
+                                    cx,
+                                    session_id,
+                                    SlashCommand::Unknown(command, argument),
+                                    &cancellation,
+                                )
+                                .await;
+                        }
+                    },
                 }
             }
             Some(command) => return self.run_slash(cx, session_id, command, &cancellation).await,
@@ -5664,6 +5736,7 @@ async fn exec_slash_acp(
                      /skills        - list available Agent Skills\n\
                      /agents        - list configured subagent types (.sigit/agents/*.md)\n\
                      /commands      - list user-defined commands (.sigit/commands/*.md)\n\
+                     /<skill-name> [task] - run an Agent Skill, optionally on a task\n\
                      /mcp           - list MCP servers and their tools\n\
                      /load          - load the selected on-device model\n\
                      /login E P     - sign in to siGit Code Cloud\n\
@@ -5991,15 +6064,15 @@ async fn exec_slash_acp(
                     .unwrap_or_else(|message| message),
             };
             mcp::refresh_session_auth().await;
-            agent.send_assistant_message(cx, session_id, message).ok();
+            agent.send_system_notice(cx, session_id, message).ok();
         }
         SlashCommand::Logout => {
             let message = agent.sign_out(cx).await;
-            agent.send_assistant_message(cx, session_id, message).ok();
+            agent.send_system_notice(cx, session_id, message).ok();
         }
         SlashCommand::Whoami => {
             let message = account::status_line().await;
-            agent.send_assistant_message(cx, session_id, message).ok();
+            agent.send_system_notice(cx, session_id, message).ok();
         }
         SlashCommand::Reload => {
             agent.handle_reload(cx, session_id).await;
@@ -6552,7 +6625,18 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                         // which has to be between turns.
                         let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
-                        handle_response(responder, state.handle_fork_session(&task_cx, req).await)
+                        let result = state.handle_fork_session(&task_cx, req).await;
+                        let new_id = result.as_ref().ok().map(|r| r.session_id.clone());
+                        handle_response(responder, result)?;
+                        // Zed creates the thread only once it has this
+                        // response and drops updates for a session it does
+                        // not know yet, so the command list has to follow the
+                        // response, not precede it. Notifications and
+                        // responses share one ordered writer.
+                        if let Some(id) = new_id {
+                            state.advertise_commands(&task_cx, id);
+                        }
+                        Ok(())
                     })
                 }
             },
@@ -6566,7 +6650,18 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let task_cx = cx.clone();
                     cx.spawn(async move {
                         let _workspace = state.workspace_lock.lock().await;
-                        handle_response(responder, state.handle_new_session(&task_cx, req).await)
+                        let result = state.handle_new_session(req).await;
+                        let session_id = result.as_ref().ok().map(|r| r.session_id.clone());
+                        handle_response(responder, result)?;
+                        // Zed creates the thread only once it has this
+                        // response and drops updates for a session it does
+                        // not know yet, so the command list has to follow the
+                        // response, not precede it. Notifications and
+                        // responses share one ordered writer.
+                        if let Some(id) = session_id {
+                            state.advertise_commands(&task_cx, id);
+                        }
+                        Ok(())
                     })
                 }
             },
@@ -6974,6 +7069,22 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notices_split_into_title_and_body() {
+        assert_eq!(super::split_notice("Signed in"), ("Signed in".into(), None));
+        assert_eq!(
+            super::split_notice("Signed in\n"),
+            ("Signed in".into(), None)
+        );
+        assert_eq!(
+            super::split_notice("Open this page:\nhttps://x.test/a\nthen return"),
+            (
+                "Open this page:".into(),
+                Some("https://x.test/a\nthen return".into())
+            )
+        );
+    }
+
     use super::*;
 
     /// Compares path components so the tests pass on both Unix (forward slashes)

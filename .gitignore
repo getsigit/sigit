@@ -2,3 +2,4 @@
 /.zed
 /.idea
 issues:*
+/nuget/
